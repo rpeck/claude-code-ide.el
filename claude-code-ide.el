@@ -228,6 +228,26 @@ display-buffer behavior."
   :type 'boolean
   :group 'claude-code-ide)
 
+(defcustom claude-code-ide-side-window-scope 'all
+  "Which sessions hold a side window at the same time.
+
+`all'      Every session, from every project, owns a side window.
+           Windows group by project.  This is the default.
+`project'  Only one project's sessions stay on screen.  Displaying a
+           session of another project removes the other project's
+           windows first.
+`single'   Every session shares one side window, so displaying a
+           session replaces the one on screen.
+
+A large number of sessions splits the side window area into small
+windows under `all'.  Use `project' or `single' to bound it.
+
+This setting has no effect when `claude-code-ide-use-side-window' is nil."
+  :type '(choice (const :tag "All sessions, grouped by project" all)
+                 (const :tag "One project at a time" project)
+                 (const :tag "One window for everything" single))
+  :group 'claude-code-ide)
+
 (defcustom claude-code-ide-terminal-backend 'vterm
   "Terminal backend to use for Claude Code sessions.
 Can be `vterm', `eat', or `ghostel'.  The vterm backend is the default
@@ -849,6 +869,28 @@ interleaved by global creation order.")
 
 (defun claude-code-ide--assign-window-slot (project-dir)
   "Return a side-window slot for a new instance of PROJECT-DIR.
+`claude-code-ide-side-window-scope' decides the rule:
+`single' puts every instance in slot 0, `project' numbers each project
+from 0, and `all' gives each project its own block of slots."
+  (pcase claude-code-ide-side-window-scope
+    ('single 0)
+    ('project (claude-code-ide--slot-within-project project-dir))
+    (_ (claude-code-ide--slot-across-projects project-dir))))
+
+(defun claude-code-ide--slot-within-project (project-dir)
+  "Return the smallest slot no live session of PROJECT-DIR uses.
+Slots restart at 0 for each project, because `project' scope keeps only
+one project on screen, so two projects never compete for a slot."
+  (let ((used (cl-remove nil
+                         (mapcar #'claude-code-ide-mcp-session-window-slot
+                                 (claude-code-ide-mcp--sessions-for-project project-dir))))
+        (slot 0))
+    (while (memq slot used)
+      (cl-incf slot))
+    slot))
+
+(defun claude-code-ide--slot-across-projects (project-dir)
+  "Return a side-window slot for a new instance of PROJECT-DIR.
 Each project owns a block of `claude-code-ide--window-slot-block'
 slots, so windows sort as emacs, emacs, src, src rather than by
 creation order.  Within the block the smallest slot not used by any
@@ -949,12 +991,33 @@ most recently used one — only displaying or hiding windows would."
 ;; Ensure cleanup on Emacs exit
 (add-hook 'kill-emacs-hook #'claude-code-ide--cleanup-all-sessions)
 
+(defun claude-code-ide--hide-foreign-side-windows (project-dir)
+  "Delete every Claude side window whose session is not in PROJECT-DIR.
+This is how `project' scope keeps one project on screen.  Only windows
+that hold a Claude session buffer are touched."
+  (when project-dir
+    (let ((keep (expand-file-name project-dir)))
+      (dolist (win (window-list nil 'never))
+        (when (and (window-live-p win)
+                   (window-parameter win 'window-side))
+          (when-let* ((session (claude-code-ide--buffer-session (window-buffer win)))
+                      (dir (claude-code-ide-mcp-session-project-dir session)))
+            (unless (string= (expand-file-name dir) keep)
+              (delete-window win))))))))
+
 (defun claude-code-ide--display-buffer-in-side-window (buffer)
   "Display BUFFER in a side window according to customization.
 The window is displayed on the side specified by
 `claude-code-ide-window-side' with dimensions from
 `claude-code-ide-window-width' or `claude-code-ide-window-height'.
 If `claude-code-ide-focus-on-open' is non-nil, the window is selected."
+  ;; In `project' scope only one project stays on screen.  Remove the other
+  ;; projects' windows before this one is displayed.
+  (when (and claude-code-ide-use-side-window
+             (eq claude-code-ide-side-window-scope 'project))
+    (claude-code-ide--hide-foreign-side-windows
+     (when-let* ((session (claude-code-ide--buffer-session buffer)))
+       (claude-code-ide-mcp-session-project-dir session))))
   (let ((window
          (if claude-code-ide-use-side-window
              ;; Use side window
