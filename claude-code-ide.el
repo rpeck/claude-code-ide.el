@@ -236,7 +236,8 @@ display-buffer behavior."
 `project'  Only one project's sessions stay on screen.  Displaying a
            session of another project removes the other project's
            windows first, and so does moving focus into a session
-           buffer of another project.
+           buffer of another project.  All live sessions of the
+           project you return to come back, each in its own window.
 `single'   Every session shares one side window, so displaying a
            session replaces the one on screen.
 
@@ -1006,6 +1007,34 @@ that hold a Claude session buffer are touched."
             (unless (string= (expand-file-name dir) keep)
               (delete-window win))))))))
 
+(defun claude-code-ide--show-project-side-windows (project-dir focus-buffer)
+  "Display every live session of PROJECT-DIR, then select FOCUS-BUFFER.
+
+In `project' scope a swap removes the other projects' windows. Without this
+step, returning to a project with several sessions showed only the one you
+selected, and its siblings stayed hidden. Each sibling keeps its own slot,
+so the side area splits the way it did before you left the project.
+
+Displaying a buffer marks its session as used. Restore the previous times,
+so the siblings do not move ahead of the session you chose in the order
+that `claude-code-ide-switch-to-buffer' uses."
+  (let* ((sessions (claude-code-ide-mcp--sessions-for-project project-dir))
+         (saved (mapcar (lambda (session)
+                          (cons session
+                                (claude-code-ide-mcp-session-last-used session)))
+                        sessions))
+         (claude-code-ide-focus-on-open nil))
+    (dolist (session sessions)
+      (let ((buffer (claude-code-ide-mcp-session-buffer session)))
+        (when (and (buffer-live-p buffer)
+                   (not (get-buffer-window buffer)))
+          (claude-code-ide--display-buffer-in-side-window buffer))))
+    (dolist (pair saved)
+      (setf (claude-code-ide-mcp-session-last-used (car pair)) (cdr pair)))
+    (setq claude-code-ide--last-accessed-buffer focus-buffer)
+    (when-let* ((window (get-buffer-window focus-buffer)))
+      (select-window window))))
+
 (defvar claude-code-ide--swapping-side-windows nil
   "Non-nil while a side-window swap runs, to stop the hook re-entering.")
 
@@ -1017,6 +1046,7 @@ two things when a Claude session buffer becomes selected:
 
   1. Removes the side windows of every other project.
   2. Moves the buffer into the side area when it is not already there.
+  3. Brings back the project's other live sessions, each in its own slot.
 
 Step 2 is what makes ordinary commands work. C-x b calls
 `switch-to-buffer', which does not consult `display-buffer-alist' unless
@@ -1054,7 +1084,10 @@ windows while the hook runs would call the hook again."
                        (error (switch-to-prev-buffer window)))
                      (when-let* ((side (claude-code-ide--display-buffer-in-side-window
                                         buffer)))
-                       (select-window side)))))
+                       (select-window side))))
+                 ;; Bring back the project's other sessions as well.
+                 (claude-code-ide--show-project-side-windows
+                  (claude-code-ide-mcp-session-project-dir session) buffer))
              (setq claude-code-ide--swapping-side-windows nil))))))))
 
 ;; The function returns at once unless the scope is `project', so adding the
