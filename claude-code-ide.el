@@ -235,7 +235,8 @@ display-buffer behavior."
            Windows group by project.  This is the default.
 `project'  Only one project's sessions stay on screen.  Displaying a
            session of another project removes the other project's
-           windows first.
+           windows first, and so does moving focus into a session
+           buffer of another project.
 `single'   Every session shares one side window, so displaying a
            session replaces the one on screen.
 
@@ -1004,6 +1005,39 @@ that hold a Claude session buffer are touched."
                       (dir (claude-code-ide-mcp-session-project-dir session)))
             (unless (string= (expand-file-name dir) keep)
               (delete-window win))))))))
+
+(defvar claude-code-ide--swapping-side-windows nil
+  "Non-nil while a side-window swap runs, to stop the hook re-entering.")
+
+(defun claude-code-ide--maybe-swap-side-windows (&optional _frame)
+  "Swap the side area to the project of the session buffer now selected.
+
+Runs from `window-selection-change-functions' in `project' scope. Only a
+Claude session buffer triggers a swap. Selecting an ordinary buffer changes
+nothing, so reading a file of another project leaves the windows alone.
+
+The swap runs from a timer rather than inside the hook, because deleting a
+window while the hook runs changes the selected window and would call the
+hook again."
+  (when (and claude-code-ide-use-side-window
+             (eq claude-code-ide-side-window-scope 'project)
+             (not claude-code-ide--swapping-side-windows))
+    (when-let* ((session (claude-code-ide--buffer-session
+                          (window-buffer (selected-window))))
+                (dir (claude-code-ide-mcp-session-project-dir session)))
+      (setq claude-code-ide--swapping-side-windows t)
+      (run-at-time
+       0 nil
+       (lambda ()
+         (unwind-protect
+             (claude-code-ide--hide-foreign-side-windows dir)
+           (setq claude-code-ide--swapping-side-windows nil)))))))
+
+;; The function returns at once unless the scope is `project', so adding the
+;; hook is harmless in the other scopes.
+(add-hook 'window-selection-change-functions
+          #'claude-code-ide--maybe-swap-side-windows)
+
 
 (defun claude-code-ide--display-buffer-in-side-window (buffer)
   "Display BUFFER in a side window according to customization.
