@@ -1010,28 +1010,52 @@ that hold a Claude session buffer are touched."
   "Non-nil while a side-window swap runs, to stop the hook re-entering.")
 
 (defun claude-code-ide--maybe-swap-side-windows (&optional _frame)
-  "Swap the side area to the project of the session buffer now selected.
+  "Put the selected Claude session in the side area, alone for its project.
 
-Runs from `window-selection-change-functions' in `project' scope. Only a
-Claude session buffer triggers a swap. Selecting an ordinary buffer changes
-nothing, so reading a file of another project leaves the windows alone.
+Runs from `window-selection-change-functions' in `project' scope. It does
+two things when a Claude session buffer becomes selected:
 
-The swap runs from a timer rather than inside the hook, because deleting a
-window while the hook runs changes the selected window and would call the
-hook again."
+  1. Removes the side windows of every other project.
+  2. Moves the buffer into the side area when it is not already there.
+
+Step 2 is what makes ordinary commands work. C-x b calls
+`switch-to-buffer', which does not consult `display-buffer-alist' unless
+`switch-to-buffer-obey-display-actions' is set, and it cannot reuse a side
+window because the package dedicates those. So the buffer lands in a split
+window instead. This moves it where it belongs and disposes of the split.
+
+Selecting an ordinary buffer does nothing, so reading a file of another
+project leaves the windows alone.
+
+The work runs from a timer rather than inside the hook, because changing
+windows while the hook runs would call the hook again."
   (when (and claude-code-ide-use-side-window
              (eq claude-code-ide-side-window-scope 'project)
              (not claude-code-ide--swapping-side-windows))
-    (when-let* ((session (claude-code-ide--buffer-session
-                          (window-buffer (selected-window))))
-                (dir (claude-code-ide-mcp-session-project-dir session)))
-      (setq claude-code-ide--swapping-side-windows t)
-      (run-at-time
-       0 nil
-       (lambda ()
-         (unwind-protect
-             (claude-code-ide--hide-foreign-side-windows dir)
-           (setq claude-code-ide--swapping-side-windows nil)))))))
+    (let* ((buffer (window-buffer (selected-window)))
+           (session (claude-code-ide--buffer-session buffer)))
+      (when session
+        (setq claude-code-ide--swapping-side-windows t)
+        (run-at-time
+         0 nil
+         (lambda ()
+           (unwind-protect
+               (progn
+                 (claude-code-ide--hide-foreign-side-windows
+                  (claude-code-ide-mcp-session-project-dir session))
+                 (let ((window (get-buffer-window buffer)))
+                   (when (and (window-live-p window)
+                              (not (window-parameter window 'window-side)))
+                     ;; Dispose of the window the switch created. Fall back
+                     ;; to the previous buffer when it cannot be deleted,
+                     ;; for example when it is the only window.
+                     (condition-case nil
+                         (delete-window window)
+                       (error (switch-to-prev-buffer window)))
+                     (when-let* ((side (claude-code-ide--display-buffer-in-side-window
+                                        buffer)))
+                       (select-window side)))))
+             (setq claude-code-ide--swapping-side-windows nil))))))))
 
 ;; The function returns at once unless the scope is `project', so adding the
 ;; hook is harmless in the other scopes.
