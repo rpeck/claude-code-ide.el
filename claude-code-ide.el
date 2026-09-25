@@ -617,6 +617,26 @@ from the window where it was initially created."
                 (set-process-window-size proc height width))
             (set-process-window-size proc height width)))))))
 
+(defun claude-code-ide--sync-all-session-windows ()
+  "Send each visible Claude session's real window size to its terminal.
+
+`claude-code-ide--terminal-reflow-filter' lets a resize reach the CLI only
+when the window width changes, to work around Claude Code bug #1422. The
+backend still resizes its own screen first, so after a height-only change
+the terminal shows the new number of rows while the CLI keeps drawing for
+the old one. Its input box then lands a line or more away from the cursor,
+and typed text appears on the wrong line.
+
+Stacking sessions in the side area makes exactly those changes: a new
+window shortens its neighbours, and deleting one makes the others taller.
+Call this after the package itself changes the layout. It gives each CLI
+its real size once, and it leaves the filter in place for the transient
+resizes that the filter exists to suppress."
+  (dolist (window (window-list nil 'never))
+    (let ((buffer (window-buffer window)))
+      (when (claude-code-ide--session-buffer-p buffer)
+        (claude-code-ide--sync-terminal-dimensions buffer window)))))
+
 (defun claude-code-ide--setup-terminal-keybindings ()
   "Set up keybindings for the Claude Code terminal buffer.
 This function binds:
@@ -1032,6 +1052,9 @@ that `claude-code-ide-switch-to-buffer' uses."
     (dolist (pair saved)
       (setf (claude-code-ide-mcp-session-last-used (car pair)) (cdr pair)))
     (setq claude-code-ide--last-accessed-buffer focus-buffer)
+    ;; Deleting other projects' windows made these taller without any display
+    ;; call, so resync here as well.
+    (claude-code-ide--sync-all-session-windows)
     (when-let* ((window (get-buffer-window focus-buffer)))
       (select-window window))))
 
@@ -1157,7 +1180,10 @@ If `claude-code-ide-focus-on-open' is non-nil, the window is selected."
     ;; This is necessary because vterm/eat may have been created with
     ;; different dimensions before being displayed in this window
     (when window
-      (claude-code-ide--sync-terminal-dimensions buffer window))
+      (claude-code-ide--sync-terminal-dimensions buffer window)
+      ;; Showing this window changed its neighbours' heights too, and the
+      ;; reflow filter keeps height-only changes from reaching their CLIs.
+      (claude-code-ide--sync-all-session-windows))
     window))
 
 (defun claude-code-ide--cleanup-session (session &optional buffer-dying)
