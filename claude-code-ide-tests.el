@@ -235,6 +235,7 @@ non-nil."
 (require 'claude-code-ide-mcp-handlers)
 (require 'claude-code-ide)
 (require 'claude-code-ide-session-registry-tests)
+(require 'claude-code-ide-session-status-tests)
 
 ;;; Test Helper Functions
 
