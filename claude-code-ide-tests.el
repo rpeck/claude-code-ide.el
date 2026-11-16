@@ -3874,6 +3874,166 @@ and pruning drops entries whose tab no longer exists."
             (should (memq other cleaned))))
       (claude-code-ide-tests--clear-processes))))
 
+;;; LSP readiness tests
+
+(require 'claude-code-ide-emacs-tools)
+
+(defmacro claude-code-ide-tests--with-lsp-mocks (lsp-on project &rest body)
+  "Run BODY in a temp file buffer with lsp-mode calls mocked.
+LSP-ON is the buffer's initial `lsp-mode' value; PROJECT is what
+`project-current' returns.  Binds `started' and `primed' to counters."
+  (declare (indent 2))
+  `(let* ((file (make-temp-file "cci-lsp" nil ".py"))
+          (buf (find-file-noselect file))
+          (started 0)
+          (primed 0)
+          (real-featurep (symbol-function 'featurep)))
+     (unwind-protect
+         (cl-letf (((symbol-function 'featurep)
+                    (lambda (f &rest r)
+                      (or (eq f 'lsp-mode) (apply real-featurep f r))))
+                   ((symbol-function 'project-current)
+                    (lambda (&rest _) ,project))
+                   ((symbol-function 'lsp)
+                    (lambda (&rest _)
+                      (setq started (1+ started))
+                      (setq-local lsp-mode t)))
+                   ((symbol-function 'xref-backend-identifier-completion-table)
+                    (lambda (&rest _) (setq primed (1+ primed)) nil)))
+           (with-current-buffer buf
+             (setq-local lsp-mode ,lsp-on))
+           ,@body)
+       (kill-buffer buf)
+       (delete-file file))))
+
+(ert-deftest claude-code-ide-test-cci-ensure-lsp-starts-and-primes ()
+  "A project file without lsp-mode gets it started and its cache filled."
+  (claude-code-ide-tests--with-lsp-mocks nil '(transient . "/tmp/")
+                                         (cci-ensure-lsp "some_symbol" file)
+                                         (should (= started 1))
+                                         (should (= primed 1))))
+
+(ert-deftest claude-code-ide-test-cci-ensure-lsp-running-only-primes ()
+  "When lsp-mode already runs, only the symbol cache is filled."
+  (claude-code-ide-tests--with-lsp-mocks t '(transient . "/tmp/")
+                                         (cci-ensure-lsp "some_symbol" file)
+                                         (should (= started 0))
+                                         (should (= primed 1))))
+
+(ert-deftest claude-code-ide-test-cci-ensure-lsp-skips-loose-files ()
+  "A file outside any project does not start lsp-mode."
+  (claude-code-ide-tests--with-lsp-mocks nil nil
+                                         (cci-ensure-lsp "some_symbol" file)
+                                         (should (= started 0))
+                                         (should (= primed 0))))
+
+(ert-deftest claude-code-ide-test-cci-ensure-lsp-without-lsp-mode ()
+  "Without lsp-mode loaded the function does nothing."
+  (let ((started 0))
+    (cl-letf (((symbol-function 'featurep)
+               (let ((real (symbol-function 'featurep)))
+                 (lambda (f &rest r) (and (not (eq f 'lsp-mode)) (apply real f r)))))
+              ((symbol-function 'lsp) (lambda (&rest _) (setq started (1+ started)))))
+      (cci-ensure-lsp "some_symbol" "/nonexistent/file.py")
+      (should (= started 0)))))
+
+(ert-deftest claude-code-ide-test-cci-ensure-lsp-gives-up-after-timeout ()
+  "If lsp-mode never attaches, the wait ends and the cache is not filled."
+  (claude-code-ide-tests--with-lsp-mocks nil '(transient . "/tmp/")
+                                         (cl-letf (((symbol-function 'lsp)
+                                                    (lambda (&rest _) (setq started (1+ started)))))
+                                           (let ((cci-ensure-lsp-timeout 0.3)
+                                                 (t0 (float-time)))
+                                             (cci-ensure-lsp "some_symbol" file)
+                                             (should (= started 1))
+                                             (should (= primed 0))
+                                             (should (< (- (float-time) t0) 2))))))
+
+(ert-deftest claude-code-ide-test-cci-ensure-lsp-advises-xref-tools ()
+  "References resolve their arguments first; apropos ensures lsp-mode first."
+  (should (advice-member-p #'cci-resolve-reference-args 'claude-code-ide-mcp-xref-find-references))
+  (should (advice-member-p #'cci-ensure-lsp 'claude-code-ide-mcp-xref-find-apropos)))
+
+(defmacro claude-code-ide-tests--with-resolve-mocks (content cache workspace-file &rest body)
+  "Run BODY with a temp .py file holding CONTENT and lsp-mode mocked.
+CACHE is the symbol cache lsp-mode would fill for the file.
+WORKSPACE-FILE is the defining file the workspace symbol search
+reports, or nil.  Binds `file', `other' (a second temp file) and
+`buf'."
+  (declare (indent 3))
+  `(let* ((file (make-temp-file "cci-resolve" nil ".py" ,content))
+          (other (make-temp-file "cci-def" nil ".py" "def target():\n    pass\n"))
+          (buf (find-file-noselect file))
+          (real-featurep (symbol-function 'featurep)))
+     (unwind-protect
+         (cl-letf (((symbol-function 'featurep)
+                    (lambda (f &rest r)
+                      (or (eq f 'lsp-mode) (apply real-featurep f r))))
+                   ((symbol-function 'project-current)
+                    (lambda (&rest _) '(transient . "/tmp/")))
+                   ((symbol-function 'lsp)
+                    (lambda (&rest _) (setq-local lsp-mode t)))
+                   ((symbol-function 'xref-backend-identifier-completion-table)
+                    (lambda (&rest _) (setq-local lsp--symbols-cache ,cache)))
+                   ((symbol-function 'xref-backend-apropos)
+                    (lambda (_backend pattern)
+                      (let ((wf ,workspace-file))
+                        (when wf
+                          (list (xref-make (format "[Function] %s" pattern)
+                                           (xref-make-file-location wf 1 0))
+                                (xref-make (format "[Function] %s_helper" pattern)
+                                           (xref-make-file-location file 1 0))))))))
+           (with-current-buffer buf (setq-local lsp-mode nil))
+           ,@body)
+       (kill-buffer buf)
+       (when (find-buffer-visiting other) (kill-buffer (find-buffer-visiting other)))
+       (delete-file file)
+       (delete-file other))))
+
+(ert-deftest claude-code-ide-test-cci-resolve-defined-in-file ()
+  "A name the file defines keeps the arguments unchanged."
+  (claude-code-ide-tests--with-resolve-mocks "def target():\n    pass\n" '(("target" . 1)) nil
+                                             (should (equal (cci-resolve-reference-args (list "target" file))
+                                                            (list "target" file)))))
+
+(ert-deftest claude-code-ide-test-cci-resolve-used-in-file ()
+  "A name the file only uses is cached at its first code occurrence."
+  (claude-code-ide-tests--with-resolve-mocks
+   "# target in a comment\nfrom lib import target\ntarget()\n" nil nil
+   (should (equal (cci-resolve-reference-args (list "target" file))
+                  (list "target" file)))
+   (with-current-buffer buf
+     (let ((pos (cdr (assoc "target" lsp--symbols-cache))))
+       (should pos)
+       (should (= (line-number-at-pos pos) 2))))))
+
+(ert-deftest claude-code-ide-test-cci-resolve-whole-symbol-only ()
+  "A longer symbol containing the name is not an occurrence."
+  (claude-code-ide-tests--with-resolve-mocks "target_helper()\n" nil nil
+                                             (cci-resolve-reference-args (list "target" file))
+                                             (with-current-buffer buf
+                                               (should-not (assoc "target" lsp--symbols-cache)))))
+
+(ert-deftest claude-code-ide-test-cci-resolve-redirects-to-definition ()
+  "A name the file never mentions is searched from its defining file."
+  (claude-code-ide-tests--with-resolve-mocks "x = 1\n" nil other
+                                             (should (equal (cci-resolve-reference-args (list "target" file))
+                                                            (list "target" other)))))
+
+(ert-deftest claude-code-ide-test-cci-resolve-unknown-name ()
+  "With no occurrence and no workspace match the arguments are unchanged."
+  (claude-code-ide-tests--with-resolve-mocks "x = 1\n" nil nil
+                                             (should (equal (cci-resolve-reference-args (list "target" file))
+                                                            (list "target" file)))))
+
+(ert-deftest claude-code-ide-test-cci-resolve-without-lsp-mode ()
+  "Without lsp-mode loaded the arguments pass through untouched."
+  (cl-letf (((symbol-function 'featurep)
+             (let ((real (symbol-function 'featurep)))
+               (lambda (f &rest r) (and (not (eq f 'lsp-mode)) (apply real f r))))))
+    (should (equal (cci-resolve-reference-args (list "target" "/nonexistent/x.py"))
+                   (list "target" "/nonexistent/x.py")))))
+
 (provide 'claude-code-ide-tests)
 
 ;; Local Variables:

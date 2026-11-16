@@ -219,6 +219,14 @@ When nil, the current tab remains active when ediff is opened."
   :type 'boolean
   :group 'claude-code-ide)
 
+(defcustom claude-code-ide-ediff-frame nil
+  "Whether to show diffs in a dedicated frame named \"ediff\".
+When non-nil, ediff opens in that frame, which is created on demand and
+deleted once no ediff is left in it; the Claude Code window stays in its
+own frame.  When nil (default), ediff uses the selected frame."
+  :type 'boolean
+  :group 'claude-code-ide)
+
 (defcustom claude-code-ide-use-side-window t
   "Whether to display Claude Code in a side window.
 When non-nil (default), Claude Code opens in a dedicated side window
@@ -226,6 +234,28 @@ controlled by `claude-code-ide-window-side' and related settings.
 When nil, Claude Code opens in a regular buffer that follows standard
 display-buffer behavior."
   :type 'boolean
+  :group 'claude-code-ide)
+
+(defcustom claude-code-ide-side-window-scope 'all
+  "Which sessions hold a side window at the same time.
+
+`all'      Every session, from every project, owns a side window.
+           Windows group by project.  This is the default.
+`project'  Only one project's sessions stay on screen.  Displaying a
+           session of another project removes the other project's
+           windows first, and so does moving focus into a session
+           buffer of another project.  All live sessions of the
+           project you return to come back, each in its own window.
+`single'   Every session shares one side window, so displaying a
+           session replaces the one on screen.
+
+A large number of sessions splits the side window area into small
+windows under `all'.  Use `project' or `single' to bound it.
+
+This setting has no effect when `claude-code-ide-use-side-window' is nil."
+  :type '(choice (const :tag "All sessions, grouped by project" all)
+                 (const :tag "One project at a time" project)
+                 (const :tag "One window for everything" single))
   :group 'claude-code-ide)
 
 (defcustom claude-code-ide-terminal-backend 'vterm
@@ -595,6 +625,26 @@ from the window where it was initially created."
                 (set-process-window-size proc height width))
             (set-process-window-size proc height width)))))))
 
+(defun claude-code-ide--sync-all-session-windows ()
+  "Send each visible Claude session's real window size to its terminal.
+
+`claude-code-ide--terminal-reflow-filter' lets a resize reach the CLI only
+when the window width changes, to work around Claude Code bug #1422. The
+backend still resizes its own screen first, so after a height-only change
+the terminal shows the new number of rows while the CLI keeps drawing for
+the old one. Its input box then lands a line or more away from the cursor,
+and typed text appears on the wrong line.
+
+Stacking sessions in the side area makes exactly those changes: a new
+window shortens its neighbours, and deleting one makes the others taller.
+Call this after the package itself changes the layout. It gives each CLI
+its real size once, and it leaves the filter in place for the transient
+resizes that the filter exists to suppress."
+  (dolist (window (window-list nil 'never))
+    (let ((buffer (window-buffer window)))
+      (when (claude-code-ide--session-buffer-p buffer)
+        (claude-code-ide--sync-terminal-dimensions buffer window)))))
+
 (defun claude-code-ide--setup-terminal-keybindings ()
   "Set up keybindings for the Claude Code terminal buffer.
 This function binds:
@@ -849,6 +899,28 @@ interleaved by global creation order.")
 
 (defun claude-code-ide--assign-window-slot (project-dir)
   "Return a side-window slot for a new instance of PROJECT-DIR.
+`claude-code-ide-side-window-scope' decides the rule:
+`single' puts every instance in slot 0, `project' numbers each project
+from 0, and `all' gives each project its own block of slots."
+  (pcase claude-code-ide-side-window-scope
+    ('single 0)
+    ('project (claude-code-ide--slot-within-project project-dir))
+    (_ (claude-code-ide--slot-across-projects project-dir))))
+
+(defun claude-code-ide--slot-within-project (project-dir)
+  "Return the smallest slot no live session of PROJECT-DIR uses.
+Slots restart at 0 for each project, because `project' scope keeps only
+one project on screen, so two projects never compete for a slot."
+  (let ((used (cl-remove nil
+                         (mapcar #'claude-code-ide-mcp-session-window-slot
+                                 (claude-code-ide-mcp--sessions-for-project project-dir))))
+        (slot 0))
+    (while (memq slot used)
+      (cl-incf slot))
+    slot))
+
+(defun claude-code-ide--slot-across-projects (project-dir)
+  "Return a side-window slot for a new instance of PROJECT-DIR.
 Each project owns a block of `claude-code-ide--window-slot-block'
 slots, so windows sort as emacs, emacs, src, src rather than by
 creation order.  Within the block the smallest slot not used by any
@@ -949,12 +1021,127 @@ most recently used one — only displaying or hiding windows would."
 ;; Ensure cleanup on Emacs exit
 (add-hook 'kill-emacs-hook #'claude-code-ide--cleanup-all-sessions)
 
+(defun claude-code-ide--hide-foreign-side-windows (project-dir)
+  "Delete every Claude side window whose session is not in PROJECT-DIR.
+This is how `project' scope keeps one project on screen.  Only windows
+that hold a Claude session buffer are touched."
+  (when project-dir
+    (let ((keep (expand-file-name project-dir)))
+      (dolist (win (window-list nil 'never))
+        (when (and (window-live-p win)
+                   (window-parameter win 'window-side))
+          (when-let* ((session (claude-code-ide--buffer-session (window-buffer win)))
+                      (dir (claude-code-ide-mcp-session-project-dir session)))
+            (unless (string= (expand-file-name dir) keep)
+              (delete-window win))))))))
+
+(defun claude-code-ide--show-project-side-windows (project-dir focus-buffer)
+  "Display every live session of PROJECT-DIR, then select FOCUS-BUFFER.
+
+In `project' scope a swap removes the other projects' windows. Without this
+step, returning to a project with several sessions showed only the one you
+selected, and its siblings stayed hidden. Each sibling keeps its own slot,
+so the side area splits the way it did before you left the project.
+
+Displaying a buffer marks its session as used. Restore the previous times,
+so the siblings do not move ahead of the session you chose in the order
+that `claude-code-ide-switch-to-buffer' uses."
+  (let* ((sessions (claude-code-ide-mcp--sessions-for-project project-dir))
+         (saved (mapcar (lambda (session)
+                          (cons session
+                                (claude-code-ide-mcp-session-last-used session)))
+                        sessions))
+         (claude-code-ide-focus-on-open nil))
+    (dolist (session sessions)
+      (let ((buffer (claude-code-ide-mcp-session-buffer session)))
+        (when (and (buffer-live-p buffer)
+                   (not (get-buffer-window buffer)))
+          (claude-code-ide--display-buffer-in-side-window buffer))))
+    (dolist (pair saved)
+      (setf (claude-code-ide-mcp-session-last-used (car pair)) (cdr pair)))
+    (setq claude-code-ide--last-accessed-buffer focus-buffer)
+    ;; Deleting other projects' windows made these taller without any display
+    ;; call, so resync here as well.
+    (claude-code-ide--sync-all-session-windows)
+    (when-let* ((window (get-buffer-window focus-buffer)))
+      (select-window window))))
+
+(defvar claude-code-ide--swapping-side-windows nil
+  "Non-nil while a side-window swap runs, to stop the hook re-entering.")
+
+(defun claude-code-ide--maybe-swap-side-windows (&optional _frame)
+  "Put the selected Claude session in the side area, alone for its project.
+
+Runs from `window-selection-change-functions' in `project' scope. It does
+two things when a Claude session buffer becomes selected:
+
+  1. Removes the side windows of every other project.
+  2. Moves the buffer into the side area when it is not already there.
+  3. Brings back the project's other live sessions, each in its own slot.
+
+Step 2 is what makes ordinary commands work. C-x b calls
+`switch-to-buffer', which does not consult `display-buffer-alist' unless
+`switch-to-buffer-obey-display-actions' is set, and it cannot reuse a side
+window because the package dedicates those. So the buffer lands in a split
+window instead. This moves it where it belongs and disposes of the split.
+
+Selecting an ordinary buffer does nothing, so reading a file of another
+project leaves the windows alone.
+
+The work runs from a timer rather than inside the hook, because changing
+windows while the hook runs would call the hook again."
+  (when (and claude-code-ide-use-side-window
+             (eq claude-code-ide-side-window-scope 'project)
+             (not claude-code-ide--swapping-side-windows))
+    (let* ((buffer (window-buffer (selected-window)))
+           (frame (window-frame (selected-window)))
+           (session (claude-code-ide--buffer-session buffer)))
+      (when session
+        (setq claude-code-ide--swapping-side-windows t)
+        (run-at-time
+         0 nil
+         (lambda ()
+           (unwind-protect
+               ;; Focus may have moved to another frame before the timer runs.
+               (with-selected-frame (if (frame-live-p frame) frame (selected-frame))
+                 (claude-code-ide--hide-foreign-side-windows
+                  (claude-code-ide-mcp-session-project-dir session))
+                 (let ((window (get-buffer-window buffer)))
+                   (when (and (window-live-p window)
+                              (not (window-parameter window 'window-side)))
+                     ;; Dispose of the window the switch created. Fall back
+                     ;; to the previous buffer when it cannot be deleted,
+                     ;; for example when it is the only window.
+                     (condition-case nil
+                         (delete-window window)
+                       (error (switch-to-prev-buffer window)))
+                     (when-let* ((side (claude-code-ide--display-buffer-in-side-window
+                                        buffer)))
+                       (select-window side))))
+                 ;; Bring back the project's other sessions as well.
+                 (claude-code-ide--show-project-side-windows
+                  (claude-code-ide-mcp-session-project-dir session) buffer))
+             (setq claude-code-ide--swapping-side-windows nil))))))))
+
+;; The function returns at once unless the scope is `project', so adding the
+;; hook is harmless in the other scopes.
+(add-hook 'window-selection-change-functions
+          #'claude-code-ide--maybe-swap-side-windows)
+
+
 (defun claude-code-ide--display-buffer-in-side-window (buffer)
   "Display BUFFER in a side window according to customization.
 The window is displayed on the side specified by
 `claude-code-ide-window-side' with dimensions from
 `claude-code-ide-window-width' or `claude-code-ide-window-height'.
 If `claude-code-ide-focus-on-open' is non-nil, the window is selected."
+  ;; In `project' scope only one project stays on screen.  Remove the other
+  ;; projects' windows before this one is displayed.
+  (when (and claude-code-ide-use-side-window
+             (eq claude-code-ide-side-window-scope 'project))
+    (claude-code-ide--hide-foreign-side-windows
+     (when-let* ((session (claude-code-ide--buffer-session buffer)))
+       (claude-code-ide-mcp-session-project-dir session))))
   (let ((window
          (if claude-code-ide-use-side-window
              ;; Use side window
@@ -1003,7 +1190,10 @@ If `claude-code-ide-focus-on-open' is non-nil, the window is selected."
     ;; This is necessary because vterm/eat may have been created with
     ;; different dimensions before being displayed in this window
     (when window
-      (claude-code-ide--sync-terminal-dimensions buffer window))
+      (claude-code-ide--sync-terminal-dimensions buffer window)
+      ;; Showing this window changed its neighbours' heights too, and the
+      ;; reflow filter keeps height-only changes from reaching their CLIs.
+      (claude-code-ide--sync-all-session-windows))
     window))
 
 (defun claude-code-ide--cleanup-session (session &optional buffer-dying)
@@ -1091,9 +1281,10 @@ hook signals wrong-type-argument that way)."
     (setq claude-code-ide--cli-available available)))
 
 (defun claude-code-ide--ensure-cli ()
-  "Ensure Claude Code CLI is available, detect if needed."
-  (unless claude-code-ide--cli-available
-    (claude-code-ide--detect-cli))
+  "Ensure Claude Code CLI is available.
+Always re-detects to handle PATH changes during the Emacs session
+\(e.g. after `exec-path-from-shell-initialize')."
+  (claude-code-ide--detect-cli)
   claude-code-ide--cli-available)
 
 ;;; Commands
@@ -1438,17 +1629,29 @@ This function handles:
             ;; The ghostel backend stashes its native sentinel on the
             ;; process so we can chain it here — otherwise ghostel's
             ;; buffer-local timers and focus-change hook never tear down.
-            (let ((prev-sentinel (process-get process 'claude-code-ide--ghostel-sentinel)))
+            (let ((prev-sentinel (process-get process 'claude-code-ide--ghostel-sentinel))
+                  (cli-path claude-code-ide-cli-path))
               (set-process-sentinel process
                                     (lambda (proc event)
                                       (when prev-sentinel
                                         (ignore-errors (funcall prev-sentinel proc event)))
                                       ;; Check for abnormal exit with error code
                                       (when (string-match "exited abnormally with code \\([0-9]+\\)" event)
-                                        (let ((exit-code (match-string 1 event)))
-                                          (claude-code-ide-debug "Claude process exited with code %s, event: %s"
+                                        (let ((exit-code (string-to-number (match-string 1 event))))
+                                          (claude-code-ide-debug "Claude process exited with code %d, event: %s"
                                                                  exit-code event)
-                                          (message "Claude exited with error code %s" exit-code)))
+                                          (cond
+                                           ((= exit-code 127)
+                                            (message "Claude Code CLI not found (exit 127).  Ensure '%s' is in your PATH.  In Emacs, try: M-x exec-path-from-shell-initialize"
+                                                     cli-path))
+                                           ((= exit-code 126)
+                                            (message "Claude Code CLI '%s' was found but is not executable (exit 126).  Check file permissions"
+                                                     cli-path))
+                                           ((and (= exit-code 1) (or continue resume))
+                                            (message "Claude could not %s (exit 1).  That conversation may already be running in the background.  Use M-x claude-code-ide for a new session, M-x claude-code-ide-resume to pick another, or run `claude agents' in a terminal to attach to the running one"
+                                                     (if continue "continue" "resume")))
+                                           (t
+                                            (message "Claude exited with error code %d" exit-code)))))
                                       (when (or (string-match "finished" event)
                                                 (string-match "exited" event)
                                                 (string-match "killed" event)
