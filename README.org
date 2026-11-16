@@ -122,6 +122,54 @@ In =config.el=:
 
 After saving the above, run: =doom sync= in the terminal.
 
+*** From a local checkout
+
+Use a local checkout to run a branch that is not on the package archives, for example a fork's =session-registry= branch with the session registry and the status buffer.
+
+1. Get the code. Any folder works; the examples use =~/Source/claude-code-ide.el=:
+
+   #+begin_src bash
+   git clone https://github.com/<you>/claude-code-ide.el ~/Source/claude-code-ide.el
+   cd ~/Source/claude-code-ide.el
+   git checkout session-registry
+   #+end_src
+
+   Or keep your usual branch checked out and put the branch in a worktree: =git worktree add .worktrees/session-registry session-registry=.
+
+2. Load the package from that folder, and nowhere else. Do not use =:vc= or =:straight= for it: such an install puts its own copy early in =load-path=, and that copy hides the checkout without any warning. Use =:demand t=, so that the modes below are on before the first session starts:
+
+   #+begin_src elisp
+   (defconst my/claude-code-ide-dir
+     (expand-file-name "~/Source/claude-code-ide.el")  ; or the worktree folder
+     "The claude-code-ide.el checkout that this Emacs loads.")
+
+   (use-package claude-code-ide
+     :load-path my/claude-code-ide-dir
+     :demand t
+     :bind ("C-c C-'" . claude-code-ide-menu)
+     :config
+     ;; Optional: Claude Code uses your claude.ai login, not an API key
+     ;; that the Emacs environment holds for other packages.
+     (setq claude-code-ide-cli-environment-unset '("ANTHROPIC_API_KEY"))
+     ;; Record sessions for restore, and show their live status.  The
+     ;; checks keep this file working with a checkout that lacks the modes.
+     (when (fboundp 'claude-code-ide-session-registry-mode)
+       (claude-code-ide-session-registry-mode 1))
+     (when (fboundp 'claude-code-ide-session-status-mode)
+       (claude-code-ide-session-status-mode 1)))
+   #+end_src
+
+3. Remove an installed copy, if one exists. Look for =~/.emacs.d/elpa/claude-code-ide*=. Delete it with =M-x package-delete=, or move the folder out of =elpa=. Also remove =claude-code-ide= from =package-vc-selected-packages= in your custom settings, or Emacs installs it again.
+
+4. Restart Emacs, and check:
+
+   #+begin_src elisp
+   (locate-library "claude-code-ide")       ; must name your checkout
+   claude-code-ide-session-registry-mode    ; must be t
+   #+end_src
+
+Sessions that already run when the registry turns on are recorded too, but without status hooks; =M-x claude-code-ide-session-registry-track-sessions= restarts them with hooks (see [[*Session Registry and Restore][Session Registry and Restore]]).
+
 * Usage
 
 ** Basic Commands
@@ -438,6 +486,16 @@ You can pass additional flags to the Claude Code CLI:
 
 Note: These flags are appended to the Claude command after any built-in flags like =-d= (debug) or =-r= (resume).
 
+*** CLI Environment
+
+To keep a variable of the Emacs environment away from the Claude Code CLI, name it in =claude-code-ide-cli-environment-unset=. For example, when Emacs holds an API key for other packages, but Claude Code must use your claude.ai login:
+
+#+begin_src emacs-lisp
+(setq claude-code-ide-cli-environment-unset '("ANTHROPIC_API_KEY"))
+#+end_src
+
+Only the CLI's environment changes; Emacs and its other processes keep the variable.
+
 *** Custom System Prompt
 
 You can append a custom system prompt to Claude's default prompt, allowing you to customize Claude's behavior for specific projects or contexts:
@@ -505,6 +563,136 @@ M-x claude-code-ide
 #+end_src
 
 Each worktree is treated as a separate project by =project.el=, giving fully independent sessions with their own buffers (e.g., =*claude-code[myproject]*= and =*claude-code[myproject-worktree]*=).
+
+** Session Registry and Restore
+
+The session registry records each Claude Code instance that Emacs starts. After a crash of Emacs or of the machine, one command starts again every instance that was open, with the same conversation, directory, buffer name, model and flags.
+
+To enable it, put this in your init file:
+
+#+begin_src elisp
+(claude-code-ide-session-registry-mode 1)
+;; Optional; this is the default
+(setq claude-code-ide-state-file "~/.emacs-claude-code-ide-state.json")
+#+end_src
+
+When the mode turns on, it also records the instances that already run in this Emacs. Their session id comes from the file that each CLI process keeps in =~/.claude/sessions=, and the registry reads it again every minute and at exit, because =/clear= changes it. These instances have no status hooks; they show as =UNTRACKED= in the status buffer. =M-x claude-code-ide-session-registry-track-sessions= restarts them with hooks (=T= does it for the session on a line of the status buffer): each resumes its conversation with its instance name, title and model, and a note as its first message tells it to re-arm its background tasks, which end. A session that is busy is skipped unless you give a prefix argument.
+
+*** States
+
+| State      | Meaning                                                                             |
+|------------+-------------------------------------------------------------------------------------|
+| =open=     | The instance runs, or it ran when its Emacs crashed. =claude-code-ide-restore-sessions= starts these again. |
+| =closed=   | The instance ended, its buffer was killed, or Emacs exited normally. =claude-code-ide-reopen-session= starts it again. |
+| =archived= | The work is done. No command starts it again.                                     |
+
+An exit of Emacs marks its running instances =closed=, with =closed_by= set to =emacs-exit=. After a crash this cannot happen, so they stay =open=. An end of Emacs by a signal also runs the exit, so a restore takes both: the =open= instances of an Emacs that crashed, and the instances that the last Emacs closed at its exit.
+
+*** Commands
+
+| Command                                   | Description                                                      |
+|-------------------------------------------+------------------------------------------------------------------|
+| =M-x claude-code-ide-restore-sessions=      | Start again every instance that ran when the last Emacs ended (=C-u=: choose which) |
+| =M-x claude-code-ide-reopen-session=        | Choose an instance that is not running and start it again        |
+| =M-x claude-code-ide-archive-session=       | Mark an instance =archived=                                      |
+| =M-x claude-code-ide-forget-session=        | Remove an instance from the registry (the transcript stays)      |
+| =M-x claude-code-ide-list-session-registry= | List the registry: state, buffer, directory, last activity, title |
+
+In the list, =RET= switches to a running instance or reopens a stopped one, =a= archives, =d= removes, and =R= restores.
+
+*** Restore after a crash
+
+1. Start Emacs. The mode reports how many instances can be restored.
+2. Run =M-x claude-code-ide-restore-sessions=. The instances start one after the other, half a second apart; one that fails, or a =C-g=, does not stop the others, and the last start reports the result.
+3. Each instance starts in its directory with =claude --resume <id>=, its instance name, its flags, the model of its last answer, and its title (=--name=, from =/rename=), so that other sessions find it by name.
+4. Each instance gets =claude-code-ide-restore-note= as its first message. The default note says that the session was resumed after a crash, that its background tasks and unread messages from other sessions are gone, and that it must re-read its last state and re-arm its watches. Set the variable to =nil= to send no message.
+
+The registry does not restore an instance that runs in this Emacs, that belongs to another live Emacs or to another host, or whose session id a running CLI process already has.
+
+*** The state file
+
+The state file holds only what Emacs knows. The conversation, its title and its model stay in the CLI transcript, =~/.claude/projects/<project>/<session-id>.jsonl=, and the registry reads them from there when it needs them.
+
+#+begin_src json
+{
+  "version": 1,
+  "sessions": [
+    {
+      "key": "5afe576e-88a4-4ecf-b317-1cd4b509ca6d",
+      "session_id": "5afe576e-88a4-4ecf-b317-1cd4b509ca6d",
+      "transcript_path": "/home/me/.claude/projects/-home-me-src-app/5afe576e-88a4-4ecf-b317-1cd4b509ca6d.jsonl",
+      "project_dir": "/home/me/src/app/",
+      "buffer_name": "*claude-code[app:refactor]*",
+      "instance_name": "refactor",
+      "model": "opus",
+      "extra_flags": "--permission-mode plan",
+      "permission_mode": "plan",
+      "state": "open",
+      "started_at": "2026-11-03T09:12:44Z",
+      "last_seen_at": "2026-11-03T09:12:44Z",
+      "closed_at": null,
+      "closed_by": null,
+      "emacs_pid": 41022,
+      "host": "laptop"
+    }
+  ]
+}
+#+end_src
+
+- =key= is the id of the entry and never changes.
+- =session_id= is the current Claude CLI session id. Emacs starts a new conversation with =--session-id <key>=. A SessionStart hook, passed with =--settings=, reports a new id after =/clear=, =/resume=, or a start with =-c= or =-r=. The reports go to a directory next to the state file (=claude-code-ide-session-registry-report-directory=).
+- If =claude-code-ide-cli-extra-flags= has its own =--settings=, the registry does not add its hook, because a second =--settings= replaces the first. Then a new id after =/clear= or =/resume= is not recorded.
+- =model= and =extra_flags= come from =claude-code-ide-cli-extra-flags= at start. Session flags (=-c=, =-r=, =--resume=, =--session-id=, =--fork-session=) are not stored.
+- =closed_by= is =exited= (the CLI ended), =killed= (Emacs ended a running CLI) or =emacs-exit=.
+
+Every change goes through one queue. The queue writes under a lock directory (=<state-file>.lock=), writes a temporary file and renames it over the state file, and keeps the previous version as =<state-file>.bak=. If the state file cannot be read, the registry uses the =.bak= file, shows a warning, and moves the unreadable file aside on the next write.
+
+** Session Status
+
+The status buffer shows what each running instance does, grouped by project (the directory that Claude Code works in). The projects and instances that need you come first. Keep it open to see at a glance which sessions are blocked, and press =RET= to go to one; on a project line, =RET= goes to the first instance of that project.
+
+#+begin_src elisp
+(claude-code-ide-session-status-mode 1)   ; also turns on the session registry
+#+end_src
+
+Turn the mode off to close the buffer. =M-x claude-code-ide-show-session-status= shows it again.
+
+Each state says who waits for whom. They are listed in the order of the buffer: what needs you first.
+
+| State            | Meaning                                                                                       |
+|------------------+-----------------------------------------------------------------------------------------------|
+| =NEEDS ANSWER=   | A permission dialog, a question menu, a plan approval or an MCP input form is open. The agent is blocked until you answer |
+| =ASKS YOU=       | The turn ended with a reply that asks you something (by default, a line that ends with "?"). The agent waits for your answer, also while its tasks run |
+| =FAILED=         | The turn ended with an API error                                                              |
+| =NO SIGNAL=      | The instance sent nothing since it started, for example at the dialog that asks whether to trust the folder |
+| =TASKS QUIET=    | The turn ended and the background subagents show no activity for a long time. Look at it: one may hang |
+| =WAITS FOR YOU=  | The turn ended. The agent waits for your next message. Background shells (tests, watchers, servers) may still run; the detail names them |
+| =WAITS ON TASKS= | The turn ended, but its subagents still run. The agent continues by itself when they finish |
+| =STARTING=       | The instance has started and has not reported yet                                             |
+| =WORKING=        | The agent works                                                                               |
+| =UNTRACKED=      | The instance started without status hooks                                                     |
+
+The =For= column shows how long the instance has been in its state. =Detail= shows the command or question that waits for you, the first line of the last reply, or the running tasks (for example "2 agents, 1 shell: Run the tests").
+
+| Command                                | Description                                              |
+|----------------------------------------+----------------------------------------------------------|
+| =M-x claude-code-ide-show-session-status=  | Show the status buffer                                   |
+| =M-x claude-code-ide-visit-waiting-session= | Go to the first session in the list that needs you        |
+
+In the buffer, =RET= goes to the session on the line, and =w= goes to the first session that needs you, in the order of the table; the longest wait first within each state. While the mode is on, the mode line shows =Claude[N need you]= when instances are in one of the first four states.
+
+*** How it works
+
+The registry passes Claude Code hooks to each instance it starts. Each hook runs a small shell script that writes the hook input to a file, numbered per instance, in a directory next to the state file. Emacs reads the files in order, deletes them, and updates the status. The script prints nothing and always exits with 0, so it never changes what Claude does. Each hook has a timeout of 5 seconds.
+
+- After you approve a command, the status stays =NEEDS ANSWER= until the command ends, because no hook fires on the approval.
+- Claude Code starts subagents in the background, so the main turn often ends while they work. The list of running tasks comes with the end of each turn, and the subagents report their own steps. Subagents are quiet after =claude-code-ide-session-status-agent-quiet-time= seconds (600) without activity, or after =claude-code-ide-session-status-task-quiet-time= seconds (900) while one runs a long command.
+- A background shell does not keep the agent from you: the agent often starts tests, a watcher or a server in the background and then asks you something. Claude Code itself reports that it waits for your input while shells run, but not while subagents run.
+- =claude-code-ide-session-status-ask-regexps= sets which lines of a reply ask you something. For example, add ="\\`Next for Raymond:"= when your sessions end their replies with such a line.
+- An interrupt (=Esc=) fires no hook. When a working instance sends no event for =claude-code-ide-session-status-quiet-time= seconds, Emacs checks two things. If the new part of the transcript has an interrupt marker (an interrupt during a tool), the state becomes =WAITS FOR YOU= with "Interrupted". If the terminal no longer shows Claude's spinner line (for example "✢ Misting… (3s)"), the state becomes =WAITS FOR YOU= with "Interrupted?". If a later version of Claude Code changes the spinner, this check shows a working instance as =WAITS FOR YOU=; it never shows a waiting instance as working. When the spinner shows again, or the agent uses a tool, the state is =WORKING= again.
+- A turn that a queued prompt, a message from another session or a task notification starts fires no prompt hook. Its first tool use, or its record in the transcript, shows the instance as =WORKING=.
+- A denial with =Esc= fires no hook either. The instance stays =NEEDS ANSWER= until Claude reports, 60 seconds later, that it waits for your input.
+- Set =claude-code-ide-session-status-tracking= to =nil= to start instances without status hooks.
 
 ** Emacs MCP Tools
 
