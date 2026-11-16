@@ -38,14 +38,18 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT" || exit 1
 echo "Running compile and test checks..." >&2
 
-# Use $EMACS, else emacs on PATH, else the macOS application bundle
+# Use $EMACS, else emacs on PATH, else a macOS application bundle such
+# as "Emacs.app" or "Emacs 30.1.app" (the last one in sort order wins)
 if [ -z "$EMACS" ]; then
     if command -v emacs >/dev/null 2>&1; then
         EMACS=emacs
-    elif [ -x /Applications/Emacs.app/Contents/MacOS/Emacs ]; then
-        EMACS=/Applications/Emacs.app/Contents/MacOS/Emacs
     else
         EMACS=emacs
+        for app in /Applications/Emacs*.app ~/Applications/Emacs*.app; do
+            if [ -x "$app/Contents/MacOS/Emacs" ]; then
+                EMACS="$app/Contents/MacOS/Emacs"
+            fi
+        done
     fi
 fi
 
@@ -151,7 +155,7 @@ TEST_FAILED=0
 if [ $COMPILE_EXIT_CODE -eq 0 ] && [ $NATIVE_COMPILE_EXIT_CODE -eq 0 ]; then
     echo "" >&2
     echo "=== Running tests ===" >&2
-    "$EMACS" -batch -L . --eval "$NO_TRAMPOLINES" -l ert -l claude-code-ide-tests.el -f ert-run-tests-batch-and-exit >&2
+    "$EMACS" -batch $LOAD_PATH --eval "$NO_TRAMPOLINES" -l ert -l claude-code-ide-tests.el -f ert-run-tests-batch-and-exit >&2
     TEST_EXIT_CODE=$?
 
     if [ $TEST_EXIT_CODE -eq 0 ]; then
