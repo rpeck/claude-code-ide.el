@@ -168,7 +168,7 @@ BODY can refer to that directory as `registry-dir'."
   (claude-code-ide-tests--with-registry
     (claude-code-ide-session-registry--submit "a" (claude-code-ide-tests--registry-add "a"))
     (claude-code-ide-session-registry--submit "b" (claude-code-ide-tests--registry-add "b"))
-    (with-temp-file claude-code-ide-state-file
+    (with-temp-file (claude-code-ide-session-registry--state-file)
       (insert "{\"version\": 1, \"sessions\": [{\"key\""))
     (let ((warnings '()))
       (cl-letf (((symbol-function 'display-warning)
@@ -176,7 +176,7 @@ BODY can refer to that directory as `registry-dir'."
         (should (equal (mapcar #'claude-code-ide-session-registry-entry-key
                                (claude-code-ide-session-registry--entries))
                        '("a")))
-        (should (string-match-p "using .*state\\.json\\.bak" (car warnings)))
+        (should (string-match-p "using .*state-v2\\.json\\.bak" (car warnings)))
         (claude-code-ide-session-registry--submit "c" (claude-code-ide-tests--registry-add "c"))))
     (should (equal (claude-code-ide-tests--registry-file-keys) '("a" "c")))
     ;; The good backup survived, and the unreadable file was kept
@@ -197,8 +197,9 @@ BODY can refer to that directory as `registry-dir'."
            (key (gethash session claude-code-ide-session-registry--keys)))
       (unwind-protect
           (progn
-            ;; A new conversation gets its id from Emacs, and the report hook
-            (should (equal (cl-subseq args 0 2) (list "--session-id" key)))
+            ;; A new conversation gets its own id from Emacs, and the report hook
+            (should (equal (car args) "--session-id"))
+            (should-not (equal (cadr args) key))
             (should (equal (nth 2 args) "--settings"))
             (should (string-match-p (regexp-quote (concat key ".json")) (nth 3 args)))
             (claude-code-ide-session-registry--on-start
@@ -206,7 +207,8 @@ BODY can refer to that directory as `registry-dir'."
                       :extra-flags "--model opus --permission-mode plan"))
             (let ((entry (claude-code-ide-tests--registry-get key)))
               (should (eq (claude-code-ide-session-registry-entry-state entry) 'open))
-              (should (equal (claude-code-ide-session-registry-entry-session-id entry) key))
+              (should (equal (claude-code-ide-session-registry-entry-session-id entry)
+                             (cadr args)))
               (should (equal (claude-code-ide-session-registry-entry-model entry) "opus"))
               (should (equal (claude-code-ide-session-registry-entry-extra-flags entry)
                              "--permission-mode plan"))
@@ -336,7 +338,8 @@ BODY can refer to that directory as `registry-dir'."
              (hook (car (alist-get 'hooks (car (alist-get 'SessionStart
                                                           (alist-get 'hooks settings)))))))
         (should (equal (car parts) claude-code-ide-cli-path))
-        (should (equal (cadr (member "--session-id" parts)) key))
+        (should (equal (cadr (member "--session-id" parts))
+                       (gethash session claude-code-ide-session-registry--new-native-ids)))
         (should (equal (alist-get 'command hook)
                        (concat "cat > " (shell-quote-argument
                                          (claude-code-ide-session-registry--report-file key)))))))))

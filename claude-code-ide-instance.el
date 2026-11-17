@@ -158,8 +158,10 @@ That is: its buffer is live, and its process is live or not yet known."
 
 (defun claude-code-ide-instance-register (instance)
   "Add INSTANCE to the running instances and return it.
-Signal an error when a live instance has the same ID.  The generation
-of INSTANCE becomes the current generation of its ID."
+Signal an error when a live instance has the same ID; then nothing
+changes.  Else the generation of INSTANCE becomes the current
+generation of its ID, so get it from
+`claude-code-ide-instance-candidate-generation' first."
   (let* ((id (claude-code-ide-instance-id instance))
          (old (claude-code-ide-instance-by-id id)))
     (unless (stringp id)
@@ -188,12 +190,21 @@ Its last generation stays known."
   "Return the generation of the last launch of INSTANCE-ID, or nil."
   (gethash instance-id claude-code-ide-instance--generations))
 
+(defun claude-code-ide-instance-candidate-generation (instance-id &optional last)
+  "Return the generation for a new launch of INSTANCE-ID, without recording it.
+That is one more than the highest of LAST (the generation that a saved
+record holds, or nil) and the last generation in this Emacs.
+`claude-code-ide-instance-register' records it, so a launch that fails
+before it changes nothing."
+  (1+ (max (or last 0)
+           (gethash instance-id claude-code-ide-instance--generations 0))))
+
 (defun claude-code-ide-instance-next-generation (instance-id &optional last)
   "Return the generation for a new launch of INSTANCE-ID and record it.
-That is one more than the highest of LAST (the generation that a saved
-record holds, or nil) and the last generation in this Emacs."
-  (let ((generation (1+ (max (or last 0)
-                             (gethash instance-id claude-code-ide-instance--generations 0)))))
+See `claude-code-ide-instance-candidate-generation'.  A launch uses the
+candidate and registers its descriptor instead, so that a refused
+launch leaves the current generation alone."
+  (let ((generation (claude-code-ide-instance-candidate-generation instance-id last)))
     (puthash instance-id generation claude-code-ide-instance--generations)
     generation))
 

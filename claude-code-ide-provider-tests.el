@@ -33,6 +33,9 @@
          (claude-code-ide-instance--generations (make-hash-table :test 'equal)))
      ,@body))
 
+(defvar claude-code-ide-tests--terminal-args nil
+  "Arguments of the last mocked `claude-code-ide--create-terminal-session'.")
+
 (defun claude-code-ide-tests--start-mocked (spec &optional state)
   "Start an instance as SPEC says, with the terminal and the MCP server mocked.
 Return (SESSION . LAUNCH-FN): the new session, and the function that
@@ -57,9 +60,15 @@ cdr of its :cleanup key."
                   dir :session-id session-id :instance-name instance-name :port 12345)))
               ((symbol-function 'claude-code-ide--create-terminal-session)
                (lambda (&rest args)
-                 (setq launch-fn (nth 8 args))
+                 (setq launch-fn (nth 8 args)
+                       claude-code-ide-tests--terminal-args args)
                  (cons buffer process)))
               ((symbol-function 'claude-code-ide-mcp-server-session-started) #'ignore)
+              ((symbol-function 'claude-code-ide-mcp-server-session-ended) #'ignore)
+              ((symbol-function 'claude-code-ide-mcp--stop-session)
+               (lambda (session)
+                 (remhash (claude-code-ide-mcp-session-session-id session)
+                          claude-code-ide-mcp--sessions)))
               ((symbol-function 'claude-code-ide-mcp-server-update-session-buffer) #'ignore)
               ((symbol-function 'claude-code-ide--setup-terminal-keybindings) #'ignore)
               ((symbol-function 'claude-code-ide--display-buffer-in-side-window) #'ignore)
@@ -120,8 +129,31 @@ cdr of its :cleanup key."
     (should (equal (claude-code-ide-provider-display-name provider) "Claude Code"))
     (should (equal (claude-code-ide-provider-buffer-name-prefix provider) "claude-code"))
     (dolist (operation claude-code-ide-provider-operations)
-      (should (claude-code-ide-provider-supports-p provider operation))
-      (should (memq operation (claude-code-ide-provider-capabilities provider))))))
+      (should (claude-code-ide-provider-supports-p provider operation)))
+    ;; Every registered provider names exactly its operations
+    (dolist (name (claude-code-ide-provider-names))
+      (let ((provider (claude-code-ide-get-provider name)))
+        (should (equal (claude-code-ide-provider-capabilities provider)
+                       (cl-remove-if-not (lambda (operation)
+                                           (claude-code-ide-provider-supports-p provider operation))
+                                         claude-code-ide-provider-operations)))))
+    (should (equal (claude-code-ide-provider-capabilities provider)
+                   claude-code-ide-provider-operations))))
+
+(ert-deftest claude-code-ide-test-provider-capabilities-checked ()
+  "Registration derives the capabilities, and refuses ones that disagree."
+  (let ((claude-code-ide-provider--registry (copy-alist claude-code-ide-provider--registry)))
+    (should (equal (claude-code-ide-provider-capabilities
+                    (claude-code-ide-register-provider
+                     (claude-code-ide-provider-create :name 'cci-test-cap :launch #'ignore
+                                                      :stop #'ignore)))
+                   '(launch stop)))
+    (should-error (claude-code-ide-register-provider
+                   (claude-code-ide-provider-create :name 'cci-test-cap :launch #'ignore
+                                                    :capabilities '(launch continue))))
+    (should-error (claude-code-ide-register-provider
+                   (claude-code-ide-provider-create :name 'cci-test-cap :launch #'ignore
+                                                    :stop #'ignore :capabilities '(launch))))))
 
 (ert-deftest claude-code-ide-test-provider-claude-command-unchanged ()
   "The claude launch gives the command and the environment of the old code."
@@ -131,6 +163,7 @@ cdr of its :cleanup key."
             ((symbol-function 'claude-code-ide-mcp-server-get-tool-names)
              (lambda (_) '("mcp__emacs-tools__a"))))
     (let* ((claude-code-ide-cli-path "claude")
+           (claude-code-ide-cli-args-functions nil)
            (claude-code-ide-cli-extra-flags "--model opus")
            (claude-code-ide-cli-debug t)
            (claude-code-ide-mcp-allowed-tools 'auto)
@@ -402,6 +435,8 @@ cdr of its :cleanup key."
   (claude-code-ide-tests--with-instances
     (claude-code-ide-tests--with-status
       (let* ((session (make-claude-code-ide-mcp-session))
+             (seen nil)
+             (claude-code-ide-event-functions (list (lambda (event) (push event seen))))
              (instance (claude-code-ide-instance-register
                         (claude-code-ide-instance-create
                          :id "cci-test-old" :provider 'claude :session session
@@ -419,19 +454,31 @@ cdr of its :cleanup key."
           (write 1 "SessionStart" "{\"source\":\"startup\"}")
           (claude-code-ide-session-status--drain)
           (should (equal (claude-code-ide-tests--state status) '(idle "Ready")))
+          ;; The event functions got the common event, mapped by the provider
+          (should (= (length seen) 1))
+          (should (equal (plist-get (car seen) :instance-id) "cci-test-old"))
+          (should (= (plist-get (car seen) :generation) 1))
+          (should (eq (plist-get (car seen) :event) 'session-start))
+          (should (equal (plist-get (car seen) :provider-event) "SessionStart"))
+          (should (equal (plist-get (car seen) :data) '((source . "startup"))))
           ;; The instance launches again; the old launch still writes
           (setf (claude-code-ide-instance-generation instance)
                 (claude-code-ide-instance-next-generation "cci-test-old"))
           (write 2 "UserPromptSubmit" "{\"prompt\":\"late\"}")
           (claude-code-ide-session-status--drain)
           (should (equal (claude-code-ide-tests--state status) '(idle "Ready")))
+          ;; The event functions did not get the old event
+          (should (= (length seen) 1))
           ;; The file is gone all the same
           (should-not (directory-files dir nil "\\.json\\'"))
           ;; A record of the current launch takes events
           (setf (claude-code-ide-session-status-generation status) 2)
           (write 3 "UserPromptSubmit" "{\"prompt\":\"now\"}")
           (claude-code-ide-session-status--drain)
-          (should (eq (car (claude-code-ide-tests--state status)) 'working)))))))
+          (should (eq (car (claude-code-ide-tests--state status)) 'working))
+          (should (= (length seen) 2))
+          (should (eq (plist-get (car seen) :event) 'prompt-submit))
+          (should (= (plist-get (car seen) :generation) 2)))))))
 
 ;;; Common states
 
@@ -513,36 +560,45 @@ cdr of its :cleanup key."
 ;;; Registry schema
 
 (ert-deftest claude-code-ide-test-registry-v1-and-v2-files ()
-  "A version 1 file and a version 2 file both load; writes are version 2."
+  "Version 2 goes to its own file; the version 1 file is read once and never written."
   (claude-code-ide-tests--with-registry
-    (let ((v1 (expand-file-name "v1.json" registry-dir))
-          (v2 (expand-file-name "v2.json" registry-dir)))
-      (with-temp-file v1
-        (insert "{\"version\": 1, \"sessions\": [{\"key\": \"cci-test-k1\", \"session_id\": \"cci-test-n1\","
-                " \"project_dir\": \"/tmp/cci-test-v1/\", \"model\": null, \"extra_flags\": \"\","
-                " \"state\": \"open\", \"host\": \"h\"}]}"))
+    (let ((v1 (claude-code-ide-session-registry--v1-file))
+          (v2 (expand-file-name "other-v2.json" registry-dir))
+          (v1-text (concat "{\"version\": 1, \"sessions\": [{\"key\": \"cci-test-k1\","
+                           " \"session_id\": \"cci-test-n1\", \"project_dir\": \"/tmp/cci-test-v1/\","
+                           " \"model\": null, \"extra_flags\": \"\", \"state\": \"open\", \"host\": \"h\"}]}")))
+      ;; The two file names, and the report directory of version 1
+      (should (equal v1 (expand-file-name "state.json" registry-dir)))
+      (should (equal (claude-code-ide-session-registry--state-file)
+                     (expand-file-name "state-v2.json" registry-dir)))
+      (should (equal (claude-code-ide-session-registry--report-directory)
+                     (file-name-as-directory (expand-file-name "state-reports" registry-dir))))
+      ;; A version 2 record reads with all its fields
       (with-temp-file v2
         (insert "{\"version\": 2, \"sessions\": [{\"instance_id\": \"cci-test-k2\", \"provider\": \"codex\","
                 " \"native_id\": \"cci-test-n2\", \"generation\": 3, \"role\": \"cci-test-reviewer\","
                 " \"project_dir\": \"/tmp/cci-test-v2/\", \"model\": \"gpt-x\", \"extra_flags\": \"\","
                 " \"state\": \"closed\"}]}"))
-      (let ((old (car (claude-code-ide-session-registry--read-file v1)))
-            (new (car (claude-code-ide-session-registry--read-file v2))))
-        (should (equal (claude-code-ide-session-registry-entry-key old) "cci-test-k1"))
-        (should (equal (claude-code-ide-session-registry-entry-session-id old) "cci-test-n1"))
-        (should (eq (claude-code-ide-session-registry-entry-provider old) 'claude))
-        (should (= (claude-code-ide-session-registry-entry-generation old) 0))
-        (should-not (claude-code-ide-session-registry-entry-role old))
-        (should (eq (claude-code-ide-session-registry-entry-state old) 'open))
+      (let ((new (car (claude-code-ide-session-registry--read-file v2))))
         (should (equal (claude-code-ide-session-registry-entry-key new) "cci-test-k2"))
         (should (eq (claude-code-ide-session-registry-entry-provider new) 'codex))
         (should (equal (claude-code-ide-session-registry-entry-session-id new) "cci-test-n2"))
         (should (= (claude-code-ide-session-registry-entry-generation new) 3))
         (should (equal (claude-code-ide-session-registry-entry-role new) "cci-test-reviewer"))
         (should (equal (claude-code-ide-session-registry-entry-model new) "gpt-x")))
-      ;; The state file is version 1; the next write makes it version 2
-      (copy-file v1 (claude-code-ide-session-registry--state-file) t)
+      ;; Without a version 2 file, the version 1 file is read and migrated
+      (with-temp-file v1 (insert v1-text))
+      (let ((old (car (claude-code-ide-session-registry--entries))))
+        (should (equal (claude-code-ide-session-registry-entry-key old) "cci-test-k1"))
+        (should (equal (claude-code-ide-session-registry-entry-session-id old) "cci-test-n1"))
+        (should (eq (claude-code-ide-session-registry-entry-provider old) 'claude))
+        (should (= (claude-code-ide-session-registry-entry-generation old) 0))
+        (should-not (claude-code-ide-session-registry-entry-role old))
+        (should (eq (claude-code-ide-session-registry-entry-state old) 'open)))
+      ;; The first write makes the version 2 file and leaves version 1 alone
       (claude-code-ide-session-registry--submit "noop" #'identity)
+      (should (equal (claude-code-ide-session-registry--file-string v1) v1-text))
+      (should-not (file-exists-p (concat v1 ".bak")))
       (let ((data (claude-code-ide-session-registry--json-decode
                    (claude-code-ide-session-registry--file-string
                     (claude-code-ide-session-registry--state-file)))))
@@ -554,14 +610,36 @@ cdr of its :cleanup key."
           (should (= (alist-get 'generation record) 0))
           (should-not (assq 'key record))
           (should-not (assq 'session_id record))))
-      ;; The kept backup is the version 1 file, which still reads
-      (should (equal (claude-code-ide-tests--registry-file-keys
-                      (claude-code-ide-session-registry--backup-file))
-                     '("cci-test-k1")))
+      ;; An older Emacs that writes the version 1 file does not change version 2
+      (with-temp-file v1 (insert (replace-regexp-in-string "cci-test-k1" "cci-test-k9" v1-text)))
+      (should (equal (claude-code-ide-tests--registry-file-keys) '("cci-test-k1")))
+      (claude-code-ide-session-registry--submit "b" (claude-code-ide-tests--registry-add "b"))
+      (should (equal (claude-code-ide-tests--registry-file-keys) '("cci-test-k1" "b")))
+      (should (string-match-p "cci-test-k9" (claude-code-ide-session-registry--file-string v1)))
+      (should (= 1 (length (directory-files registry-dir nil "\\`state\\.json"))))
       ;; An unknown version is refused
       (with-temp-file v2 (insert "{\"version\": 3, \"sessions\": []}"))
       (should-error (claude-code-ide-session-registry--read-file v2)
                     :type 'claude-code-ide-session-registry-error))))
+
+(ert-deftest claude-code-ide-test-registry-unreadable-v1-file ()
+  "An unreadable version 1 file falls back to its backup and is not moved."
+  (claude-code-ide-tests--with-registry
+    (let ((v1 (claude-code-ide-session-registry--v1-file)))
+      (with-temp-file v1 (insert "{\"version\": 1, \"sessions\": [{\"key\""))
+      (with-temp-file (concat v1 ".bak")
+        (insert "{\"version\": 1, \"sessions\": [{\"key\": \"cci-test-bak\", \"project_dir\": \"/tmp/\"}]}"))
+      (cl-letf (((symbol-function 'display-warning) #'ignore))
+        (should (equal (claude-code-ide-tests--registry-file-keys
+                        (concat v1 ".bak"))
+                       '("cci-test-bak")))
+        (should (equal (mapcar #'claude-code-ide-session-registry-entry-key
+                               (claude-code-ide-session-registry--entries))
+                       '("cci-test-bak")))
+        (claude-code-ide-session-registry--submit "noop" #'identity))
+      (should (equal (claude-code-ide-tests--registry-file-keys) '("cci-test-bak")))
+      (should (file-exists-p v1))
+      (should-not (directory-files registry-dir nil "\\.corrupt-")))))
 
 (ert-deftest claude-code-ide-test-registry-records-descriptor ()
   "A start records the instance ID, the provider, the generation and the role."
@@ -573,16 +651,20 @@ cdr of its :cleanup key."
                          :id "cci-test-rec" :provider 'claude :session session
                          :generation (claude-code-ide-instance-next-generation "cci-test-rec" 2))))
              (spec (claude-code-ide-tests--registry-spec :provider 'claude :role "cci-test-lead"))
-             (args (claude-code-ide-session-registry--cli-args session spec)))
-        ;; The entry key is the instance ID, and a new conversation gets it as its id
-        (should (equal (cl-subseq args 0 2) '("--session-id" "cci-test-rec")))
+             (args (claude-code-ide-session-registry--cli-args session spec))
+             (native (cadr args)))
+        ;; The entry key is the instance ID; the new conversation has its own id
+        (should (equal (gethash session claude-code-ide-session-registry--keys) "cci-test-rec"))
+        (should (equal (car args) "--session-id"))
+        (should (string-match-p "\\`[0-9a-f]\\{8\\}-" native))
+        (should-not (equal native "cci-test-rec"))
         (claude-code-ide-session-registry--on-start session spec)
         (let ((entry (claude-code-ide-tests--registry-get "cci-test-rec")))
           (should (eq (claude-code-ide-session-registry-entry-provider entry) 'claude))
           (should (= (claude-code-ide-session-registry-entry-generation entry) 3))
           (should (equal (claude-code-ide-session-registry-entry-role entry) "cci-test-lead"))
-          (should (equal (claude-code-ide-session-registry-entry-session-id entry) "cci-test-rec")))
-        (should (equal (claude-code-ide-instance-native-id instance) "cci-test-rec"))
+          (should (equal (claude-code-ide-session-registry-entry-session-id entry) native)))
+        (should (equal (claude-code-ide-instance-native-id instance) native))
         ;; A report of a new CLI session id reaches the descriptor
         (with-temp-file (claude-code-ide-session-registry--report-file "cci-test-rec")
           (insert "{\"session_id\":\"cci-test-cleared\",\"transcript_path\":\"/x/t.jsonl\"}"))
@@ -592,6 +674,39 @@ cdr of its :cleanup key."
         (should (equal (claude-code-ide-session-registry-entry-session-id
                         (claude-code-ide-tests--registry-get "cci-test-rec"))
                        "cci-test-cleared"))))))
+
+(ert-deftest claude-code-ide-test-registry-fresh-conversation-in-existing-instance ()
+  "A new conversation of an existing instance gets a new native ID, not a taken one."
+  (claude-code-ide-tests--with-instances
+    (claude-code-ide-tests--with-registry
+      (let* ((spec (claude-code-ide-tests--registry-spec :provider 'claude))
+             (first (make-claude-code-ide-mcp-session :buffer (current-buffer)))
+             (_one (claude-code-ide-instance-register
+                    (claude-code-ide-instance-create
+                     :id "cci-test-fresh" :provider 'claude :session first
+                     :generation (claude-code-ide-instance-next-generation "cci-test-fresh"))))
+             (native1 (cadr (claude-code-ide-session-registry--cli-args first spec))))
+        (claude-code-ide-session-registry--on-start first spec)
+        (claude-code-ide-session-registry--on-end first 'exited)
+        (claude-code-ide-instance-unregister "cci-test-fresh")
+        ;; The same instance starts again, without a resume
+        (let* ((second (make-claude-code-ide-mcp-session :buffer (current-buffer)))
+               (two (claude-code-ide-instance-register
+                     (claude-code-ide-instance-create
+                      :id "cci-test-fresh" :provider 'claude :session second
+                      :generation (claude-code-ide-instance-next-generation "cci-test-fresh"))))
+               (args (claude-code-ide-session-registry--cli-args second spec))
+               (native2 (cadr args)))
+          (should (equal (car args) "--session-id"))
+          (should-not (equal native2 native1))
+          (should-not (equal native2 "cci-test-fresh"))
+          (claude-code-ide-session-registry--on-start second spec)
+          (let ((entry (claude-code-ide-tests--registry-get "cci-test-fresh")))
+            (should (equal (claude-code-ide-session-registry-entry-session-id entry) native2))
+            (should (= (claude-code-ide-session-registry-entry-generation entry) 2)))
+          (should (equal (claude-code-ide-instance-native-id two) native2))
+          ;; One entry, for the one instance
+          (should (equal (claude-code-ide-tests--registry-file-keys) '("cci-test-fresh"))))))))
 
 (ert-deftest claude-code-ide-test-registry-restore-passes-identity ()
   "A restore starts the record with its instance ID, provider, generation and role."
@@ -647,14 +762,218 @@ cdr of its :cleanup key."
 ;;; Load points
 
 (ert-deftest claude-code-ide-test-load-points ()
-  "The main file loads the optional files only when they exist."
+  "The main file loads each optional file, and survives a broken one."
   (let ((source (with-temp-buffer
                   (insert-file-contents (locate-library "claude-code-ide.el" t))
                   (buffer-string))))
     (dolist (feature '("codex" "control" "transcript" "handover" "review"))
-      (should (string-match-p (regexp-quote (format "(require 'claude-code-ide-%s nil t)" feature))
-                              source))))
-  (should (featurep 'claude-code-ide-provider-tests)))
+      (should (string-match-p
+               (regexp-quote (format "(claude-code-ide--require-optional 'claude-code-ide-%s)" feature))
+               source))))
+  (should (featurep 'claude-code-ide-provider-tests))
+  ;; A missing file loads nothing and says nothing
+  (let ((warnings nil))
+    (cl-letf (((symbol-function 'display-warning)
+               (lambda (_type message &rest _) (push message warnings))))
+      (should-not (claude-code-ide--require-optional 'claude-code-ide-cci-test-missing))
+      (should-not warnings)))
+  ;; A broken file gives a warning and no error
+  (let* ((dir (make-temp-file "cci-test-broken-" t))
+         (load-path (cons dir load-path))
+         (warnings nil))
+    (unwind-protect
+        (progn
+          (with-temp-file (expand-file-name "claude-code-ide-cci-test-broken.el" dir)
+            (insert "(error \"cci-test broken file\")\n"))
+          (cl-letf (((symbol-function 'display-warning)
+                     (lambda (_type message &rest _) (push message warnings))))
+            (should-not (claude-code-ide--require-optional 'claude-code-ide-cci-test-broken)))
+          (should (string-match-p "cci-test broken file" (car warnings)))
+          (should-not (featurep 'claude-code-ide-cci-test-broken)))
+      (delete-directory dir t))))
+
+(ert-deftest claude-code-ide-test-load-with-broken-optional-file ()
+  "The package loads in a new Emacs while an optional file signals an error."
+  (let* ((dir (make-temp-file "cci-test-broken-" t))
+         (emacs (expand-file-name invocation-name invocation-directory))
+         (package-dir (file-name-directory (locate-library "claude-code-ide.el" t))))
+    (unwind-protect
+        (progn
+          (with-temp-file (expand-file-name "claude-code-ide-codex.el" dir)
+            (insert "(error \"cci-test broken codex\")\n"))
+          (with-temp-buffer
+            (let ((status (apply #'call-process emacs nil t nil "-Q" "-batch" "-L" dir "-L" package-dir
+                                 (append (mapcan (lambda (path) (list "-L" path))
+                                                 (cl-remove-if-not #'stringp load-path))
+                                         (list "--eval"
+                                               (concat "(progn (require 'claude-code-ide)"
+                                                       " (princ (format \"cci-loaded=%s codex=%s\""
+                                                       " (featurep 'claude-code-ide)"
+                                                       " (featurep 'claude-code-ide-codex))))"))))))
+              (should (eq status 0))
+              (should (string-match-p "cci-loaded=t codex=nil" (buffer-string)))
+              (should (string-match-p "cci-test broken codex" (buffer-string))))))
+      (delete-directory dir t))))
+
+;;; Review fixes
+
+(ert-deftest claude-code-ide-test-instance-duplicate-start-keeps-live-instance ()
+  "A second start of a live instance ID fails and leaves the live one intact."
+  (claude-code-ide-tests--with-instances
+    (claude-code-ide-tests--with-status
+      (claude-code-ide-tests--clear-processes)
+      (let ((state (list :cleanup nil)))
+        (unwind-protect
+            (let* ((session (car (claude-code-ide-tests--start-mocked
+                                  (claude-code-ide-start-spec-create
+                                   :directory "/tmp/cci-test-dup1/" :instance-id "cci-test-dup")
+                                  state)))
+                   (instance (claude-code-ide-instance-of-session session))
+                   (_hooks (claude-code-ide-session-status--hooks session "key-dup"))
+                   (status (gethash session claude-code-ide-session-status--by-session))
+                   (dir (claude-code-ide-session-status--events-directory)))
+              (should (= (claude-code-ide-instance-generation instance) 1))
+              (should-error (claude-code-ide-tests--start-mocked
+                             (claude-code-ide-start-spec-create
+                              :directory "/tmp/cci-test-dup2/" :instance-id "cci-test-dup")
+                             state))
+              ;; Nothing changed for the live instance
+              (should (= (claude-code-ide-instance-current-generation "cci-test-dup") 1))
+              (should (eq (claude-code-ide-instance-by-id "cci-test-dup") instance))
+              (should (= 1 (hash-table-count claude-code-ide-mcp--sessions)))
+              ;; It still takes its events
+              (make-directory dir t)
+              (with-temp-file (expand-file-name
+                               (format "%s-%08d-SessionStart.json"
+                                       (claude-code-ide-session-status-nonce status) 1)
+                               dir)
+                (insert "{\"source\":\"startup\"}"))
+              (claude-code-ide-session-status--drain)
+              (should (equal (claude-code-ide-tests--state status) '(idle "Ready"))))
+          (claude-code-ide-tests--cleanup-mocked state))))))
+
+(defun claude-code-ide-tests--stub-provider (&rest overrides)
+  "Return a stub provider named `cci-test-stub', changed by OVERRIDES."
+  (apply #'claude-code-ide-provider-create
+         (append overrides
+                 (list :name 'cci-test-stub :display-name "Stub" :buffer-name-prefix "cci-stub"
+                       :detect (lambda (&optional _)
+                                 '(:available t :program "/x/cci-stub" :version unknown))))))
+
+(ert-deftest claude-code-ide-test-provider-stub-gets-no-claude-parts ()
+  "Another provider gets no CC arguments, its own buffer prefix and its own program."
+  (claude-code-ide-tests--with-instances
+    (claude-code-ide-tests--with-registry
+      (claude-code-ide-tests--clear-processes)
+      (let* ((claude-code-ide-provider--registry (copy-alist claude-code-ide-provider--registry))
+             (launch-args 'none)
+             (exit-args nil)
+             (claude-code-ide-cli-args-functions (list #'claude-code-ide-session-registry--cli-args))
+             (state (list :cleanup nil)))
+        (claude-code-ide-register-provider
+         (claude-code-ide-tests--stub-provider
+          :launch (lambda (_instance _spec args)
+                    (setq launch-args args)
+                    (list :command "cci-stub" :environment nil))
+          :exit-message (lambda (code spec program)
+                          (setq exit-args (list code spec program))
+                          (format "%s ended with %d" program code))))
+        (unwind-protect
+            (let* ((started (claude-code-ide-tests--start-mocked
+                             (claude-code-ide-start-spec-create
+                              :directory "/tmp/cci-test-stub/proj/" :provider 'cci-test-stub)
+                             state))
+                   (session (car started))
+                   (instance (claude-code-ide-instance-of-session session)))
+              (should (eq (claude-code-ide-instance-provider instance) 'cci-test-stub))
+              ;; The buffer name has the stub's prefix
+              (should (equal (car claude-code-ide-tests--terminal-args) "*cci-stub[proj]*"))
+              ;; The launch gets no --session-id and no --settings
+              (should (equal (funcall (cdr started)) '(:command "cci-stub" :environment nil)))
+              (should-not (member "--session-id" launch-args))
+              (should-not (member "--settings" launch-args))
+              (should-not (gethash session claude-code-ide-session-registry--keys))
+              (should-not (claude-code-ide-session-registry--cli-args
+                           session (claude-code-ide-start-spec-create
+                                    :directory "/tmp/" :provider 'cci-test-stub)))
+              ;; The exit message names the program that detect found
+              (cl-letf (((symbol-function 'message) #'ignore))
+                (funcall (process-sentinel (claude-code-ide-mcp-session-process session))
+                         (claude-code-ide-mcp-session-process session)
+                         "exited abnormally with code 3\n"))
+              (should (equal (car exit-args) 3))
+              (should (equal (nth 2 exit-args) "/x/cci-stub")))
+          (claude-code-ide-tests--cleanup-mocked state))))))
+
+(ert-deftest claude-code-ide-test-provider-buffer-name-prefix ()
+  "The default buffer name uses the provider's prefix; CC names stay the same."
+  (let ((claude-code-ide-provider--registry (copy-alist claude-code-ide-provider--registry))
+        (claude-code-ide-default-provider 'claude))
+    (should (equal (claude-code-ide--default-buffer-name "/tmp/cci-test-proj/")
+                   "*claude-code[cci-test-proj]*"))
+    (should (equal (claude-code-ide--instance-buffer-name "/tmp/cci-test-proj/" "docs")
+                   "*claude-code[cci-test-proj:docs]*"))
+    (let ((claude-code-ide--naming-provider
+           (claude-code-ide-register-provider (claude-code-ide-tests--stub-provider))))
+      (should (equal (claude-code-ide--default-buffer-name "/tmp/cci-test-proj/")
+                     "*cci-stub[cci-test-proj]*")))))
+
+(ert-deftest claude-code-ide-test-status-blocker-reasons ()
+  "A permission notification asks for an approval; an unmatched AskUserQuestion asks a question."
+  (let ((status (claude-code-ide-tests--status)))
+    (claude-code-ide-tests--feed
+     status '(("SessionStart" "{\"source\":\"startup\"}")
+              ("UserPromptSubmit" "{}")
+              ("Notification" "{\"notification_type\":\"permission_prompt\",\"message\":\"Allow?\"}")))
+    (should (equal (cl-subseq (claude-code-ide-session-status--common-state status 10.0) 0 4)
+                   '(:state waiting-for-user :reason approval))))
+  (let ((status (claude-code-ide-tests--status)))
+    (claude-code-ide-tests--feed
+     status '(("UserPromptSubmit" "{}")
+              ("Notification" "{\"notification_type\":\"worker_permission_prompt\"}")))
+    (should (eq (plist-get (claude-code-ide-session-status--common-state status 10.0) :reason)
+                'approval)))
+  (let ((status (claude-code-ide-tests--status)))
+    (claude-code-ide-tests--feed
+     status '(("UserPromptSubmit" "{}")
+              ("Notification" "{\"notification_type\":\"elicitation_dialog\"}")))
+    (should (eq (plist-get (claude-code-ide-session-status--common-state status 10.0) :reason)
+                'dialog)))
+  ;; No PreToolUse came first, so no tool in flight matches the request
+  (let ((status (claude-code-ide-tests--status)))
+    (claude-code-ide-tests--feed
+     status (list '("UserPromptSubmit" "{}")
+                  (claude-code-ide-tests--permission "{\"questions\":[]}" nil "AskUserQuestion")))
+    (should (equal (cl-subseq (claude-code-ide-session-status--common-state status 10.0) 0 4)
+                   '(:state waiting-for-user :reason question)))))
+
+(ert-deftest claude-code-ide-test-send-prompt-unavailable ()
+  "A provider without submit-prompt gives its result from Lisp and an error interactively."
+  (claude-code-ide-tests--with-instances
+    (claude-code-ide-tests--clear-processes)
+    (let* ((claude-code-ide-provider--registry (copy-alist claude-code-ide-provider--registry))
+           (buffer (generate-new-buffer "*cci-test-send*"))
+           (session (claude-code-ide-tests--make-session "/tmp/cci-test-send/" :buffer buffer))
+           (logged nil))
+      (claude-code-ide-register-provider (claude-code-ide-tests--stub-provider))
+      (claude-code-ide-instance-register
+       (claude-code-ide-instance-create :id "cci-test-send" :provider 'cci-test-stub
+                                        :session session :buffer buffer))
+      (unwind-protect
+          (cl-letf (((symbol-function 'claude-code-ide-debug)
+                     (lambda (&rest args) (push args logged))))
+            (should (equal (claude-code-ide-send-prompt "cci-test-hello" session)
+                           '(:status unavailable :capability submit-prompt)))
+            (should-not logged)
+            (with-current-buffer buffer
+              (setq-local claude-code-ide--session session)
+              (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "cci-test-typed")))
+                (should-error (call-interactively #'claude-code-ide-send-prompt)
+                              :type 'user-error)))
+            (should-not logged))
+        (let ((kill-buffer-hook nil))
+          (kill-buffer buffer))
+        (claude-code-ide-tests--clear-processes)))))
 
 (provide 'claude-code-ide-provider-tests)
 
