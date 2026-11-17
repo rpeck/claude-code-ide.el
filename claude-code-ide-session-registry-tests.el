@@ -512,8 +512,12 @@ BODY can refer to that directory as `registry-dir'."
                       :directory "/tmp/spec-project/" :instance-name "refactor"
                       :resume-id "cli-id" :extra-flags "--model opus" :prompt "note"))
             (should (equal (nth 1 terminal-args) "/tmp/spec-project/"))
-            (should (equal (nthcdr 6 terminal-args)
-                           '(("--resume" "cli-id" "--hooked") "note")))
+            ;; The provider builds the command from the spec and the args
+            (let ((built nil))
+              (cl-letf (((symbol-function 'claude-code-ide--build-claude-command)
+                         (lambda (&rest args) (setq built args) "claude")))
+                (funcall (nth 8 terminal-args)))
+              (should (equal (nthcdr 3 built) '(("--resume" "cli-id" "--hooked") "note"))))
             (let ((session (car started))
                   (spec (cdr started)))
               (should (equal (claude-code-ide-mcp-session-instance-name session) "refactor"))

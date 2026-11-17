@@ -32,10 +32,17 @@
 ;; sequence number per launch.  Emacs reads the files in order, deletes
 ;; them, and updates the status of the session.
 ;;
-;; `claude-code-ide-session-status-mode' shows the sessions in a buffer
-;; that updates itself, the ones that wait for the user first.  RET in
-;; that buffer, or `claude-code-ide-visit-waiting-session' from
-;; anywhere, goes to the session.
+;; Each launch has its own nonce, and its status record holds the
+;; instance ID and the launch generation of that launch.  The drain makes
+;; a common event of each file (see `claude-code-ide-make-event') and
+;; skips the events of a launch older than the current generation of
+;; its instance.
+;;
+;; `claude-code-ide-session-status-mode' shows the sessions in the buffer
+;; *Coding Agents Sessions*, which updates itself, the ones that wait for
+;; the user first.  RET in that buffer, or
+;; `claude-code-ide-visit-waiting-session' from anywhere, goes to the
+;; session.
 
 ;;; Code:
 
@@ -163,6 +170,9 @@ time, which is true: the agent no longer waits on it."
   (session nil :documentation "The `claude-code-ide-mcp-session'.")
   (key nil :type (or null string) :documentation "Registry key.")
   (nonce "" :type string :documentation "Id of this launch in event file names.")
+  (instance-id nil :type (or null string)
+               :documentation "Instance ID of the launch, or nil without a descriptor.")
+  (generation 0 :type integer :documentation "Launch generation of the launch.")
   (phase 'starting :type symbol
          :documentation "`starting', `working', `idle' or `error'.")
   (detail "" :type string)
@@ -258,7 +268,7 @@ exit 0
 (defvar claude-code-ide-session-status--tick-timer nil
   "Timer that reads events, checks quiet sessions and updates the buffer.")
 
-(defconst claude-code-ide-session-status--buffer-name "*Claude Code Status*"
+(defconst claude-code-ide-session-status--buffer-name "*Coding Agents Sessions*"
   "Name of the status buffer.")
 
 (defvar claude-code-ide-session-status--urgent-count 0
@@ -798,7 +808,8 @@ Files of launches that this Emacs does not track are deleted unread."
           (let ((status (gethash (match-string 1 name) claude-code-ide-session-status--by-nonce))
                 (event (match-string 2 name)))
             (when status
-              (when-let* ((data (claude-code-ide-session-status--read-event file)))
+              (when-let* ((data (claude-code-ide-session-status--read-event file))
+                          ((claude-code-ide-session-status--current-p status event data)))
                 (condition-case err
                     (progn
                       (claude-code-ide-session-status--apply status event data)
@@ -812,6 +823,18 @@ Files of launches that this Emacs does not track are deleted unread."
       (claude-code-ide-session-status--schedule-drain))
     (when changed
       (claude-code-ide-session-status--refresh))))
+
+(defun claude-code-ide-session-status--current-p (status event data)
+  "Return non-nil unless the hook EVENT with DATA comes from an old launch.
+STATUS is the record of the launch that wrote the event.  A record
+without an instance ID has no generation to check."
+  (or (null (claude-code-ide-session-status-instance-id status))
+      (claude-code-ide-event-current-p
+       (claude-code-ide-make-event
+        (claude-code-ide-session-status-instance-id status)
+        (claude-code-ide-session-status-generation status)
+        (claude-code-ide--claude-map-event event data)
+        event data))))
 
 (defun claude-code-ide-session-status--schedule-drain ()
   "Read the event files in a moment.
@@ -877,8 +900,11 @@ script with a new nonce for this launch.  When
                               "-" "" (claude-code-ide-session-registry--uuid))
                              0 12))
            (now (float-time))
+           (instance (claude-code-ide-instance-of-session session))
            (status (claude-code-ide-session-status-create
                     :session session :key key :nonce nonce
+                    :instance-id (and instance (claude-code-ide-instance-id instance))
+                    :generation (if instance (claude-code-ide-instance-generation instance) 0)
                     :since now :registered now :last-event now)))
       (claude-code-ide-session-status--install-script)
       (puthash nonce status claude-code-ide-session-status--by-nonce)
@@ -1053,6 +1079,59 @@ shells run.  Else the phase.  A nil STATUS is
     ('unobserved (claude-code-ide-session-status-registered status))
     (_ (claude-code-ide-session-status-since status))))
 
+;;; Common states
+
+(defun claude-code-ide-session-status--blocker-reason (status blocker)
+  "Return the common reason of BLOCKER of STATUS.
+That is `approval', `question' or `dialog'.  A permission dialog of
+AskUserQuestion is a question menu; the other permission dialogs ask
+for an approval.  An elicitation and a waiting notification are
+dialogs."
+  (pcase (claude-code-ide-session-status--blocker-kind blocker)
+    ('permission
+     (let* ((tool (claude-code-ide-session-status--blocker-tool blocker))
+            (value (and tool (gethash tool (claude-code-ide-session-status-inflight status)))))
+       (if (equal (nth 1 value) "AskUserQuestion") 'question 'approval)))
+    (_ 'dialog)))
+
+(defun claude-code-ide-session-status--common-state (status now)
+  "Return the common state of STATUS at NOW.
+See `claude-code-ide-instance-state' for the result.
+A nil STATUS, a session without status hooks, is `disconnected': no
+event comes from it."
+  (let* ((state (claude-code-ide-session-status--state status now))
+         (since (claude-code-ide-session-status--state-since status state)))
+    (pcase state
+      ('waiting
+       (claude-code-ide-instance-make-state
+        'waiting-for-user
+        (claude-code-ide-session-status--blocker-reason
+         status (car (claude-code-ide-session-status-blockers status)))
+        since))
+      ;; The reply ends with a question: a guess of the ask regexps
+      ('asks (claude-code-ide-instance-make-state 'waiting-for-user 'question since t))
+      ('error (claude-code-ide-instance-make-state 'failed 'error since))
+      ((or 'tasks 'tasks-quiet)
+       (claude-code-ide-instance-make-state 'waiting-for-task 'subagent since))
+      ('idle (claude-code-ide-instance-make-state
+              'idle nil since (claude-code-ide-session-status-guessed status)))
+      ;; The CLI starts and takes no prompt yet
+      ((or 'starting 'working) (claude-code-ide-instance-make-state 'working nil since))
+      ;; `unobserved' and `untracked': no event comes
+      (_ (claude-code-ide-instance-make-state 'disconnected nil since)))))
+
+(defun claude-code-ide-session-status--instance-state (instance now)
+  "Return the common state of the Claude Code INSTANCE at NOW, or nil.
+This is a function of `claude-code-ide-instance-state-functions'."
+  (when (eq (claude-code-ide-instance-provider instance) 'claude)
+    (claude-code-ide-session-status--common-state
+     (gethash (claude-code-ide-instance-session instance)
+              claude-code-ide-session-status--by-session)
+     now)))
+
+(add-hook 'claude-code-ide-instance-state-functions
+          #'claude-code-ide-session-status--instance-state)
+
 (defconst claude-code-ide-session-status--rank
   '((waiting . 0) (asks . 1) (error . 2) (unobserved . 3) (tasks-quiet . 4) (idle . 5)
     (tasks . 6) (starting . 7) (working . 8) (untracked . 9))
@@ -1129,6 +1208,16 @@ oldest first within a state."
 (defconst claude-code-ide-session-status--session-width 30
   "Width of the Session column; longer names are cut.")
 
+(defconst claude-code-ide-session-status--provider-width 8
+  "Width of the Provider column.")
+
+(defun claude-code-ide-session-status--provider-label (session)
+  "Return the provider name of SESSION for its row, or \"unknown\"."
+  (claude-code-ide-format-value
+   (claude-code-ide-or-unknown
+    (when-let* ((instance (claude-code-ide-instance-of-session session)))
+      (claude-code-ide-instance-provider instance)))))
+
 (cl-defstruct (claude-code-ide-session-status--group
                (:constructor claude-code-ide-session-status--group-create)
                (:copier nil))
@@ -1198,7 +1287,7 @@ Each group starts with a header entry whose id is the group."
   (apply #'append
          (mapcar
           (lambda (group)
-            (cons (list group (vector (claude-code-ide-session-status--group-header group) "" "" ""))
+            (cons (list group (vector (claude-code-ide-session-status--group-header group) "" "" "" ""))
                   (mapcar (lambda (row)
                             (pcase-let* ((`(,session ,state ,since ,detail) row)
                                          (`(,label ,face) (alist-get state claude-code-ide-session-status--labels)))
@@ -1212,6 +1301,7 @@ Each group starts with a header entry whose id is the group."
                                             (truncate-string-to-width
                                              (concat "  " (claude-code-ide-session-status--session-label session))
                                              claude-code-ide-session-status--session-width nil nil "…")
+                                            (claude-code-ide-session-status--provider-label session)
                                             (claude-code-ide-session-status--age since now)
                                             (or detail "")))))
                           (claude-code-ide-session-status--group-rows group))))
@@ -1244,6 +1334,7 @@ line goes to its first session.
   (setq tabulated-list-format
         (vector (list "Status" (claude-code-ide-session-status--label-width) nil)
                 (list "Session" claude-code-ide-session-status--session-width nil)
+                (list "Provider" claude-code-ide-session-status--provider-width nil)
                 '("For" 5 nil :right-align t)
                 '("Detail" 0 nil)))
   (setq tabulated-list-sort-key nil)

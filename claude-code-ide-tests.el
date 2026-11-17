@@ -234,8 +234,15 @@ non-nil."
 (define-error 'mcp-error "MCP Error" 'error)
 (require 'claude-code-ide-mcp-handlers)
 (require 'claude-code-ide)
-(require 'claude-code-ide-session-registry-tests)
-(require 'claude-code-ide-session-status-tests)
+
+;; Load every claude-code-ide-*-tests.el file of this folder, in name
+;; order, so that a branch adds its tests without an edit here.  The
+;; files load after the mocks above and use the helpers below, which
+;; they reach at run time.
+(let ((directory (file-name-directory (or load-file-name buffer-file-name))))
+  (dolist (file (directory-files directory nil "\\`claude-code-ide-.+-tests\\.el\\'"))
+    (require (intern (file-name-sans-extension file))
+             (expand-file-name file directory))))
 
 ;;; Test Helper Functions
 
