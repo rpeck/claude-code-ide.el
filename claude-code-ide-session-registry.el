@@ -23,8 +23,8 @@
 ;;; Commentary:
 
 ;; `claude-code-ide-session-registry-mode' records every Claude Code
-;; instance that Emacs starts in `claude-code-ide-state-file', a JSON
-;; file.  After a crash, `claude-code-ide-restore-sessions' starts every
+;; instance that Emacs starts in a JSON file: `claude-code-ide-state-file'
+;; with "-v2" before the extension.  After a crash, `claude-code-ide-restore-sessions' starts every
 ;; instance that was still open again, in its directory, with its
 ;; instance name, its model and its flags, resumed by its CLI session id.
 ;;
@@ -33,8 +33,9 @@
 ;; each instance.  The conversation, its title and its model stay in the
 ;; CLI transcript under ~/.claude/projects, which is read when needed.
 ;;
-;; Emacs starts each new instance with --session-id, so the id is known
-;; at once.  A SessionStart hook, passed with --settings, writes the
+;; Emacs starts each new conversation with --session-id and a new id,
+;; so the id is known at once.  It is not the instance ID: one instance
+;; can start several conversations.  A SessionStart hook, passed with --settings, writes the
 ;; current id to a report file when the CLI changes it (/clear, /resume,
 ;; or a start with -c or -r), and the registry reads it from there.
 ;;
@@ -44,9 +45,12 @@
 ;;
 ;; The file has version 2: each record also holds its provider, its
 ;; launch generation and its role, and the entry key is the instance ID
-;; of `claude-code-ide-instance'.  A version 1 file, which held only
-;; Claude Code records, is read and migrated in memory; every write is
-;; version 2.  docs/session-schema.md describes both versions.
+;; of `claude-code-ide-instance'.  While the version 2 file does not
+;; exist, the version 1 file `claude-code-ide-state-file', which held
+;; only Claude Code records, is read and migrated in memory.  The
+;; registry never writes or moves the version 1 file, so an older
+;; version of the package can go on using it.  docs/session-schema.md
+;; describes both versions.
 
 ;;; Code:
 
@@ -65,8 +69,14 @@
 
 (defcustom claude-code-ide-state-file
   (expand-file-name "~/.emacs-claude-code-ide-state.json")
-  "File where `claude-code-ide-session-registry-mode' records sessions.
-The previous version is kept next to it, with the suffix \".bak\"."
+  "File of the version 1 session registry.
+`claude-code-ide-session-registry-mode' records sessions in version 2,
+in a file with the same name plus \"-v2\" before the extension, for
+example ~/.emacs-claude-code-ide-state-v2.json.  The previous version
+is kept next to that file, with the suffix \".bak\".  When the
+version 2 file does not exist yet, the registry reads this file and
+migrates it.  The registry never writes this file, so an older version
+of the package can still use it."
   :type 'file
   :group 'claude-code-ide)
 
@@ -239,6 +249,10 @@ it the backup.")
   (make-hash-table :test 'eq :weakness 'key)
   "Registry key of each session that this Emacs started.")
 
+(defvar claude-code-ide-session-registry--new-native-ids
+  (make-hash-table :test 'eq :weakness 'key)
+  "CLI session id that Emacs chose for the new conversation of each session.")
+
 (defvar claude-code-ide-session-registry--started
   (make-hash-table :test 'eq :weakness 'key)
   "Sessions whose start the registry recorded.
@@ -272,19 +286,19 @@ Only their end changes an entry; a start that failed does not.")
 
 (defun claude-code-ide-session-registry--uuid ()
   "Return a new random UUID (version 4) as a string."
-  (let ((hex (secure-hash 'sha256 (format "%S %S %S %S" (current-time) (emacs-pid)
-                                          (random) (random)))))
-    (format "%s-%s-4%s-%x%s-%s"
-            (substring hex 0 8)
-            (substring hex 8 12)
-            (substring hex 13 16)
-            (logior 8 (logand 3 (string-to-number (substring hex 16 17) 16)))
-            (substring hex 17 20)
-            (substring hex 20 32))))
+  (claude-code-ide-instance-new-id))
+
+(defun claude-code-ide-session-registry--v1-file ()
+  "Return the absolute name of the version 1 state file.
+The registry reads it only while the version 2 file does not exist."
+  (expand-file-name claude-code-ide-state-file))
 
 (defun claude-code-ide-session-registry--state-file ()
-  "Return the absolute name of the state file."
-  (expand-file-name claude-code-ide-state-file))
+  "Return the absolute name of the state file, which has version 2.
+It is `claude-code-ide-state-file' with \"-v2\" before the extension."
+  (let* ((v1 (claude-code-ide-session-registry--v1-file))
+         (extension (file-name-extension v1 t)))
+    (concat (file-name-sans-extension v1) "-v2" extension)))
 
 (defun claude-code-ide-session-registry--backup-file ()
   "Return the name of the backup of the state file."
@@ -299,8 +313,9 @@ Only their end changes an entry; a start that failed does not.")
   (file-name-as-directory
    (expand-file-name
     (or claude-code-ide-session-registry-report-directory
+        ;; The name of the version 1 file, so that the place stays
         (concat (file-name-sans-extension
-                 (claude-code-ide-session-registry--state-file))
+                 (claude-code-ide-session-registry--v1-file))
                 "-reports")))))
 
 (defun claude-code-ide-session-registry--report-file (key)
@@ -398,24 +413,39 @@ Signal `claude-code-ide-session-registry-error' when FILE is unreadable."
 
 (defun claude-code-ide-session-registry--load ()
   "Return the entries of the state file.
-When the state file is unreadable, use its backup and report it."
+When the state file is unreadable, use its backup and report it.  When
+the version 2 state file does not exist yet, read the version 1 file
+\(or its backup) and migrate it; that file is never written."
   (setq claude-code-ide-session-registry--loaded-from-backup nil)
+  (if (file-exists-p (claude-code-ide-session-registry--state-file))
+      (claude-code-ide-session-registry--read-with-backup
+       (claude-code-ide-session-registry--state-file)
+       (claude-code-ide-session-registry--backup-file)
+       t)
+    (claude-code-ide-session-registry--read-with-backup
+     (claude-code-ide-session-registry--v1-file)
+     (concat (claude-code-ide-session-registry--v1-file) ".bak")
+     nil)))
+
+(defun claude-code-ide-session-registry--read-with-backup (file backup mark)
+  "Return the entries of FILE, or of BACKUP when FILE is unreadable.
+MARK non-nil records the use of BACKUP, so that the next write moves
+the unreadable FILE aside."
   (condition-case err
-      (claude-code-ide-session-registry--read-file
-       (claude-code-ide-session-registry--state-file))
+      (claude-code-ide-session-registry--read-file file)
     (claude-code-ide-session-registry-error
-     (setq claude-code-ide-session-registry--loaded-from-backup t)
-     (let ((backup (claude-code-ide-session-registry--backup-file)))
-       (condition-case err2
-           (prog1 (claude-code-ide-session-registry--read-file backup)
-             (display-warning 'claude-code-ide
-                              (format "Session registry: cannot read %s (%s); using %s"
-                                      (nth 1 err) (nth 2 err) backup)))
-         (claude-code-ide-session-registry-error
-          (display-warning 'claude-code-ide
-                           (format "Session registry: cannot read %s (%s) nor %s (%s); starting empty"
-                                   (nth 1 err) (nth 2 err) backup (nth 2 err2)))
-          nil))))))
+     (when mark
+       (setq claude-code-ide-session-registry--loaded-from-backup t))
+     (condition-case err2
+         (prog1 (claude-code-ide-session-registry--read-file backup)
+           (display-warning 'claude-code-ide
+                            (format "Session registry: cannot read %s (%s); using %s"
+                                    (nth 1 err) (nth 2 err) backup)))
+       (claude-code-ide-session-registry-error
+        (display-warning 'claude-code-ide
+                         (format "Session registry: cannot read %s (%s) nor %s (%s); starting empty"
+                                 (nth 1 err) (nth 2 err) backup (nth 2 err2)))
+        nil)))))
 
 (defun claude-code-ide-session-registry--write-file (entries)
   "Write ENTRIES to the state file atomically, and keep the old file as backup.
@@ -767,21 +797,26 @@ or names a session itself gets its id from the CLI."
     (claude-code-ide-instance-id instance)))
 
 (defun claude-code-ide-session-registry--cli-args (session spec)
-  "Return the CLI arguments that let the registry track SESSION.
+  "Return the Claude Code CLI arguments that let the registry track SESSION.
 SPEC describes the start.  The entry key is the instance ID.  A new
-conversation gets --session-id with the entry key.  Every start gets
-the SessionStart hook that reports the id, unless the flags pass their
-own --settings, which a second --settings would replace."
-  (let ((key (or claude-code-ide-session-registry--start-key
-                 (claude-code-ide-session-registry--instance-key session)
-                 (claude-code-ide-session-registry--uuid)))
-        (flags (claude-code-ide-session-registry--parse-flags
-                (claude-code-ide-start-spec-extra-flags spec))))
-    (puthash session key claude-code-ide-session-registry--keys)
-    (append (when (claude-code-ide-session-registry--own-id-p spec flags)
-              (list "--session-id" key))
-            (unless (claude-code-ide-session-registry--flags-has-settings flags)
-              (list "--settings" (claude-code-ide-session-registry--hook-settings session key))))))
+conversation gets --session-id with a new id, which is not the
+instance ID: one instance can start several conversations.  Every
+start gets the SessionStart hook that reports the id, unless the flags
+pass their own --settings, which a second --settings would replace.
+A start of another provider than `claude' gets no arguments."
+  (when (memq (claude-code-ide-start-spec-provider spec) '(nil claude))
+    (let ((key (or claude-code-ide-session-registry--start-key
+                   (claude-code-ide-session-registry--instance-key session)
+                   (claude-code-ide-session-registry--uuid)))
+          (flags (claude-code-ide-session-registry--parse-flags
+                  (claude-code-ide-start-spec-extra-flags spec))))
+      (puthash session key claude-code-ide-session-registry--keys)
+      (append (when (claude-code-ide-session-registry--own-id-p spec flags)
+                (let ((native-id (claude-code-ide-session-registry--uuid)))
+                  (puthash session native-id claude-code-ide-session-registry--new-native-ids)
+                  (list "--session-id" native-id)))
+              (unless (claude-code-ide-session-registry--flags-has-settings flags)
+                (list "--settings" (claude-code-ide-session-registry--hook-settings session key)))))))
 
 (defun claude-code-ide-session-registry--on-start (session spec)
   "Record that SESSION started as SPEC describes."
@@ -792,7 +827,8 @@ own --settings, which a second --settings would replace."
            (instance (claude-code-ide-instance-of-session session))
            (session-id (or (claude-code-ide-start-spec-resume-id spec)
                            (claude-code-ide-session-registry--flags-session-id flags)
-                           (and (claude-code-ide-session-registry--own-id-p spec flags) key)))
+                           (and (claude-code-ide-session-registry--own-id-p spec flags)
+                                (gethash session claude-code-ide-session-registry--new-native-ids))))
            (now (claude-code-ide-session-registry--now)))
       (puthash session t claude-code-ide-session-registry--started)
       (when (and instance session-id)

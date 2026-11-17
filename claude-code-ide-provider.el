@@ -63,7 +63,11 @@ the result of each operation."
   (mcp-setup nil :documentation "(INSTANCE) -> MCP config in the provider's format.")
   (transcript nil :documentation "(INSTANCE WHAT) -> file, title or model, or `unknown'.")
   (exit-message nil :documentation "(EXIT-CODE SPEC PROGRAM) -> message or nil.")
-  (capabilities nil :type list :documentation "Symbols of the supported operations."))
+  (capabilities nil :type list
+                :documentation "Symbols of the supported operations.
+`claude-code-ide-register-provider' fills it in when it is nil, and
+refuses a list that does not name exactly the operations with a
+function."))
 
 (defconst claude-code-ide-provider-operations
   '(detect launch resume fork submit-prompt stop native-id status-events
@@ -74,14 +78,30 @@ The order is that of docs/providers.md.")
 (defvar claude-code-ide-provider--registry nil
   "Registered providers, as an alist of (NAME . PROVIDER), oldest first.")
 
+(defun claude-code-ide-provider--operations-of (provider)
+  "Return the operations of PROVIDER that have a function, in the standard order."
+  (cl-remove-if-not (lambda (operation)
+                      (cl-struct-slot-value 'claude-code-ide-provider operation provider))
+                    claude-code-ide-provider-operations))
+
 (defun claude-code-ide-register-provider (provider)
   "Register PROVIDER under its name and return it.
-A provider of the same name is replaced."
+A provider of the same name is replaced.  When the capabilities of
+PROVIDER are nil, they become its operations that have a function.
+Capabilities that name other operations signal an error."
   (unless (claude-code-ide-provider-p provider)
     (signal 'wrong-type-argument (list 'claude-code-ide-provider-p provider)))
-  (let ((name (claude-code-ide-provider-name provider)))
+  (let ((name (claude-code-ide-provider-name provider))
+        (operations (claude-code-ide-provider--operations-of provider)))
     (unless (and name (symbolp name))
       (error "A provider needs a symbol as its name, not %S" name))
+    (let ((capabilities (claude-code-ide-provider-capabilities provider)))
+      (cond
+       ((null capabilities)
+        (setf (claude-code-ide-provider-capabilities provider) operations))
+       ((cl-set-exclusive-or capabilities operations)
+        (error "The capabilities of provider %s are not its operations: %S"
+               name (cl-set-exclusive-or capabilities operations)))))
     (if-let* ((cell (assq name claude-code-ide-provider--registry)))
         (setcdr cell provider)
       (setq claude-code-ide-provider--registry

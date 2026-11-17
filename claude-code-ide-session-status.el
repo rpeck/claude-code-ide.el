@@ -34,9 +34,9 @@
 ;;
 ;; Each launch has its own nonce, and its status record holds the
 ;; instance ID and the launch generation of that launch.  The drain makes
-;; a common event of each file (see `claude-code-ide-make-event') and
-;; skips the events of a launch older than the current generation of
-;; its instance.
+;; a common event of each file (see `claude-code-ide-make-event'), skips
+;; the events of a launch older than the current generation of its
+;; instance, and passes the others to `claude-code-ide-dispatch-event'.
 ;;
 ;; `claude-code-ide-session-status-mode' shows the sessions in the buffer
 ;; *Coding Agents Sessions*, which updates itself, the ones that wait for
@@ -151,6 +151,8 @@ time, which is true: the agent no longer waits on it."
   (kind 'permission :type symbol
         :documentation "`permission', `elicitation' or `notification'.")
   (tool nil :documentation "(AGENT-ID . TOOL-USE-ID) of the tool, or nil.")
+  (name nil :type (or null string)
+        :documentation "Tool name of a permission dialog, or type of a notification.")
   (detail "" :type string)
   (since 0.0 :type float))
 
@@ -427,12 +429,14 @@ Dialogs and tools of subagents can outlive the main turn."
                  (remhash key inflight)))
              inflight)))
 
-(defun claude-code-ide-session-status--add-blocker (status kind tool detail now)
-  "Add a blocker of KIND for TOOL with DETAIL to STATUS at NOW."
+(defun claude-code-ide-session-status--add-blocker (status kind tool detail now &optional name)
+  "Add a blocker of KIND for TOOL with DETAIL to STATUS at NOW.
+NAME is the tool name of a permission dialog or the type of a
+notification."
   (setf (claude-code-ide-session-status-blockers status)
         (append (claude-code-ide-session-status-blockers status)
                 (list (claude-code-ide-session-status--blocker-create
-                       :kind kind :tool tool :detail detail :since now)))))
+                       :kind kind :tool tool :name name :detail detail :since now)))))
 
 (defun claude-code-ide-session-status--remove-blockers (status predicate)
   "Remove the blockers of STATUS for which PREDICATE is non-nil."
@@ -571,7 +575,8 @@ UserPromptSubmit, so the tool event is its first sign."
         (or (claude-code-ide-session-status--match-tool status data) (cons agent nil))
         (claude-code-ide-session-status--tool-detail (alist-get 'tool_name data)
                                                      (alist-get 'tool_input data))
-        now))
+        now
+        (let ((name (alist-get 'tool_name data))) (and (stringp name) name))))
       ((or "PostToolUse" "PostToolUseFailure")
        (let ((key (claude-code-ide-session-status--tool-key data)))
          (remhash key (claude-code-ide-session-status-inflight status))
@@ -591,7 +596,7 @@ UserPromptSubmit, so the tool event is its first sign."
               status 'notification nil
               (claude-code-ide-session-status--one-line
                (or (alist-get 'message data) "Waiting for you"))
-              now)))
+              now type)))
           ((equal type "idle_prompt")
            ;; No dialog is open; an idle phase keeps the first line of the reply
            (setf (claude-code-ide-session-status-blockers status) nil)
@@ -809,14 +814,21 @@ Files of launches that this Emacs does not track are deleted unread."
                 (event (match-string 2 name)))
             (when status
               (when-let* ((data (claude-code-ide-session-status--read-event file))
-                          ((claude-code-ide-session-status--current-p status event data)))
+                          (common (claude-code-ide-session-status--common-event status event data))
+                          ((or (eq common 'none) (claude-code-ide-event-current-p common))))
                 (condition-case err
                     (progn
                       (claude-code-ide-session-status--apply status event data)
                       (setq changed t))
                   (error
                    (message "Claude session status: %s event failed: %s"
-                            event (error-message-string err))))))))
+                            event (error-message-string err))))
+                (unless (eq common 'none)
+                  (condition-case err
+                      (claude-code-ide-dispatch-event common)
+                    (error
+                     (message "Claude session status: event function failed on %s: %s"
+                              event (error-message-string err)))))))))
         (ignore-errors (delete-file file))
         (cl-incf count)))
     (when files
@@ -824,17 +836,22 @@ Files of launches that this Emacs does not track are deleted unread."
     (when changed
       (claude-code-ide-session-status--refresh))))
 
-(defun claude-code-ide-session-status--current-p (status event data)
-  "Return non-nil unless the hook EVENT with DATA comes from an old launch.
-STATUS is the record of the launch that wrote the event.  A record
-without an instance ID has no generation to check."
-  (or (null (claude-code-ide-session-status-instance-id status))
-      (claude-code-ide-event-current-p
-       (claude-code-ide-make-event
-        (claude-code-ide-session-status-instance-id status)
-        (claude-code-ide-session-status-generation status)
-        (claude-code-ide--claude-map-event event data)
-        event data))))
+(defun claude-code-ide-session-status--common-event (status event data)
+  "Return the common event of the hook EVENT with DATA, or `none'.
+STATUS is the record of the launch that wrote the event; its instance
+ID and generation go into the event.  The provider of the instance
+maps EVENT.  A record without an instance ID gives `none': it has no
+generation to check and no event to dispatch."
+  (if-let* ((id (claude-code-ide-session-status-instance-id status)))
+      (let* ((instance (claude-code-ide-instance-by-id id))
+             (provider (if instance (claude-code-ide-instance-provider instance) 'claude))
+             (common (and (claude-code-ide-get-provider provider)
+                          (claude-code-ide-provider-call provider 'map-event event data))))
+        (claude-code-ide-make-event
+         id (claude-code-ide-session-status-generation status)
+         (if (memq common claude-code-ide-event-names) common 'other)
+         event data))
+    'none))
 
 (defun claude-code-ide-session-status--schedule-drain ()
   "Read the event files in a moment.
@@ -1081,18 +1098,28 @@ shells run.  Else the phase.  A nil STATUS is
 
 ;;; Common states
 
+(defconst claude-code-ide-session-status--approval-notifications
+  '("permission_prompt" "worker_permission_prompt")
+  "Notification types that ask the user for an approval.")
+
 (defun claude-code-ide-session-status--blocker-reason (status blocker)
   "Return the common reason of BLOCKER of STATUS.
 That is `approval', `question' or `dialog'.  A permission dialog of
 AskUserQuestion is a question menu; the other permission dialogs ask
-for an approval.  An elicitation and a waiting notification are
-dialogs."
-  (pcase (claude-code-ide-session-status--blocker-kind blocker)
-    ('permission
-     (let* ((tool (claude-code-ide-session-status--blocker-tool blocker))
-            (value (and tool (gethash tool (claude-code-ide-session-status-inflight status)))))
-       (if (equal (nth 1 value) "AskUserQuestion") 'question 'approval)))
-    (_ 'dialog)))
+for an approval.  The tool name comes from the PermissionRequest, else
+from the tool in flight.  A permission notification asks for an
+approval.  An elicitation and the other notifications are dialogs."
+  (let ((name (claude-code-ide-session-status--blocker-name blocker)))
+    (pcase (claude-code-ide-session-status--blocker-kind blocker)
+      ('permission
+       (let* ((tool (claude-code-ide-session-status--blocker-tool blocker))
+              (value (and tool (gethash tool (claude-code-ide-session-status-inflight status)))))
+         (if (equal (or name (nth 1 value)) "AskUserQuestion") 'question 'approval)))
+      ('notification
+       (if (member name claude-code-ide-session-status--approval-notifications)
+           'approval
+         'dialog))
+      (_ 'dialog))))
 
 (defun claude-code-ide-session-status--common-state (status now)
   "Return the common state of STATUS at NOW.
