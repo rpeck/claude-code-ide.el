@@ -84,7 +84,7 @@ A later branch can need a value that the frozen descriptor does not have, for ex
 
 ### Life of a descriptor
 
-1. `claude-code-ide--start-session` makes the descriptor after it makes the MCP session, and before it collects the CLI arguments. So `claude-code-ide-cli-args-functions` can find the instance.
+1. `claude-code-ide--start-session` makes the descriptor after it makes the MCP session, and before the provider builds the command. So `claude-code-ide-cli-args-functions` can find the instance. A second start of an instance ID that runs fails at the registration, and leaves the running instance and its generation as they are.
 2. After the terminal starts, the start sets `buffer`, `pid`, and `process-start-time`.
 3. A rename updates `display-name`.
 4. The session registry sets `native-id` when it knows the CLI session id. That happens at the start, after a SessionStart report, and for an adopted session.
@@ -105,10 +105,12 @@ For Claude Code, the model comes from `--model` in the start flags. Without `--m
 
 | Function | Arguments | Result |
 |---|---|---|
-| `claude-code-ide-instance-next-generation` | `(INSTANCE-ID &optional LAST)` | The generation of a new launch. It is one more than the highest of LAST and the last generation in this Emacs. It is recorded. |
+| `claude-code-ide-instance-candidate-generation` | `(INSTANCE-ID &optional LAST)` | The generation of a new launch: one more than the highest of LAST and the last generation in this Emacs. It is not recorded. |
+| `claude-code-ide-instance-next-generation` | `(INSTANCE-ID &optional LAST)` | The same value, and it is recorded at once. |
 | `claude-code-ide-instance-current-generation` | `(INSTANCE-ID)` | The last generation of INSTANCE-ID, or nil when this Emacs never launched it. |
 
 - A new instance gets generation 1.
+- A start uses the candidate. `claude-code-ide-instance-register` records it only when the registration succeeds.
 - A restore passes the generation of the registry record as LAST. So the count continues after an Emacs restart.
 
 ## The common event
@@ -141,11 +143,13 @@ The common events are `session-start`, `session-end`, `prompt-submit`, `tool-sta
 | `claude-code-ide-event-current-p` | `(EVENT)` | Non-nil when the generation of EVENT is not lower than the current generation of its instance. An instance that this Emacs never launched gives nil. |
 | `claude-code-ide-dispatch-event` | `(EVENT)` | When EVENT is current, it calls `claude-code-ide-event-functions` with EVENT and returns t. Otherwise it returns nil. |
 
+The status drain builds one common event for each event file. The `map-event` operation of the instance's provider gives `:event`. The drain applies the event to the status, and then passes it to `claude-code-ide-dispatch-event`. An event of an older generation is neither applied nor dispatched. An error in an event function gives a message and does not stop the drain.
+
 ### The Claude Code launch nonce
 
 - Each Claude Code launch with status hooks has a nonce. The hook command contains the nonce, and each event file name starts with it.
 - The status record of the nonce holds the instance ID and the generation of that launch.
-- The drain makes a common event of each file and checks `claude-code-ide-event-current-p`. It deletes the file of an older launch without applying it.
+- The drain makes a common event of each file and checks `claude-code-ide-event-current-p`. It deletes the file of an older launch without applying or dispatching it.
 - The hook command does not contain the generation. So the command, and the CLI behavior, do not change.
 
 ## The common states
@@ -189,8 +193,9 @@ The accessor decides the state in this order:
 | Status buffer state | Label | Common state | Reason | Guess |
 |---|---|---|---|---|
 | `waiting`, a permission dialog | NEEDS ANSWER | `waiting-for-user` | `approval` | no |
-| `waiting`, a dialog of AskUserQuestion | NEEDS ANSWER | `waiting-for-user` | `question` | no |
-| `waiting`, an elicitation or a waiting notification | NEEDS ANSWER | `waiting-for-user` | `dialog` | no |
+| `waiting`, a notification `permission_prompt` or `worker_permission_prompt` | NEEDS ANSWER | `waiting-for-user` | `approval` | no |
+| `waiting`, a dialog of AskUserQuestion (tool name from the PermissionRequest, else from the tool in flight) | NEEDS ANSWER | `waiting-for-user` | `question` | no |
+| `waiting`, an elicitation or another waiting notification | NEEDS ANSWER | `waiting-for-user` | `dialog` | no |
 | `asks` | ASKS YOU | `waiting-for-user` | `question` | yes |
 | `error` | FAILED | `failed` | `error` | no |
 | `unobserved` | NO SIGNAL | `disconnected` | none | no |
@@ -210,7 +215,14 @@ Notes on the mapping:
 
 ## The registry file
 
-The session registry writes `claude-code-ide-state-file`. Emacs writes version 2 only. It reads version 1 and version 2.
+The session registry has two files:
+
+| File | Name (default) | Use |
+|---|---|---|
+| Version 2 | `claude-code-ide-state-file` with `-v2` before the extension: `~/.emacs-claude-code-ide-state-v2.json` | Emacs reads and writes it. Its backup is `<v2 file>.bak` and its lock is `<v2 file>.lock`. |
+| Version 1 | `claude-code-ide-state-file`: `~/.emacs-claude-code-ide-state.json` | Emacs reads it only while the version 2 file does not exist. Emacs never writes or moves it. |
+
+The report directory stays `<version 1 name without extension>-reports`, so both versions of the package use the same reports.
 
 ### Version 2
 
@@ -271,15 +283,24 @@ A version 1 file holds only Claude Code records. When Emacs reads it, it migrate
 4. `generation` becomes 0.
 5. `role` stays null.
 
-The next write makes the file version 2. The backup (`<state-file>.bak`) keeps the version 1 file of the write before.
+The next write makes the version 2 file. The version 1 file stays as it is. From then on, Emacs reads only the version 2 file.
 
-A file of another version is unreadable. Then the registry uses the backup, and moves the unreadable file aside on the next write.
+When the version 1 file is unreadable, Emacs reads its `.bak` file. It does not move the unreadable version 1 file.
 
-**Downgrade.** An older package reads only version 1. It treats a version 2 file as unreadable. To go back to an older package, restore a version 1 `.bak` file first.
+A version 2 file of another version is unreadable. Then the registry uses the version 2 backup, and moves the unreadable version 2 file aside on the next write.
+
+**Older packages.** An older package reads and writes only the version 1 file. It never sees the version 2 file, so it cannot overwrite version 2 records.
+
+The cost of two files:
+
+- After the first version 2 write, a session that an older package starts goes only to the version 1 file. A restore in the new package does not see it.
+- A session of the new package goes only to the version 2 file. A restore in an older package does not see it.
+- To start again from the version 1 file, delete the version 2 file. The next read migrates the version 1 file again.
 
 ### Records and descriptors
 
-- The entry key is the instance ID. A new Claude Code conversation also gets the instance ID as its `--session-id`.
+- The entry key is the instance ID.
+- A new Claude Code conversation gets a new UUID as its `--session-id`. The record stores it as `native_id`. It is never the instance ID, so a new conversation of an existing instance never reuses a native ID.
 - A start records the provider, the generation, and the role of the descriptor.
 - A restore starts each record with a start spec that has its `instance_id`, its `provider`, its `generation` as `last-generation`, and its `role`. So the restored instance keeps its instance ID and gets the next generation.
 - A record of a provider that is not registered fails to restore with a `user-error`. The other records restore normally.
