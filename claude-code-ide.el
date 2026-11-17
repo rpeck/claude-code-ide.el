@@ -61,6 +61,8 @@
 (require 'cl-lib)
 (require 'project)
 (require 'claude-code-ide-debug)
+(require 'claude-code-ide-provider)
+(require 'claude-code-ide-instance)
 (require 'claude-code-ide-mcp)
 (require 'claude-code-ide-transient)
 (require 'claude-code-ide-mcp-server)
@@ -109,6 +111,14 @@
 (defcustom claude-code-ide-cli-path "claude"
   "Path to the Claude Code CLI executable."
   :type 'string
+  :group 'claude-code-ide)
+
+(defcustom claude-code-ide-default-provider 'claude
+  "Provider of a new instance when the start does not name one.
+The value is the name of a registered provider; see
+`claude-code-ide-provider-names'.  Each instance keeps its own
+provider, so instances of several providers can run at once."
+  :type 'symbol
   :group 'claude-code-ide)
 
 (defcustom claude-code-ide-buffer-name-function #'claude-code-ide--default-buffer-name
@@ -770,7 +780,16 @@ unnamed slot)."
                :documentation "Value of `claude-code-ide-cli-extra-flags' to use.
 nil keeps the current value.")
   (prompt nil :type (or null string)
-          :documentation "Initial prompt, sent as the first message."))
+          :documentation "Initial prompt, sent as the first message.")
+  (provider nil :type (or null symbol)
+            :documentation "Provider name; nil means `claude-code-ide-default-provider'.")
+  (instance-id nil :type (or null string)
+               :documentation "Instance ID to start again, or nil for a new instance.")
+  (last-generation nil :type (or null integer)
+                   :documentation "Launch generation that a saved record of the
+instance holds, or nil.  The new launch gets a higher one.")
+  (role nil :type (or null string)
+        :documentation "Optional role of the instance, for coordinators."))
 
 (defvar claude-code-ide-cli-args-functions nil
   "Functions that add arguments to the Claude CLI command line.
@@ -1360,6 +1379,10 @@ hook signals wrong-type-argument that way)."
               (cl-loop for s in (claude-code-ide-mcp--active-sessions)
                        for b = (claude-code-ide-mcp-session-buffer s)
                        when (and b (buffer-live-p b)) return b))))
+    ;; The descriptor goes last, so the end functions above can still
+    ;; find it.  Its last generation stays known for a later launch.
+    (when-let* ((instance (claude-code-ide-instance-of-session session)))
+      (claude-code-ide-instance-unregister (claude-code-ide-instance-id instance)))
     (claude-code-ide-debug "Cleaned up Claude Code session %s"
                            (claude-code-ide--session-display-name session))))
 
@@ -1580,7 +1603,7 @@ which removes that variable from the CLI's environment."
             (list "CLAUDE_CODE_NO_FLICKER=1"))))
 
 (defun claude-code-ide--create-terminal-session (buffer-name working-dir port continue resume session-id
-                                                              &optional extra-args prompt)
+                                                              &optional extra-args prompt launch-fn)
   "Create a new terminal session for Claude Code.
 BUFFER-NAME is the name for the terminal buffer.
 WORKING-DIR is the working directory.
@@ -1589,15 +1612,23 @@ CONTINUE is whether to continue the most recent conversation.
 RESUME is whether to resume a previous conversation.
 SESSION-ID is the unique identifier for this session.
 EXTRA-ARGS and PROMPT go to `claude-code-ide--build-claude-command'.
+LAUNCH-FN, when non-nil, replaces that command and the environment:
+it is called without arguments once the backend is ready, and returns
+the (:command STRING :environment LIST) of a provider's launch.
 
 Returns a cons cell of (buffer . process) on success.
 Signals an error if terminal fails to initialize."
   ;; Ensure terminal backend is available before proceeding
   (claude-code-ide--terminal-ensure-backend)
-  (let* ((claude-cmd (claude-code-ide--build-claude-command continue resume session-id
-                                                            extra-args prompt))
+  (let* ((launch (and launch-fn (funcall launch-fn)))
+         (claude-cmd (if launch
+                         (plist-get launch :command)
+                       (claude-code-ide--build-claude-command continue resume session-id
+                                                              extra-args prompt)))
          (default-directory working-dir)
-         (env-vars (claude-code-ide--cli-environment port)))
+         (env-vars (if launch
+                       (plist-get launch :environment)
+                     (claude-code-ide--cli-environment port))))
     ;; Log the command for debugging
     (claude-code-ide-debug "Starting Claude with command: %s" claude-cmd)
     (claude-code-ide-debug "Working directory: %s" working-dir)
@@ -1720,6 +1751,218 @@ Signals an error if terminal fails to initialize."
              (ignore-errors (kill-buffer created-buffer))))
          (signal (car err) (cdr err)))))))
 
+;;; The claude provider
+;;
+;; The `claude' provider holds what is special to the Claude Code CLI.
+;; Its operations call the functions above, so a start through the
+;; provider gives the same command, environment and messages as before.
+
+(declare-function claude-code-ide-session-registry-entry-create "claude-code-ide-session-registry")
+(declare-function claude-code-ide-session-registry--transcript-file "claude-code-ide-session-registry" (entry))
+(declare-function claude-code-ide-session-registry--transcript-title "claude-code-ide-session-registry" (file))
+(declare-function claude-code-ide-session-registry--transcript-model "claude-code-ide-session-registry" (file))
+(declare-function claude-code-ide-session-registry--read-report "claude-code-ide-session-registry" (key))
+(declare-function claude-code-ide-session-registry--report-transcript-path "claude-code-ide-session-registry" (report))
+(declare-function claude-code-ide-session-registry--cli-session-of "claude-code-ide-session-registry" (session))
+(declare-function claude-code-ide-session-registry--cli-session-session-id "claude-code-ide-session-registry" (cli))
+
+(defconst claude-code-ide--claude-event-map
+  '(("SessionStart" . session-start)
+    ("SessionEnd" . session-end)
+    ("UserPromptSubmit" . prompt-submit)
+    ("PreToolUse" . tool-start)
+    ("PostToolUse" . tool-end)
+    ("PostToolUseFailure" . tool-end)
+    ("PermissionRequest" . approval-request)
+    ("Elicitation" . dialog-open)
+    ("ElicitationResult" . dialog-close)
+    ("Notification" . notification)
+    ("Stop" . turn-end)
+    ("StopFailure" . turn-failed)
+    ("SubagentStart" . subagent-start)
+    ("SubagentStop" . subagent-end))
+  "Common event of each Claude Code hook event.")
+
+(defun claude-code-ide--flags-model (flags)
+  "Return the value of --model in the CLI flag string FLAGS, or nil."
+  (let ((tokens (claude-code-ide--split-command-line (or flags "")))
+        (model nil))
+    (while tokens
+      (let ((token (pop tokens)))
+        (cond
+         ((equal token "--model") (setq model (pop tokens)))
+         ((string-prefix-p "--model=" token) (setq model (substring token 8))))))
+    model))
+
+(defun claude-code-ide--worktree-root (directory)
+  "Return the top directory of the Git working tree of DIRECTORY, or `unknown'."
+  (if-let* ((root (and (stringp directory)
+                       (locate-dominating-file directory ".git"))))
+      (file-name-as-directory (expand-file-name root))
+    'unknown))
+
+(defun claude-code-ide--terminal-submit (buffer text)
+  "Type TEXT into the terminal BUFFER and press return.
+Return non-nil when BUFFER is live."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (claude-code-ide--terminal-send-string text)
+      ;; Small delay to ensure prompt text is processed before sending return
+      (sit-for 0.1)
+      (claude-code-ide--terminal-send-return))
+    t))
+
+(defun claude-code-ide--stop-session (session)
+  "End SESSION: kill its terminal buffer, or clean it up when it has none.
+The process sentinel and the buffer kill hook clean up the rest."
+  (let ((buffer (claude-code-ide-mcp-session-buffer session)))
+    (if (and buffer (buffer-live-p buffer))
+        (kill-buffer buffer)
+      (claude-code-ide--cleanup-session session))))
+
+(defun claude-code-ide--claude-detect (&optional with-version)
+  "Find the Claude Code CLI; with WITH-VERSION, read its version too.
+Return (:available BOOL :program PATH :version STRING-OR-unknown)."
+  (let* ((available (claude-code-ide--ensure-cli))
+         (version (when (and available with-version)
+                    (ignore-errors
+                      (with-temp-buffer
+                        (call-process claude-code-ide-cli-path nil t nil "--version")
+                        (string-trim (buffer-string)))))))
+    (list :available (and available t)
+          :program claude-code-ide-cli-path
+          :version (if (and (stringp version) (not (string-empty-p version)))
+                       version
+                     'unknown))))
+
+(defun claude-code-ide--claude-launch (instance spec args)
+  "Return the command and the environment that start INSTANCE as SPEC says.
+ARGS are the arguments of `claude-code-ide-cli-args-functions'.  The
+start continues (-c), opens the picker (-r) or resumes the conversation
+of SPEC's resume ID (--resume) when SPEC asks for it."
+  (let* ((session (claude-code-ide-instance-session instance))
+         (resume-id (claude-code-ide-start-spec-resume-id spec)))
+    (list :command (claude-code-ide--build-claude-command
+                    (claude-code-ide-start-spec-continue spec)
+                    (claude-code-ide-start-spec-resume spec)
+                    (claude-code-ide-mcp-session-session-id session)
+                    (append (when resume-id (list "--resume" resume-id)) args)
+                    (claude-code-ide-start-spec-prompt spec))
+          :environment (claude-code-ide--cli-environment
+                        (claude-code-ide-mcp-session-port session)))))
+
+(defun claude-code-ide--claude-fork (instance spec args)
+  "Return the command that starts INSTANCE in a fork of SPEC's resume ID.
+The CLI gives the fork a new native ID.  ARGS are as for a launch."
+  (unless (claude-code-ide-start-spec-resume-id spec)
+    (error "A fork needs the native ID of the conversation to fork"))
+  (claude-code-ide--claude-launch instance spec (append args (list "--fork-session"))))
+
+(defun claude-code-ide--claude-submit-prompt (instance text)
+  "Type TEXT into the terminal of INSTANCE and press return."
+  (claude-code-ide--terminal-submit (claude-code-ide-instance-buffer instance) text))
+
+(defun claude-code-ide--claude-stop (instance)
+  "End the CLI of INSTANCE.  Return non-nil when INSTANCE had a session."
+  (when-let* ((session (claude-code-ide-instance-session instance)))
+    (claude-code-ide--stop-session session)
+    t))
+
+(defun claude-code-ide--claude-native-id (instance)
+  "Return the CLI session ID of INSTANCE, or `unknown'.
+The descriptor holds it when Emacs chose it, resumed it, or read the
+CLI's report.  Else the file that the CLI process keeps in
+~/.claude/sessions gives it, when the session registry is loaded."
+  (or (claude-code-ide-known-or-nil (claude-code-ide-instance-native-id instance))
+      (when-let* (((featurep 'claude-code-ide-session-registry))
+                  (session (claude-code-ide-instance-session instance))
+                  (cli (claude-code-ide-session-registry--cli-session-of session)))
+        (claude-code-ide-session-registry--cli-session-session-id cli))
+      'unknown))
+
+(defun claude-code-ide--claude-status-events (_instance)
+  "Return the hooks that report the status of an instance: none here.
+Claude Code gets its status hooks in the --settings argument that
+`claude-code-ide-session-registry-mode' adds; see
+`claude-code-ide-session-registry-hook-functions'."
+  nil)
+
+(defun claude-code-ide--claude-map-event (provider-event _data)
+  "Return the common event of the Claude Code hook event PROVIDER-EVENT."
+  (or (cdr (assoc provider-event claude-code-ide--claude-event-map)) 'other))
+
+(defun claude-code-ide--claude-mcp-setup (instance)
+  "Return the MCP tools config of INSTANCE for --mcp-config, or nil."
+  (when (claude-code-ide-mcp-server-ensure-server)
+    (claude-code-ide-mcp-server-get-config
+     (claude-code-ide-mcp-session-session-id (claude-code-ide-instance-session instance)))))
+
+(defun claude-code-ide--claude-transcript (instance what)
+  "Return WHAT of the transcript of INSTANCE, or `unknown'.
+WHAT is `file', `title' or `model'."
+  (require 'claude-code-ide-session-registry)
+  (let* ((native (claude-code-ide-known-or-nil (claude-code-ide--claude-native-id instance)))
+         (report (claude-code-ide-session-registry--read-report
+                  (claude-code-ide-instance-id instance)))
+         (entry (claude-code-ide-session-registry-entry-create
+                 :key (claude-code-ide-instance-id instance)
+                 :session-id native
+                 :transcript-path (and report
+                                       (claude-code-ide-session-registry--report-transcript-path report))
+                 :project-dir (claude-code-ide-instance-project-root instance)))
+         (file (claude-code-ide-session-registry--transcript-file entry)))
+    (claude-code-ide-or-unknown
+     (and file
+          (pcase what
+            ('file file)
+            ('title (claude-code-ide-session-registry--transcript-title file))
+            ('model (claude-code-ide-session-registry--transcript-model file))
+            (_ (error "Unknown transcript value: %S" what)))))))
+
+(defun claude-code-ide--claude-exit-message (exit-code spec program)
+  "Return the message for a Claude Code CLI that ended with EXIT-CODE.
+SPEC describes the start, and PROGRAM is the CLI that ran."
+  (let ((continue (claude-code-ide-start-spec-continue spec))
+        (resume (claude-code-ide-start-spec-resume spec)))
+    (cond
+     ((= exit-code 127)
+      (format "Claude Code CLI not found (exit 127).  Ensure '%s' is in your PATH.  In Emacs, try: M-x exec-path-from-shell-initialize"
+              program))
+     ((= exit-code 126)
+      (format "Claude Code CLI '%s' was found but is not executable (exit 126).  Check file permissions"
+              program))
+     ((and (= exit-code 1) (or continue resume))
+      (format "Claude could not %s (exit 1).  That conversation may already be running in the background.  Use M-x claude-code-ide for a new session, M-x claude-code-ide-resume to pick another, or run `claude agents' in a terminal to attach to the running one"
+              (if continue "continue" "resume")))
+     (t
+      (format "Claude exited with error code %d" exit-code)))))
+
+(defconst claude-code-ide--claude-provider
+  (claude-code-ide-register-provider
+   (claude-code-ide-provider-create
+    :name 'claude
+    :display-name "Claude Code"
+    :buffer-name-prefix "claude-code"
+    :detect #'claude-code-ide--claude-detect
+    :launch #'claude-code-ide--claude-launch
+    :resume #'claude-code-ide--claude-launch
+    :fork #'claude-code-ide--claude-fork
+    :submit-prompt #'claude-code-ide--claude-submit-prompt
+    :stop #'claude-code-ide--claude-stop
+    :native-id #'claude-code-ide--claude-native-id
+    :status-events #'claude-code-ide--claude-status-events
+    :map-event #'claude-code-ide--claude-map-event
+    :mcp-setup #'claude-code-ide--claude-mcp-setup
+    :transcript #'claude-code-ide--claude-transcript
+    :exit-message #'claude-code-ide--claude-exit-message
+    :capabilities '(detect launch resume continue fork submit-prompt stop native-id
+                           status-events map-event mcp-setup transcript exit-message)))
+  "The provider of the Claude Code CLI.")
+
+(defun claude-code-ide--spec-provider (spec)
+  "Return the provider that starts SPEC: its own, else the default one."
+  (claude-code-ide-resolve-provider (and spec (claude-code-ide-start-spec-provider spec))))
+
 (defun claude-code-ide--start-session (&optional continue resume spec)
   "Start a new Claude Code instance for the current project.
 If CONTINUE is non-nil, start Claude with the -c (continue) flag.
@@ -1738,9 +1981,16 @@ This function handles:
 - CLI availability checking
 - Dead session cleanup
 - New session creation with a per-instance MCP server
-- Process and buffer lifecycle management"
-  (unless (claude-code-ide--ensure-cli)
-    (user-error "Claude Code CLI not available.  Please install it and ensure it's in PATH"))
+- Process and buffer lifecycle management
+- The instance descriptor and its launch generation
+
+SPEC's provider, else `claude-code-ide-default-provider', checks the
+CLI, builds the command and the environment, and words the exit
+messages."
+  (let ((provider (claude-code-ide--spec-provider spec)))
+    (unless (plist-get (claude-code-ide-provider-call provider 'detect) :available)
+      (user-error "%s CLI not available.  Please install it and ensure it's in PATH"
+                  (claude-code-ide-provider-display-name provider))))
 
   ;; Clean up any dead sessions first
   (claude-code-ide--cleanup-dead-sessions)
@@ -1748,7 +1998,8 @@ This function handles:
   ;; Ensure the selected terminal backend is available before starting MCP
   (claude-code-ide--terminal-ensure-backend)
 
-  (let* ((claude-code-ide-cli-extra-flags
+  (let* ((provider (claude-code-ide--spec-provider spec))
+         (claude-code-ide-cli-extra-flags
           (or (and spec (claude-code-ide-start-spec-extra-flags spec))
               claude-code-ide-cli-extra-flags))
          (continue (if spec (claude-code-ide-start-spec-continue spec) continue))
@@ -1771,7 +2022,12 @@ This function handles:
                   :resume resume
                   :resume-id (and spec (claude-code-ide-start-spec-resume-id spec))
                   :extra-flags claude-code-ide-cli-extra-flags
-                  :prompt (and spec (claude-code-ide-start-spec-prompt spec))))
+                  :prompt (and spec (claude-code-ide-start-spec-prompt spec))
+                  :provider (claude-code-ide-provider-name provider)
+                  :instance-id (or (and spec (claude-code-ide-start-spec-instance-id spec))
+                                   (claude-code-ide-instance-new-id))
+                  :last-generation (and spec (claude-code-ide-start-spec-last-generation spec))
+                  :role (and spec (claude-code-ide-start-spec-role spec))))
          (resume-id (claude-code-ide-start-spec-resume-id launch))
          ;; A live instance may already own the base name — e.g. two
          ;; projects sharing a basename both render as *claude-code[proj]*.
@@ -1783,6 +2039,7 @@ This function handles:
                           base)))
          (session-id (claude-code-ide--generate-session-id working-dir))
          (session nil)
+         (instance nil)
          (registered nil))
     (condition-case err
         (progn
@@ -1790,20 +2047,53 @@ This function handles:
           (setq session (claude-code-ide-mcp-create-session working-dir session-id instance-name))
           (setf (claude-code-ide-mcp-session-window-slot session)
                 (claude-code-ide--assign-window-slot working-dir))
+          ;; The descriptor exists before the CLI arguments are collected,
+          ;; so the functions that add them can find the instance
+          (let ((instance-id (claude-code-ide-start-spec-instance-id launch)))
+            (setq instance
+                  (claude-code-ide-instance-register
+                   (claude-code-ide-instance-create
+                    :id instance-id
+                    :provider (claude-code-ide-provider-name provider)
+                    :native-id (claude-code-ide-or-unknown resume-id)
+                    :display-name (claude-code-ide--session-display-name session)
+                    :project-root working-dir
+                    :worktree (claude-code-ide--worktree-root working-dir)
+                    :generation (claude-code-ide-instance-next-generation
+                                 instance-id (claude-code-ide-start-spec-last-generation launch))
+                    :model (claude-code-ide-or-unknown
+                            (claude-code-ide--flags-model claude-code-ide-cli-extra-flags))
+                    :role (claude-code-ide-start-spec-role launch)
+                    :session session))))
           ;; Register with the MCP tools server BEFORE spawning the CLI so
           ;; an early /mcp/<session-id> request finds its context
           (claude-code-ide-mcp-server-session-started session-id working-dir nil)
           (setq registered t)
           (let* ((port (claude-code-ide-mcp-session-port session))
-                 (extra-args (append (when resume-id (list "--resume" resume-id))
-                                     (claude-code-ide--collect-cli-args session launch)))
-                 (buffer-and-process (claude-code-ide--create-terminal-session
-                                      buffer-name working-dir port continue resume session-id
-                                      extra-args (claude-code-ide-start-spec-prompt launch)))
+                 (extra-args (claude-code-ide--collect-cli-args session launch))
+                 (operation (if (or continue resume resume-id) 'resume 'launch))
+                 (buffer-and-process
+                  (claude-code-ide--create-terminal-session
+                   buffer-name working-dir port continue resume session-id
+                   nil (claude-code-ide-start-spec-prompt launch)
+                   (lambda ()
+                     (let ((command (claude-code-ide-provider-call
+                                     provider operation instance launch extra-args)))
+                       (when (claude-code-ide-provider-unavailable-p command)
+                         (error "The %s provider cannot %s an instance"
+                                (claude-code-ide-provider-name provider) operation))
+                       command))))
                  (buffer (car buffer-and-process))
                  (process (cdr buffer-and-process)))
             (setf (claude-code-ide-mcp-session-buffer session) buffer
                   (claude-code-ide-mcp-session-process session) process)
+            (setf (claude-code-ide-instance-buffer instance) buffer)
+            (when-let* ((pid (and (processp process) (process-id process))))
+              (setf (claude-code-ide-instance-pid instance) pid
+                    (claude-code-ide-instance-process-start-time instance)
+                    (claude-code-ide-or-unknown
+                     (when-let* ((start (alist-get 'start (process-attributes pid))))
+                       (float-time start)))))
             (claude-code-ide-mcp-server-update-session-buffer session-id buffer)
             (with-current-buffer buffer
               (setq-local claude-code-ide--session session))
@@ -1824,18 +2114,10 @@ This function handles:
                                         (let ((exit-code (string-to-number (match-string 1 event))))
                                           (claude-code-ide-debug "Claude process exited with code %d, event: %s"
                                                                  exit-code event)
-                                          (cond
-                                           ((= exit-code 127)
-                                            (message "Claude Code CLI not found (exit 127).  Ensure '%s' is in your PATH.  In Emacs, try: M-x exec-path-from-shell-initialize"
-                                                     cli-path))
-                                           ((= exit-code 126)
-                                            (message "Claude Code CLI '%s' was found but is not executable (exit 126).  Check file permissions"
-                                                     cli-path))
-                                           ((and (= exit-code 1) (or continue resume))
-                                            (message "Claude could not %s (exit 1).  That conversation may already be running in the background.  Use M-x claude-code-ide for a new session, M-x claude-code-ide-resume to pick another, or run `claude agents' in a terminal to attach to the running one"
-                                                     (if continue "continue" "resume")))
-                                           (t
-                                            (message "Claude exited with error code %d" exit-code)))))
+                                          (let ((text (claude-code-ide-provider-call
+                                                       provider 'exit-message exit-code launch cli-path)))
+                                            (when (stringp text)
+                                              (message "%s" text)))))
                                       (when (or (string-match "finished" event)
                                                 (string-match "exited" event)
                                                 (string-match "killed" event)
@@ -1900,6 +2182,8 @@ This function handles:
              (claude-code-ide-mcp-server-session-ended session-id))
            (when session
              (claude-code-ide-mcp--stop-session session))))
+       (when instance
+         (claude-code-ide-instance-unregister (claude-code-ide-instance-id instance)))
        ;; Re-signal the error with improved message
        (signal (car err) (cdr err))))))
 
@@ -1955,13 +2239,10 @@ picks the instance."
   (let ((session (claude-code-ide--resolve-session 'prompt "Stop Claude instance: ")))
     (if (not session)
         (claude-code-ide-log "No Claude Code session is running in this directory")
-      (let ((display-name (claude-code-ide--session-display-name session))
-            (buffer (claude-code-ide-mcp-session-buffer session)))
-        (if (and buffer (buffer-live-p buffer))
-            ;; Kill the buffer (cleanup will be handled by hooks)
-            ;; The process sentinel will handle cleanup when the process dies
-            (kill-buffer buffer)
-          (claude-code-ide--cleanup-session session))
+      (let ((display-name (claude-code-ide--session-display-name session)))
+        ;; Kill the buffer (cleanup will be handled by hooks)
+        ;; The process sentinel will handle cleanup when the process dies
+        (claude-code-ide--stop-session session)
         (claude-code-ide-log "Stopping Claude Code %s..." display-name)))))
 
 ;;;###autoload
@@ -2016,6 +2297,9 @@ Empty input converts the instance to the lowest free auto number."
                       (format "Rename %s to (empty for auto number): " old-name)
                       session)))
       (setf (claude-code-ide-mcp-session-instance-name session) new-name)
+      (when-let* ((instance (claude-code-ide-instance-of-session session)))
+        (setf (claude-code-ide-instance-display-name instance)
+              (claude-code-ide--session-display-name session)))
       (when-let* ((buffer (claude-code-ide-mcp-session-buffer session)))
         (when (buffer-live-p buffer)
           (with-current-buffer buffer
@@ -2157,11 +2441,11 @@ overrides the automatic instance resolution."
     (if-let* ((buffer (and session (claude-code-ide-mcp-session-buffer session))))
         (let ((prompt-to-send (or prompt (read-string "Claude prompt: "))))
           (when (not (string-empty-p prompt-to-send))
-            (with-current-buffer buffer
-              (claude-code-ide--terminal-send-string prompt-to-send)
-              ;; Small delay to ensure prompt text is processed before sending return
-              (sit-for 0.1)
-              (claude-code-ide--terminal-send-return))
+            ;; The instance's provider types the prompt
+            (if-let* ((instance (claude-code-ide-instance-of-session session)))
+                (claude-code-ide-provider-call (claude-code-ide-instance-provider instance)
+                                               'submit-prompt instance prompt-to-send)
+              (claude-code-ide--terminal-submit buffer prompt-to-send))
             (claude-code-ide-debug "Sent prompt to Claude Code: %s" prompt-to-send)))
       (user-error "No Claude Code session for this project"))))
 
@@ -2325,5 +2609,15 @@ window layouts, so each tab hides and restores its own set."
 (autoload 'claude-code-ide-visit-waiting-session "claude-code-ide-session-status" nil t)
 
 (provide 'claude-code-ide)
+
+;; Load points.  Each optional file below adds a part of the package
+;; without an edit to this file.  A missing file is skipped.  The files
+;; load after the `provide' above, because each of them requires this
+;; file.
+(require 'claude-code-ide-codex nil t)
+(require 'claude-code-ide-control nil t)
+(require 'claude-code-ide-transcript nil t)
+(require 'claude-code-ide-handover nil t)
+(require 'claude-code-ide-review nil t)
 
 ;;; claude-code-ide.el ends here
