@@ -1,0 +1,7 @@
+{"timestamp":"2026-11-17T11:00:00.000Z","type":"session_meta","ordinal":0,"payload":{"id":"cci-test-codex-0004","cwd":"/tmp/cci-test-proj","source":"vscode","history_mode":"legacy","timestamp":"2026-11-17T12:00:00.000Z","git":{"commit_hash":"fedcba9876543210fedcba9876543210fedcba98","branch":"cci-test-branch"}}}
+{"timestamp":"2026-11-17T11:01:00.000Z","type":"event_msg","ordinal":1,"payload":{"type":"user_message","message":"cci-test-import: read README.md","text_elements":[],"local_images":[]}}
+{"timestamp":"2026-11-17T11:02:00.000Z","type":"response_item","ordinal":2,"payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"cci-test-response-item-text"}]}}
+{"timestamp":"2026-11-17T11:03:00.000Z","type":"event_msg","ordinal":3,"payload":{"type":"agent_message","phase":null,"memory_citation":null,"message":"[external_agent_tool_call: Read]\nfile: /tmp/cci-test-proj/README.md\n[/external_agent_tool_call]"}}
+{"timestamp":"2026-11-17T11:04:00.000Z","type":"event_msg","ordinal":4,"payload":{"type":"agent_message","phase":null,"memory_citation":null,"message":"[external_agent_tool_result]\ncci-test-result-text\n[/external_agent_tool_result]"}}
+{"timestamp":"2026-11-17T11:05:00.000Z","type":"event_msg","ordinal":5,"payload":{"type":"agent_message","phase":null,"memory_citation":null,"message":"cci-test: The README names the project."}}
+{"timestamp":"2026-11-17T11:06:00.000Z","type":"event_msg","ordinal":6,"payload":{"type":"agent_message","phase":null,"memory_citation":null,"message":"<EXTERNAL SESSION IMPORTED>"}}
