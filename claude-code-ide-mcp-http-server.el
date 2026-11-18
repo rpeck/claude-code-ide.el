@@ -147,10 +147,9 @@ with the appropriate session context."
 
         ;; Check if this is a notification (no id field)
         (if (null id)
-            ;; Notifications don't require a response
+            ;; A notification gets 202 Accepted with no body
             (progn
               (claude-code-ide-debug "Received notification: %s" method)
-              ;; Still close the connection for HTTP transport
               (claude-code-ide-mcp-http-server--send-empty-response request))
           ;; Process the request with session context
           (let* ((claude-code-ide-mcp-server--current-session-id url-session-id)
@@ -330,10 +329,12 @@ Returns a list of arguments in the correct order."
       (throw 'close-connection nil))))
 
 (defun claude-code-ide-mcp-http-server--send-empty-response (request)
-  "Send an empty HTTP 200 response for notifications."
+  "Send `202 Accepted' with no body to REQUEST, a notification.
+The MCP Streamable HTTP transport requires this reply.  A client
+such as Codex drops the connection when a notification gets a 200
+reply with a content type."
   (with-slots (process) request
-    (ws-response-header process 200
-                        (cons "Content-Type" "text/plain")
+    (ws-response-header process 202
                         (cons "Content-Length" "0"))
     ;; Close the connection
     (throw 'close-connection nil)))
