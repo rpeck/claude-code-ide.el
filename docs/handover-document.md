@@ -1,0 +1,180 @@
+# The handover document
+
+A handover moves the work of one instance to a new native conversation (plan §4.7).
+The first prompt of the new conversation is the handover document.
+This document describes how Emacs reads the transcripts and writes the handover document.
+
+- Code: `claude-code-ide-transcript.el`.
+- Tests: `claude-code-ide-transcript-tests.el`, with the synthetic transcripts in `test-fixtures/transcripts/`.
+- Instances and providers: [session-schema.md](session-schema.md) and [providers.md](providers.md).
+
+## Turns
+
+A reader turns a transcript into a list of turns, oldest first.
+Each turn is a plist:
+
+| Key | Value |
+|---|---|
+| `:role` | `user` or `assistant`. |
+| `:text` | The text, or nil when the turn has only tool calls. |
+| `:tools` | A list of strings. Each string is one tool call on one line, for example `"Bash: git status"`. |
+| `:time` | The time stamp string of the transcript, or nil. |
+
+Rules for all readers:
+
+- Consecutive assistant records join one assistant turn.
+- Thinking and reasoning are left out.
+- Tool results are left out.
+- A tool line is at most `claude-code-ide-transcript-tool-line-limit` characters.
+- With a ROOT folder, a path inside ROOT becomes relative, and a leading `cd DIR &&` is removed from a command.
+- A broken line, a line that is not a JSON object, and a record of an unknown type are skipped. The read continues.
+
+## The readers
+
+| Function | Transcript |
+|---|---|
+| `(claude-code-ide-transcript-read FILE &optional FORMAT ROOT)` | Any. FORMAT is `claude` or `codex`, or nil to find it from the file. A missing file or an unknown format gives nil. |
+| `(claude-code-ide-transcript-read-claude FILE &optional ROOT)` | A CC transcript in `~/.claude/projects/`. |
+| `(claude-code-ide-transcript-read-codex FILE &optional ROOT)` | A Codex rollout in `~/.codex/sessions/`. |
+| `(claude-code-ide-transcript-format FILE)` | Returns `claude`, `codex`, or nil, from the first records. |
+| `(claude-code-ide-transcript-codex-meta FILE)` | Returns `(:id :cwd :commit :branch :time)` from the `session_meta` record of a rollout. |
+
+`claude-code-ide-transcript-readers` maps a format to its reader. A new provider can add its reader there.
+
+### CC transcripts
+
+- A turn comes from a record of type `user` or `assistant`.
+- A `user` record is a prompt only when a person wrote it. These records are skipped:
+  - `isMeta`, `isSidechain`, or `isCompactSummary` is true.
+  - The record has `toolUseResult` (a tool result).
+  - `promptSource` is `"system"` (for example a task notification).
+  - The text starts with a tag that the CLI writes, for example `<local-command-stdout>` or `<system-reminder>`.
+- A slash command becomes `/NAME ARGS`. A shell escape (`<bash-input>`) becomes `! COMMAND`.
+- An image in a prompt becomes `[image]`.
+- In an `assistant` record, `text` blocks give the text, and `tool_use` blocks give the tool lines. `thinking` blocks are left out.
+- Tool lines name the main input: the command for Bash, the file for Read, Edit, and Write, the pattern for Grep and Glob, and the description for Task and Agent. Other tools show their first string input.
+
+### Codex rollouts
+
+- The turns come from the `event_msg` records of type `item_completed` (test T3).
+  - `UserMessage` gives a user turn. `AgentMessage` gives assistant text.
+  - `CommandExecution` gives `exec: COMMAND`, with `(exit N)` when the exit code is not 0.
+  - `FileChange` gives one `apply_patch: KIND PATH` line for each changed file.
+  - `McpToolCall` gives `mcp: SERVER/TOOL`. `CollabAgentToolCall` and `SubAgentActivity` give `agent:` and `subagent:` lines.
+  - `Reasoning` and unknown item types are left out.
+- `response_item` records are not read. Their `custom_tool_call` "exec" records hold code-mode wrappers, not the commands.
+- A rollout without `item_completed` records (an imported one, with `history_mode: legacy`) gives its turns from the `user_message` and `agent_message` events.
+  - `[external_agent_tool_call: NAME] ... [/external_agent_tool_call]` text becomes a tool line.
+  - `[external_agent_tool_result] ...` text and the `<EXTERNAL SESSION IMPORTED>` marker are left out.
+
+### Speed
+
+- A reader reads the whole file. It parses only the lines that can hold a turn.
+- Measured on Emacs 30.1: a 400 MB CC transcript takes about 8 seconds. Transcripts below 1 MB take less than 0.1 seconds.
+
+## Workspace state
+
+`(claude-code-ide-transcript-workspace-state DIR &optional SINCE)` returns a plist:
+
+| Key | Value |
+|---|---|
+| `:worktree` | The top folder of the working tree. |
+| `:git` | nil when DIR is not in a Git working tree. Then no other key follows. |
+| `:branch` | The branch, or `detached`. |
+| `:head`, `:head-subject` | The full commit ID and its subject, or `unknown` before the first commit. |
+| `:status` | The lines of `git status --porcelain`. |
+| `:since` | The full ID of SINCE, or nil when SINCE is not a commit. |
+| `:diff-stat` | The lines of `git diff --stat SINCE`: the commits since SINCE and the changes that are not committed. |
+| `:untracked` | The lines of `git ls-files --others --exclude-standard`. |
+| `:log` | The lines of `git log --oneline -n 20`. |
+
+- Each listing has at most `claude-code-ide-transcript-git-line-limit` lines. A cut listing ends with `... (N more lines)`.
+- Git runs with `GIT_OPTIONAL_LOCKS=0`, so the status does not lock the index.
+- `(claude-code-ide-transcript-commit-at DIR TIME)` returns the last commit of HEAD before the ISO 8601 time TIME.
+
+## Legs of a chain
+
+A chain is the list of native conversations that handovers connect. Each conversation is a leg.
+A leg is a plist, or an instance descriptor that becomes a plist:
+
+| Key | Value |
+|---|---|
+| `:provider` | The provider name, for example `claude` or `codex`. |
+| `:instance-id` | The instance ID, or nil. |
+| `:native-id` | The native conversation ID, or nil. |
+| `:transcript` | The transcript file, or nil. |
+| `:worktree` | The working tree, or nil. |
+| `:handover-id` | The ID of the handover document that started the leg. nil for the first leg. |
+| `:document-hash` | The SHA-256 of that document, or nil. |
+| `:summary-file` | The state summary file that the leg wrote in its first turn, or nil. |
+| `:start-commit` | HEAD when the leg started, or nil. |
+
+- `(claude-code-ide-transcript-instance-leg INSTANCE)` makes the leg of the current conversation of INSTANCE. Its transcript file comes from the `transcript` operation of the provider, with WHAT `file`.
+- The record of the source leg: when a leg of CHAIN has the same native ID or the same transcript file as the source, it is the source. Its values fill in the values that the source lacks, for example `:handover-id` and `:summary-file`. It does not show as a separate leg.
+
+## The document
+
+```elisp
+(claude-code-ide-transcript-handover-document
+ :source SOURCE :chain CHAIN :context CONTEXT :budget BUDGET
+ :handover-id ID :target-provider PROVIDER :summary-file FILE :time TIME)
+```
+
+- `:source`, `:chain`, `:context`, and `:budget` are the keys of PHASE2-CONTRACTS §6.
+  - SOURCE is an instance descriptor. A leg plist also works.
+  - CHAIN is the list of the earlier legs, oldest first.
+  - CONTEXT is text from the coordinator, or nil.
+  - BUDGET is the size budget in characters. nil uses `claude-code-ide-transcript-budget` (40000).
+- These keys are optional:
+  - `:handover-id`: the ID of the new handover. nil makes a new UUID.
+  - `:target-provider`: the provider of the target. nil shows `unknown`.
+  - `:summary-file`: the file for the state summary of the target. nil gives `.handover/<ID>-state.md` in the worktree (`claude-code-ide-transcript-summary-file-format`).
+  - `:time`: a Lisp time for the header. nil is now.
+- The result is the text. The caller records its hash, for example with `(secure-hash 'sha256 TEXT)`.
+
+### Parts, in this order
+
+1. **Header.** The first line is the marker `<!-- claude-code-ide-handover-document id=ID -->`. Then: the handover ID, the source, the target provider, the time, the worktree, the state summary file of the target, and each leg of the chain with its handover ID and document hash.
+2. **Workspace state.** The branch, HEAD, `git status --porcelain`, the diff stat since the start of the source, the untracked files, and `git log --oneline -n 20`.
+   - The start of the source is its `:start-commit`. Else it is the commit in the Codex session metadata. Else it is the last commit before the first turn of the source.
+3. **Context from the coordinator**, when CONTEXT is given.
+4. **History of the chain:**
+   - **Original task:** the first user prompt of the first leg, marked "it can be out of date". When a handover document started the first leg, the original task of that document is used.
+   - **State summary of the previous target:** the summary file of the source, verbatim. The file comes from `:summary-file`, or from the document that started the source. The part is left out when no handover started the source.
+   - **User prompts of the chain:** every other user prompt, oldest first, with the numbers P2, P3, and so on. P1 is the original task. Each prompt is cut to `claude-code-ide-transcript-prompt-limit` characters.
+   - **Latest turns:** the turns of all legs, oldest first. Each turn text is cut to `claude-code-ide-transcript-turn-limit` characters. A user turn whose prompt is already in the document shows only its number, for example "(P5 in the list of user prompts above.)".
+5. **Not carried over:** background tasks and subagents that still run, the permission mode, and the plan mode.
+6. **Instructions to the target:**
+   - The workspace state and the coordinator context have priority over older history.
+   - A newer user prompt replaces an older one.
+   - The instructions of earlier handover documents do not apply.
+   - Read each file again before you edit it.
+   - First turn: write a short state summary to the given file. Do not commit it.
+   - Then reply `ready` and wait.
+
+All transcript text (prompts, turns, and the state summary) is in Markdown block quotes, so that it cannot add headings to the document.
+
+### No nested documents
+
+Test S7 showed that a document that copies the previous document doubles in size at each leg, and that it carries old instructions.
+
+- A user turn that holds the marker of a handover document is a document turn.
+- A document turn and the assistant turns after it, up to the next user turn, are the bootstrap of a leg. The bootstrap is left out of the prompts and of the latest turns. This also leaves out the turn that wrote the state summary and the "ready" reply.
+- The document names each earlier document only by its handover ID and hash, in the header.
+- `(claude-code-ide-transcript-document-id TEXT)`, `(claude-code-ide-transcript-document-summary-file TEXT)`, and `(claude-code-ide-transcript-document-original-task TEXT)` read these values from a document.
+
+### The size budget
+
+- The budget never cuts the header, the workspace state, the coordinator context, the original task, the "not carried over" list, or the instructions. When these parts are larger than the budget, the document is larger than the budget.
+- The rest of the budget goes to the other parts, in this order:
+  1. The state summary. It is cut at the end when it does not fit.
+  2. The user prompts. They get half of the rest, or more when the latest turns need less. The oldest prompts are left out first.
+  3. The latest turns. They get what remains. The oldest turns are left out first.
+- A note counts what is left out, for example "(84 earlier prompts are left out because of the size budget.)".
+- When the fixed parts fit in the budget, the document is never larger than the budget.
+
+## Limits
+
+- The diff stat uses the commits of the current branch. A start commit on another branch gives a diff against that commit.
+- The default state summary file is inside the worktree. `git status` shows it as untracked, and the instructions tell the target not to commit it.
+- The readers do not read subagent transcripts.
