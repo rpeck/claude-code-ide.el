@@ -199,8 +199,9 @@ Timers and file watches are not started."
                   (claude-code-ide-tests--tool "PreToolUse" "late" nil "agent-3")
                   (claude-code-ide-tests--tool "PostToolUse" "late" nil "agent-3")))
     (should (equal (claude-code-ide-tests--state status) '(idle "Done")))
+    ;; A rate limit is the quota limit of the account
     (claude-code-ide-tests--feed status '(("StopFailure" "{\"error\":\"rate_limit\"}")))
-    (should (equal (claude-code-ide-tests--state status) '(error "Error: rate_limit")))))
+    (should (equal (claude-code-ide-tests--state status) '(quota "Quota limit: rate_limit")))))
 
 (ert-deftest claude-code-ide-test-status-stop-failure-with-dialog ()
   "An API error ends the main turn: its dialog closes and the state is error."
