@@ -213,8 +213,9 @@ the buffer even when it is narrowed."
   "Return the provider operation symbol of the string NAME, or nil.
 NAME may use underscores for hyphens, as in \"submit_prompt\"."
   (when (stringp name)
-    (let ((symbol (intern (replace-regexp-in-string "_" "-" name))))
-      (and (memq symbol claude-code-ide-provider-operations) symbol))))
+    ;; `intern-soft': a client string never makes a new symbol
+    (let ((symbol (intern-soft (replace-regexp-in-string "_" "-" name))))
+      (and symbol (memq symbol claude-code-ide-provider-operations) symbol))))
 
 (defun claude-code-ide-mcp-capabilities (instance-id &optional operation)
   "Return the capabilities of the instance INSTANCE-ID as an alist for JSON.

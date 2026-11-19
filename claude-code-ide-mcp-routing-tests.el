@@ -39,12 +39,16 @@
   "Send a POST of BODY to PATH through the HTTP handler, with HEADERS.
 BODY is a string or an alist, which is encoded as JSON.  HEADERS is
 an alist of web-server header keys, such as :X-EMACS-MCP-TOKEN, and
-values.  Return a plist with :status, :headers and :body (the parsed
-JSON reply, or nil when no body was sent)."
+values.  The request gets Content-Type application/json unless
+HEADERS has its own :CONTENT-TYPE entry (nil for none).  Return a
+plist with :status, :headers and :body (the parsed JSON reply, or nil
+when no body was sent)."
   (let* ((reply (list :status nil :headers nil :body nil))
          (request (make-claude-code-ide-mcp-routing-tests--request
                    :process 'cci-test-process
-                   :headers (cons (cons :POST path) headers)
+                   :headers (cons (cons :POST path)
+                                  (append headers
+                                          (list (cons :CONTENT-TYPE "application/json"))))
                    :body (if (stringp body) body (json-encode body)))))
     (cl-letf (((symbol-function 'ws-headers)
                #'claude-code-ide-mcp-routing-tests--request-headers)
@@ -98,8 +102,9 @@ BODY can read from the variable `cci-test-dir'."
   `(let* ((cci-test-dir (file-name-as-directory (make-temp-file "cci-test-mcp-" t)))
           (claude-code-ide-mcp-server--sessions (make-hash-table :test 'equal))
           (claude-code-ide-mcp-server--instance-keys (make-hash-table :test 'equal))
-          (claude-code-ide-mcp-server--last-noted-buffer nil)
+          (claude-code-ide-mcp--sessions (make-hash-table :test 'equal))
           (claude-code-ide-mcp-server-tools nil)
+          (claude-code-ide-mcp-server-extra-headers nil)
           (claude-code-ide-mcp-server-secret-placement 'header)
           (claude-code-ide-mcp-server-coordinator-credential-file
            (expand-file-name "reports/coordinator-credential" cci-test-dir))
@@ -177,25 +182,125 @@ of the main file makes it.  Return the descriptor."
 
 (ert-deftest claude-code-ide-mcp-routing-test-notification-accepted ()
   "A notification gets 202 Accepted with no body and no content type."
-  (let ((reply (claude-code-ide-mcp-routing-tests--post
-                "/mcp/cci-test-instance"
-                '((jsonrpc . "2.0") (method . "notifications/initialized")))))
-    (should (equal (plist-get reply :status) 202))
-    (should-not (plist-get reply :body))
-    (should-not (assoc "Content-Type" (plist-get reply :headers)))
-    (should (equal (cdr (assoc "Content-Length" (plist-get reply :headers))) "0"))))
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-session" cci-test-dir nil)
+    (let ((reply (claude-code-ide-mcp-routing-tests--post
+                  "/mcp/cci-test-session"
+                  '((jsonrpc . "2.0") (method . "notifications/initialized")))))
+      (should (equal (plist-get reply :status) 202))
+      (should-not (plist-get reply :body))
+      (should-not (assoc "Content-Type" (plist-get reply :headers)))
+      (should (equal (cdr (assoc "Content-Length" (plist-get reply :headers))) "0")))))
 
 (ert-deftest claude-code-ide-mcp-routing-test-request-gets-reply ()
-  "A request with an ID gets a 200 JSON-RPC reply with the same ID."
-  (let ((reply (claude-code-ide-mcp-routing-tests--post
-                "/mcp/cci-test-instance"
-                '((jsonrpc . "2.0") (id . 7) (method . "initialize")
-                  (params . ((protocolVersion . "2024-11-05")))))))
-    (should (equal (plist-get reply :status) 200))
-    (should (equal (cdr (assoc "Content-Type" (plist-get reply :headers)))
-                   "application/json"))
-    (should (equal (alist-get 'id (plist-get reply :body)) 7))
-    (should (alist-get 'serverInfo (alist-get 'result (plist-get reply :body))))))
+  "A request with an ID gets a 200 JSON-RPC reply with the same ID.
+The reply has no CORS header."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-session" cci-test-dir nil)
+    (let ((reply (claude-code-ide-mcp-routing-tests--post
+                  "/mcp/cci-test-session"
+                  '((jsonrpc . "2.0") (id . 7) (method . "initialize")
+                    (params . ((protocolVersion . "2024-11-05")))))))
+      (should (equal (plist-get reply :status) 200))
+      (should (equal (cdr (assoc "Content-Type" (plist-get reply :headers)))
+                     "application/json"))
+      (should-not (assoc "Access-Control-Allow-Origin" (plist-get reply :headers)))
+      (should (equal (alist-get 'id (plist-get reply :body)) 7))
+      (should (alist-get 'serverInfo (alist-get 'result (plist-get reply :body)))))))
+
+;;; Requests without a credential, and requests from web pages
+
+(ert-deftest claude-code-ide-mcp-routing-test-unknown-session-refused ()
+  "A request without ID, or for an unknown or ended session, gets 403.
+A session without a secret is reached only by its exact key and with
+no secret.  No tool runs for a refused request."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (let ((ran nil)
+          (body '((jsonrpc . "2.0") (id . 8) (method . "tools/call")
+                  (params . ((name . "cci_test_flag") (arguments . ((x . 1))))))))
+      (claude-code-ide-make-tool :function (lambda () (setq ran t) "ran")
+                                 :name "cci_test_flag" :description "Set a flag")
+      (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+      (claude-code-ide-mcp-routing-tests--start "cci-test-inst-a" cci-test-dir)
+      (let ((secret (claude-code-ide-mcp-routing-tests--secret "cci-test-inst-a")))
+        ;; Ended: the old ID and secret are unknown now
+        (claude-code-ide-mcp-server-unregister-session "cci-test-inst-a")
+        (dolist (case (list (list "/mcp" nil "missing session ID")
+                            (list "/mcp/" nil "missing session ID")
+                            (list "/mcp/cci-test-garbage" nil "unknown session")
+                            (list "/mcp/cci-test-garbage/anything" nil "unknown session")
+                            (list (concat "/mcp/cci-test-inst-a/" secret) nil "unknown session")
+                            (list "/mcp/cci-test-inst-a"
+                                  (claude-code-ide-mcp-routing-tests--secret-header secret)
+                                  "unknown session")
+                            (list "/mcp/cci-test-cowork/anything" nil "unexpected instance secret")
+                            (list "/mcp/cci-test-cowork"
+                                  (claude-code-ide-mcp-routing-tests--secret-header "x")
+                                  "unexpected instance secret")))
+          (let ((reply (claude-code-ide-mcp-routing-tests--post
+                        (nth 0 case) body (nth 1 case))))
+            (should (equal (plist-get reply :status) 403))
+            (should (string-match-p (nth 2 case)
+                                    (alist-get 'message
+                                               (alist-get 'error (plist-get reply :body))))))))
+      (should-not ran)
+      ;; The session without a secret by its exact key
+      (should (equal (claude-code-ide-mcp-routing-tests--call "/mcp/cci-test-cowork" "cci_test_flag")
+                     "ran")))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-web-page-refused ()
+  "A request with an Origin header gets 403, one that is not JSON gets 415.
+The body is not read, so no tool runs."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (let ((ran nil)
+          (body '((jsonrpc . "2.0") (id . 9) (method . "tools/call")
+                  (params . ((name . "cci_test_flag"))))))
+      (claude-code-ide-make-tool :function (lambda () (setq ran t) "ran")
+                                 :name "cci_test_flag" :description "Set a flag")
+      (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+      (dolist (case (list (list (list (cons :ORIGIN "https://cci-test.example")) 403)
+                          (list (list (cons :ORIGIN "null")) 403)
+                          (list (list (cons :CONTENT-TYPE "text/plain")) 415)
+                          (list (list (cons :CONTENT-TYPE "application/x-www-form-urlencoded")) 415)
+                          (list (list (cons :CONTENT-TYPE "application/jsonx")) 415)
+                          (list (list (cons :CONTENT-TYPE nil)) 415)))
+        (let ((reply (claude-code-ide-mcp-routing-tests--post
+                      "/mcp/cci-test-cowork" body (nth 0 case))))
+          (should (equal (plist-get reply :status) (nth 1 case)))
+          (should-not (assoc "Access-Control-Allow-Origin" (plist-get reply :headers)))))
+      (should-not ran)
+      ;; A parameter after the type is fine
+      (should (equal 200 (plist-get (claude-code-ide-mcp-routing-tests--post
+                                     "/mcp/cci-test-cowork" body
+                                     (list (cons :CONTENT-TYPE "Application/JSON; charset=utf-8")))
+                                    :status)))
+      (should ran))))
+
+;;; Random secrets
+
+(ert-deftest claude-code-ide-mcp-routing-test-secret-needs-random-device ()
+  "A secret is 32 bytes of the random device; without the device, an error.
+The global random generator is not used."
+  (cl-letf (((symbol-function 'random)
+             (lambda (&rest _) (error "The global random generator must not be used"))))
+    (let ((a (claude-code-ide-mcp-server--new-secret))
+          (b (claude-code-ide-mcp-server--new-secret)))
+      (should (string-match-p "\\`[0-9a-f]\\{64\\}\\'" a))
+      (should-not (equal a b)))
+    (let ((claude-code-ide-mcp-server--random-device "/nonexistent/cci-test-random"))
+      (let ((err (should-error (claude-code-ide-mcp-server--new-secret))))
+        (should (string-match-p "random bytes from /nonexistent/cci-test-random"
+                                (error-message-string err)))))
+    ;; A device that gives too few bytes
+    (let* ((short (make-temp-file "cci-test-short-"))
+           (claude-code-ide-mcp-server--random-device short))
+      (unwind-protect
+          (progn
+            (with-temp-file short (insert "abc"))
+            (should (string-match-p "gave 3 of 32"
+                                    (error-message-string
+                                     (should-error (claude-code-ide-mcp-server--new-secret))))))
+        (delete-file short)))))
 
 ;;; Paths
 
@@ -508,11 +613,12 @@ is the current one when the request comes."
           (claude-code-ide-emacs-tools-setup)
           (let ((header (claude-code-ide-mcp-routing-tests--secret-header
                          (claude-code-ide-mcp-routing-tests--secret "cci-test-inst-a"))))
-            ;; The user visits a file of A, then works in a file of B
+            ;; The user visits a file of A, then works in a file of B.
+            ;; Neither instance has an IDE connection, as for Codex.
             (with-current-buffer file-a
-              (claude-code-ide-mcp-server--track-buffer))
+              (claude-code-ide-mcp--track-active-buffer))
             (switch-to-buffer file-b)
-            (claude-code-ide-mcp-server--track-buffer)
+            (claude-code-ide-mcp--track-active-buffer)
             (should (eq (window-buffer (selected-window)) file-b))
             ;; A keeps its own buffer; B got its own
             (should (eq (plist-get (claude-code-ide-mcp-server-get-session-context
@@ -569,10 +675,45 @@ not change it."
                                 "cci-test-inst-a")
                                :last-active-buffer)
                     inside))
-        ;; The tracking hook is on while a session is registered
-        (should (memq #'claude-code-ide-mcp-server--track-buffer post-command-hook))
+        ;; The one tracker is on while a session is registered
+        (should (memq #'claude-code-ide-mcp--track-active-buffer post-command-hook))
+        (should-not (fboundp 'claude-code-ide-mcp-server--track-buffer))
         (claude-code-ide-mcp-server-unregister-session "cci-test-inst-a")
-        (should-not (memq #'claude-code-ide-mcp-server--track-buffer post-command-hook))))))
+        (should-not (memq #'claude-code-ide-mcp--track-active-buffer post-command-hook))))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-one-tracker ()
+  "The IDE tracker also serves tools server sessions, and stays while one is left.
+A connected IDE session is updated once, not twice."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (let* ((dir-a (claude-code-ide-mcp-routing-tests--make-worktree cci-test-dir "wt-a"))
+           (file-a (find-file-noselect (expand-file-name "a.el" dir-a)))
+           (updates nil))
+      (claude-code-ide-mcp-routing-tests--start "cci-test-inst-a" dir-a)
+      (claude-code-ide-mcp-server-register-session "cci-test-other" cci-test-dir nil)
+      ;; An IDE session of the same key, with a connected client
+      (puthash "cci-test-inst-a"
+               (make-claude-code-ide-mcp-session :session-id "cci-test-inst-a"
+                                                 :project-dir dir-a :client 'cci-test-client)
+               claude-code-ide-mcp--sessions)
+      (let ((update (symbol-function 'claude-code-ide-mcp-server-update-last-active-buffer)))
+        (cl-letf (((symbol-function 'claude-code-ide-mcp--get-buffer-project) (lambda () dir-a))
+                  ((symbol-function 'claude-code-ide-mcp-server-update-last-active-buffer)
+                   (lambda (key buffer) (push key updates) (funcall update key buffer))))
+          (with-current-buffer file-a
+            (claude-code-ide-mcp--track-active-buffer))))
+      ;; Each session once: the IDE part updates A, the tools part the other
+      (should (equal (sort updates #'string<) '("cci-test-inst-a" "cci-test-other")))
+      (should (eq (plist-get (claude-code-ide-mcp-server-get-session-context "cci-test-inst-a")
+                             :last-active-buffer)
+                  file-a))
+      ;; The hook stays while the IDE session or a tools session is left
+      (claude-code-ide-mcp-server-unregister-session "cci-test-inst-a")
+      (claude-code-ide-mcp-server-unregister-session "cci-test-other")
+      (should (memq #'claude-code-ide-mcp--track-active-buffer post-command-hook))
+      (clrhash claude-code-ide-mcp--sessions)
+      (claude-code-ide-mcp-server-register-session "cci-test-other" cci-test-dir nil)
+      (claude-code-ide-mcp-server-unregister-session "cci-test-other")
+      (should-not (memq #'claude-code-ide-mcp--track-active-buffer post-command-hook)))))
 
 (ert-deftest claude-code-ide-mcp-routing-test-context-from-descriptor ()
   "The context comes from the descriptor of the launch and has no secret.
@@ -657,7 +798,11 @@ credential gives 403."
         ;; The refusal also holds without any arguments
         (should (string-match-p "coordinator-only"
                                 (claude-code-ide-mcp-routing-tests--call
-                                 "/mcp" "cci_test_coord" nil)))
+                                 "/mcp/cci-test-inst-a" "cci_test_coord" nil secret)))
+        ;; /mcp without the credential is refused before any tool
+        (should (equal 403 (plist-get (claude-code-ide-mcp-routing-tests--call
+                                       "/mcp" "cci_test_coord" args)
+                                      :status)))
         ;; The instance secret is not a coordinator credential
         (should (equal 403 (plist-get (claude-code-ide-mcp-routing-tests--call
                                        "/mcp" "cci_test_coord" args
@@ -710,6 +855,41 @@ credential gives 403."
       (should (equal (claude-code-ide-mcp-server-coordinator-credential-file)
                      "/nonexistent/cci-test-reports/coordinator-credential")))))
 
+(ert-deftest claude-code-ide-mcp-routing-test-credential-path-stable ()
+  "The credential path is the same whether or not the registry is loaded.
+The server's report directory equals the registry's for the default,
+a custom state file and a custom report directory, and keeps the
+registry defaults when the registry options are not bound."
+  (dolist (settings '((nil nil)
+                      ("/nonexistent/cci-test-state.json" nil)
+                      ("/nonexistent/cci-test-state" nil)
+                      ("/nonexistent/cci-test-state.json" "/nonexistent/cci-test-reports")))
+    (let ((claude-code-ide-state-file
+           (or (nth 0 settings) (eval (car (get 'claude-code-ide-state-file 'standard-value)) t)))
+          (claude-code-ide-session-registry-report-directory (nth 1 settings)))
+      (should (equal (claude-code-ide-mcp-server--report-directory)
+                     (claude-code-ide-session-registry--report-directory)))))
+  ;; The registry not loaded: its options are unbound
+  (let ((loaded (claude-code-ide-mcp-server--report-directory))
+        (state claude-code-ide-state-file)
+        (reports claude-code-ide-session-registry-report-directory))
+    (unwind-protect
+        (progn
+          (makunbound 'claude-code-ide-state-file)
+          (makunbound 'claude-code-ide-session-registry-report-directory)
+          (should (equal (claude-code-ide-mcp-server--report-directory)
+                         (file-name-as-directory
+                          (expand-file-name "~/.emacs-claude-code-ide-state-reports"))))
+          (when (and (equal state (eval (car (get 'claude-code-ide-state-file 'standard-value)) t))
+                     (null reports))
+            (should (equal (claude-code-ide-mcp-server--report-directory) loaded))))
+      (set-default 'claude-code-ide-state-file state)
+      (set-default 'claude-code-ide-session-registry-report-directory reports)))
+  ;; The default of the server equals the default of the registry
+  (should (equal claude-code-ide-mcp-server--default-state-file
+                 (abbreviate-file-name
+                  (eval (car (get 'claude-code-ide-state-file 'standard-value)) t)))))
+
 (ert-deftest claude-code-ide-mcp-routing-test-request-instance-id ()
   "The current request has the ID of its instance, or nil without one."
   (claude-code-ide-mcp-routing-tests--with-state
@@ -722,7 +902,12 @@ credential gives 403."
       (should (equal (claude-code-ide-mcp-routing-tests--call "/mcp/cci-test-key-a" "cci_test_id"
                                                               nil secret)
                      "cci-test-inst-a"))
-      (should (equal (claude-code-ide-mcp-routing-tests--call "/mcp" "cci_test_id") "nil"))
+      ;; A coordinator request to /mcp has no instance
+      (should (equal (claude-code-ide-mcp-routing-tests--call
+                      "/mcp" "cci_test_id" nil
+                      (list (cons :X-EMACS-MCP-COORDINATOR
+                                  (claude-code-ide-mcp-server-coordinator-credential t))))
+                     "nil"))
       (should-not (claude-code-ide-mcp-request-instance-id)))
     (kill-buffer (claude-code-ide-instance-buffer
                   (claude-code-ide-instance-by-id "cci-test-inst-a")))))
@@ -793,12 +978,52 @@ A missing operation gives {\"status\": \"unavailable\", \"capability\": ...}."
         (should (equal (alist-get 'instance_id
                                   (funcall capabilities "/mcp"
                                            '((instance_id . "cci-test-inst-s")) coordinator))
-                       "cci-test-inst-s")))
-      ;; No instance
-      (should (equal (funcall capabilities "/mcp" nil nil)
-                     '((status . "unavailable") (reason . "no-instance")))))
+                       "cci-test-inst-s"))
+        ;; No instance: a coordinator request to /mcp without instance_id
+        (should (equal (funcall capabilities "/mcp" nil coordinator)
+                       '((status . "unavailable") (reason . "no-instance")))))
+      ;; An operation name that no symbol has is unavailable and makes no symbol
+      (should (equal (funcall capabilities "/mcp/cci-test-inst-a"
+                              '((operation . "cci-test-never-a-symbol-q7")) secret-a)
+                     '((status . "unavailable") (capability . "cci-test-never-a-symbol-q7"))))
+      (should-not (intern-soft "cci-test-never-a-symbol-q7")))
     (dolist (instance (claude-code-ide-instances))
       (kill-buffer (claude-code-ide-instance-buffer instance)))))
+
+;;; Extra headers
+
+(ert-deftest claude-code-ide-mcp-routing-test-extra-headers ()
+  "get-config merges the extra headers with the secret in one entry.
+A function value is called, a nil value drops the header, and the
+secret wins over an extra header of the same name."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-routing-tests--start "cci-test-inst-a" cci-test-dir)
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (let ((claude-code-ide-mcp-server-extra-headers
+           `(("X-Emacs-MCP-Token" . "cci-test-token")
+             (X-Cci-Test-Lazy . ,(lambda () "cci-test-lazy"))
+             (X-Cci-Test-Dropped . ,(lambda () nil))
+             ("x-emacs-mcp-instance-secret" . "cci-test-not-the-secret")))
+          (secret (claude-code-ide-mcp-routing-tests--secret "cci-test-inst-a")))
+      (let ((server (claude-code-ide-mcp-routing-tests--server-config
+                     (claude-code-ide-mcp-server-get-config "cci-test-inst-a"))))
+        (should (= 1 (cl-count 'headers server :key #'car-safe)))
+        (should (equal (alist-get 'headers server)
+                       `((X-Emacs-MCP-Token . "cci-test-token")
+                         (X-Cci-Test-Lazy . "cci-test-lazy")
+                         (X-Emacs-MCP-Instance-Secret . ,secret)))))
+      ;; A session without a secret gets the extra headers only
+      (let ((claude-code-ide-mcp-server-extra-headers '(("X-Emacs-MCP-Token" . "cci-test-token"))))
+        (should (equal (alist-get 'headers (claude-code-ide-mcp-routing-tests--server-config
+                                            (claude-code-ide-mcp-server-get-config "cci-test-cowork")))
+                       '((X-Emacs-MCP-Token . "cci-test-token")))))
+      ;; Path placement: the extra headers stay, the secret goes to the URL
+      (let ((claude-code-ide-mcp-server-secret-placement 'path)
+            (claude-code-ide-mcp-server-extra-headers '(("X-Emacs-MCP-Token" . "cci-test-token"))))
+        (let ((server (claude-code-ide-mcp-routing-tests--server-config
+                       (claude-code-ide-mcp-server-get-config "cci-test-inst-a"))))
+          (should (equal (alist-get 'headers server) '((X-Emacs-MCP-Token . "cci-test-token"))))
+          (should (string-suffix-p secret (alist-get 'url server))))))))
 
 (provide 'claude-code-ide-mcp-routing-tests)
 ;;; claude-code-ide-mcp-routing-tests.el ends here

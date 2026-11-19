@@ -54,7 +54,8 @@
 (declare-function claude-code-ide-mcp-http-server-stop "claude-code-ide-mcp-http-server" (server))
 (declare-function claude-code-ide-mcp-session-p "claude-code-ide-mcp" (object))
 (declare-function claude-code-ide-mcp-session-session-id "claude-code-ide-mcp" (session))
-(declare-function claude-code-ide-session-registry--report-directory "claude-code-ide-session-registry" ())
+(declare-function claude-code-ide-mcp--track-active-buffer "claude-code-ide-mcp" ())
+(defvar claude-code-ide-mcp--sessions)
 
 ;;; Customization
 
@@ -94,14 +95,27 @@ Each entry is (FUNCTION . PLIST) where PLIST contains:
 (defcustom claude-code-ide-mcp-server-secret-placement 'header
   "Where the generated MCP config puts the secret of an instance.
 `header': the URL is /mcp/<instance-id>, and the secret is the value
-of the header `claude-code-ide-mcp-server-secret-header'.  A provider
-can pass a header value through an environment variable, so that the
-secret does not show in the argument list of the CLI.
+of the header `claude-code-ide-mcp-server-secret-header'.  The secret
+stays out of the argument list of the CLI (what `ps' shows) only for
+a provider that passes header values through the environment, as the
+Codex provider can.  A provider that puts the whole config on the
+command line shows the header too.
 `path': the URL is /mcp/<instance-id>/<secret>.  Every local program
 that can list processes can then read the secret.
 The server accepts the secret in both places, whatever this says."
   :type '(choice (const :tag "In a header" header)
                  (const :tag "In the URL path" path))
+  :group 'claude-code-ide-mcp-server)
+
+(defcustom claude-code-ide-mcp-server-extra-headers nil
+  "Headers that the generated MCP config adds for every session.
+An alist of (NAME . VALUE).  NAME is a string or a symbol.  VALUE is a
+string, or a function without arguments that returns the value (for
+example one that reads a token file); a nil value drops the header.
+`claude-code-ide-mcp-server-get-config' merges these headers with the
+secret of the instance into one `headers' entry."
+  :type '(alist :key-type (choice string symbol)
+                :value-type (choice string function))
   :group 'claude-code-ide-mcp-server)
 
 (defcustom claude-code-ide-mcp-server-coordinator-credential-file nil
@@ -111,7 +125,9 @@ A request that carries this credential in the header
 with the scope `coordinator'.  The credential is separate from the
 secrets of the instances.  Emacs makes the file with mode 0600 when
 the server starts and a coordinator tool exists, and accepts it only
-while no other user can read it.
+while no other user can read it.  This protects against mistakes and
+against other local clients, not against an agent that runs as the
+same user and reads the file; see docs/api-mcp.md.
 nil means the file \"coordinator-credential\" in the report directory
 of the session registry (see
 `claude-code-ide-session-registry-report-directory')."
@@ -162,8 +178,6 @@ This is dynamically bound during tool execution.")
   "Hash table from instance IDs to keys of `claude-code-ide-mcp-server--sessions'.
 A request can name a session by its key or by the ID of its instance.")
 
-(defvar claude-code-ide-mcp-server--last-noted-buffer nil
-  "The buffer that `claude-code-ide-mcp-server--track-buffer' saw last.")
 
 ;;; Tool Definition Functions
 
@@ -373,6 +387,8 @@ the secret of the instance, as `claude-code-ide-mcp-server-secret-placement'
 says: in the header `claude-code-ide-mcp-server-secret-header', or as
 the last part of the URL path.  Other sessions keep the URL
 /mcp/<session-id> and get no secret.
+The headers of `claude-code-ide-mcp-server-extra-headers' come first;
+the secret header comes last and wins over one of the same name.
 Returns an alist suitable for JSON encoding."
   (when-let* ((port (claude-code-ide-mcp-server-get-port)))
     (let* ((key (and session-id (claude-code-ide-mcp-server--resolve-key session-id)))
@@ -386,22 +402,51 @@ Returns an alist suitable for JSON encoding."
                   (session-id (format "/mcp/%s" session-id))
                   (t "/mcp")))
            (url (format "http://localhost:%d%s" port path))
+           (headers (claude-code-ide-mcp-server--merge-header-lists
+                     (list (claude-code-ide-mcp-server--extra-headers)
+                           (and secret (not in-path)
+                                `((,(intern claude-code-ide-mcp-server-secret-header)
+                                   . ,secret))))))
            (config `((type . "http")
                      (url . ,url))))
-      (when (and secret (not in-path))
-        (setq config
-              (append config
-                      `((headers . ((,(intern claude-code-ide-mcp-server-secret-header)
-                                     . ,secret)))))))
+      (when headers
+        (setq config (append config `((headers . ,headers)))))
       `((mcpServers . ((emacs-tools . ,config)))))))
+
+(defun claude-code-ide-mcp-server--extra-headers ()
+  "Return `claude-code-ide-mcp-server-extra-headers' with the values computed.
+A value that is a function is called; a nil result drops the header."
+  (delq nil
+        (mapcar (lambda (header)
+                  (let* ((value (cdr header))
+                         (value (if (functionp value) (funcall value) value)))
+                    (when value
+                      (cons (if (stringp (car header)) (intern (car header)) (car header))
+                            (format "%s" value)))))
+                claude-code-ide-mcp-server-extra-headers)))
+
+(defun claude-code-ide-mcp-server--merge-header-lists (lists)
+  "Merge the header alists of LISTS, in order, into one alist.
+A later header with the same name (case does not matter) replaces an
+earlier one at its own position."
+  (let ((merged nil))
+    (dolist (headers lists)
+      (dolist (header headers)
+        (let ((name (downcase (format "%s" (car header)))))
+          (setq merged (cl-remove-if (lambda (old)
+                                       (string= (downcase (format "%s" (car old))) name))
+                                     merged))
+          (setq merged (append merged (list header))))))
+    merged))
 
 (defun claude-code-ide-mcp-server--merge-config-headers (config)
   "Return CONFIG with at most one `headers' entry in each server.
-An advice of `claude-code-ide-mcp-server-get-config' can append a
-second `headers' entry, for example a global token.  A JSON reader
-keeps only the last of two equal keys, so the secret of the instance
-would be lost.  This merges the entries in order; a later header with
-the same name wins."
+Use `claude-code-ide-mcp-server-extra-headers' to add headers.  An
+older way is an advice of `claude-code-ide-mcp-server-get-config' that
+appends a second `headers' entry, for example a global token.  A JSON
+reader keeps only the last of two equal keys, so the secret of the
+instance would be lost.  This merges the entries in order; a later
+header with the same name wins."
   (if (not (and (consp config) (assq 'mcpServers config)))
       config
     (mapcar
@@ -421,19 +466,17 @@ the same name wins."
                                          alist))))
     (if (< (length header-lists) 2)
         server
-      (let ((merged nil))
-        (dolist (headers header-lists)
-          (dolist (header headers)
-            (let ((name (downcase (format "%s" (car header)))))
-              (setq merged (cl-remove-if (lambda (old)
-                                           (string= (downcase (format "%s" (car old))) name))
-                                         merged))
-              (setq merged (append merged (list header))))))
-        (cons (car server)
-              (append (cl-remove-if (lambda (cell) (eq (car-safe cell) 'headers)) alist)
-                      (list (cons 'headers merged))))))))
+      (cons (car server)
+            (append (cl-remove-if (lambda (cell) (eq (car-safe cell) 'headers)) alist)
+                    (list (cons 'headers
+                                (claude-code-ide-mcp-server--merge-header-lists
+                                 header-lists))))))))
 
-;; The outermost advice, so that it sees the result of every other advice
+;; Compatibility with user advice that appends a `headers' entry, such as
+;; the token advice of rp-emacs-mcp.el.  The body of `get-config' cannot
+;; see what an advice adds after it returns, so only an advice can merge
+;; it.  This one is the outermost (depth -100): it runs after every other
+;; advice, also one that is added later.
 (advice-add 'claude-code-ide-mcp-server-get-config :filter-return
             #'claude-code-ide-mcp-server--merge-config-headers
             '((depth . -100)))
@@ -472,8 +515,10 @@ must then carry that secret."
                                   :secret (claude-code-ide-mcp-server--new-secret))))
         (puthash instance-id session-id claude-code-ide-mcp-server--instance-keys)))
     (puthash session-id entry claude-code-ide-mcp-server--sessions)
-    (setq claude-code-ide-mcp-server--last-noted-buffer nil)
-    (add-hook 'post-command-hook #'claude-code-ide-mcp-server--track-buffer)
+    ;; The one active buffer tracker; it also serves instances without
+    ;; an IDE connection
+    (when (fboundp 'claude-code-ide-mcp--track-active-buffer)
+      (add-hook 'post-command-hook #'claude-code-ide-mcp--track-active-buffer))
     (claude-code-ide-debug "Registered MCP session %s for project %s%s"
                            session-id project-dir
                            (if instance
@@ -490,9 +535,16 @@ must then carry that secret."
                  (equal (gethash instance-id claude-code-ide-mcp-server--instance-keys)
                         session-id))
         (remhash instance-id claude-code-ide-mcp-server--instance-keys)))
-    (when (= 0 (hash-table-count claude-code-ide-mcp-server--sessions))
-      (remove-hook 'post-command-hook #'claude-code-ide-mcp-server--track-buffer))
+    (claude-code-ide-mcp-server--maybe-remove-tracker)
     (claude-code-ide-debug "Unregistered MCP session %s" session-id)))
+
+(defun claude-code-ide-mcp-server--maybe-remove-tracker ()
+  "Remove the active buffer tracker when no session of any kind is left.
+The tracker also serves the IDE sessions of `claude-code-ide-mcp'."
+  (when (and (= 0 (hash-table-count claude-code-ide-mcp-server--sessions))
+             (or (not (boundp 'claude-code-ide-mcp--sessions))
+                 (= 0 (hash-table-count claude-code-ide-mcp--sessions))))
+    (remove-hook 'post-command-hook #'claude-code-ide-mcp--track-active-buffer)))
 
 (defun claude-code-ide-mcp-server-get-session-context (&optional session-id)
   "Get the context for SESSION-ID or the current session.
@@ -616,23 +668,33 @@ A descriptor of a later launch of the same instance ID does not count."
                 (plist-get entry :generation))
          instance)))
 
-(defun claude-code-ide-mcp-server--random-bytes ()
-  "Return 32 bytes from the random device of the system, or nil."
-  (with-temp-buffer
-    (set-buffer-multibyte nil)
-    (when (and (file-readable-p "/dev/urandom")
-               (eq 0 (ignore-errors
-                       (call-process "head" "/dev/urandom" t nil "-c" "32")))
-               (= (buffer-size) 32))
+(defvar claude-code-ide-mcp-server--random-device "/dev/urandom"
+  "The file that gives the random bytes of secrets and credentials.")
+
+(defun claude-code-ide-mcp-server--random-bytes (count)
+  "Return COUNT bytes from `claude-code-ide-mcp-server--random-device'.
+Signal an error when the device cannot give them.  There is no weaker
+fallback: a secret that another process can guess protects nothing."
+  (let ((device claude-code-ide-mcp-server--random-device))
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (condition-case err
+          ;; The device cannot seek, so read from its start with a limit
+          (insert-file-contents-literally device nil nil count)
+        (file-error
+         (error "Cannot make an MCP secret: cannot read random bytes from %s: %s"
+                device (error-message-string err))))
+      (unless (= (buffer-size) count)
+        (error "Cannot make an MCP secret: %s gave %d of %d random bytes"
+               device (buffer-size) count))
       (buffer-string))))
 
 (defun claude-code-ide-mcp-server--new-secret ()
-  "Return a new random secret: 64 hexadecimal characters."
-  (secure-hash 'sha256
-               (or (claude-code-ide-mcp-server--random-bytes)
-                   ;; No random device: mix what Emacs has
-                   (format "%S %S %S %S" (random t) (random) (current-time)
-                           (emacs-pid)))))
+  "Return a new random secret: 64 hexadecimal characters (32 random bytes).
+Signal an error when the system has no random device."
+  (mapconcat (lambda (byte) (format "%02x" byte))
+             (claude-code-ide-mcp-server--random-bytes 32)
+             ""))
 
 (defun claude-code-ide-mcp-server--secret-equal (a b)
   "Return non-nil when the strings A and B are equal.
@@ -653,9 +715,16 @@ PATH-SECRET is the rest of the path, HEADER-SECRET the value of
 the value of `claude-code-ide-mcp-server-coordinator-header'; each is
 nil when the request has none.
 The result is (:ok t :key KEY :instance-id ID :coordinator BOOL), or
-\(:ok nil :reason TEXT).  A session with a secret needs it in the path
-or in the header, and a secret in either place must be right.  A
-coordinator credential, when given, must be right."
+\(:ok nil :reason TEXT).  The rules:
+- A coordinator credential, when given, must be right.
+- A request without ID needs the coordinator credential.
+- The ID must name a registered session.  A session that ended is
+  unknown.
+- A session with a secret needs it in the path or in the header, and
+  a secret in either place must be right.
+- A session without a secret (for example one that a user
+  configuration registers itself) is reached only by its exact key,
+  and the request must carry no secret."
   (let* ((key (and id (claude-code-ide-mcp-server--resolve-key id)))
          (entry (and key (gethash key claude-code-ide-mcp-server--sessions)))
          (secret (plist-get entry :secret))
@@ -666,31 +735,63 @@ coordinator credential, when given, must be right."
     (cond
      ((and coordinator-credential (not coordinator))
       (list :ok nil :reason "wrong coordinator credential"))
-     ((and secret (not (or path-secret header-secret)))
+     ((null id)
+      (if coordinator
+          (list :ok t :key nil :instance-id nil :coordinator t)
+        (list :ok nil :reason "missing session ID")))
+     ((null entry)
+      (list :ok nil :reason "unknown session"))
+     ((null secret)
+      (cond
+       ((not (equal id key))
+        (list :ok nil :reason "unknown session"))
+       ((or path-secret header-secret)
+        (list :ok nil :reason "unexpected instance secret"))
+       (t (list :ok t :key key :instance-id nil :coordinator coordinator))))
+     ((not (or path-secret header-secret))
       (list :ok nil :reason "missing instance secret"))
-     ((and secret path-secret
+     ((and path-secret
            (not (claude-code-ide-mcp-server--secret-equal path-secret secret)))
       (list :ok nil :reason "wrong instance secret"))
-     ((and secret header-secret
+     ((and header-secret
            (not (claude-code-ide-mcp-server--secret-equal header-secret secret)))
       (list :ok nil :reason "wrong instance secret"))
      (t (list :ok t
-              :key (or key id)
+              :key key
               :instance-id (plist-get entry :instance-id)
               :coordinator coordinator)))))
 
 ;;; Coordinator credential
 
+(defconst claude-code-ide-mcp-server--default-state-file "~/.emacs-claude-code-ide-state.json"
+  "The default of `claude-code-ide-state-file' in the session registry.")
+
+(defun claude-code-ide-mcp-server--report-directory ()
+  "Return the report directory of the session registry.
+This gives the same folder as
+`claude-code-ide-session-registry--report-directory' whether or not
+the registry is loaded: it reads the same two options
+when they are bound, and uses their defaults when they are not.  So
+the server does not need to load the registry and the whole package."
+  (file-name-as-directory
+   (expand-file-name
+    (or (and (boundp 'claude-code-ide-session-registry-report-directory)
+             (symbol-value 'claude-code-ide-session-registry-report-directory))
+        (concat (file-name-sans-extension
+                 (expand-file-name
+                  (if (boundp 'claude-code-ide-state-file)
+                      (symbol-value 'claude-code-ide-state-file)
+                    claude-code-ide-mcp-server--default-state-file)))
+                "-reports")))))
+
 (defun claude-code-ide-mcp-server-coordinator-credential-file ()
   "Return the absolute name of the coordinator credential file.
-See `claude-code-ide-mcp-server-coordinator-credential-file'."
+See `claude-code-ide-mcp-server-coordinator-credential-file'.  The
+default is in `claude-code-ide-mcp-server--report-directory'."
   (expand-file-name
    (or claude-code-ide-mcp-server-coordinator-credential-file
        (expand-file-name "coordinator-credential"
-                         (if (fboundp 'claude-code-ide-session-registry--report-directory)
-                             (claude-code-ide-session-registry--report-directory)
-                           ;; The default report directory of the registry
-                           "~/.emacs-claude-code-ide-state-reports/")))))
+                         (claude-code-ide-mcp-server--report-directory)))))
 
 (defun claude-code-ide-mcp-server--private-file-p (file)
   "Return non-nil when FILE belongs to this user and only this user can read it."
@@ -773,25 +874,20 @@ must be the worktree, so that a nested worktree does not count."
                  (when-let* ((top (locate-dominating-file file ".git")))
                    (string= (file-name-as-directory (expand-file-name top)) root))))))))
 
-(defun claude-code-ide-mcp-server-note-buffer (buffer)
+(defun claude-code-ide-mcp-server-note-buffer (buffer &optional except)
   "Make BUFFER the last active buffer of each session whose worktree has it.
-Sessions of other worktrees keep their last active buffer."
-  (maphash (lambda (key _entry)
-             (claude-code-ide-mcp-server-update-last-active-buffer key buffer))
-           claude-code-ide-mcp-server--sessions))
-
-(defun claude-code-ide-mcp-server--track-buffer ()
-  "Note the current buffer for the sessions, after a command.
-This also serves instances without an IDE connection."
-  (let ((buffer (current-buffer)))
-    (unless (eq buffer claude-code-ide-mcp-server--last-noted-buffer)
-      (setq claude-code-ide-mcp-server--last-noted-buffer buffer)
-      (when (buffer-file-name buffer)
-        (condition-case err
-            (claude-code-ide-mcp-server-note-buffer buffer)
-          (error
-           (claude-code-ide-debug "MCP server buffer tracking failed: %s"
-                                  (error-message-string err))))))))
+Sessions of other worktrees keep their last active buffer.  Skip the
+session keys in the list EXCEPT, which the caller has already updated.
+`claude-code-ide-mcp--track-active-buffer' calls this after each command."
+  (when (buffer-file-name buffer)
+    (maphash (lambda (key _entry)
+               (unless (member key except)
+                 (condition-case err
+                     (claude-code-ide-mcp-server-update-last-active-buffer key buffer)
+                   (error
+                    (claude-code-ide-debug "MCP server buffer tracking failed: %s"
+                                           (error-message-string err))))))
+             claude-code-ide-mcp-server--sessions)))
 
 ;;; Internal Functions
 
@@ -839,7 +935,7 @@ This also serves instances without an IDE connection."
           ;; Clear all registered sessions
           (clrhash claude-code-ide-mcp-server--sessions)
           (clrhash claude-code-ide-mcp-server--instance-keys)
-          (remove-hook 'post-command-hook #'claude-code-ide-mcp-server--track-buffer)
+          (claude-code-ide-mcp-server--maybe-remove-tracker)
           (claude-code-ide-debug "MCP server stopped"))
       (error
        (claude-code-ide-debug "Error stopping MCP server: %s"

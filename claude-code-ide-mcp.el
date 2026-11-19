@@ -989,9 +989,17 @@ file receives `claude-code-ide-mcp--empty-selection'."
                                             session)))
 
 (defun claude-code-ide-mcp--track-active-buffer ()
-  "Track active buffer changes for every instance of the current project."
+  "Track active buffer changes for every instance.
+This is the only tracker of the active buffer, in `post-command-hook'.
+It records the buffer for the IDE connection of each connected
+instance of the current project, and for the MCP tools server
+session of each instance.  The tools server keeps a buffer only
+when it is inside the worktree of that instance; see
+`claude-code-ide-mcp-server-update-last-active-buffer'.  Instances
+without an IDE connection, such as Codex, get their buffer this way."
   (let ((current-buffer (current-buffer))
-        (file-path (buffer-file-name)))
+        (file-path (buffer-file-name))
+        (noted nil))
     ;; Early exit for non-file buffers
     (when file-path
       (when-let* ((project-dir (claude-code-ide-mcp--get-buffer-project)))
@@ -1003,9 +1011,12 @@ file receives `claude-code-ide-mcp--empty-selection'."
                                 (claude-code-ide-mcp-session-last-buffer session))))
               (setf (claude-code-ide-mcp-session-last-buffer session) current-buffer)
               ;; Update MCP tools server's last active buffer
+              (push (claude-code-ide-mcp-session-session-id session) noted)
               (claude-code-ide-mcp-server-update-last-active-buffer
                (claude-code-ide-mcp-session-session-id session)
-               current-buffer))))))))
+               current-buffer)))))
+      ;; Every other tools server session, with the same worktree rule
+      (claude-code-ide-mcp-server-note-buffer current-buffer noted))))
 
 ;;; Public API
 
@@ -1101,10 +1112,13 @@ phantom session wedged in the registry with the global hooks alive."
           (ignore-errors (cancel-timer timer)))
         (remhash project-dir claude-code-ide-mcp--selection-timers))
 
-      ;; Remove hooks if no more sessions
+      ;; Remove hooks if no more sessions.  The active buffer tracker
+      ;; also serves the tools server sessions, so it stays while one
+      ;; of them is left.
       (when (= 0 (hash-table-count claude-code-ide-mcp--sessions))
         (remove-hook 'post-command-hook #'claude-code-ide-mcp--track-selection)
-        (remove-hook 'post-command-hook #'claude-code-ide-mcp--track-active-buffer)))
+        (when (= 0 (hash-table-count claude-code-ide-mcp-server--sessions))
+          (remove-hook 'post-command-hook #'claude-code-ide-mcp--track-active-buffer))))
 
     (claude-code-ide-debug "MCP server stopped for %s"
                            (file-name-nondirectory (directory-file-name project-dir)))))
