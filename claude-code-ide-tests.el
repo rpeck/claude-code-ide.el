@@ -234,6 +234,41 @@ non-nil."
 (define-error 'mcp-error "MCP Error" 'error)
 (require 'claude-code-ide-mcp-handlers)
 (require 'claude-code-ide)
+(require 'claude-code-ide-mcp)
+
+;;; A private folder for each test run
+
+;; Two test runs can run at the same time, for example in two
+;; worktrees.  So no test of a run uses a fixed shared path: the lock
+;; files of the MCP servers, the state file and its report folder, and
+;; the configuration folders of Claude Code and Codex all go to a new
+;; folder of this run.  Tests that need their own folders still bind
+;; them.
+
+(defvar claude-code-ide-tests--run-directory
+  (file-name-as-directory (make-temp-file "cci-test-run-" t))
+  "Temporary folder of this test run.  Emacs removes it when it quits.")
+
+(defun claude-code-ide-tests--run-lockfile-directory ()
+  "Return the folder for the MCP lock files of this test run.
+It replaces ~/.claude/ide/, which the CLIs that run on this machine
+read."
+  (expand-file-name "ide/" claude-code-ide-tests--run-directory))
+
+(advice-add 'claude-code-ide-mcp--lockfile-directory :override
+            #'claude-code-ide-tests--run-lockfile-directory)
+
+(setq claude-code-ide-state-file
+      (expand-file-name "state.json" claude-code-ide-tests--run-directory))
+(setenv "CLAUDE_CONFIG_DIR" (expand-file-name "claude-config" claude-code-ide-tests--run-directory))
+(setenv "CODEX_HOME" (expand-file-name "codex-home" claude-code-ide-tests--run-directory))
+
+;; Depth 90: after the cleanup functions of the package, which remove
+;; the lock files and the status snapshot of this run
+(add-hook 'kill-emacs-hook
+          (lambda ()
+            (ignore-errors (delete-directory claude-code-ide-tests--run-directory t)))
+          90)
 
 ;; Load every claude-code-ide-*-tests.el file of this folder, in name
 ;; order, so that a branch adds its tests without an edit here.  The
