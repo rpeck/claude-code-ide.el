@@ -102,7 +102,8 @@ A line that is not a JSON object gives nil."
 (defun claude-code-ide-transcript--map-records (file regexp function)
   "Call FUNCTION with each JSON object of the JSONL FILE, in order.
 Only lines that match REGEXP are parsed, when REGEXP is non-nil.  A
-line that does not parse is skipped."
+line that does not parse, and a record for which FUNCTION signals an
+error, are skipped."
   (with-temp-buffer
     (let ((coding-system-for-read 'utf-8))
       (insert-file-contents file))
@@ -114,7 +115,10 @@ line that does not parse is skipped."
                        (save-excursion (re-search-forward regexp end t))))
           (when-let* ((record (claude-code-ide-transcript--parse-line
                                (buffer-substring-no-properties (point) end))))
-            (funcall function record))))
+            ;; One bad record does not stop the read.
+            (condition-case nil
+                (funcall function record)
+              (error nil)))))
       (forward-line 1))))
 
 (defun claude-code-ide-transcript--add (turns role text tools time)
@@ -144,14 +148,30 @@ and without tools adds nothing."
         (concat (substring line 0 (max 0 (- limit 3))) "...")
       line)))
 
+(defconst claude-code-ide-transcript--path-char "[:alnum:]._~+@-"
+  "Characters, other than /, that can be part of a file name in a command.")
+
 (defun claude-code-ide-transcript--relative-text (text root)
-  "Return TEXT with the directory ROOT removed from its absolute paths."
+  "Return TEXT with the directory ROOT removed from its absolute paths.
+ROOT followed by / is removed, and ROOT alone becomes \".\".  ROOT
+counts only as a whole path: /a/proj does not change /a/proj-other,
+/a/proj.bak or /b/a/proj."
   (if (and root (stringp text))
-      (let ((dir (file-name-as-directory (expand-file-name root))))
-        (replace-regexp-in-string
-         (concat (regexp-quote (directory-file-name dir)) "\\b") "."
-         (replace-regexp-in-string (regexp-quote dir) "" text t t)
-         t t))
+      (let* ((case-fold-search nil)
+             (other (concat "[^/" claude-code-ide-transcript--path-char "]"))
+             (regexp (concat "\\(\\`\\|" other "\\)"
+                             (regexp-quote (directory-file-name (expand-file-name root)))
+                             "\\(/\\|\\'\\|" other "\\)"))
+             (start 0)
+             parts)
+        (while (string-match regexp text start)
+          (let ((slash (equal (match-string 2 text) "/")))
+            (push (substring text start (match-end 1)) parts)
+            (push (if slash "" ".") parts)
+            ;; The character after ROOT can start the next match.
+            (setq start (if slash (match-end 0) (match-beginning 2)))))
+        (push (substring text start) parts)
+        (apply #'concat (nreverse parts)))
     text))
 
 (defun claude-code-ide-transcript--path (path root)
@@ -198,22 +218,43 @@ and without tools adds nothing."
     "bash-notification" "user-prompt-submit-hook")
   "Leading tags of CC user texts that the CLI wrote, not a person.")
 
+(defconst claude-code-ide-transcript--interrupt-marker
+  "[Request interrupted by user"
+  "Start of the text that the CC CLI writes to the transcript after an interrupt.
+It is the same text as `claude-code-ide-session-status--interrupt-marker'.
+That file is not loaded here, because it loads the main file, which
+loads this file.")
+
+(defun claude-code-ide-transcript--between (text open close)
+  "Return the text between the first OPEN and the next CLOSE in TEXT, or nil.
+The search uses string positions, so that a very large TEXT cannot
+overflow the regexp stack."
+  (when-let* ((start (string-search open text))
+              (from (+ start (length open)))
+              (end (string-search close text from)))
+    (substring text from end)))
+
 (defun claude-code-ide-transcript--claude-clean-prompt (text)
   "Return the CC user TEXT as a prompt, or nil when no person wrote it.
-A slash command becomes \"/NAME ARGS\" and a shell escape \"! COMMAND\"."
+A slash command becomes \"/NAME ARGS\" and a shell escape \"! COMMAND\".
+A text of the CLI, such as command output, a reminder or an interrupt
+marker, gives nil."
   (let ((text (string-trim text)))
     (cond
      ((string-empty-p text) nil)
+     ((string-prefix-p claude-code-ide-transcript--interrupt-marker text) nil)
      ((string-prefix-p "<command-" text)
-      (when (string-match "<command-name>\\([^<]*\\)</command-name>" text)
-        (let* ((name (string-trim (match-string 1 text)))
-               (args (and (string-match "<command-args>\\(\\(?:.\\|\n\\)*?\\)</command-args>" text)
-                          (string-trim (match-string 1 text)))))
-          (if (and args (not (string-empty-p args)))
-              (concat name " " args)
-            name))))
-     ((string-match "\\`<bash-input>\\(\\(?:.\\|\n\\)*?\\)</bash-input>" text)
-      (concat "! " (string-trim (match-string 1 text))))
+      (when-let* ((name (claude-code-ide-transcript--between
+                         text "<command-name>" "</command-name>")))
+        (let ((name (string-trim name))
+              (args (string-trim (or (claude-code-ide-transcript--between
+                                      text "<command-args>" "</command-args>")
+                                     ""))))
+          (if (string-empty-p args) name (concat name " " args)))))
+     ((string-prefix-p "<bash-input>" text)
+      (when-let* ((command (claude-code-ide-transcript--between
+                            text "<bash-input>" "</bash-input>")))
+        (concat "! " (string-trim command))))
      ((and (string-match "\\`<\\([a-zA-Z_-]+\\)>" text)
            (member (match-string 1 text) claude-code-ide-transcript--claude-skip-tags))
       nil)
@@ -222,25 +263,27 @@ A slash command becomes \"/NAME ARGS\" and a shell escape \"! COMMAND\"."
 (defun claude-code-ide-transcript--claude-prompt (record)
   "Return the prompt that a person gave in the CC user RECORD, or nil.
 Meta records, tool results, compaction summaries, subagent records and
-messages of the CLI give nil."
+messages of the CLI give nil.  Each text block is cleaned on its own,
+so a block of the CLI drops only itself."
   (unless (or (alist-get 'isMeta record)
               (alist-get 'isSidechain record)
               (alist-get 'isCompactSummary record)
               (alist-get 'toolUseResult record)
               (equal (alist-get 'promptSource record) "system"))
-    (let* ((content (alist-get 'content (alist-get 'message record)))
-           (text (cond
-                  ((stringp content) content)
-                  ((listp content)
-                   (let (parts)
-                     (dolist (block content)
-                       (pcase (and (listp block) (alist-get 'type block))
-                         ("text" (when (stringp (alist-get 'text block))
-                                   (push (alist-get 'text block) parts)))
-                         ("image" (push "[image]" parts))
-                         ("document" (push "[document]" parts))))
-                     (and parts (string-join (nreverse parts) "\n")))))))
-      (and text (claude-code-ide-transcript--claude-clean-prompt text)))))
+    (let ((content (alist-get 'content (alist-get 'message record))))
+      (cond
+       ((stringp content) (claude-code-ide-transcript--claude-clean-prompt content))
+       ((listp content)
+        (let (parts)
+          (dolist (block content)
+            (pcase (and (listp block) (alist-get 'type block))
+              ("text" (when-let* ((text (and (stringp (alist-get 'text block))
+                                             (claude-code-ide-transcript--claude-clean-prompt
+                                              (alist-get 'text block)))))
+                        (push text parts)))
+              ("image" (push "[image]" parts))
+              ("document" (push "[document]" parts))))
+          (and parts (string-join (nreverse parts) "\n"))))))))
 
 (defun claude-code-ide-transcript--claude-tool (block root)
   "Return the tool call line of the CC tool_use BLOCK, with paths relative to ROOT."
@@ -304,8 +347,8 @@ this file for the form of a turn."
 ;;; Codex rollouts
 
 (defconst claude-code-ide-transcript--codex-line-regexp
-  "\"type\" *: *\"\\(?:item_completed\\|user_message\\|agent_message\\)\""
-  "Lines of a Codex rollout that can hold a turn.")
+  "\"type\" *: *\"\\(?:item_completed\\|user_message\\|agent_message\\|task_started\\|session_meta\\)\""
+  "Lines of a Codex rollout that can hold a turn or the session metadata.")
 
 (defun claude-code-ide-transcript--codex-texts (content)
   "Return the texts of the Codex item CONTENT list, joined, or nil."
@@ -356,99 +399,179 @@ An item type that is not known gives nil."
     ("SubAgentActivity"
      (list (claude-code-ide-transcript--tool-line "subagent" (alist-get 'kind item))))))
 
-(defconst claude-code-ide-transcript--codex-import-call-regexp
-  "\\[external_agent_tool_call: *\\([^]\n]+\\)\\]\\(\\(?:.\\|\n\\)*?\\)\\[/external_agent_tool_call\\]"
-  "A tool call that an import from CC wrote as assistant text.")
+(defconst claude-code-ide-transcript--import-call-open "[external_agent_tool_call:"
+  "Start of a tool call that an import from CC wrote as assistant text.")
 
-(defconst claude-code-ide-transcript--codex-import-result-regexp
-  "\\[external_agent_tool_result[^]\n]*\\]\\(?:.\\|\n\\)*?\\[/external_agent_tool_result\\]"
-  "A tool result that an import from CC wrote as assistant text.")
+(defconst claude-code-ide-transcript--import-call-close "[/external_agent_tool_call]"
+  "End of a tool call that an import from CC wrote as assistant text.")
+
+(defconst claude-code-ide-transcript--import-result-open "[external_agent_tool_result"
+  "Start of a tool result that an import from CC wrote as assistant text.")
+
+(defconst claude-code-ide-transcript--import-result-close "[/external_agent_tool_result]"
+  "End of a tool result that an import from CC wrote as assistant text.")
 
 (defun claude-code-ide-transcript--codex-legacy-agent (text root)
   "Return (TEXT . TOOLS) of the agent message TEXT of an imported rollout.
 The import writes tool calls and results as marked text: a call becomes
-a tool line, and a result is left out.  Paths are relative to ROOT."
-  (let (tools (start 0))
-    (while (string-match claude-code-ide-transcript--codex-import-call-regexp text start)
-      (push (claude-code-ide-transcript--tool-line
-             (string-trim (match-string 1 text))
-             (claude-code-ide-transcript--relative-text
-              (string-join (split-string (match-string 2 text) "\n" t "[ \t]+") "; ")
-              root))
-            tools)
-      (setq start (match-end 0)))
-    (let ((rest (replace-regexp-in-string
-                 claude-code-ide-transcript--codex-import-result-regexp ""
-                 (replace-regexp-in-string
-                  claude-code-ide-transcript--codex-import-call-regexp "" text t t)
-                 t t)))
-      (setq rest (replace-regexp-in-string "<EXTERNAL SESSION IMPORTED>" "" rest t t))
-      (cons rest (nreverse tools)))))
+a tool line, and a result is left out.  A block without its end marker
+lasts to the end of TEXT.  Paths are relative to ROOT.  The markers are
+found with string positions, so a very large result cannot overflow
+the regexp stack."
+  (let ((pos 0) (size (length text)) kept tools)
+    (while (< pos size)
+      (let* ((call (string-search claude-code-ide-transcript--import-call-open text pos))
+             (result (string-search claude-code-ide-transcript--import-result-open text pos))
+             (next (if (and call result) (min call result) (or call result))))
+        (if (null next)
+            (setq kept (cons (substring text pos) kept)
+                  pos size)
+          (push (substring text pos next) kept)
+          (let* ((call-p (eql next call))
+                 (close (if call-p
+                            claude-code-ide-transcript--import-call-close
+                          claude-code-ide-transcript--import-result-close))
+                 (end (or (string-search close text next) size))
+                 (header-end (string-search "]" text next)))
+            (when call-p
+              (let* ((name-start (+ next (length claude-code-ide-transcript--import-call-open)))
+                     (name-end (if (and header-end (< header-end end)) header-end end))
+                     (body (substring text (min end (1+ name-end)) end)))
+                (push (claude-code-ide-transcript--tool-line
+                       (string-trim (substring text name-start name-end))
+                       (claude-code-ide-transcript--relative-text
+                        (string-join (split-string body "\n" t "[ \t]+") "; ")
+                        root))
+                      tools)))
+            (setq pos (min size (+ end (length close))))))))
+    (cons (string-replace "<EXTERNAL SESSION IMPORTED>" ""
+                          (apply #'concat (nreverse kept)))
+          (nreverse tools))))
 
-(defun claude-code-ide-transcript-read-codex (file &optional root)
-  "Return the turns of the Codex rollout FILE, oldest first.
-The turns come from the `item_completed' events.  A rollout without
-them (an imported one, with history mode legacy) gives its turns from
-the `user_message' and `agent_message' events.  Reasoning is left out.
-Tool paths inside ROOT are relative to ROOT."
-  (let (items events)
+(defun claude-code-ide-transcript--codex-item-turn (turns time item root)
+  "Add the Codex ITEM of TIME to TURNS, newest first, and return TURNS.
+Paths are relative to ROOT."
+  (pcase (alist-get 'type item)
+    ("UserMessage"
+     (claude-code-ide-transcript--add
+      turns 'user (claude-code-ide-transcript--codex-texts (alist-get 'content item)) nil time))
+    ("AgentMessage"
+     (claude-code-ide-transcript--add
+      turns 'assistant (claude-code-ide-transcript--codex-texts (alist-get 'content item))
+      nil time))
+    (_ (if-let* ((tools (claude-code-ide-transcript--codex-tools item root)))
+           (claude-code-ide-transcript--add turns 'assistant nil tools time)
+         turns))))
+
+(defun claude-code-ide-transcript--codex-event-turn (turns time payload root)
+  "Add the Codex user_message or agent_message PAYLOAD of TIME to TURNS.
+TURNS is newest first; return it.  Paths are relative to ROOT."
+  (let ((message (alist-get 'message payload)))
+    (cond
+     ((not (stringp message)) turns)
+     ((equal (alist-get 'type payload) "user_message")
+      (claude-code-ide-transcript--add turns 'user message nil time))
+     (t (let ((part (claude-code-ide-transcript--codex-legacy-agent message root)))
+          (claude-code-ide-transcript--add turns 'assistant (car part) (cdr part) time))))))
+
+(defun claude-code-ide-transcript--codex-meta-of (payload)
+  "Return the plist of the Codex session_meta PAYLOAD."
+  (let ((git (alist-get 'git payload)))
+    (list :id (alist-get 'id payload)
+          :cwd (alist-get 'cwd payload)
+          :commit (and (listp git) (alist-get 'commit_hash git))
+          :branch (and (listp git) (alist-get 'branch git))
+          :time (alist-get 'timestamp payload))))
+
+(defun claude-code-ide-transcript--codex-history-end (entries)
+  "Return the position in ENTRIES where the item_completed records take over.
+ENTRIES are (KIND TIME VALUE) lists, oldest first.  An imported rollout
+has only events up to its first item; a later resume writes items, and
+can also write events for the same messages.  The position is that of
+the task_started record of the turn with the first item, else that of
+the first item, else the length of ENTRIES."
+  (let ((first-item (cl-position 'item entries :key #'car)))
+    (if (null first-item)
+        (length entries)
+      (or (cl-position 'task entries :key #'car :end first-item :from-end t)
+          first-item))))
+
+(defun claude-code-ide-transcript--read-codex-full (file root)
+  "Return (:turns TURNS :meta META) of the Codex rollout FILE, in one read.
+See `claude-code-ide-transcript-read-codex' for TURNS and ROOT, and
+`claude-code-ide-transcript-codex-meta' for META."
+  (let (entries meta)
     (claude-code-ide-transcript--map-records
      file claude-code-ide-transcript--codex-line-regexp
      (lambda (record)
-       (let ((payload (alist-get 'payload record)))
-         (when (and (equal (alist-get 'type record) "event_msg") (listp payload))
-           (pcase (alist-get 'type payload)
-             ("item_completed"
-              (when (listp (alist-get 'item payload))
-                (push (cons (alist-get 'timestamp record) (alist-get 'item payload)) items)))
-             ((or "user_message" "agent_message")
-              (push (cons (alist-get 'timestamp record) payload) events)))))))
-    (let (turns)
-      (if items
-          (dolist (entry (nreverse items))
-            (let ((time (car entry)) (item (cdr entry)))
-              (pcase (alist-get 'type item)
-                ("UserMessage"
-                 (setq turns (claude-code-ide-transcript--add
-                              turns 'user (claude-code-ide-transcript--codex-texts
-                                           (alist-get 'content item))
-                              nil time)))
-                ("AgentMessage"
-                 (setq turns (claude-code-ide-transcript--add
-                              turns 'assistant (claude-code-ide-transcript--codex-texts
-                                                (alist-get 'content item))
-                              nil time)))
-                (_ (when-let* ((tools (claude-code-ide-transcript--codex-tools item root)))
-                     (setq turns (claude-code-ide-transcript--add
-                                  turns 'assistant nil tools time)))))))
-        (dolist (entry (nreverse events))
-          (let* ((time (car entry))
-                 (payload (cdr entry))
-                 (message (alist-get 'message payload)))
-            (when (stringp message)
-              (if (equal (alist-get 'type payload) "user_message")
-                  (setq turns (claude-code-ide-transcript--add turns 'user message nil time))
-                (let ((part (claude-code-ide-transcript--codex-legacy-agent message root)))
-                  (setq turns (claude-code-ide-transcript--add
-                               turns 'assistant (car part) (cdr part) time))))))))
-      (nreverse turns))))
+       (let ((payload (alist-get 'payload record))
+             (time (alist-get 'timestamp record))
+             (type (alist-get 'type record)))
+         (when (listp payload)
+           (cond
+            ((equal type "session_meta")
+             (unless meta (setq meta (claude-code-ide-transcript--codex-meta-of payload))))
+            ((not (equal type "event_msg")))
+            ((equal (alist-get 'type payload) "item_completed")
+             (when (listp (alist-get 'item payload))
+               (push (list 'item time (alist-get 'item payload)) entries)))
+            ((equal (alist-get 'type payload) "task_started")
+             (push (list 'task time nil) entries))
+            ((member (alist-get 'type payload) '("user_message" "agent_message"))
+             (push (list 'event time payload) entries)))))))
+    (let* ((entries (nreverse entries))
+           (history-end (claude-code-ide-transcript--codex-history-end entries))
+           (first-item t)
+           (turns nil))
+      (cl-loop
+       for entry in entries
+       for position from 0
+       do (let ((kind (nth 0 entry)) (time (nth 1 entry)) (value (nth 2 entry)))
+            (condition-case nil
+                (cond
+                 ((and (< position history-end) (eq kind 'event))
+                  (setq turns (claude-code-ide-transcript--codex-event-turn turns time value root)))
+                 ((and (>= position history-end) (eq kind 'item))
+                  (let ((last (car turns))
+                        (next (claude-code-ide-transcript--codex-item-turn nil time value root)))
+                    ;; The first item can repeat the last event before it.
+                    (unless (and first-item next last
+                                 (eq (plist-get last :role) (plist-get (car next) :role))
+                                 (plist-get (car next) :text)
+                                 (string-suffix-p (plist-get (car next) :text)
+                                                  (or (plist-get last :text) "")))
+                      (setq turns (claude-code-ide-transcript--codex-item-turn
+                                   turns time value root)))
+                    (setq first-item nil))))
+              ;; One bad record does not stop the read.
+              (error nil))))
+      (list :turns (nreverse turns) :meta meta))))
+
+(defun claude-code-ide-transcript-read-codex (file &optional root)
+  "Return the turns of the Codex rollout FILE, oldest first.
+The turns come from the `item_completed' events.  The part before the
+first such event (the history of an imported rollout, with history
+mode legacy) comes from the `user_message' and `agent_message' events.
+Reasoning is left out.  Tool paths inside ROOT are relative to ROOT."
+  (plist-get (claude-code-ide-transcript--read-codex-full file root) :turns))
 
 (defun claude-code-ide-transcript-codex-meta (file)
   "Return the session metadata of the Codex rollout FILE as a plist, or nil.
-The keys are :id, :cwd, :commit, :branch and :time."
-  (catch 'found
-    (claude-code-ide-transcript--map-records
-     file "\"session_meta\""
-     (lambda (record)
-       (when (equal (alist-get 'type record) "session_meta")
-         (let* ((payload (alist-get 'payload record))
-                (git (alist-get 'git payload)))
-           (throw 'found (list :id (alist-get 'id payload)
-                               :cwd (alist-get 'cwd payload)
-                               :commit (alist-get 'commit_hash git)
-                               :branch (alist-get 'branch git)
-                               :time (alist-get 'timestamp payload)))))))
-    nil))
+The keys are :id, :cwd, :commit, :branch and :time.  Only the start of
+FILE is read, because the metadata is its first record."
+  (with-temp-buffer
+    (let ((coding-system-for-read 'utf-8))
+      (insert-file-contents file nil 0 4194304))
+    (goto-char (point-min))
+    (catch 'found
+      (dotimes (_ 20)
+        (let ((record (claude-code-ide-transcript--parse-line
+                       (buffer-substring-no-properties (point) (line-end-position)))))
+          (when (equal (alist-get 'type record) "session_meta")
+            (throw 'found (claude-code-ide-transcript--codex-meta-of
+                           (alist-get 'payload record)))))
+        (forward-line 1))
+      nil)))
 
 ;;; Format of a transcript
 
@@ -635,13 +758,16 @@ lines of git diff --stat SINCE), :untracked (the untracked files) and
   "First line of each handover document.  %s is the handover ID.")
 
 (defconst claude-code-ide-transcript--marker-regexp
-  "<!-- claude-code-ide-handover-document id=\\([^ \n]+\\) -->"
-  "Regexp that finds the marker line of a handover document.")
+  "\\`[ \t\n]*<!-- claude-code-ide-handover-document id=\\([^ \n]+\\) -->[ \t]*$"
+  "Regexp that finds the marker of a handover document on the first line.")
 
 (defun claude-code-ide-transcript-document-id (text)
-  "Return the handover ID when TEXT holds a handover document, else nil."
+  "Return the handover ID when TEXT is a handover document, else nil.
+TEXT is a document when its first line is the marker line.  A marker
+in a later line, for example in a quoted text, does not count."
   (and (stringp text)
-       (string-match claude-code-ide-transcript--marker-regexp text)
+       (let ((case-fold-search nil))
+         (string-match claude-code-ide-transcript--marker-regexp text))
        (match-string 1 text)))
 
 (defun claude-code-ide-transcript-document-summary-file (text)
@@ -651,18 +777,20 @@ lines of git diff --stat SINCE), :untracked (the untracked files) and
        (match-string 1 text)))
 
 (defun claude-code-ide-transcript-document-original-task (text)
-  "Return the original first prompt that the handover document TEXT holds, or nil."
+  "Return the original first prompt that the handover document TEXT holds, or nil.
+The prompt is the block quote of the \"Original task\" part.  A part
+without a block quote (the original task was not found) gives nil."
   (when (and (stringp text)
              (string-match "^### Original task.*\n\n" text))
     (let* ((start (match-end 0))
            (end (if (string-match "^#\\{2,3\\} " text start) (match-beginning 0) (length text)))
-           (lines (split-string (substring text start end) "\n")))
-      (string-trim
-       (mapconcat (lambda (line)
-                    (cond ((string-prefix-p "> " line) (substring line 2))
-                          ((string= ">" line) "")
-                          (t line)))
-                  lines "\n")))))
+           (quoted (delq nil (mapcar (lambda (line)
+                                       (cond ((string-prefix-p "> " line) (substring line 2))
+                                             ((string= ">" line) "")))
+                                     (split-string (substring text start end) "\n"))))
+           (prompt (string-trim (string-join quoted "\n"))))
+      (unless (string-empty-p prompt)
+        prompt))))
 
 ;;; Rendering
 
@@ -828,15 +956,24 @@ Return nil when not even the heading and the note fit."
    "This file is not part of the work.  Do not commit it.\n"
    "- Then reply `ready` and wait for the next prompt."))
 
-(defun claude-code-ide-transcript--leg-turns (leg root)
-  "Return the turns of LEG, read with ROOT for relative paths."
-  (let ((file (plist-get leg :transcript)))
-    (and (stringp file)
-         (claude-code-ide-transcript-read
-          file (and (memq (plist-get leg :provider)
-                          (mapcar #'car claude-code-ide-transcript-readers))
-                    (plist-get leg :provider))
-          root))))
+(defun claude-code-ide-transcript--leg-read (leg root)
+  "Return (:format FORMAT :turns TURNS :meta META) of the transcript of LEG.
+The transcript is read one time.  The format is the provider of LEG
+when it has a reader, else it comes from the file.  META is the Codex
+session metadata, or nil.  Tool paths are relative to ROOT.  A leg
+without a readable transcript gives nil."
+  (let* ((file (plist-get leg :transcript))
+         (file (and (stringp file) (file-readable-p file) file))
+         (provider (plist-get leg :provider))
+         (format (and file (if (assq provider claude-code-ide-transcript-readers)
+                               provider
+                             (claude-code-ide-transcript-format file))))
+         (reader (alist-get format claude-code-ide-transcript-readers)))
+    (cond
+     ((null reader) nil)
+     ((eq reader #'claude-code-ide-transcript-read-codex)
+      (cons :format (cons format (claude-code-ide-transcript--read-codex-full file root))))
+     (t (list :format format :turns (funcall reader file root) :meta nil)))))
 
 (defun claude-code-ide-transcript--split-bootstrap (turns)
   "Return (KEPT . DOCUMENTS) for TURNS.
@@ -865,30 +1002,43 @@ document turn."
   "Return the commit where the source LEG started, or nil.
 DATA is the leg data of the source and WORKTREE the working tree.  The
 commit is the :start-commit of LEG, else the commit of the Codex
-session metadata, else the last commit before the first turn."
+session metadata of the read, else the last commit before the first
+turn."
   (or (plist-get leg :start-commit)
-      (and (stringp (plist-get leg :transcript))
-           (eq (claude-code-ide-transcript-format (plist-get leg :transcript)) 'codex)
-           (plist-get (claude-code-ide-transcript-codex-meta (plist-get leg :transcript))
-                      :commit))
+      (plist-get (plist-get data :meta) :commit)
       (and worktree
            (when-let* ((start (plist-get (car (plist-get data :all)) :time)))
              (claude-code-ide-transcript-commit-at worktree start)))))
 
+(defun claude-code-ide-transcript--quote-cut (text limit)
+  "Return TEXT as a block quote of at most LIMIT characters, or nil.
+The length counts the \"> \" of each line.  A quote that is too long
+keeps its start, and its last line is \"> [... cut]\".  nil means that
+not even that line fits."
+  (let ((full (claude-code-ide-transcript--quote text))
+        (note "> [... cut]"))
+    (cond
+     ((<= (length full) limit) full)
+     ((< limit (length note)) nil)
+     (t
+      ;; The cut is in the quoted text, so each kept line keeps its "> ".
+      (let ((kept (string-trim-right
+                   (substring full 0 (max 0 (- limit (length note) 1)))
+                   "\n")))
+        (if (string-empty-p kept) note (concat kept "\n" note)))))))
+
 (defun claude-code-ide-transcript--render-summary (file summary budget)
   "Return the state summary part for FILE with the text SUMMARY, or nil.
-SUMMARY is nil when FILE does not exist.  The part is cut to BUDGET
-characters; nil means that not even its heading fits."
-  (let* ((heading (format "### State summary of the previous target (%s)" file))
-         (part (concat heading "\n\n" (if summary
-                                          (claude-code-ide-transcript--quote summary)
-                                        "The file does not exist."))))
-    (when (and summary (> (length part) budget))
-      (setq part (concat heading "\n\n"
-                         (claude-code-ide-transcript--quote
-                          (claude-code-ide-transcript--cut
-                           summary (- budget (length heading) 40))))))
-    (and (<= (length part) budget) part)))
+SUMMARY is nil when FILE does not exist.  The part is at most BUDGET
+characters: a long SUMMARY is cut at the end.  nil means that not even
+the heading and the cut note fit."
+  (let* ((heading (format "### State summary of the previous target (%s)\n\n" file))
+         (body (if summary
+                   (claude-code-ide-transcript--quote-cut summary (- budget (length heading)))
+                 "The file does not exist.")))
+    (and body
+         (<= (+ (length heading) (length body)) budget)
+         (concat heading body))))
 
 (cl-defun claude-code-ide-transcript-handover-document
     (&key source chain context budget handover-id target-provider summary-file time)
@@ -920,13 +1070,16 @@ and TIME (a Lisp time, nil for now)."
                            (let ((name (format claude-code-ide-transcript-summary-file-format id)))
                              (if worktree (expand-file-name name worktree) name))))
          (budget (or budget claude-code-ide-transcript-budget))
-         ;; For each leg: all its turns, the turns without the
-         ;; bootstrap, and the handover documents that it received.
+         ;; For each leg: the result of one read of its transcript, all
+         ;; its turns, the turns without the bootstrap, and the
+         ;; handover documents that it received.
          (leg-data (cl-loop for leg in legs
                             for number from 1
-                            collect (let* ((all (claude-code-ide-transcript--leg-turns leg worktree))
+                            collect (let* ((read (claude-code-ide-transcript--leg-read leg worktree))
+                                           (all (plist-get read :turns))
                                            (split (claude-code-ide-transcript--split-bootstrap all)))
                                       (list :leg leg :number number :all all
+                                            :meta (plist-get read :meta)
                                             :turns (car split) :documents (cdr split)))))
          (source-data (car (last leg-data)))
          ;; The state summary of the previous target is that of the
@@ -982,7 +1135,8 @@ and TIME (a Lisp time, nil for now)."
       (push part variable)
       (setq remaining (- remaining 2 (length part))))
     ;; Every user prompt of the chain, oldest first.  The original
-    ;; task is not repeated.
+    ;; task is not repeated.  Without an original task, the first
+    ;; listed prompt is P1.
     (let ((count (if first-prompt 1 0)))
       (when first-turn
         (puthash first-turn 1 numbers))
@@ -1001,33 +1155,37 @@ and TIME (a Lisp time, nil for now)."
                   prompt-entries)))))
     (setq prompt-entries (nreverse prompt-entries))
     (let* ((turn-heading "### Latest turns, oldest first")
-           ;; The latest turns.  A prompt that is already in the
-           ;; document is named, not repeated: P1, and the prompts with
-           ;; a number above LISTED-ABOVE.
-           (render-turns
-            (lambda (listed-above)
-              (cl-loop for data in leg-data
-                       append (mapcar
-                               (lambda (turn)
-                                 (let ((number (gethash turn numbers)))
-                                   (claude-code-ide-transcript--render-turn
-                                    turn (plist-get data :number)
-                                    (plist-get (plist-get data :leg) :provider)
-                                    (cond
-                                     ((null number) nil)
-                                     ((eq turn first-turn) "P1, the original task above")
-                                     ((> number listed-above)
-                                      (format "P%d in the list of user prompts above" number))))))
-                               (plist-get data :turns)))))
+           ;; A prompt that is already in the document is named in the
+           ;; latest turns, not repeated: P1, and the prompts with a
+           ;; number above LISTED-ABOVE.
+           (render
+            (lambda (turn data listed-above)
+              (let ((number (gethash turn numbers)))
+                (claude-code-ide-transcript--render-turn
+                 turn (plist-get data :number)
+                 (plist-get (plist-get data :leg) :provider)
+                 (cond
+                  ((null number) nil)
+                  ((eq turn first-turn) "P1, the original task above")
+                  ((> number listed-above)
+                   (format "P%d in the list of user prompts above" number)))))))
+           ;; Each turn is rendered one time, as if every prompt were in
+           ;; the list.  This also measures what the turns need.
+           (items (cl-loop for data in leg-data
+                           append (mapcar (lambda (turn)
+                                            (list turn data (funcall render turn data 0)))
+                                          (plist-get data :turns))))
+           (turns-need (+ 2 (length turn-heading)
+                          (apply #'+ (mapcar (lambda (item) (+ 2 (length (nth 2 item))))
+                                             items))))
            ;; The list of prompts gets half of the rest of the budget,
            ;; or more when the latest turns need less.
-           (turns-need (+ 2 (length turn-heading)
-                          (apply #'+ (mapcar (lambda (entry) (+ 2 (length entry)))
-                                             (funcall render-turns 0)))))
            (prompt-budget (max (/ (- remaining 2) 2) (- remaining 2 turns-need)))
            (fit (and prompt-entries
                      (claude-code-ide-transcript--fit
-                      "### User prompts of the chain, oldest first (P1 is the original task)"
+                      (if first-prompt
+                          "### User prompts of the chain, oldest first (P1 is the original task)"
+                        "### User prompts of the chain, oldest first")
                       prompt-entries prompt-budget
                       "(%d earlier prompts are left out because of the size budget.)")))
            ;; The prompts with a number above this one are in the list.
@@ -1036,7 +1194,15 @@ and TIME (a Lisp time, nil for now)."
       (when fit
         (push (car fit) variable)
         (setq remaining (- remaining 2 (length (car fit)))))
-      (let* ((entries (funcall render-turns listed-above))
+      ;; Only the turns of the prompts that the list left out are
+      ;; rendered again, with their text.
+      (let* ((entries (mapcar (lambda (item)
+                                (let ((number (gethash (car item) numbers)))
+                                  (if (and number (not (eq (car item) first-turn))
+                                           (<= number listed-above))
+                                      (funcall render (car item) (nth 1 item) listed-above)
+                                    (nth 2 item))))
+                              items))
              (fit (and entries
                        (claude-code-ide-transcript--fit
                         turn-heading entries (- remaining 2)

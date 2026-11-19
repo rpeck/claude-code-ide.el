@@ -566,6 +566,275 @@ A missing state summary file is named, and the nested document is not copied."
                             (claude-code-ide-instance-create :id "cci-test-j" :provider 'cci-test-none))
                            :transcript))))
 
+;;; Review fixes
+
+(ert-deftest claude-code-ide-test-transcript-claude-prompt-blocks ()
+  "Each text block of a CC prompt is cleaned on its own.
+A CLI block, such as a reminder or an interrupt marker, drops only
+itself; the text of the person stays."
+  (let ((record (lambda (content)
+                  `((type . "user") (message (role . "user") (content . ,content))))))
+    (should (equal (claude-code-ide-transcript--claude-prompt
+                    (funcall record '(((type . "text") (text . "<system-reminder>cci-test</system-reminder>"))
+                                      ((type . "text") (text . "cci-test-real-prompt"))
+                                      ((type . "image")))))
+                   "cci-test-real-prompt\n[image]"))
+    (should-not (claude-code-ide-transcript--claude-prompt
+                 (funcall record '(((type . "text") (text . "<system-reminder>cci-test</system-reminder>"))
+                                   ((type . "text") (text . "[Request interrupted by user]"))))))
+    (should-not (claude-code-ide-transcript--claude-prompt
+                 (funcall record "[Request interrupted by user for tool use]")))
+    (should (equal (claude-code-ide-transcript--claude-prompt (funcall record " cci-test-plain "))
+                   "cci-test-plain"))))
+
+(ert-deftest claude-code-ide-test-transcript-interrupt-markers ()
+  "The interrupt markers of the CC CLI are not prompts."
+  (should-not (claude-code-ide-transcript--claude-clean-prompt "[Request interrupted by user]"))
+  (should-not (claude-code-ide-transcript--claude-clean-prompt
+               "[Request interrupted by user for tool use]"))
+  (should (equal (claude-code-ide-transcript--claude-clean-prompt
+                  "cci-test: [Request interrupted by user] is a phrase")
+                 "cci-test: [Request interrupted by user] is a phrase")))
+
+(ert-deftest claude-code-ide-test-transcript-large-records ()
+  "A 1 MB tool result in an imported rollout and a 1 MB CC command read without error."
+  (claude-code-ide-transcript-tests--with-dir dir
+    (let ((codex (expand-file-name "cci-test-large-codex.jsonl" dir))
+          (claude (expand-file-name "cci-test-large-claude.jsonl" dir))
+          (big (make-string 1048576 ?x)))
+      (with-temp-file codex
+        (dolist (payload
+                 `(((type . "user_message") (message . "cci-test-large prompt"))
+                   ((type . "agent_message")
+                    (message . ,(concat "[external_agent_tool_call: Bash]\ncommand: cci-test\n"
+                                        "[/external_agent_tool_call]\n"
+                                        "[external_agent_tool_result]\n" big
+                                        "\n[/external_agent_tool_result]\ncci-test-after-result")))
+                   ((type . "agent_message")
+                    (message . ,(concat "[external_agent_tool_result]\n" big)))))
+          (insert (json-encode `((timestamp . "2026-11-17T10:00:00Z") (type . "event_msg")
+                                 (payload . ,payload)))
+                  "\n")))
+      (should (equal (claude-code-ide-transcript-read-codex codex)
+                     '((:role user :text "cci-test-large prompt" :tools nil
+                              :time "2026-11-17T10:00:00Z")
+                       (:role assistant :text "cci-test-after-result"
+                              :tools ("Bash: command: cci-test")
+                              :time "2026-11-17T10:00:00Z"))))
+      (with-temp-file claude
+        (insert (json-encode `((type . "user") (timestamp . "2026-11-17T10:00:00Z")
+                               (message (role . "user")
+                                        (content . ,(concat "<bash-input>" big "</bash-input>")))))
+                "\n"
+                (json-encode `((type . "user") (timestamp . "2026-11-17T10:01:00Z")
+                               (message (role . "user")
+                                        (content . ,(concat "<command-name>/cci-test</command-name>"
+                                                            "<command-args>" big
+                                                            "</command-args>")))))
+                "\n"))
+      (let ((turns (claude-code-ide-transcript-read-claude claude)))
+        (should (= (length turns) 2))
+        (should (string-prefix-p "! xxx" (plist-get (nth 0 turns) :text)))
+        (should (string-prefix-p "/cci-test xxx" (plist-get (nth 1 turns) :text)))))))
+
+(ert-deftest claude-code-ide-test-transcript-bad-record-skipped ()
+  "A record whose handling signals an error is skipped, and the read goes on."
+  (let ((real-assistant (symbol-function 'claude-code-ide-transcript--claude-assistant))
+        (real-tools (symbol-function 'claude-code-ide-transcript--codex-tools)))
+    (cl-letf (((symbol-function 'claude-code-ide-transcript--claude-assistant)
+               (lambda (record root)
+                 (if (equal (alist-get 'uuid record) "cci-test-uuid-0001-04")
+                     (error "cci-test bad record")
+                   (funcall real-assistant record root))))
+              ((symbol-function 'claude-code-ide-transcript--codex-tools)
+               (lambda (item root)
+                 (if (equal (alist-get 'type item) "CommandExecution")
+                     (error "cci-test bad item")
+                   (funcall real-tools item root)))))
+      (let ((turns (claude-code-ide-transcript-read-claude
+                    (claude-code-ide-transcript-tests--fixture "claude-leg1.jsonl")
+                    claude-code-ide-transcript-tests--root)))
+        (should (= (length turns) 5))
+        (should-not (string-search "I look at the project" (plist-get (nth 1 turns) :text))))
+      (let ((turns (claude-code-ide-transcript-read-codex
+                    (claude-code-ide-transcript-tests--fixture "codex-leg2.jsonl")
+                    claude-code-ide-transcript-tests--root)))
+        (should (equal (plist-get (nth 3 turns) :tools)
+                       '("apply_patch: update stats.py" "mcp: emacs-tools/getDiagnostics")))))))
+
+(ert-deftest claude-code-ide-test-transcript-summary-cut ()
+  "A long state summary is cut at the end, with the \"> \" of each line counted."
+  (let* ((summary (mapconcat (lambda (i) (format "cci-test-line-%02d" i)) (number-sequence 1 50) "\n"))
+         (heading "### State summary of the previous target (cci-test.md)\n\n")
+         (full (claude-code-ide-transcript--render-summary "cci-test.md" summary 100000)))
+    (should (equal full (concat heading (claude-code-ide-transcript--quote summary))))
+    ;; The exact size fits; one character less cuts.
+    (should (equal (claude-code-ide-transcript--render-summary "cci-test.md" summary (length full))
+                   full))
+    (let ((cut (claude-code-ide-transcript--render-summary "cci-test.md" summary (1- (length full)))))
+      (should (<= (length cut) (1- (length full))))
+      (should (string-suffix-p "\n> [... cut]" cut)))
+    (dolist (budget '(120 200 333 500))
+      (let ((cut (claude-code-ide-transcript--render-summary "cci-test.md" summary budget)))
+        (should cut)
+        (should (<= (length cut) budget))
+        (should (string-prefix-p (concat heading "> cci-test-line-01") cut))
+        (should (string-suffix-p "> [... cut]" cut))
+        (dolist (line (cdr (split-string cut "\n\n")))
+          (dolist (quoted (split-string line "\n"))
+            (should (string-prefix-p ">" quoted))))))
+    ;; Not even the note fits.
+    (should-not (claude-code-ide-transcript--render-summary "cci-test.md" summary 60))
+    (should (equal (claude-code-ide-transcript--render-summary "cci-test.md" nil 100)
+                   (concat heading "The file does not exist.")))))
+
+(ert-deftest claude-code-ide-test-transcript-long-summary-in-document ()
+  "In a document, a long state summary is cut, not dropped."
+  (claude-code-ide-transcript-tests--with-dir dir
+    (claude-code-ide-transcript-tests--write
+     (expand-file-name ".handover/cci-test-h2-state.md" dir)
+     (mapconcat (lambda (i) (format "cci-test-summary-line-%03d" i)) (number-sequence 1 400) "\n"))
+    (let ((doc (claude-code-ide-transcript-handover-document
+                :source (list :provider 'claude :worktree dir
+                              :transcript (claude-code-ide-transcript-tests--fixture
+                                           "claude-leg3.jsonl"))
+                :handover-id "cci-test-h6" :budget 8000)))
+      (should (<= (length doc) 8000))
+      (should (string-search "> cci-test-summary-line-001" doc))
+      (should (string-search "> [... cut]" doc))
+      (should-not (string-search "cci-test-summary-line-400" doc)))))
+
+(ert-deftest claude-code-ide-test-transcript-relative-text-boundaries ()
+  "ROOT is removed only as a whole path, with case."
+  (let ((root "/a/proj"))
+    (should (equal (claude-code-ide-transcript--relative-text "cat /a/proj/x.el" root) "cat x.el"))
+    (should (equal (claude-code-ide-transcript--relative-text "ls /a/proj" root) "ls ."))
+    (should (equal (claude-code-ide-transcript--relative-text "ls /a/proj /a/proj/y" root) "ls . y"))
+    (should (equal (claude-code-ide-transcript--relative-text "cd \"/a/proj\"; ls" root) "cd \".\"; ls"))
+    (dolist (text '("ls /a/proj-other" "ls /a/proj.bak" "ls /b/a/proj/x" "ls /a/projx"
+                    "ls /A/PROJ/x" "ls x/a/proj"))
+      (should (equal (claude-code-ide-transcript--relative-text text root) text)))
+    (let ((case-fold-search t))
+      (should (equal (claude-code-ide-transcript--relative-text "ls /A/PROJ/x" root) "ls /A/PROJ/x")))
+    (should (equal (claude-code-ide-transcript--relative-text "ls /a/proj/x" "/a/proj/") "ls x"))))
+
+(ert-deftest claude-code-ide-test-transcript-marker-first-line ()
+  "The handover marker counts only on the first line of a prompt."
+  (should (equal (claude-code-ide-transcript-document-id
+                  "<!-- claude-code-ide-handover-document id=cci-test-a -->\n# Handover document")
+                 "cci-test-a"))
+  (should (equal (claude-code-ide-transcript-document-id
+                  "\n  <!-- claude-code-ide-handover-document id=cci-test-b -->\nx")
+                 "cci-test-b"))
+  (should-not (claude-code-ide-transcript-document-id
+               "cci-test: look at this\n<!-- claude-code-ide-handover-document id=cci-test-c -->"))
+  (should-not (claude-code-ide-transcript-document-id
+               "cci-test <!-- claude-code-ide-handover-document id=cci-test-d -->"))
+  ;; A prompt that quotes a marker later is a normal prompt.
+  (let* ((quoting (list :role 'user :time nil :tools nil
+                        :text "cci-test-quote\n<!-- claude-code-ide-handover-document id=cci-test-e -->"))
+         (split (claude-code-ide-transcript--split-bootstrap
+                 (list quoting (list :role 'assistant :text "cci-test-reply" :tools nil :time nil)))))
+    (should (= (length (car split)) 2))
+    (should-not (cdr split))))
+
+(ert-deftest claude-code-ide-test-transcript-codex-resumed-import ()
+  "An imported rollout that was resumed keeps its imported history.
+The events before the first item_completed record give the history;
+after it, the items give the turns, and the repeated events are not used."
+  (claude-code-ide-transcript-tests--with-dir dir
+    (let ((file (expand-file-name "cci-test-resumed.jsonl" dir))
+          (event (lambda (minute payload)
+                   (json-encode `((timestamp . ,(format "2026-11-17T10:%02d:00Z" minute))
+                                  (type . "event_msg") (payload . ,payload)))))
+          (item (lambda (minute item)
+                  (json-encode `((timestamp . ,(format "2026-11-17T10:%02d:00Z" minute))
+                                 (type . "event_msg")
+                                 (payload (type . "item_completed") (item . ,item)))))))
+      ;; With and without a task_started record before the resume.
+      (dolist (task '(nil t))
+        (with-temp-file file
+          (insert (json-encode '((type . "session_meta")
+                                 (payload (id . "cci-test-resumed") (history_mode . "legacy"))))
+                  "\n"
+                  (funcall event 1 '((type . "user_message") (message . "cci-test-imported prompt"))) "\n"
+                  (funcall event 2 '((type . "agent_message") (message . "cci-test-imported reply"))) "\n"
+                  (if task (concat (funcall event 3 '((type . "task_started") (turn_id . "cci-test"))) "\n") "")
+                  ;; The resume: an event and its item for each new message.
+                  (funcall event 3 '((type . "user_message") (message . "cci-test-new prompt"))) "\n"
+                  (funcall item 3 '((type . "UserMessage")
+                                    (content . [((type . "text") (text . "cci-test-new prompt"))]))) "\n"
+                  (funcall event 4 '((type . "agent_message") (message . "cci-test-new reply"))) "\n"
+                  (funcall item 4 '((type . "AgentMessage")
+                                    (content . [((type . "Text") (text . "cci-test-new reply"))]))) "\n"))
+        (should (equal (mapcar (lambda (turn) (list (plist-get turn :role) (plist-get turn :text)))
+                               (claude-code-ide-transcript-read-codex file))
+                       '((user "cci-test-imported prompt") (assistant "cci-test-imported reply")
+                         (user "cci-test-new prompt") (assistant "cci-test-new reply"))))))))
+
+(ert-deftest claude-code-ide-test-transcript-original-task-not-found ()
+  "A document without an original task gives nil, and the next document says so.
+The first listed prompt is then P1."
+  (should-not (claude-code-ide-transcript-document-original-task
+               (concat "<!-- claude-code-ide-handover-document id=cci-test-n -->\n"
+                       "### Original task (the first user prompt of the chain; it can be out of date)\n\n"
+                       "Not found in the transcripts.\n\n## Not carried over\n")))
+  (claude-code-ide-transcript-tests--with-dir dir
+    (let ((file (expand-file-name "cci-test-no-task.jsonl" dir)))
+      (with-temp-file file
+        (insert (json-encode
+                 `((type . "user") (timestamp . "2026-11-17T10:00:00Z")
+                   (message (role . "user")
+                            (content . ,(concat "<!-- claude-code-ide-handover-document id=cci-test-n -->\n"
+                                                "### Original task (x)\n\nNot found in the transcripts.\n")))))
+                "\n"
+                (json-encode '((type . "user") (timestamp . "2026-11-17T10:01:00Z")
+                               (message (role . "user") (content . "cci-test-next prompt"))))
+                "\n"))
+      (let ((doc (claude-code-ide-transcript-handover-document
+                  :source (list :provider 'claude :transcript file :worktree dir)
+                  :handover-id "cci-test-h7")))
+        (should (string-search "it can be out of date)\n\nNot found in the transcripts." doc))
+        (should (string-search "### User prompts of the chain, oldest first\n" doc))
+        (should-not (string-search "(P1 is the original task)" doc))
+        (should (string-search "- P1: User, leg 1 (claude)" doc))
+        (should (string-search "(P1 in the list of user prompts above.)" doc))
+        (should-not (string-search "the original task above" doc))))))
+
+(ert-deftest claude-code-ide-test-transcript-read-once ()
+  "Each transcript is read one time, and each turn is rendered one time.
+The Codex start commit comes from the same read."
+  (let ((reads nil) (renders 0) (metas 0)
+        (real-map (symbol-function 'claude-code-ide-transcript--map-records))
+        (real-render (symbol-function 'claude-code-ide-transcript--render-turn)))
+    (cl-letf (((symbol-function 'claude-code-ide-transcript--map-records)
+               (lambda (file &rest args)
+                 (push file reads)
+                 (apply real-map file args)))
+              ((symbol-function 'claude-code-ide-transcript--render-turn)
+               (lambda (&rest args)
+                 (setq renders (1+ renders))
+                 (apply real-render args)))
+              ((symbol-function 'claude-code-ide-transcript-codex-meta)
+               (lambda (&rest _) (setq metas (1+ metas)) nil))
+              ((symbol-function 'claude-code-ide-transcript-workspace-state)
+               (lambda (dir since) (list :worktree dir :git nil :cci-test-since since))))
+      (let* ((claude (claude-code-ide-transcript-tests--fixture "claude-leg1.jsonl"))
+             (codex (claude-code-ide-transcript-tests--fixture "codex-leg2.jsonl"))
+             (since nil))
+        (cl-letf* ((real-state (symbol-function 'claude-code-ide-transcript-workspace-state))
+                   ((symbol-function 'claude-code-ide-transcript-workspace-state)
+                    (lambda (dir commit) (setq since commit) (funcall real-state dir commit))))
+          (claude-code-ide-transcript-handover-document
+           :source (list :provider 'codex :transcript codex :worktree "/cci-test/none")
+           :chain (list (list :provider 'claude :transcript claude))
+           :handover-id "cci-test-h8"))
+        (should (equal (sort reads #'string<) (sort (list claude codex) #'string<)))
+        (should (= metas 0))
+        (should (equal since "0123456789abcdef0123456789abcdef01234567"))
+        ;; 5 turns of leg 1 and 2 of leg 2 (its bootstrap is left out).
+        (should (= renders 7))))))
+
 (provide 'claude-code-ide-transcript-tests)
 
 ;;; claude-code-ide-transcript-tests.el ends here
