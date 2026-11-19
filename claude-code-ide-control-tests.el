@@ -71,6 +71,7 @@ are those of the test."
           (claude-code-ide-control-ack-timeout 60)
           (claude-code-ide-control--timer nil)
           (claude-code-ide-control--scheduled nil)
+          (claude-code-ide-control--index (make-hash-table :test 'equal))
           (claude-code-ide-control--warned-providers nil)
           (claude-code-ide-control-delivered-functions nil)
           (claude-code-ide-instance--all nil)
@@ -287,9 +288,11 @@ The two instances have the same display name."
     (claude-code-ide-control-submit "cci-test-a" "cci-test-two" :request-id "k2")
     ;; Clear the memory, and load the file again
     (setq claude-code-ide-control--scheduled nil
-          claude-code-ide-control--timer nil)
+          claude-code-ide-control--timer nil
+          claude-code-ide-control--index (make-hash-table :test 'equal))
     (load (locate-library "claude-code-ide-control") nil t)
-    (let ((records (claude-code-ide-control--records "cci-test-a")))
+    (should (= (hash-table-count claude-code-ide-control--index) 0))
+    (let ((records (claude-code-ide-control--pending-records "cci-test-a")))
       (should (equal (mapcar #'claude-code-ide-control--record-request-id records) '("k1" "k2")))
       (should (equal (mapcar #'claude-code-ide-control--record-text records)
                      '("cci-test-one" "cci-test-two")))
@@ -385,13 +388,36 @@ The two instances have the same display name."
       (should (equal (claude-code-ide-control-deliver-pending "cci-test-a") "a2")))
     (should (equal (car claude-code-ide-tests--control-sent) '("cci-test-a" "cci-test-next")))
     (let ((status (claude-code-ide-control-request-status "cci-test-a" "a1")))
-      (should (eq (plist-get status :result) 'queued))
-      (should (eq (plist-get status :reason) 'unacknowledged)))
-    ;; Never sent again; a late acknowledgement still counts
+      (should (eq (plist-get status :result) 'unacknowledged))
+      (should (eq (plist-get status :reason) 'no-acknowledgement)))
+    ;; Final: in the done folder, never sent again, and a late
+    ;; acknowledgement changes nothing
+    (should (file-exists-p (claude-code-ide-control--record-file "cci-test-a" "a1" t)))
+    (should-not (file-exists-p (claude-code-ide-control--record-file "cci-test-a" "a1")))
     (should (= (length claude-code-ide-tests--control-sent) 2))
     (claude-code-ide-tests--control-event "cci-test-a" 'prompt-submit '((prompt . "cci-test-lost")))
     (should (eq (plist-get (claude-code-ide-control-request-status "cci-test-a" "a1") :result)
-                'delivered))))
+                'unacknowledged))
+    (should (eq (plist-get (claude-code-ide-control-submit "cci-test-a" "cci-test-lost"
+                                                           :request-id "a1")
+                           :result)
+                'unacknowledged))
+    (should (= (length claude-code-ide-tests--control-sent) 2))))
+
+(ert-deftest claude-code-ide-test-control-older-generation-expires ()
+  "A prompt sent to an earlier launch is unacknowledged at once."
+  (claude-code-ide-tests--with-control
+    (claude-code-ide-tests--control-add "cci-test-a" "proj" 'idle)
+    (claude-code-ide-control-submit "cci-test-a" "cci-test-gen1" :request-id "g1")
+    (claude-code-ide-control-submit "cci-test-a" "cci-test-gen2" :request-id "g2")
+    ;; The instance runs again as generation 2; the events of 1 are dropped
+    (claude-code-ide-instance-unregister "cci-test-a")
+    (claude-code-ide-tests--control-add "cci-test-a" "proj" 'idle)
+    (should (= (claude-code-ide-instance-current-generation "cci-test-a") 2))
+    (claude-code-ide-tests--control-event "cci-test-a" 'session-start)
+    (should (eq (plist-get (claude-code-ide-control-request-status "cci-test-a" "g1") :result)
+                'unacknowledged))
+    (should (equal (car claude-code-ide-tests--control-sent) '("cci-test-a" "cci-test-gen2")))))
 
 (ert-deftest claude-code-ide-test-control-no-prompt-text ()
   "A prompt-submit event without prompt text gives a warning and no delivery."
@@ -420,8 +446,9 @@ The two instances have the same display name."
     (should (equal (claude-code-ide-control-deliver-pending "cci-test-a") "e1"))
     ;; A provider without submit-prompt rejects at once
     (setf (claude-code-ide-provider-submit-prompt (claude-code-ide-get-provider 'cci-test-stub)) nil)
-    (should (eq (plist-get (claude-code-ide-control-submit "cci-test-a" "y" :request-id "e2") :reason)
-                'submit-prompt-unavailable))))
+    (should (equal (claude-code-ide-control-submit "cci-test-a" "y" :request-id "e2")
+                   '(:destination "cci-test-a" :request-id "e2" :result rejected
+                                  :reason no-submit :sent-at nil)))))
 
 ;;; Inbox place and retry timer
 
@@ -461,6 +488,168 @@ The two instances have the same display name."
         (claude-code-ide-tests--control-event "cci-test-a" 'prompt-submit '((prompt . "cci-test-wait2")))
         (claude-code-ide-control--tick)
         (should-not claude-code-ide-control--timer)))))
+
+;;; Review fixes
+
+(ert-deftest claude-code-ide-test-control-line-ends ()
+  "CR and CR LF become LF before the send, not only before the hash."
+  (claude-code-ide-tests--with-control
+    (claude-code-ide-tests--control-add "cci-test-a" "proj" 'idle)
+    (claude-code-ide-control-submit "cci-test-a" "Fix A\r\nthen B\rthen C" :request-id "l1")
+    (should (equal claude-code-ide-tests--control-sent
+                   '(("cci-test-a" "Fix A\nthen B\nthen C"))))
+    (claude-code-ide-tests--control-event "cci-test-a" 'prompt-submit
+                                          '((prompt . "Fix A\nthen B\nthen C")))
+    (should (eq (plist-get (claude-code-ide-control-request-status "cci-test-a" "l1") :result)
+                'delivered))))
+
+(ert-deftest claude-code-ide-test-control-done-folder ()
+  "Final records move to done at once, and old ones there are deleted."
+  (claude-code-ide-tests--with-control
+    (claude-code-ide-tests--control-add "cci-test-a" "proj" 'waiting-for-user 'question)
+    (claude-code-ide-control-submit "cci-test-a" "cci-test-r" :request-id "x1" :queue nil)
+    (claude-code-ide-control-submit "cci-test-a" "cci-test-q" :request-id "x2")
+    (let ((done (claude-code-ide-control--done-directory "cci-test-a")))
+      (should (equal (claude-code-ide-tests--control-files "cci-test-a")
+                     (sort (list "done" (claude-code-ide-control--file-name "x2")) #'string<)))
+      (should (equal (directory-files done nil "\\.json\\'")
+                     (list (claude-code-ide-control--file-name "x1"))))
+      ;; A final record older than the limit goes at the next move
+      (set-file-times (claude-code-ide-control--record-file "cci-test-a" "x1" t)
+                      (time-subtract nil (* 8 86400)))
+      (claude-code-ide-tests--control-set-state "cci-test-a" 'idle)
+      (claude-code-ide-control-deliver-pending "cci-test-a")
+      (claude-code-ide-tests--control-event "cci-test-a" 'prompt-submit '((prompt . "cci-test-q")))
+      (should (equal (directory-files done nil "\\.json\\'")
+                     (list (claude-code-ide-control--file-name "x2"))))
+      (should (equal (claude-code-ide-tests--control-files "cci-test-a") '("done")))
+      ;; The duplicate of a final record is found in done
+      (claude-code-ide-control-submit "cci-test-a" "cci-test-q" :request-id "x2")
+      (should (= (length claude-code-ide-tests--control-sent) 1))
+      ;; An interrupted move: the pending copy of a final record is dropped
+      (copy-file (claude-code-ide-control--record-file "cci-test-a" "x2" t)
+                 (claude-code-ide-control--record-file "cci-test-a" "x2"))
+      (clrhash claude-code-ide-control--index)
+      (should-not (claude-code-ide-control--pending-records "cci-test-a"))
+      (should-not (file-exists-p (claude-code-ide-control--record-file "cci-test-a" "x2"))))))
+
+(ert-deftest claude-code-ide-test-control-index-reads-no-files ()
+  "Events and submits use the index; only the first use reads the folder."
+  (claude-code-ide-tests--with-control
+    (claude-code-ide-tests--control-add "cci-test-a" "proj" 'working)
+    (claude-code-ide-control-submit "cci-test-a" "cci-test-1" :request-id "i1")
+    (clrhash claude-code-ide-control--index)
+    (let ((reads 0)
+          (read-record (symbol-function 'claude-code-ide-control--read-record)))
+      (cl-letf (((symbol-function 'claude-code-ide-control--read-record)
+                 (lambda (file) (cl-incf reads) (funcall read-record file))))
+        (claude-code-ide-tests--control-event "cci-test-a" 'tool-end)
+        (should (= reads 1))
+        (dotimes (_ 5) (claude-code-ide-tests--control-event "cci-test-a" 'tool-end))
+        (claude-code-ide-control-submit "cci-test-a" "cci-test-2" :request-id "i2")
+        (should (= reads 1))
+        (should (equal (mapcar #'claude-code-ide-control--record-request-id
+                               (claude-code-ide-control--pending-records "cci-test-a"))
+                       '("i1" "i2")))))))
+
+(ert-deftest claude-code-ide-test-control-reader-without-native-json ()
+  "The inbox reads its files also when Emacs has no native JSON parser."
+  (claude-code-ide-tests--with-control
+    (claude-code-ide-tests--control-add "cci-test-a" "proj" 'idle)
+    (claude-code-ide-control-submit "cci-test-a" "cci-test-once" :request-id "j1")
+    (claude-code-ide-control-submit "cci-test-a" "cci-test-wait" :request-id "j2")
+    (clrhash claude-code-ide-control--index)
+    (cl-letf (((symbol-function 'json-available-p) #'ignore)
+              ((symbol-function 'json-parse-string)
+               (lambda (&rest _) (error "No native JSON"))))
+      (let ((records (claude-code-ide-control--pending-records "cci-test-a")))
+        (should (equal (mapcar #'claude-code-ide-control--record-request-id records) '("j1" "j2")))
+        (should (eq (claude-code-ide-control--record-sent-guess (car records)) nil))
+        (should (stringp (claude-code-ide-control--record-sent-at (car records)))))
+      (should (plist-get (claude-code-ide-control-submit "cci-test-a" "cci-test-once"
+                                                         :request-id "j1")
+                         :duplicate))
+      (should (= (length claude-code-ide-tests--control-sent) 1)))))
+
+(ert-deftest claude-code-ide-test-control-guess-and-request-ids ()
+  "A guessed idle state sends and is recorded; number request IDs work."
+  (claude-code-ide-tests--with-control
+    (claude-code-ide-tests--control-add "cci-test-a" "proj")
+    (setf (alist-get "cci-test-a" claude-code-ide-tests--control-states nil nil #'equal)
+          (claude-code-ide-instance-make-state 'idle nil (float-time) t))
+    (let ((result (claude-code-ide-control-submit "cci-test-a" "cci-test-g" :request-id 42)))
+      (should (equal (plist-get result :request-id) "42")))
+    (should (claude-code-ide-control--record-sent-guess
+             (claude-code-ide-control--find-record "cci-test-a" "42")))
+    (should (equal (plist-get (claude-code-ide-control-request-status "cci-test-a" 42) :request-id)
+                   "42"))
+    (should (eq (plist-get (claude-code-ide-control-request-status "cci-test-a" 'bad) :reason)
+                'unknown-request))))
+
+(ert-deftest claude-code-ide-test-control-no-submit-is-final ()
+  "Queued prompts of a provider without submit-prompt become final."
+  (claude-code-ide-tests--with-control
+    (let ((claude-code-ide-control-retry-interval 5))
+      (cl-letf (((symbol-function 'run-with-timer) (lambda (&rest _) (timer-create)))
+                ((symbol-function 'cancel-timer) #'ignore))
+        (claude-code-ide-tests--control-add "cci-test-a" "proj" 'working)
+        (claude-code-ide-control-submit "cci-test-a" "cci-test-n" :request-id "s1")
+        (should (timerp claude-code-ide-control--timer))
+        (setf (claude-code-ide-provider-submit-prompt (claude-code-ide-get-provider 'cci-test-stub))
+              nil)
+        (claude-code-ide-tests--control-set-state "cci-test-a" 'idle)
+        (claude-code-ide-control--tick)
+        (let ((status (claude-code-ide-control-request-status "cci-test-a" "s1")))
+          (should (eq (plist-get status :result) 'rejected))
+          (should (eq (plist-get status :reason) 'no-submit)))
+        (should-not claude-code-ide-control--timer)))))
+
+(ert-deftest claude-code-ide-test-control-unacknowledged-stops-timer ()
+  "The timer stops when the last sent prompt becomes unacknowledged."
+  (claude-code-ide-tests--with-control
+    (let ((claude-code-ide-control-retry-interval 5))
+      (cl-letf (((symbol-function 'run-with-timer) (lambda (&rest _) (timer-create)))
+                ((symbol-function 'cancel-timer) #'ignore))
+        (claude-code-ide-tests--control-add "cci-test-a" "proj" 'working)
+        (claude-code-ide-control-submit "cci-test-a" "cci-test-u" :request-id "u1")
+        (claude-code-ide-tests--control-set-state "cci-test-a" 'idle)
+        (claude-code-ide-control--tick)
+        (should (= (length claude-code-ide-tests--control-sent) 1))
+        (should (timerp claude-code-ide-control--timer))
+        (let ((claude-code-ide-control-ack-timeout -1))
+          (claude-code-ide-control--tick))
+        (should (eq (plist-get (claude-code-ide-control-request-status "cci-test-a" "u1") :result)
+                    'unacknowledged))
+        (should-not claude-code-ide-control--timer)))))
+
+(ert-deftest claude-code-ide-test-control-resume-dead-descriptor ()
+  "A descriptor whose terminal is gone does not block a resume."
+  (claude-code-ide-tests--with-control
+    (let ((dir (make-temp-file "cci-test-proj-" t))
+          (started nil))
+      (unwind-protect
+          (progn
+            (claude-code-ide-tests--control-add "cci-test-a" "proj" 'idle)
+            (kill-buffer (claude-code-ide-instance-buffer (claude-code-ide-instance-by-id "cci-test-a")))
+            (cl-letf (((symbol-function 'claude-code-ide--start-session)
+                       (lambda (_c _r spec) (setq started spec))))
+              (claude-code-ide-control-resume "cci-test-a" :directory dir :native-id "cci-test-n"))
+            (should (equal (claude-code-ide-start-spec-instance-id started) "cci-test-a")))
+        (delete-directory dir t)))))
+
+(ert-deftest claude-code-ide-test-control-make-tool-keeps-scope ()
+  "The :scope workaround changes nothing when make-tool keeps the key."
+  (let ((claude-code-ide-mcp-server-tools nil))
+    (cl-letf (((symbol-function 'claude-code-ide-make-tool)
+               (lambda (&rest slots)
+                 (let ((tool (copy-sequence slots)))
+                   (push tool claude-code-ide-mcp-server-tools)
+                   tool))))
+      (let ((tool (claude-code-ide-control--make-tool
+                   '(:name "cci-test-tool" :function ignore :description "x"))))
+        (should (eq (plist-get tool :scope) 'coordinator))
+        ;; One :scope only: the workaround did not add a second one
+        (should (= (cl-count :scope tool) 1))))))
 
 ;;; Launch, resume and the Phase 3 operations
 
@@ -596,7 +785,7 @@ The two instances have the same display name."
                                       :null-object nil :false-object nil)))
       (should (equal (alist-get 'capabilities inspect) '("submit-prompt" "stop")))
       (should (equal (mapcar (lambda (r) (alist-get 'request_id r)) (alist-get 'inbox inspect))
-                     '("m1" "m2")))
+                     '("m2")))
       (should-not (alist-get 'text (car (alist-get 'inbox inspect)))))
     (should (string-match-p "\"result\":\"stopped\""
                             (claude-code-ide-control--mcp-stop "cci-test-a")))))
