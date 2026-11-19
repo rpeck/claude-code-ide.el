@@ -263,6 +263,7 @@ The report directory stays `<version 1 name without extension>-reports`, so both
       "process_start_time": 1794201164.0,
       "emacs_start_time": 1794190002.0,
       "failure": null,
+      "failure_count": 0,
       "failed_at": null
     }
   ]
@@ -283,6 +284,7 @@ These fields are new or have a new name in version 2:
 | `process_start_time` | `process-start-time` | The start time of that process, as seconds since the epoch (a float), or null. |
 | `emacs_start_time` | `emacs-start-time` | The start time of the Emacs process `emacs_pid`, or null. |
 | `failure` | `failure` | Why the last restore or reopen failed, or null. |
+| `failure_count` | `failure-count` | The restores or reopens that failed in a row since the last start that worked. |
 | `failed_at` | `failed-at` | When it failed, or null. |
 
 The fields from `worktree` to `failed_at` came after the first version 2 release. A record without them reads as before, with null values. A value of a wrong type also reads as null. The version number stays 2, because an older version 2 reader ignores the new fields.
@@ -300,15 +302,15 @@ The other fields keep their version 1 meaning:
 | `pending` | Emacs starts the instance, or the instance runs and its native ID is not known yet. | Yes, when the Emacs that owns it ended. Without a native ID, the restore starts nothing and shows it as unknown. |
 | `open` | The instance runs, or it ran when its Emacs crashed. | Yes, when the Emacs that owns it ended. |
 | `closed` | The instance ended, or Emacs exited normally. | Only the records that the last Emacs closed at its exit (`closed_by` = `emacs-exit`). |
-| `failed` | The last restore or reopen failed. `failure` says why. | Yes: the next restore tries it again. |
+| `failed` | The last restore or reopen failed. `failure` says why. | Yes, until it failed `claude-code-ide-session-registry-restore-attempts` (3) times in a row. Then only a reopen by hand starts it. |
 | `archived` | The instance is done. | Never. |
 
 The transitions:
 
 1. **Before the spawn**, a start saves the provisional record with the state `pending`. A crash during the start therefore leaves a record.
 2. **After the spawn**, the record becomes `open` when the native ID is known. A Codex record of a new conversation stays `pending` (see below).
-3. **The SessionStart report** gives the native ID. A `pending` record becomes `open`.
-4. **The end** of the CLI makes the record `closed`. A normal exit of Emacs closes the records of its running instances with `emacs-exit`.
+3. **The SessionStart report** gives the native ID. A `pending` record becomes `open`. This holds for the Codex event and for the Claude Code report file (a start with `-c` or the picker `-r`).
+4. **The end** of the CLI makes the record `closed`, also a `pending` one. A normal exit of Emacs closes the records of its running instances with `emacs-exit`. So a session that ended never comes back at a restore. A `pending` record without a native ID that the last Emacs closed at its exit shows as unknown at the next restore, and stays until you archive or forget it.
 5. **A failed start** removes the provisional record of a new instance. A restore or a reopen that fails makes its record `failed`, with the reason.
 
 ### Provisional records
@@ -320,7 +322,9 @@ The transitions:
 - **A new instance whose start fails** loses its record:
   - The end functions of a start that fails after the terminal exists remove it.
   - A start that fails before the terminal exists runs no end functions. A timer checks the provisional records every 5 seconds. It removes a record whose MCP session is gone and whose start was never recorded.
-- **A known record whose start fails** (a restore or a reopen) becomes `failed`. Its native ID and names stay.
+- **A known record whose start fails** (a restore or a reopen) becomes `failed`. Its native ID and names stay. One failed start counts one time: when `claude-code-ide-session-registry--start-entry` runs the start, it records the failure with the error, and the end functions and the check do not record it again.
+- **The kind of the record** (`new` or `reopen`) is decided before the change is queued, from the file and the changes in the queue. A busy lock does not change it.
+- **The tables** of started and pending sessions hold their sessions strongly. The start, the end, or the check removes them.
 
 ### Codex records
 
@@ -354,14 +358,16 @@ Each record restores alone:
 - **The flags of each provider** come from `claude-code-ide-session-registry-restore-flags-functions`, an alist of a provider name and a function of the record. A provider without an entry gets no flags. The provider struct has no slot for restore flags, so the registry keeps this table.
 - **The start spec** has the record's `instance_id`, `provider`, `generation` as `last-generation`, `role`, `project_dir`, and `instance_name`. So the instance keeps its instance ID, its name, its buffer name, and its worktree, and gets the next generation.
 - **Each start runs from its own timer.** An error or a quit in one start does not stop the others.
+- **Each timer reads its record again.** A record that runs now, or that is no longer restorable (for example, you closed or archived it after the plan), is skipped. An instance whose ID runs already in this Emacs is skipped too. A skip is not a failure, and the record does not change.
 - **A failure marks only its own record `failed`**, with the reason:
   - The provider CLI is missing (for example "Codex CLI not available").
   - The directory is missing.
   - The start signals an error.
-  - The CLI exits with an error within `claude-code-ide-session-registry-restore-grace` seconds (default 20) of its start, for example for a conversation ID that the CLI does not know. The reason gives the exit code.
-- **A failed record restores again** at the next restore. The Emacs that marks it owns it, so another running Emacs leaves it alone.
+  - The CLI exits with an error within `claude-code-ide-session-registry-restore-grace` seconds (default 60) of its start, for example for a conversation ID that the CLI does not know. The reason gives the exit code.
+- **A failed record restores again** at the next restore, up to `claude-code-ide-session-registry-restore-attempts` (default 3) failures in a row. Then it stays `failed` and a restore no longer tries it. `claude-code-ide-reopen-session` still starts it by hand. A start that works sets `failure_count` to 0. The Emacs that marks a record owns it, so another running Emacs leaves it alone.
 - **Refusals are not failures.** A record without a native ID, or whose owner process still runs, is refused and does not change.
-- **The message** names the number of started sessions, each failure with its reason, and each unknown record.
+- **The message** names the number of started sessions, each failure with its reason, each skipped record, and each unknown record.
+- **The restore context** reads the live sessions of this Emacs, the running Claude Code CLIs, and each process ID one time for all records.
 
 `claude-code-ide-reopen-session` starts one record in the same way, with the same failure handling.
 
@@ -393,6 +399,6 @@ The cost of two files:
 
 - The entry key is the instance ID.
 - A new Claude Code conversation gets a new UUID as its `--session-id`. The record stores it as `native_id`. It is never the instance ID, so a new conversation of an existing instance never reuses a native ID.
-- A fork gets no `--session-id`, and its record has no native ID until the report.
+- A fork gets no `--session-id`, and its record has no native ID until the report. The record never takes the native ID of the parent conversation, also when it had that ID before. The start spec's `fork` slot tells a fork; the CLI flag (`--fork-session`) is in the launch arguments, not in the stored flags.
 - A start records the provider, the generation, the role, the worktree, and the process of the descriptor.
 - The list buffer (`M-x claude-code-ide-list-session-registry`) shows the provider of each record. The state is `live` for a record that runs in this Emacs, and `unknown` for a record without a native ID. For a `failed` record, the Title column shows the reason.
