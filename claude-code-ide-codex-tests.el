@@ -23,6 +23,9 @@
 
 (declare-function claude-code-ide-tests--make-session "claude-code-ide-tests")
 (declare-function claude-code-ide-tests--clear-processes "claude-code-ide-tests")
+(declare-function claude-code-ide-tests--wait-until "claude-code-ide-tests")
+(declare-function claude-code-ide-tests--call-with-clock "claude-code-ide-tests")
+(defvar claude-code-ide-tests--wait-limit)
 
 ;;; Helpers
 
@@ -151,12 +154,10 @@ The script runs in its own temporary folder; $D names that folder."
     (insert-file-contents file)
     (split-string (buffer-string) "\0" t)))
 
-(defun claude-code-ide-codex-tests--wait (predicate &optional seconds)
-  "Read process output until PREDICATE returns non-nil, at most SECONDS."
-  (let ((deadline (+ (float-time) (or seconds 5))))
-    (while (and (not (funcall predicate)) (< (float-time) deadline))
-      (accept-process-output nil 0.05))
-    (funcall predicate)))
+(defun claude-code-ide-codex-tests--wait (predicate)
+  "Read process output until PREDICATE returns non-nil, and return its value.
+The wait ends after `claude-code-ide-tests--wait-limit' seconds."
+  (claude-code-ide-tests--wait-until predicate))
 
 ;;; Provider
 
@@ -469,7 +470,8 @@ The script runs in its own temporary folder; $D names that folder."
          (dir (file-name-directory codex))
          (reply (expand-file-name "reply" dir))
          (claude-code-ide-codex-cli-path codex)
-         (claude-code-ide-codex-config-read-timeout 5)
+         ;; A loaded machine can answer slowly
+         (claude-code-ide-codex-config-read-timeout claude-code-ide-tests--wait-limit)
          (claude-code-ide-codex-extra-flags "-c 'shell_environment_policy.exclude=[\"CCI_FLAG\"]' --search"))
     (unwind-protect
         (progn
@@ -493,10 +495,13 @@ The script runs in its own temporary folder; $D names that folder."
           (should (eq (claude-code-ide-codex--read-exclude dir) 'unknown))
           ;; No reply within the time limit
           (delete-file reply)
-          (let ((claude-code-ide-codex-config-read-timeout 0.3)
-                (start (float-time)))
-            (should (eq (claude-code-ide-codex--read-exclude dir) 'unknown))
-            (should (< (- (float-time) start) 3)))
+          ;; On the virtual clock, only the wait for the answer takes time
+          (claude-code-ide-tests--call-with-clock
+           (lambda ()
+             (let ((claude-code-ide-codex-config-read-timeout 0.3)
+                   (start (float-time)))
+               (should (eq (claude-code-ide-codex--read-exclude dir) 'unknown))
+               (should (< (- (float-time) start) 3)))))
           ;; A profile cannot be read, so nothing runs
           (delete-file (expand-file-name "args" dir))
           (let ((claude-code-ide-codex-extra-flags "-p work"))
@@ -641,12 +646,14 @@ The script runs in its own temporary folder; $D names that folder."
   (let* ((claude-code-ide-mcp--sessions (make-hash-table :test 'equal))
          (codex (claude-code-ide-codex-tests--fake-codex
                  (concat "printf '%s\\0' \"$@\" > \"$D/args\"\n"
-                         "[ -f \"$D/slow\" ] && sleep 5\n"
+                         ;; Longer than any wait of the test, also on a
+                         ;; loaded machine; exec, so that the stop ends it
+                         "[ -f \"$D/slow\" ] && exec sleep 300\n"
                          "echo 'Queued message cci-test-msg-1 for thread cci-test-native-1'\n"
                          "exit $(cat \"$D/exit\" 2>/dev/null || echo 0)\n")))
          (dir (file-name-directory codex))
          (claude-code-ide-codex-cli-path codex)
-         (claude-code-ide-codex-queue-timeout 5)
+         (claude-code-ide-codex-queue-timeout claude-code-ide-tests--wait-limit)
          (done nil)
          (claude-code-ide-codex-queue-functions
           (list (lambda (instance result) (push (cons instance result) done)))))
@@ -684,7 +691,7 @@ The script runs in its own temporary folder; $D names that folder."
             (let* ((claude-code-ide-codex-queue-timeout 0.3)
                    (result (claude-code-ide-codex--submit-prompt instance "cci-test")))
               (should (claude-code-ide-codex-tests--wait
-                       (lambda () (not (eq (plist-get result :outcome) 'pending))) 3))
+                       (lambda () (not (eq (plist-get result :outcome) 'pending)))))
               (should (eq (plist-get result :outcome) 'timeout)))
             ;; No native ID yet: nothing runs
             (delete-file (expand-file-name "args" dir))

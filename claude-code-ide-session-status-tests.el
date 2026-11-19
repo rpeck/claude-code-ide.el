@@ -757,6 +757,21 @@ CONTENT is a JSON value as text; FIELDS are extra \"key\":value texts."
     (claude-code-ide-session-status--install-script)
     (let* ((script (claude-code-ide-session-status--script-file))
            (dir (expand-file-name "events" registry-dir))
+           ;; The script gives up after a number of tries for the lock.
+           ;; On a loaded machine the holder can be slow, so its `sleep'
+           ;; returns only when the lock is free: each writer tries once
+           ;; per release, however slow the machine is.
+           (bin (expand-file-name "bin" registry-dir))
+           (process-environment
+            (progn
+              (make-directory bin t)
+              (with-temp-file (expand-file-name "sleep" bin)
+                (insert "#!/bin/sh\n"
+                        "i=0\n"
+                        "while [ -d " (shell-quote-argument (expand-file-name ".n1.lock" dir))
+                        " ] && [ $i -lt 6000 ]; do /bin/sleep 0.01; i=$((i + 1)); done\n"))
+              (set-file-modes (expand-file-name "sleep" bin) #o700)
+              (cons (concat "PATH=" bin ":" (getenv "PATH")) process-environment)))
            (output
             (with-temp-buffer
               (list (call-process

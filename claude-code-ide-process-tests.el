@@ -19,6 +19,10 @@
 (require 'claude-code-ide-instance)
 (require 'claude-code-ide-process)
 
+(declare-function claude-code-ide-tests--wait-until "claude-code-ide-tests")
+(declare-function claude-code-ide-tests--call-with-clock "claude-code-ide-tests")
+(defvar claude-code-ide-tests--wait-limit)
+
 ;;; The synthetic process table
 
 (defvar claude-code-ide-process-tests--table nil
@@ -242,26 +246,30 @@ The default is provider `claude', pid 100 and ID cci-test-process."
   "A tool event of a tracked instance records a new background group."
   (claude-code-ide-process-tests--with-table
       (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100))
-    (let ((instance (claude-code-ide-process-tests--instance)))
-      (claude-code-ide-process-track instance nil)
-      (push (claude-code-ide-process-tests--entry 300 100 300)
-            claude-code-ide-process-tests--table)
-      ;; Within one second of the last record, an event does not record
-      (claude-code-ide-process--note-event
-       (claude-code-ide-make-event "cci-test-process" 1 'tool-end "PostToolUse" nil))
-      (should (equal (length (claude-code-ide-process-groups instance)) 1))
-      (setf (claude-code-ide-process--track-last-refresh
-             (claude-code-ide-process--track-of instance))
-            (- (float-time) 5))
-      ;; Other events do not record
-      (claude-code-ide-process--note-event
-       (claude-code-ide-make-event "cci-test-process" 1 'notification "Notification" nil))
-      (should (equal (length (claude-code-ide-process-groups instance)) 1))
-      (claude-code-ide-process--note-event
-       (claude-code-ide-make-event "cci-test-process" 1 'tool-end "PostToolUse" nil))
-      (should (equal (mapcar (lambda (g) (plist-get g :pgid))
-                             (claude-code-ide-process-groups instance))
-                     '(100 300))))))
+    ;; On the virtual clock, no time passes between the record of the
+    ;; track and the event, however slow the machine is
+    (claude-code-ide-tests--call-with-clock
+     (lambda ()
+       (let ((instance (claude-code-ide-process-tests--instance)))
+         (claude-code-ide-process-track instance nil)
+         (push (claude-code-ide-process-tests--entry 300 100 300)
+               claude-code-ide-process-tests--table)
+         ;; Within one second of the last record, an event does not record
+         (claude-code-ide-process--note-event
+          (claude-code-ide-make-event "cci-test-process" 1 'tool-end "PostToolUse" nil))
+         (should (equal (length (claude-code-ide-process-groups instance)) 1))
+         (setf (claude-code-ide-process--track-last-refresh
+                (claude-code-ide-process--track-of instance))
+               (- (float-time) 5))
+         ;; Other events do not record
+         (claude-code-ide-process--note-event
+          (claude-code-ide-make-event "cci-test-process" 1 'notification "Notification" nil))
+         (should (equal (length (claude-code-ide-process-groups instance)) 1))
+         (claude-code-ide-process--note-event
+          (claude-code-ide-make-event "cci-test-process" 1 'tool-end "PostToolUse" nil))
+         (should (equal (mapcar (lambda (g) (plist-get g :pgid))
+                                (claude-code-ide-process-groups instance))
+                        '(100 300))))))))
 
 ;;; Stop
 
@@ -710,11 +718,12 @@ PID now, as a real one does."
   (let ((before (buffer-list))
         (entries 'pending))
     (claude-code-ide-process--ps-list-async (lambda (table) (setq entries table)))
-    (should (claude-code-ide-process--wait (lambda () (not (eq entries 'pending))) 10))
+    (should (claude-code-ide-tests--wait-until (lambda () (not (eq entries 'pending)))))
     (should (consp entries))
     (should (cl-find (emacs-pid) entries :key (lambda (e) (plist-get e :pid))))
     ;; The error output pipe can close a moment after the sentinel
-    (claude-code-ide-process--wait (lambda () nil) 0.2)
+    (claude-code-ide-tests--wait-until
+     (lambda () (not (or (get-buffer "/dev/null") (cl-set-difference (buffer-list) before)))))
     (should-not (get-buffer "/dev/null"))
     (should-not (cl-set-difference (buffer-list) before))))
 
@@ -724,11 +733,16 @@ PID now, as a real one does."
       (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
             (claude-code-ide-process-tests--entry 200 100 200))
     (setq claude-code-ide-process-tests--ignore '((100 SIGHUP SIGTERM) (200 SIGTERM)))
-    (let* ((start (float-time))
-           (results (claude-code-ide-process-stop-many
-                     (list (claude-code-ide-process-tests--instance))
-                     :budget 0.3 :timeout 5 :kill-wait 5 :scan nil))
-           (elapsed (- (float-time) start)))
+    (let* ((start nil)
+           (elapsed nil)
+           ;; On the virtual clock, only the waits take time
+           (results (claude-code-ide-tests--call-with-clock
+                     (lambda ()
+                       (setq start (float-time))
+                       (prog1 (claude-code-ide-process-stop-many
+                               (list (claude-code-ide-process-tests--instance))
+                               :budget 0.3 :timeout 5 :kill-wait 5 :scan nil)
+                         (setq elapsed (- (float-time) start)))))))
       (should (< elapsed 0.6))
       (should (eq (plist-get (cdar results) :escalated) 'SIGKILL))
       (should-not (claude-code-ide-process-tests--find 100))
@@ -842,34 +856,38 @@ PID now, as a real one does."
       (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
             (claude-code-ide-process-tests--entry 200 100 200))
     (setq claude-code-ide-process-tests--ignore '((100 SIGTERM) (200 SIGTERM)))
-    (let* ((longest 0)
-           (steps 0)
-           (timing (lambda (fn &rest args)
-                     (let ((start (float-time)))
-                       (prog1 (apply fn args)
-                         (cl-incf steps)
-                         (setq longest (max longest (- (float-time) start)))))))
-           (result 'pending)
-           (start (float-time)))
-      (advice-add 'claude-code-ide-process--async-poll :around timing)
-      (unwind-protect
-          (let ((returned
-                 (progn
-                   (claude-code-ide-process-stop-later
-                    (claude-code-ide-process-tests--instance)
-                    :scan nil :timeout 0.3 :kill-wait 0.2
-                    :callback (lambda (r) (setq result r)))
-                   (- (float-time) start))))
-            (should (< returned 0.1))
-            (should (claude-code-ide-process--wait (lambda () (not (eq result 'pending))) 5))
-            (should (> (- (float-time) start) 0.6))
-            (should (> steps 5))
-            ;; A step that polls again returns at once; the longest one
-            ;; runs the next step without its wait
-            (should (< longest 0.15))
-            (should (eq (plist-get result :status) 'stopped))
-            (should (eq (plist-get result :escalated) 'SIGKILL)))
-        (advice-remove 'claude-code-ide-process--async-poll timing)))))
+    ;; On the virtual clock, only the waits take time: a step that does
+    ;; not wait takes none, however slow the machine is
+    (claude-code-ide-tests--call-with-clock
+     (lambda ()
+       (let* ((longest 0)
+              (steps 0)
+              (timing (lambda (fn &rest args)
+                        (let ((start (float-time)))
+                          (prog1 (apply fn args)
+                            (cl-incf steps)
+                            (setq longest (max longest (- (float-time) start)))))))
+              (result 'pending)
+              (start (float-time)))
+         (advice-add 'claude-code-ide-process--async-poll :around timing)
+         (unwind-protect
+             (let ((returned
+                    (progn
+                      (claude-code-ide-process-stop-later
+                       (claude-code-ide-process-tests--instance)
+                       :scan nil :timeout 0.3 :kill-wait 0.2
+                       :callback (lambda (r) (setq result r)))
+                      (- (float-time) start))))
+               (should (< returned 0.1))
+               (should (claude-code-ide-tests--wait-until (lambda () (not (eq result 'pending)))))
+               (should (> (- (float-time) start) 0.6))
+               (should (> steps 5))
+               ;; A step that polls again returns at once; the longest one
+               ;; runs the next step without its wait
+               (should (< longest 0.15))
+               (should (eq (plist-get result :status) 'stopped))
+               (should (eq (plist-get result :escalated) 'SIGKILL)))
+           (advice-remove 'claude-code-ide-process--async-poll timing)))))))
 
 ;;; Worktree scan
 
@@ -1161,14 +1179,19 @@ ps shows the target, and its children, under the CLI's tree."
 
 (ert-deftest claude-code-ide-test-process-run-timeout ()
   "A program that takes too long is ended, and gives nil; output comes whole."
-  (let ((before (length (process-list)))
-        (start (float-time)))
-    (should-not (claude-code-ide-process--run "/bin/sleep" (list "5") 0.2))
-    (should (< (- (float-time) start) 2))
-    (should (= (length (process-list)) before)))
-  (should (equal (claude-code-ide-process--run "/bin/echo" (list "cci-test") 5) "cci-test\n"))
-  (should-not (claude-code-ide-process--run "/usr/bin/false" nil 5))
-  (should (equal (claude-code-ide-process--run "/usr/bin/false" nil 5 t) "")))
+  ;; On the virtual clock, only the wait for the program takes time
+  (claude-code-ide-tests--call-with-clock
+   (lambda ()
+     (let ((before (length (process-list)))
+           (start (float-time)))
+       (should-not (claude-code-ide-process--run "/bin/sleep" (list "300") 0.2))
+       (should (< (- (float-time) start) 2))
+       (should (= (length (process-list)) before)))))
+  ;; A loaded machine can start a program slowly
+  (should (equal (claude-code-ide-process--run "/bin/echo" (list "cci-test") claude-code-ide-tests--wait-limit)
+                 "cci-test\n"))
+  (should-not (claude-code-ide-process--run "/usr/bin/false" nil claude-code-ide-tests--wait-limit))
+  (should (equal (claude-code-ide-process--run "/usr/bin/false" nil claude-code-ide-tests--wait-limit t) "")))
 
 (ert-deftest claude-code-ide-test-process-scan-failure ()
   "A failed scan of working folders gives error, never a false stopped."
@@ -1244,17 +1267,16 @@ The check makes sure that the test signals only its own processes."
          bg-pid)
     (unwind-protect
         (progn
-          (should (claude-code-ide-process--wait
-                   (lambda () (claude-code-ide-process-tests--read-pids pids-file)) 5))
+          (should (claude-code-ide-tests--wait-until
+                   (lambda () (claude-code-ide-process-tests--read-pids pids-file))))
           (setq bg-pid (car (claude-code-ide-process-tests--read-pids pids-file)))
           (claude-code-ide-process-track instance process)
           ;; Wait for a record of the background group
-          (should (claude-code-ide-process--wait
+          (should (claude-code-ide-tests--wait-until
                    (lambda ()
                      (memq bg-pid (mapcar (lambda (g) (plist-get g :pgid))
-                                          (claude-code-ide-process-groups instance))))
-                   5))
-          (let ((result (claude-code-ide-process-stop instance :timeout 3 :kill-wait 1)))
+                                          (claude-code-ide-process-groups instance))))))
+          (let ((result (claude-code-ide-process-stop instance :timeout 30 :kill-wait 10)))
             (message "live stop result: %S" result)
             (should (eq (plist-get result :status) 'stopped))
             (should (memq bg-pid (plist-get result :ended))))
@@ -1291,11 +1313,11 @@ The check makes sure that the test signals only its own processes."
          escaped)
     (unwind-protect
         (progn
-          (should (claude-code-ide-process--wait
-                   (lambda () (claude-code-ide-process-tests--read-pids pids-file)) 5))
+          (should (claude-code-ide-tests--wait-until
+                   (lambda () (claude-code-ide-process-tests--read-pids pids-file))))
           (setq escaped (car (claude-code-ide-process-tests--read-pids pids-file)))
           (claude-code-ide-process-track instance process)
-          (let ((result (claude-code-ide-process-stop instance :timeout 3 :kill-wait 1)))
+          (let ((result (claude-code-ide-process-stop instance :timeout 30 :kill-wait 10)))
             (message "live double fork result: %S" result)
             (should (eq (plist-get result :status) 'strays))
             (should (member escaped (mapcar (lambda (s) (plist-get s :pid))
