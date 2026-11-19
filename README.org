@@ -822,7 +822,7 @@ Once enabled, Claude can use these tools to navigate your codebase. For example:
 - After the commit, the queued prompts and review results of the source go to the target.
 - =M-x claude-code-ide-handover-resolve= answers a handover that needs you, and =M-x claude-code-ide-handover-cancel= cancels one.
 - Coordinators use the MCP tools =claude-code-ide-control-handover= and =claude-code-ide-control-handover-status=. Agents can ask with =request_handover=; Emacs then asks you after their turn.
-- Options: =claude-code-ide-handover-quiesce-timeout=, =claude-code-ide-handover-delivery-timeout= (600 s for the target to get the document), =claude-code-ide-handover-watch-interval= (5 s), =claude-code-ide-handover-stray-wait=, =claude-code-ide-handover-directory=, =claude-code-ide-handover-session-server-detection=, =claude-code-ide-handover-budget=, =claude-code-ide-handover-recover-at-start=, =claude-code-ide-handover-enable-request-tool=.
+- Options: =claude-code-ide-handover-quiesce-timeout=, =claude-code-ide-handover-delivery-timeout= (600 s for the target to get the document), =claude-code-ide-handover-watch-interval= (5 s), =claude-code-ide-handover-ack-wait= (10 s for the acknowledgement of a prompt that the source got), =claude-code-ide-handover-stray-wait=, =claude-code-ide-handover-directory=, =claude-code-ide-handover-session-server-detection=, =claude-code-ide-handover-budget=, =claude-code-ide-handover-recover-at-start=, =claude-code-ide-handover-enable-request-tool=.
 - See [[file:docs/handover.md][docs/handover.md]].
 
 ** Reviews

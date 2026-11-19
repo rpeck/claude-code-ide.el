@@ -202,7 +202,8 @@ The state comes from `claude-code-ide-instance-state`.
 - **Reload.** Loading the package reads no inbox file. The index fills from disk at the first use of each instance, so the inbox survives a reload of the package and a restart of Emacs.
 - **Old Emacs.** The files are read with the native JSON parser when Emacs has one, else with json.el.
 - `claude-code-ide-control-inbox-directory-of (INSTANCE-ID)` returns the folder.
-- `(claude-code-ide-control-move-inbox FROM TO)` moves the queued prompts of FROM to TO after a handover (plan §4.8). Each keeps its request ID; see the reason `handed-over`.
+- `(claude-code-ide-control-move-inbox FROM TO &optional HANDOVER-ID)` moves the pending prompts of FROM to TO at a handover (plan §4.8). Each keeps its request ID; see the reason `handed-over`. When TO has another record with that ID, the copy gets the ID `handover:HANDOVER-ID:ID`. The fields `moved_from` and `moved_to` record the mapping, and `note` says when a moved prompt may have reached FROM.
+- After a committed handover, a submit to the old instance goes to the current instance of its chain (`claude-code-ide-session-registry-chain-current`), and `:destination` names it.
 - `(claude-code-ide-control-hold INSTANCE-ID)` and `(claude-code-ide-control-release INSTANCE-ID)` hold and release the delivery to an instance; `claude-code-ide-control-held-p` tells. A held instance gets no prompt, also when it is idle. The release delivers the queued prompts.
 - Two helpers for other files of the package: `(claude-code-ide-control--write-json-file FILE DATA)` writes any JSON value atomically (file 0600, folder 0700), and `(claude-code-ide-control--prune-folder DIR DAYS &optional REGEXP)` deletes the old files of a folder. The inbox uses both.
 
@@ -242,6 +243,8 @@ The state comes from `claude-code-ide-instance-state`.
 | `sent_generation` | The launch generation that got the prompt. |
 | `sent_guess` | true when the idle state at the send was a guess. |
 | `requested_by` | The instance ID of the MCP request, from `claude-code-ide-mcp-request-instance-id`, or null. |
+| `moved_from`, `moved_to` | `INSTANCE:REQUEST-ID` of the record that a handover moved here, or that this record moved to; or null. |
+| `note` | Text for people, for example that a moved prompt may have reached the old instance; or null. |
 
 
 ## MCP coordinator tools
