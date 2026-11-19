@@ -30,6 +30,8 @@
 ;; - The MCP tools server of the package goes in `-c mcp_servers.*'
 ;;   keys.  Header values go through environment variables, which the
 ;;   shell commands of the model do not get.
+;; - Every MCP tool needs an approval, except the tools that
+;;   `claude-code-ide-mcp-allowed-tools' approves.
 ;; - Prompts go through `codex queue', never through keys in the
 ;;   terminal: a typed Return can steer a turn or approve a dialog.
 ;; - `claude-code-ide-codex-screen-dialog' finds the startup dialogs
@@ -43,6 +45,7 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'json)
 (require 'claude-code-ide)
 (require 'claude-code-ide-provider)
 (require 'claude-code-ide-instance)
@@ -60,11 +63,11 @@
   :type 'string
   :group 'claude-code-ide-codex)
 
-(defcustom claude-code-ide-codex-cli-extra-flags ""
+(defcustom claude-code-ide-codex-extra-flags ""
   "Additional flags for the Codex CLI, as one string.
-For example \"--model gpt-5.6-terra\".  The flags come after the
-flags of the package.  The Codex commands use this option instead of
-`claude-code-ide-cli-extra-flags', which holds Claude Code flags."
+For example \"--model gpt-5.6-terra\".  Every Codex launch gets them.
+Codex never gets `claude-code-ide-cli-extra-flags', which holds
+Claude Code flags, nor the extra flags of a start spec."
   :type 'string
   :group 'claude-code-ide-codex)
 
@@ -91,6 +94,24 @@ option passes `-c check_for_update_on_startup=false'."
   :type 'boolean
   :group 'claude-code-ide-codex)
 
+(defcustom claude-code-ide-codex-config-read-timeout 5
+  "Seconds that a launch waits for the Codex config.
+A launch reads the shell environment policy of the user through
+`codex app-server' before it adds its own excluded variables."
+  :type 'number
+  :group 'claude-code-ide-codex)
+
+(defcustom claude-code-ide-codex-queue-timeout 30
+  "Seconds after which a `codex queue' command is stopped."
+  :type 'number
+  :group 'claude-code-ide-codex)
+
+(defvar claude-code-ide-codex-queue-functions nil
+  "Functions called when a `codex queue' command of a prompt ends.
+Each function is called with INSTANCE and RESULT, the plist that
+`submit-prompt' returned, whose :outcome is now `queued', `failed' or
+`timeout'.")
+
 ;;; Constants
 
 (defconst claude-code-ide-codex--emacs-prompt
@@ -104,8 +125,8 @@ It is the same text that Claude Code gets in --append-system-prompt.")
 (defconst claude-code-ide-codex--nested-variables
   '("CODEX_THREAD_ID" "CODEX_SESSION_ID" "CODEX_TOOL_CALL_ID")
   "Variables that Codex sets for a nested session.
-The launch removes them, so that an Emacs that runs inside a Codex
-tool shell does not start sessions that look nested.")
+The launch removes them.  Else a Codex that Emacs starts from inside a
+Codex tool shell looks nested, and the hook script drops its events.")
 
 (defconst claude-code-ide-codex--header-variable-prefix "CCI_MCP_HEADER_"
   "Prefix of the variables that hold the MCP header values.")
@@ -139,6 +160,9 @@ Codex 0.164.0.")
 
 (defvar claude-code-ide-codex--screen-lines 50
   "Lines of a terminal screen when no window shows the terminal buffer.")
+
+(defvar claude-code-ide-codex--warned-plain-headers nil
+  "Non-nil after the warning about MCP headers in the argument list.")
 
 ;;; Values
 
@@ -197,6 +221,21 @@ text without an error."
   "Return non-nil when NAME can be one part of a dotted -c key."
   (string-match-p "\\`[A-Za-z0-9_-]+\\'" name))
 
+(defun claude-code-ide-codex--flag-words ()
+  "Return the words of `claude-code-ide-codex-extra-flags'."
+  (claude-code-ide--split-command-line (or claude-code-ide-codex-extra-flags "")))
+
+(defun claude-code-ide-codex--flags-model ()
+  "Return the model that `claude-code-ide-codex-extra-flags' selects, or nil."
+  (let ((words (claude-code-ide-codex--flag-words))
+        (model nil))
+    (while words
+      (let ((word (pop words)))
+        (cond
+         ((member word '("-m" "--model")) (setq model (pop words)))
+         ((string-prefix-p "--model=" word) (setq model (substring word 8))))))
+    model))
+
 ;;; Instructions
 
 (defun claude-code-ide-codex--developer-instructions ()
@@ -206,12 +245,111 @@ The user's prompt is `claude-code-ide-system-prompt', as for Claude Code."
       (concat claude-code-ide-codex--emacs-prompt "\n\n" claude-code-ide-system-prompt)
     claude-code-ide-codex--emacs-prompt))
 
+;;; The shell environment policy of the user
+
+(defun claude-code-ide-codex--config-overrides ()
+  "Return the -c words of `claude-code-ide-codex-extra-flags', or `unknown'.
+The result is `unknown' when the flags select a profile, because
+`codex app-server' cannot read the config of a profile."
+  (let ((words (claude-code-ide-codex--flag-words))
+        (overrides nil)
+        (profile nil))
+    (while words
+      (let ((word (pop words)))
+        (cond
+         ((member word '("-c" "--config"))
+          (when words (setq overrides (append overrides (list "-c" (pop words))))))
+         ((string-prefix-p "--config=" word)
+          (setq overrides (append overrides (list "-c" (substring word 9)))))
+         ((or (member word '("-p" "--profile"))
+              (string-prefix-p "--profile=" word)
+              (string-match-p "\\`-p." word))
+          (setq profile t)))))
+    (if profile 'unknown overrides)))
+
+(defun claude-code-ide-codex--config-read-response (output)
+  "Return the result of the config/read reply in OUTPUT, or nil.
+OUTPUT is the text that `codex app-server' wrote so far, one JSON
+message on each line.  The result is (exclude . LIST) for a reply,
+where LIST is the excluded variables, or (exclude . unknown) when the
+reply is an error or has an unexpected form."
+  (cl-loop
+   for line in (split-string output "\n" t)
+   for message = (ignore-errors
+                   (json-parse-string line :object-type 'alist :array-type 'list
+                                      :null-object nil :false-object nil))
+   when (and (consp message) (equal (alist-get 'id message) 2))
+   return (let* ((config (alist-get 'config (alist-get 'result message)))
+                 (policy (alist-get 'shell_environment_policy config))
+                 (exclude (alist-get 'exclude policy)))
+            (cons 'exclude
+                  (if (and config (listp exclude) (cl-every #'stringp exclude)
+                           (not (alist-get 'error message)))
+                      exclude
+                    'unknown)))))
+
+(defun claude-code-ide-codex--read-exclude (directory)
+  "Return the effective `shell_environment_policy.exclude' of Codex.
+DIRECTORY is the project, whose project config layers count.  The
+value comes from the config/read call of `codex app-server', with the
+-c words of `claude-code-ide-codex-extra-flags'.  The result is a list
+of variable names (nil when the user excludes none), or `unknown'
+when the value cannot be read within
+`claude-code-ide-codex-config-read-timeout'.  This reads only."
+  (let ((overrides (claude-code-ide-codex--config-overrides)))
+    (if (eq overrides 'unknown)
+        'unknown
+      (let* ((output "")
+             (found nil)
+             (stderr (generate-new-buffer " *cci-codex-config-read*"))
+             (deadline (+ (float-time) claude-code-ide-codex-config-read-timeout))
+             (process nil))
+        (unwind-protect
+            (condition-case nil
+                (let ((default-directory (file-name-as-directory directory))
+                      (process-environment (claude-code-ide-codex--process-environment)))
+                  (setq process
+                        (make-process
+                         :name "cci-codex-config-read"
+                         :command (append (list claude-code-ide-codex-cli-path)
+                                          overrides (list "app-server"))
+                         :connection-type 'pipe
+                         :noquery t
+                         :stderr stderr
+                         :filter (lambda (_process text) (setq output (concat output text)))))
+                  (dolist (message
+                           `(((id . 1) (method . "initialize")
+                              (params . ((clientInfo . ((name . "claude-code-ide")
+                                                        (version . "0"))))))
+                             ((method . "initialized"))
+                             ((id . 2) (method . "config/read")
+                              (params . ((cwd . ,(expand-file-name directory))
+                                         (includeLayers . :json-false))))))
+                    (process-send-string process (concat (json-encode message) "\n")))
+                  (while (and (not found)
+                              (process-live-p process)
+                              (< (float-time) deadline))
+                    (accept-process-output process 0.05)
+                    (setq found (claude-code-ide-codex--config-read-response output)))
+                  (unless found
+                    (setq found (claude-code-ide-codex--config-read-response output))))
+              (error nil))
+          (when (process-live-p process) (delete-process process))
+          (let ((stderr-process (get-buffer-process stderr)))
+            (when stderr-process (delete-process stderr-process)))
+          (kill-buffer stderr))
+        (if found (cdr found) 'unknown)))))
+
 ;;; MCP setup
 
 (defun claude-code-ide-codex--header-variable (header)
-  "Return the name of the variable that holds the value of HEADER."
-  (concat claude-code-ide-codex--header-variable-prefix
-          (upcase (replace-regexp-in-string "[^A-Za-z0-9]" "_" header))))
+  "Return the name of the variable that holds the value of HEADER.
+The name has the header name and a short hash of it, so that two
+headers whose names differ only in punctuation or case get two names."
+  (format "%s%s_%s"
+          claude-code-ide-codex--header-variable-prefix
+          (upcase (replace-regexp-in-string "[^A-Za-z0-9]" "_" header))
+          (upcase (substring (secure-hash 'sha1 header) 0 8))))
 
 (defun claude-code-ide-codex--all-tool-names ()
   "Return the names of all registered MCP tools.
@@ -228,45 +366,54 @@ This reads the tool list itself, so that no advice of
 This follows `claude-code-ide-mcp-allowed-tools', as for Claude Code:
 `auto' gives the result of `claude-code-ide-mcp-server-get-tool-names',
 after its advice (an advice can remove a tool, such as `emacs_eval'),
-nil gives none, and a list or a string gives the tools that it names."
-  (let ((prefix "mcp__emacs-tools__"))
-    (mapcar (lambda (name)
-              (if (string-prefix-p prefix name) (substring name (length prefix)) name))
-            (pcase claude-code-ide-mcp-allowed-tools
-              ('auto (claude-code-ide-mcp-server-get-tool-names))
-              ('nil nil)
-              ((pred stringp) (split-string claude-code-ide-mcp-allowed-tools nil t))
-              ((pred listp) claude-code-ide-mcp-allowed-tools)))))
+nil gives none, and a list or a string gives the tools that it names.
+Only registered tools count."
+  (let* ((prefix "mcp__emacs-tools__")
+         (all (claude-code-ide-codex--all-tool-names))
+         (names (mapcar (lambda (name)
+                          (if (string-prefix-p prefix name) (substring name (length prefix)) name))
+                        (pcase claude-code-ide-mcp-allowed-tools
+                          ('auto (claude-code-ide-mcp-server-get-tool-names))
+                          ('nil nil)
+                          ((pred stringp) (split-string claude-code-ide-mcp-allowed-tools nil t))
+                          ((pred listp) claude-code-ide-mcp-allowed-tools)))))
+    (delete-dups (cl-remove-if-not (lambda (name) (member name all)) names))))
 
 (defun claude-code-ide-codex--approval-args (server)
   "Return the -c arguments of the tool approvals of the MCP SERVER key.
-Each tool that `claude-code-ide-codex--approved-tool-names' leaves out
-gets approval_mode \"prompt\", and the other tools are approved.  When
-no tool is approved, or when a tool to prompt for has a name that a
-dotted key cannot hold, every tool needs an approval."
-  (let* ((approved (claude-code-ide-codex--approved-tool-names))
-         (prompted (cl-remove-if (lambda (name) (member name approved))
-                                 (claude-code-ide-codex--all-tool-names))))
-    (if (or (null approved)
-            (cl-notevery #'claude-code-ide-codex--bare-key-p prompted))
-        (claude-code-ide-codex--config-arg
-         (concat server ".default_tools_approval_mode") "\"prompt\"")
-      (append (claude-code-ide-codex--config-arg
-               (concat server ".default_tools_approval_mode") "\"approve\"")
-              (mapcan (lambda (name)
-                        (claude-code-ide-codex--config-arg
-                         (format "%s.tools.%s.approval_mode" server name) "\"prompt\""))
-                      prompted)))))
+Every tool needs an approval by default, so a tool that appears later
+or that no rule names asks too.  Each tool of
+`claude-code-ide-codex--approved-tool-names' gets approval_mode
+\"approve\", unless its name cannot be a part of a dotted key."
+  (append (claude-code-ide-codex--config-arg
+           (concat server ".default_tools_approval_mode") "\"prompt\"")
+          (mapcan (lambda (name)
+                    (claude-code-ide-codex--config-arg
+                     (format "%s.tools.%s.approval_mode" server name) "\"approve\""))
+                  (cl-remove-if-not #'claude-code-ide-codex--bare-key-p
+                                    (claude-code-ide-codex--approved-tool-names)))))
+
+(defun claude-code-ide-codex--warn-plain-headers ()
+  "Warn one time that MCP header values are in the argument list."
+  (unless claude-code-ide-codex--warned-plain-headers
+    (setq claude-code-ide-codex--warned-plain-headers t)
+    (display-warning
+     'claude-code-ide
+     "Codex: the shell environment policy of your Codex config could not be read, so the MCP header values are in the Codex argument list, which other local processes can read.  Remove -p or --profile from `claude-code-ide-codex-extra-flags', or check that `codex app-server' works.")))
 
 (defun claude-code-ide-codex--mcp-setup (instance)
   "Return the MCP config of INSTANCE for Codex, or nil.
 The result is (:args ARGS :environment ENTRIES).  ARGS are -c
 arguments for the tools server of INSTANCE's MCP session.  The config
 comes from `claude-code-ide-mcp-server-get-config', after its advice
-ran, so headers that an advice adds stay.  Each header value goes
-into a variable of ENTRIES, which `env_http_headers' names and
-`shell_environment_policy.exclude' hides from the model's shell
-commands, so that the value is not in the argument list."
+ran, so headers that an advice adds stay.
+
+Each header value goes into a variable of ENTRIES, which
+`env_http_headers' names.  `shell_environment_policy.exclude' hides
+the variables from the model's shell commands.  That -c value replaces
+the user's own list, so it holds the user's effective list and the new
+variables.  When the user's list cannot be read, the values go in
+`http_headers' instead, in the argument list, with a warning."
   (when-let* (((claude-code-ide-mcp-server-ensure-server))
               (session (claude-code-ide-instance-session instance))
               (config (claude-code-ide-mcp-server-get-config
@@ -280,34 +427,63 @@ commands, so that the value is not in the argument list."
                                       (claude-code-ide-codex--header-variable name)
                                       (format "%s" (cdr header)))))
                             (alist-get 'headers server)))
-           (variables (mapcar #'cadr headers)))
-      (list :args (append
-                   (claude-code-ide-codex--config-arg
-                    (concat key ".url") (claude-code-ide-codex--toml-string url))
-                   (when headers
-                     (append
-                      (claude-code-ide-codex--config-arg
-                       (concat key ".env_http_headers")
-                       (claude-code-ide-codex--toml-table
-                        (mapcar (lambda (header) (cons (car header) (cadr header))) headers)))
-                      (claude-code-ide-codex--config-arg
-                       "shell_environment_policy.exclude"
-                       (claude-code-ide-codex--toml-array variables))))
-                   (claude-code-ide-codex--approval-args key))
-            :environment (mapcar (lambda (header) (format "%s=%s" (cadr header) (nth 2 header)))
-                                 headers)))))
+           (root (claude-code-ide-known-or-nil (claude-code-ide-instance-project-root instance)))
+           (exclude (when headers
+                      (claude-code-ide-codex--read-exclude
+                       (if (and root (file-directory-p root)) root default-directory))))
+           (url-args (claude-code-ide-codex--config-arg
+                      (concat key ".url") (claude-code-ide-codex--toml-string url)))
+           (approval-args (claude-code-ide-codex--approval-args key)))
+      (cond
+       ((null headers)
+        (list :args (append url-args approval-args) :environment nil))
+       ((eq exclude 'unknown)
+        (claude-code-ide-codex--warn-plain-headers)
+        (list :args (append url-args
+                            (claude-code-ide-codex--config-arg
+                             (concat key ".http_headers")
+                             (claude-code-ide-codex--toml-table
+                              (mapcar (lambda (header) (cons (car header) (nth 2 header)))
+                                      headers)))
+                            approval-args)
+              :environment nil))
+       (t
+        (let ((variables (mapcar #'cadr headers)))
+          (list :args (append
+                       url-args
+                       (claude-code-ide-codex--config-arg
+                        (concat key ".env_http_headers")
+                        (claude-code-ide-codex--toml-table
+                         (mapcar (lambda (header) (cons (car header) (cadr header))) headers)))
+                       (claude-code-ide-codex--config-arg
+                        "shell_environment_policy.exclude"
+                        (claude-code-ide-codex--toml-array
+                         (append exclude
+                                 (cl-remove-if (lambda (name) (member name exclude)) variables))))
+                       approval-args)
+                :environment (mapcar (lambda (header)
+                                       (format "%s=%s" (cadr header) (nth 2 header)))
+                                     headers))))))))
 
 ;;; Launch
 
+(defun claude-code-ide-codex--launched-p (instance)
+  "Return non-nil when INSTANCE has the launch generation of its start."
+  (let ((generation (claude-code-ide-instance-generation instance)))
+    (and (integerp generation) (> generation 0))))
+
 (defun claude-code-ide-codex--hook-args (instance)
   "Return the status hook arguments of INSTANCE, or nil.
-The `codex-status' part gives them, when it is loaded."
-  (when (fboundp 'claude-code-ide-codex-status-hook-args)
+The `codex-status' part gives them, when it is loaded and INSTANCE has
+its launch generation."
+  (when (and (fboundp 'claude-code-ide-codex-status-hook-args)
+             (claude-code-ide-codex--launched-p instance))
     (funcall 'claude-code-ide-codex-status-hook-args instance)))
 
 (defun claude-code-ide-codex--hook-env (instance)
   "Return the status hook environment entries of INSTANCE, or nil."
-  (when (fboundp 'claude-code-ide-codex-status-hook-env)
+  (when (and (fboundp 'claude-code-ide-codex-status-hook-env)
+             (claude-code-ide-codex--launched-p instance))
     (funcall 'claude-code-ide-codex-status-hook-env instance)))
 
 (defun claude-code-ide-codex--removed-variables ()
@@ -335,25 +511,29 @@ MCP-ENVIRONMENT holds the variables of the MCP headers."
            (claude-code-ide-codex--toml-string
             (claude-code-ide-codex--developer-instructions)))))
 
-(defun claude-code-ide-codex--command (instance spec args subcommand positional)
-  "Return (:command :environment) for INSTANCE as SPEC says.
+(defun claude-code-ide-codex--command (instance args subcommand positional)
+  "Return (:command :environment) for INSTANCE.
 SUBCOMMAND is a list of words after the program, such as (\"resume\").
-Then come the common arguments, the MCP arguments, the hook arguments,
-SPEC's extra flags (as they are), and ARGS.  POSITIONAL, a list of
-words such as a native ID and a prompt, comes last after \"--\", so
-that no option takes it as a value and no word of it is a subcommand."
+Then come the common arguments, the hook arguments,
+`claude-code-ide-codex-extra-flags' (as they are), ARGS, and the MCP
+arguments, which come last so that they win over an earlier -c of the
+same key.  POSITIONAL, a list of words such as a native ID and a
+prompt, comes after \"--\", so that no option takes it as a value and
+no word of it is a subcommand.  The model of INSTANCE becomes the one
+of the extra flags."
   (let* ((mcp (claude-code-ide-codex--mcp-setup instance))
-         (flags (claude-code-ide-start-spec-extra-flags spec))
+         (flags (string-trim (or claude-code-ide-codex-extra-flags "")))
          (words (append subcommand
                         (claude-code-ide-codex--common-args)
-                        (plist-get mcp :args)
                         (claude-code-ide-codex--hook-args instance))))
+    (setf (claude-code-ide-instance-model instance)
+          (claude-code-ide-or-unknown (claude-code-ide-codex--flags-model)))
     (list :command (concat
                     (mapconcat #'shell-quote-argument
                                (cons claude-code-ide-codex-cli-path words) " ")
-                    (when (and flags (not (string-empty-p (string-trim flags))))
-                      (concat " " (string-trim flags)))
-                    (mapconcat (lambda (arg) (concat " " (shell-quote-argument arg))) args "")
+                    (unless (string-empty-p flags) (concat " " flags))
+                    (mapconcat (lambda (arg) (concat " " (shell-quote-argument arg)))
+                               (append args (plist-get mcp :args)) "")
                     (when positional
                       (concat " --" (mapconcat (lambda (word)
                                                  (concat " " (shell-quote-argument word)))
@@ -364,9 +544,10 @@ that no option takes it as a value and no word of it is a subcommand."
 (defun claude-code-ide-codex--launch (instance spec args)
   "Return the command and the environment of a new Codex conversation.
 INSTANCE is the descriptor, SPEC the start spec, and ARGS the caller's
-extra arguments.  SPEC's prompt is the first prompt."
+extra arguments.  SPEC's prompt is the first prompt.  SPEC's extra
+flags are not used: they hold Claude Code flags."
   (let ((prompt (claude-code-ide-start-spec-prompt spec)))
-    (claude-code-ide-codex--command instance spec args nil (and prompt (list prompt)))))
+    (claude-code-ide-codex--command instance args nil (and prompt (list prompt)))))
 
 (defun claude-code-ide-codex--resume (instance spec args)
   "Return the command that resumes a Codex conversation of INSTANCE.
@@ -378,23 +559,26 @@ picker, Codex would read the prompt as a session ID."
         (prompt (claude-code-ide-start-spec-prompt spec)))
     (cond
      (resume-id
-      (claude-code-ide-codex--command instance spec args '("resume")
+      (claude-code-ide-codex--command instance args '("resume")
                                       (cons resume-id (and prompt (list prompt)))))
      (prompt
-      (user-error "Codex takes a first prompt only with the session ID to resume"))
+      (user-error "Codex cannot take a first prompt with `codex resume --last' or the picker, because it reads the prompt as a session ID.  Resume a session ID, or type the prompt after the start"))
      ((claude-code-ide-start-spec-continue spec)
-      (claude-code-ide-codex--command instance spec args '("resume" "--last") nil))
+      (claude-code-ide-codex--command instance args '("resume" "--last") nil))
      (t
-      (claude-code-ide-codex--command instance spec args '("resume") nil)))))
+      (claude-code-ide-codex--command instance args '("resume") nil)))))
 
 (defun claude-code-ide-codex--fork (instance spec args)
   "Return the command that starts INSTANCE in a fork of SPEC's resume ID.
-Codex gives the fork a new native ID, which its SessionStart reports."
+Codex gives the fork a new native ID, which its first SessionStart
+reports.  Until then, the native ID of INSTANCE is `unknown', so that
+no prompt goes to the conversation that was forked."
   (let ((resume-id (claude-code-ide-start-spec-resume-id spec))
         (prompt (claude-code-ide-start-spec-prompt spec)))
     (unless resume-id
       (error "A fork needs the native ID of the conversation to fork"))
-    (claude-code-ide-codex--command instance spec args '("fork")
+    (setf (claude-code-ide-instance-native-id instance) 'unknown)
+    (claude-code-ide-codex--command instance args '("fork")
                                     (cons resume-id (and prompt (list prompt))))))
 
 ;;; Detection and exit
@@ -436,75 +620,120 @@ PROGRAM is the CLI that ran."
 
 (defun claude-code-ide-codex--native-id (instance)
   "Return the native conversation ID of INSTANCE, or `unknown'.
-A resume knows it at the start.  A new conversation gets it from the
-SessionStart hook, which Codex sends only at the first prompt."
+A resume knows it at the start.  A new conversation and a fork get it
+from the SessionStart hook, which Codex sends only at the first prompt."
   (claude-code-ide-or-unknown
    (claude-code-ide-known-or-nil (claude-code-ide-instance-native-id instance))))
 
 (defun claude-code-ide-codex--note-session-start (event)
   "Take the native ID of a Codex instance from the SessionStart EVENT.
-Only the first SessionStart of each launch generation counts, so that
-a nested session that sends events cannot change the ID."
+Each current SessionStart with a session ID sets it, so that a new
+conversation in the same terminal (/new) gets the queued prompts.
+Events of an earlier launch never arrive here, and the hook script
+drops the events of nested sessions."
   (when (eq (plist-get event :event) 'session-start)
     (when-let* ((instance (claude-code-ide-instance-by-id (plist-get event :instance-id)))
                 ((eq (claude-code-ide-instance-provider instance) 'codex))
-                (generation (plist-get event :generation))
                 (id (claude-code-ide-codex--get (plist-get event :data) "session_id"))
                 ((and (stringp id) (not (string-empty-p id)))))
-      (let ((seen (claude-code-ide-instance-property instance :codex-native-id-generation)))
-        (unless (and (integerp seen) (>= seen generation))
-          (setf (claude-code-ide-instance-native-id instance) id)
-          (claude-code-ide-instance-set-property
-           instance :codex-native-id-generation generation))))))
+      (setf (claude-code-ide-instance-native-id instance) id)
+      (claude-code-ide-instance-set-property
+       instance :codex-native-id-generation (plist-get event :generation)))))
 
 (defun claude-code-ide-codex--map-event (provider-event data)
-  "Return the common event of the Codex hook event PROVIDER-EVENT with DATA."
-  (cond
-   ((cdr (assoc provider-event claude-code-ide-codex--event-map)))
-   ((and (equal provider-event "PostModelRequest")
-         (equal (claude-code-ide-codex--get data "status") "failed"))
-    'turn-failed)
-   (t 'other)))
+  "Return the common event of the Codex hook event PROVIDER-EVENT with DATA.
+The Codex event adapter of the `codex-status' part maps it, when it is
+loaded."
+  (if (fboundp 'claude-code-ide-codex-events-map-event)
+      (funcall 'claude-code-ide-codex-events-map-event provider-event data)
+    (cond
+     ((cdr (assoc provider-event claude-code-ide-codex--event-map)))
+     ((and (equal provider-event "PostModelRequest")
+           (equal (claude-code-ide-codex--get data "status") "failed"))
+      'turn-failed)
+     (t 'other))))
 
 ;;; Prompts
+
+(defun claude-code-ide-codex--queue-finished (instance result process buffer)
+  "Record in RESULT how the `codex queue' PROCESS of INSTANCE ended.
+BUFFER holds its output.  Then call `claude-code-ide-codex-queue-functions'."
+  (let ((output (if (buffer-live-p buffer)
+                    (with-current-buffer buffer (string-trim (buffer-string)))
+                  "")))
+    (cond
+     ((process-get process 'claude-code-ide-codex-timeout)
+      (plist-put result :outcome 'timeout))
+     ((and (eq (process-status process) 'exit) (eq (process-exit-status process) 0))
+      (plist-put result :outcome 'queued)
+      (when (string-match "Queued message \\([^ \t\n]+\\)" output)
+        (plist-put result :message-id (match-string 1 output))))
+     (t
+      (plist-put result :outcome 'failed)
+      (plist-put result :exit (process-exit-status process))))
+    (unless (eq (plist-get result :outcome) 'queued)
+      (message "codex queue %s for thread %s: %s"
+               (plist-get result :outcome) (plist-get result :thread) output))
+    (when (buffer-live-p buffer) (kill-buffer buffer))
+    (claude-code-ide--run-session-hook 'claude-code-ide-codex-queue-functions instance result)))
 
 (defun claude-code-ide-codex--submit-prompt (instance text)
   "Queue TEXT for the conversation of INSTANCE with `codex queue'.
 Codex delivers it when the conversation is idle, also after a running
-turn or a dialog, and at the next resume when no CLI runs.  Return
-\(:status queued :thread ID :message-id ID-OR-unknown) when Codex took
-the text, else nil.  A new conversation has no native ID before its
-first prompt, so it cannot take a queued text yet."
+turn or a dialog, and at the next resume when no CLI runs.
+
+The command runs in the background, so Emacs does not wait for it.
+Return (:status queued :thread ID :outcome pending :message-id unknown
+:exit nil) at once.  When the command ends, :outcome becomes `queued'
+\(with the :message-id), `failed' (with the :exit code) or `timeout'
+\(after `claude-code-ide-codex-queue-timeout'), in the same list, and
+`claude-code-ide-codex-queue-functions' run.
+
+Return nil when the command cannot start, or when INSTANCE has no
+native ID: a new conversation gets it only at its first prompt."
   (let ((thread (claude-code-ide-known-or-nil (claude-code-ide-codex--native-id instance))))
     (if (not thread)
         (progn
           (message "This Codex session has no conversation ID yet.  Type its first prompt in the terminal")
           nil)
-      (with-temp-buffer
-        (let* ((root (claude-code-ide-known-or-nil (claude-code-ide-instance-project-root instance)))
-               (default-directory (if (and root (file-directory-p root)) root default-directory))
-               (process-environment (claude-code-ide-codex--process-environment))
-               (status (condition-case err
-                           (call-process claude-code-ide-codex-cli-path nil t nil
-                                         "queue" "--thread" thread "--message" text)
-                         (error (error-message-string err))))
-               (output (string-trim (buffer-string))))
-          (if (eq status 0)
-              (list :status 'queued
-                    :thread thread
-                    :message-id (if (string-match "Queued message \\([^ \t\n]+\\)" output)
-                                    (match-string 1 output)
-                                  'unknown))
-            (message "codex queue failed (%s): %s" status output)
-            nil))))))
-
-(defun claude-code-ide-codex--stop (instance)
-  "End the CLI of INSTANCE by killing its terminal buffer.
-With --no-daemon, this ends Codex and its child processes.  Return
-non-nil when INSTANCE had a session."
-  (when-let* ((session (claude-code-ide-instance-session instance)))
-    (claude-code-ide--stop-session session)
-    t))
+      (let* ((result (list :status 'queued :thread thread :outcome 'pending
+                           :message-id 'unknown :exit nil))
+             (buffer (generate-new-buffer " *cci-codex-queue*"))
+             (root (claude-code-ide-known-or-nil (claude-code-ide-instance-project-root instance)))
+             (process
+              (condition-case err
+                  (let ((default-directory (if (and root (file-directory-p root))
+                                               root
+                                             default-directory))
+                        (process-environment (claude-code-ide-codex--process-environment)))
+                    ;; One word for each option value, so that a text that
+                    ;; starts with "-" is not read as an option
+                    (make-process :name "cci-codex-queue"
+                                  :buffer buffer
+                                  :command (list claude-code-ide-codex-cli-path "queue"
+                                                 (concat "--thread=" thread)
+                                                 (concat "--message=" text))
+                                  :connection-type 'pipe
+                                  :noquery t
+                                  :sentinel #'ignore))
+                (error
+                 (kill-buffer buffer)
+                 (message "codex queue could not start: %s" (error-message-string err))
+                 nil))))
+        (when process
+          (process-send-eof process)
+          (let ((timer (run-at-time claude-code-ide-codex-queue-timeout nil
+                                    (lambda ()
+                                      (when (process-live-p process)
+                                        (process-put process 'claude-code-ide-codex-timeout t)
+                                        (delete-process process))))))
+            (set-process-sentinel
+             process
+             (lambda (proc _event)
+               (unless (process-live-p proc)
+                 (cancel-timer timer)
+                 (claude-code-ide-codex--queue-finished instance result proc buffer)))))
+          result)))))
 
 ;;; Dialogs on the screen
 
@@ -544,8 +773,7 @@ text of the screen.  It never sends keys."
 (defun claude-code-ide-codex--start (&optional continue resume)
   "Start a Codex instance for the current project.
 CONTINUE and RESUME are as for `claude-code-ide--start-session'."
-  (let ((claude-code-ide-default-provider 'codex)
-        (claude-code-ide-cli-extra-flags claude-code-ide-codex-cli-extra-flags))
+  (let ((claude-code-ide-default-provider 'codex))
     (claude-code-ide--start-session continue resume)))
 
 ;;;###autoload
@@ -582,7 +810,8 @@ instance name."
     :resume #'claude-code-ide-codex--resume
     :fork #'claude-code-ide-codex--fork
     :submit-prompt #'claude-code-ide-codex--submit-prompt
-    :stop #'claude-code-ide-codex--stop
+    ;; Killing the buffer ends `codex --no-daemon' and its children
+    :stop #'claude-code-ide--claude-stop
     :native-id #'claude-code-ide-codex--native-id
     :map-event #'claude-code-ide-codex--map-event
     :mcp-setup #'claude-code-ide-codex--mcp-setup
