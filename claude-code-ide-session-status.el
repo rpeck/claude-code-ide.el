@@ -1755,6 +1755,7 @@ Each group starts with a header entry whose id is the group."
     (define-key map (kbd "RET") #'claude-code-ide-session-status-visit)
     (define-key map (kbd "w") #'claude-code-ide-visit-waiting-session)
     (define-key map (kbd "T") #'claude-code-ide-session-status-track)
+    (define-key map (kbd "H") #'claude-code-ide-session-status-handover)
     map)
   "Keymap of `claude-code-ide-session-status-list-mode'.")
 
@@ -1762,7 +1763,8 @@ Each group starts with a header entry whose id is the group."
   "Claude Status"
   "Live status of the Claude Code sessions of this Emacs, by project.
 The projects and sessions that need you come first.  RET on a project
-line goes to its first session.
+line goes to its first session.  H offers a handover of the session on
+the line, or of the first session at a quota limit.
 
 \\{claude-code-ide-session-status-list-mode-map}"
   (setq tabulated-list-format
@@ -1848,6 +1850,41 @@ With a prefix argument FORCE, restart it also while it is busy."
      (if (claude-code-ide-session-status--group-p id)
          (car (car (claude-code-ide-session-status--group-rows id)))
        id))))
+
+(declare-function claude-code-ide-handover "claude-code-ide-handover"
+                  (instance-id target-provider &optional method context interrupt force))
+(declare-function claude-code-ide-handover--read-args "claude-code-ide-handover"
+                  (&optional instance-id))
+
+(defun claude-code-ide-session-status--row-instance (item)
+  "Return the instance descriptor of the row ITEM (a session or a descriptor)."
+  (if (claude-code-ide-instance-p item)
+      item
+    (claude-code-ide-instance-of-session item)))
+
+(defun claude-code-ide-session-status--handover-instance ()
+  "Return the instance that the handover key offers, or nil.
+That is the session on the current line, else the first session whose
+state is a quota limit."
+  (let ((id (tabulated-list-get-id)))
+    (or (and id (not (claude-code-ide-session-status--group-p id))
+             (claude-code-ide-session-status--row-instance id))
+        (when-let* ((row (cl-find 'quota (claude-code-ide-session-status--rows)
+                                  :key (lambda (row) (nth 1 row)))))
+          (claude-code-ide-session-status--row-instance (car row))))))
+
+(defun claude-code-ide-session-status-handover ()
+  "Offer a handover of the session on this line to a new conversation.
+Without a session on the line, offer the first session at a quota
+limit.  Emacs asks for the target provider and the rest, and starts
+nothing without your answers; see `claude-code-ide-handover'."
+  (interactive)
+  (unless (require 'claude-code-ide-handover nil t)
+    (user-error "The handover file is not available"))
+  (let ((instance (or (claude-code-ide-session-status--handover-instance)
+                      (user-error "No session on this line, and none at a quota limit"))))
+    (apply #'claude-code-ide-handover
+           (claude-code-ide-handover--read-args (claude-code-ide-instance-id instance)))))
 
 ;;;###autoload
 (defun claude-code-ide-visit-waiting-session ()

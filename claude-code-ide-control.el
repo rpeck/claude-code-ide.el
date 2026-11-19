@@ -620,21 +620,39 @@ of its dialogs.  A failed or stopped instance rejects, unless QUEUE is
      ((and (memq name '(failed stopped)) (not (eq queue 'always))) (cons 'reject reason))
      (t (cons 'queue reason)))))
 
+(defun claude-code-ide-control--failed-state (entry)
+  "Return the `failed' state of the failed registry ENTRY.
+The reason is `exit-code' when the CLI exited with an error code, else
+`error'.  The state plist also has :detail, the failure of ENTRY."
+  (let ((failure (claude-code-ide-session-registry-entry-failure entry)))
+    (append (claude-code-ide-instance-make-state
+             'failed
+             (if (and (stringp failure)
+                      (string-prefix-p "The CLI exited with code" failure))
+                 'exit-code
+               'error))
+            (list :detail failure))))
+
 (defun claude-code-ide-control--state-of (instance-id)
   "Return the state of INSTANCE-ID for the state rules, or nil when unknown.
-A running instance gives its state plist.  An instance that does not
-run gives the symbol `stopped' when the session registry marks it
-closed or archived, else the `disconnected' state, when the registry
-or this Emacs knows it."
+A running instance gives its state plist.  For an instance that does
+not run, the session registry decides:
+- closed or archived: the symbol `stopped';
+- failed: the `failed' state, with the failure of the entry as :detail;
+- pending: `working' with the reason `starting', because its start
+  has not ended;
+- open, or an instance that this Emacs knows without an entry: the
+  `disconnected' state."
   (let ((state (claude-code-ide-instance-state instance-id))
         (instance (claude-code-ide-instance-by-id instance-id)))
     (if (and instance (claude-code-ide-instance-live-p instance))
         state
-      (let ((entry (claude-code-ide-control--registry-entry instance-id)))
+      (let* ((entry (claude-code-ide-control--registry-entry instance-id))
+             (entry-state (and entry (claude-code-ide-session-registry-entry-state entry))))
         (cond
-         ((and entry (memq (claude-code-ide-session-registry-entry-state entry)
-                           '(closed archived)))
-          'stopped)
+         ((memq entry-state '(closed archived)) 'stopped)
+         ((eq entry-state 'failed) (claude-code-ide-control--failed-state entry))
+         ((eq entry-state 'pending) (claude-code-ide-instance-make-state 'working 'starting))
          ((or state entry)
           (claude-code-ide-instance-make-state 'disconnected)))))))
 
@@ -830,6 +848,48 @@ ID of the prompt that was sent, or nil."
      ((and (eq (car (claude-code-ide-control-decide state 'never)) 'deliver)
            (claude-code-ide-control--send next (plist-get state :guess)))
       (claude-code-ide-control--record-request-id next)))))
+
+;;; Moving an inbox
+
+(defun claude-code-ide-control-move-inbox (from to)
+  "Move the queued prompts of the instance FROM into the inbox of TO.
+A handover calls this after its commit, so that the prompts and the
+review results for the old instance go to the new one (plan section
+4.8).  Each prompt that FROM has not received yet gets a record in the
+inbox of TO with the same request ID, text and creation time, after
+the prompts that TO has already.  The record of FROM then becomes
+final: `rejected' with the reason `handed-over'.  A prompt that FROM
+received and that waits for its acknowledgement stays: FROM no longer
+runs, so it becomes `unacknowledged' in time.  A request ID that TO
+knows already is not moved again, so a second call moves nothing.
+Return the request IDs that moved, oldest first."
+  (when (and (claude-code-ide-control--valid-id-p from)
+             (claude-code-ide-control--valid-id-p to)
+             (not (equal from to)))
+    (let ((moved nil))
+      (dolist (record (claude-code-ide-control--pending-records from))
+        (unless (claude-code-ide-control--record-sent-at record)
+          (let* ((request-id (claude-code-ide-control--record-request-id record))
+                 (pending (claude-code-ide-control--pending-records to)))
+            (unless (claude-code-ide-control--find-record to request-id pending)
+              ;; The new record first, so that a crash loses no prompt
+              (claude-code-ide-control--write-record
+               (claude-code-ide-control--record-create
+                :request-id request-id
+                :instance-id to
+                :seq (1+ (apply #'max 0 (mapcar #'claude-code-ide-control--record-seq pending)))
+                :text-hash (claude-code-ide-control--record-text-hash record)
+                :text (claude-code-ide-control--record-text record)
+                :result 'queued
+                :reason 'handed-over
+                :created-at (claude-code-ide-control--record-created-at record)
+                :requested-by (claude-code-ide-control--record-requested-by record)))
+              (push request-id moved))
+            (claude-code-ide-control--finish record 'rejected 'handed-over))))
+      (when moved
+        (claude-code-ide-control--start-timer)
+        (claude-code-ide-control--schedule-delivery to))
+      (nreverse moved))))
 
 ;;; Acknowledgement
 

@@ -715,6 +715,8 @@ The two instances have the same display name."
   (let ((claude-code-ide-control-operations (copy-tree claude-code-ide-control-operations)))
     (dolist (op '(list-instances inspect-instance launch resume submit-prompt stop))
       (should (functionp (alist-get op claude-code-ide-control-operations))))
+    ;; The handover file fills the slot when it is loaded; test the empty slot
+    (claude-code-ide-control-define-operation 'handover nil)
     (should (equal (claude-code-ide-control-call 'handover)
                    '(:status unavailable :capability handover)))
     (claude-code-ide-control-define-operation 'handover (lambda (&rest args) (cons 'done args)))
