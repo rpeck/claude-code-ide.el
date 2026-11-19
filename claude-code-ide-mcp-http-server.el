@@ -94,15 +94,37 @@ Returns the session ID or nil if not found.  The log shows the path
 without the secret part."
   (let ((parts (claude-code-ide-mcp-http-server--split-path
                 (claude-code-ide-mcp-http-server--request-path headers))))
-    (when parts
-      (claude-code-ide-debug "MCP request URL: /mcp/%s%s"
-                             (car parts) (if (cdr parts) "/<secret>" "")))
+    (claude-code-ide-mcp-http-server--log-path parts)
     (car parts)))
+
+(defun claude-code-ide-mcp-http-server--log-path (parts)
+  "Log the path of PARTS, a value of `claude-code-ide-mcp-http-server--split-path'.
+The log never shows the secret."
+  (when parts
+    (claude-code-ide-debug "MCP request URL: /mcp/%s%s"
+                           (car parts) (if (cdr parts) "/<secret>" ""))))
 
 (defun claude-code-ide-mcp-http-server--header (headers name)
   "Return the value of the header NAME in the web-server HEADERS, or nil.
 web-server keys a header by its name in upper case, as a keyword."
   (cdr (assq (intern (concat ":" (upcase name))) headers)))
+
+(defun claude-code-ide-mcp-http-server--transport-refusal (headers)
+  "Return (STATUS . REASON) when the request with HEADERS must be refused.
+Return nil when it may be read.  These checks stop a web page in a
+browser, which can send a POST to 127.0.0.1:
+- A browser adds an Origin header; local MCP clients send none.
+- The body must be declared as application/json.  A web page can send
+  that type only after a CORS preflight, which this server never
+  answers, and the replies carry no CORS header."
+  (let ((origin (claude-code-ide-mcp-http-server--header headers "Origin"))
+        (type (claude-code-ide-mcp-http-server--header headers "Content-Type")))
+    (cond
+     (origin '(403 . "Origin header not allowed"))
+     ((not (and (stringp type)
+                (string-match-p "\\`[ \t]*application/json[ \t]*\\(?:;.*\\)?\\'"
+                                (downcase type))))
+      '(415 . "Content-Type must be application/json")))))
 
 ;;; Public Functions
 
@@ -158,59 +180,72 @@ Extracts session ID from the URL path and processes the request
 with the appropriate session context.  A request for the session of
 an instance must carry the secret of that instance, in the path or
 in the header `claude-code-ide-mcp-server-secret-header'; else it
-gets 403.  See `claude-code-ide-mcp-server-check-request'."
+gets 403.  See `claude-code-ide-mcp-server-check-request'.  A request
+with an Origin header gets 403, and one that is not application/json
+gets 415, before its body is read; see
+`claude-code-ide-mcp-http-server--transport-refusal'."
   (claude-code-ide-debug "MCP server received POST request")
   (let ((id nil))  ; bound outside the condition-case so error replies can carry it
     (condition-case err
         (let* ((headers (ws-headers request))
-               (body (ws-body request))
                ;; Extract session ID and secret from URL path
                (parts (claude-code-ide-mcp-http-server--split-path
                        (claude-code-ide-mcp-http-server--request-path headers)))
-               (url-session-id (claude-code-ide-mcp-http-server--extract-session-id-from-path headers))
-               (check (claude-code-ide-mcp-server-check-request
-                       url-session-id
-                       (cdr parts)
-                       (claude-code-ide-mcp-http-server--header
-                        headers claude-code-ide-mcp-server-secret-header)
-                       (claude-code-ide-mcp-http-server--header
-                        headers claude-code-ide-mcp-server-coordinator-header)))
-               (json-object (json-parse-string body :object-type 'alist))
-               (method (alist-get 'method json-object))
-               (params (alist-get 'params json-object)))
-          (setq id (alist-get 'id json-object))
-
-          (claude-code-ide-debug "MCP request - method: %s, id: %s, session-id: %s"
-                                 method id url-session-id)
-
-          (cond
-           ;; A wrong or missing secret ends the request, also a notification
-           ((not (plist-get check :ok))
-            (claude-code-ide-debug "MCP request rejected: %s" (plist-get check :reason))
+               (url-session-id (car parts))
+               (refusal (claude-code-ide-mcp-http-server--transport-refusal headers)))
+          (claude-code-ide-mcp-http-server--log-path parts)
+          (when refusal
+            (claude-code-ide-debug "MCP request refused: %s" (cdr refusal))
             (claude-code-ide-mcp-http-server--send-json-response
-             request 403
+             request (car refusal)
              `((jsonrpc . "2.0")
-               (id . ,id)
+               (id . nil)
                (error . ((code . -32000)
-                         (message . ,(format "Forbidden: %s" (plist-get check :reason))))))))
-           ;; A notification (no id field) gets 202 Accepted with no body
-           ((null id)
-            (claude-code-ide-debug "Received notification: %s" method)
-            (claude-code-ide-mcp-http-server--send-empty-response request))
-           (t
-            ;; Process the request with session context
-            (let* ((claude-code-ide-mcp-server--current-session-id (plist-get check :key))
-                   (claude-code-ide-mcp-server--current-instance-id (plist-get check :instance-id))
-                   (claude-code-ide-mcp-server--coordinator-request (plist-get check :coordinator))
-                   (result (claude-code-ide-mcp-http-server--dispatch method params)))
-              (claude-code-ide-debug "MCP response result computed")
-              ;; Send response
+                         (message . ,(format "Forbidden: %s" (cdr refusal))))))))
+          (let* ((body (ws-body request))
+                 (check (claude-code-ide-mcp-server-check-request
+                         url-session-id
+                         (cdr parts)
+                         (claude-code-ide-mcp-http-server--header
+                          headers claude-code-ide-mcp-server-secret-header)
+                         (claude-code-ide-mcp-http-server--header
+                          headers claude-code-ide-mcp-server-coordinator-header)))
+                 (json-object (json-parse-string body :object-type 'alist))
+                 (method (alist-get 'method json-object))
+                 (params (alist-get 'params json-object)))
+            (setq id (alist-get 'id json-object))
+
+            (claude-code-ide-debug "MCP request - method: %s, id: %s, session-id: %s"
+                                   method id url-session-id)
+
+            (cond
+             ;; A wrong or missing secret ends the request, also a notification
+             ((not (plist-get check :ok))
+              (claude-code-ide-debug "MCP request rejected: %s" (plist-get check :reason))
               (claude-code-ide-mcp-http-server--send-json-response
-               request 200
+               request 403
                `((jsonrpc . "2.0")
                  (id . ,id)
-                 (result . ,result)))
-              (claude-code-ide-debug "MCP response sent")))))
+                 (error . ((code . -32000)
+                           (message . ,(format "Forbidden: %s" (plist-get check :reason))))))))
+             ;; A notification (no id field) gets 202 Accepted with no body
+             ((null id)
+              (claude-code-ide-debug "Received notification: %s" method)
+              (claude-code-ide-mcp-http-server--send-empty-response request))
+             (t
+              ;; Process the request with session context
+              (let* ((claude-code-ide-mcp-server--current-session-id (plist-get check :key))
+                     (claude-code-ide-mcp-server--current-instance-id (plist-get check :instance-id))
+                     (claude-code-ide-mcp-server--coordinator-request (plist-get check :coordinator))
+                     (result (claude-code-ide-mcp-http-server--dispatch method params)))
+                (claude-code-ide-debug "MCP response result computed")
+                ;; Send response
+                (claude-code-ide-mcp-http-server--send-json-response
+                 request 200
+                 `((jsonrpc . "2.0")
+                   (id . ,id)
+                   (result . ,result)))
+                (claude-code-ide-debug "MCP response sent"))))))
 
       (json-parse-error
        (claude-code-ide-mcp-http-server--send-json-error
@@ -387,8 +422,8 @@ Returns a list of arguments in the correct order."
 (defun claude-code-ide-mcp-http-server--send-json-response (request status body)
   "Send JSON response to REQUEST with STATUS and BODY."
   (with-slots (process) request
-    (let ((headers (list (cons "Content-Type" "application/json")
-                         (cons "Access-Control-Allow-Origin" "*"))))
+    ;; No CORS header: a web page must not read the replies
+    (let ((headers (list (cons "Content-Type" "application/json"))))
       (apply #'ws-response-header process status headers)
       (ws-send process (json-encode body))
       ;; Close the connection after sending response
