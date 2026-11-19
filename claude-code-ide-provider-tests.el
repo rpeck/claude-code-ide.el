@@ -497,7 +497,7 @@ cdr of its :cleanup key."
             (progn
               ;; No status hooks: no event comes
               (should (equal (claude-code-ide-instance-state "cci-test-st" 50.0)
-                             '(:state disconnected :reason nil :since nil :guess nil :age nil)))
+                             '(:state disconnected :reason untracked :since nil :guess nil :age nil)))
               (claude-code-ide-session-status--hooks session "key-st")
               (let ((status (gethash session claude-code-ide-session-status--by-session)))
                 (setf (claude-code-ide-session-status-registered status) 0.0
