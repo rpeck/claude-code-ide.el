@@ -130,13 +130,15 @@ Each element is (FILE-A FILE-B STARTUP-HOOKS), the oldest first.  See
 `claude-code-ide-ediff-files-in-frame'.")
 
 (defun claude-code-ide-mcp--ediff-frame-label-of (frame)
-  "Return the label of the dedicated diff frame FRAME, or nil."
+  "Return the label of the dedicated diff frame FRAME, or nil.
+Only the table `claude-code-ide-mcp--ediff-frames' counts.  The frame
+parameter `claude-code-ide-ediff' does not: a copy of the frame (for
+example from `clone-frame' or a desktop restore) has it too."
   (when (frame-live-p frame)
-    (or (frame-parameter frame 'claude-code-ide-ediff)
-        (catch 'found
-          (maphash (lambda (label f) (when (eq f frame) (throw 'found label)))
-                   claude-code-ide-mcp--ediff-frames)
-          nil))))
+    (catch 'found
+      (maphash (lambda (label f) (when (eq f frame) (throw 'found label)))
+               claude-code-ide-mcp--ediff-frames)
+      nil)))
 
 (defun claude-code-ide-mcp-ediff-frame-p (frame)
   "Return non-nil when FRAME is a live dedicated diff frame."
@@ -197,6 +199,22 @@ daemon and child frames do not count."
     (or (cl-find-if (lambda (frame) (eq (frame-visible-p frame) t)) candidates)
         (car candidates))))
 
+(defun claude-code-ide-mcp--frame-outside-ediff ()
+  "Return a frame that is not a dedicated diff frame, or nil.
+That is another frame (see `claude-code-ide-mcp--other-frame'), or a
+new frame when no other frame exists.  Return nil when no frame can be
+made."
+  (or (claude-code-ide-mcp--other-frame)
+      (condition-case err
+          ;; A new frame shows the current buffer; a Claude one would
+          ;; pull its side windows in
+          (with-current-buffer (get-buffer-create "*scratch*")
+            (make-frame))
+        (error
+         (claude-code-ide-debug "Cannot make a frame outside the diff frame: %s"
+                                (error-message-string err))
+         nil))))
+
 (defun claude-code-ide-mcp-call-outside-ediff-frame (function)
   "Call FUNCTION with a frame selected that is not a dedicated diff frame.
 When the selected frame is not a dedicated diff frame, call FUNCTION in
@@ -207,14 +225,7 @@ can be made, do not call FUNCTION and return nil.  Return the value of
 FUNCTION."
   (if (not (claude-code-ide-mcp-ediff-frame-p (selected-frame)))
       (funcall function)
-    (let ((frame (or (claude-code-ide-mcp--other-frame)
-                     (condition-case err
-                         (with-current-buffer (get-buffer-create "*scratch*")
-                           (make-frame))
-                       (error
-                        (claude-code-ide-debug "Cannot make a frame outside the diff frame: %s"
-                                               (error-message-string err))
-                        nil)))))
+    (let ((frame (claude-code-ide-mcp--frame-outside-ediff)))
       (if (frame-live-p frame)
           (with-selected-frame frame
             (funcall function))
@@ -349,11 +360,49 @@ Return the frame of the diff, or nil."
          (claude-code-ide-mcp--schedule-ediff-next label)
          nil)))))
 
+(defvar claude-code-ide-mcp--ediff-queue-timer nil
+  "Timer that opens the waiting diffs whose frame became free.")
+
+(defconst claude-code-ide-mcp--ediff-queue-interval 2
+  "Seconds between two checks of the waiting diffs.")
+
+(defun claude-code-ide-mcp--ediff-queue-tick ()
+  "Open the next waiting diff of each label whose frame is free.
+Stop the timer when no diff waits."
+  (let ((labels nil))
+    (maphash (lambda (label _queue) (push label labels)) claude-code-ide-mcp--ediff-queue)
+    (dolist (label labels)
+      (claude-code-ide-mcp--ediff-next label)))
+  (when (and (zerop (hash-table-count claude-code-ide-mcp--ediff-queue))
+             (timerp claude-code-ide-mcp--ediff-queue-timer))
+    (cancel-timer claude-code-ide-mcp--ediff-queue-timer)
+    (setq claude-code-ide-mcp--ediff-queue-timer nil)))
+
 (defun claude-code-ide-mcp--schedule-ediff-next (label)
   "Open the next waiting diff of the frame LABEL a moment from now.
-The delay lets the ediff that ended clean up its windows first."
+The delay lets the ediff that ended clean up its windows first.  A
+timer checks again while diffs wait, because an ediff that this file
+did not start can hold the frame, and its end is not reported."
   (when (gethash label claude-code-ide-mcp--ediff-queue)
-    (run-at-time 0.3 nil #'claude-code-ide-mcp--ediff-next label)))
+    (run-at-time 0.3 nil #'claude-code-ide-mcp--ediff-next label)
+    (unless (timerp claude-code-ide-mcp--ediff-queue-timer)
+      (setq claude-code-ide-mcp--ediff-queue-timer
+            (run-with-timer claude-code-ide-mcp--ediff-queue-interval
+                            claude-code-ide-mcp--ediff-queue-interval
+                            #'claude-code-ide-mcp--ediff-queue-tick)))))
+
+(defun claude-code-ide-mcp--ediff-buffer-killed ()
+  "Open the next waiting diffs when an ediff control buffer dies.
+This runs from the global `kill-buffer-hook', so that the end of any
+ediff, also one that this file did not start, frees its frame."
+  (when (and (> (hash-table-count claude-code-ide-mcp--ediff-queue) 0)
+             (derived-mode-p 'ediff-mode))
+    (let ((labels nil))
+      (maphash (lambda (label _queue) (push label labels)) claude-code-ide-mcp--ediff-queue)
+      (dolist (label labels)
+        (claude-code-ide-mcp--schedule-ediff-next label)))))
+
+(add-hook 'kill-buffer-hook #'claude-code-ide-mcp--ediff-buffer-killed)
 
 (defun claude-code-ide-mcp--free-ediff-label (session)
   "Return the label of a dedicated diff frame for SESSION without an open ediff.
@@ -642,6 +691,16 @@ ARGUMENTS should contain:
         ;; Clean up existing diff
         (claude-code-ide-mcp--cleanup-diff tab-name session)))
 
+    ;; Without dedicated frames the diff opens in the selected frame;
+    ;; a dedicated diff frame there holds another review, so leave it
+    ;; first, for another frame or a new one, before the tab switch
+    (when (and (not claude-code-ide-ediff-frame)
+               (claude-code-ide-mcp-ediff-frame-p (selected-frame)))
+      (let ((other (claude-code-ide-mcp--frame-outside-ediff)))
+        (unless (frame-live-p other)
+          (signal 'mcp-error '("No frame outside the dedicated diff frames for the diff")))
+        (select-frame-set-input-focus other)))
+
     ;; Switch to original tab if we're on a different one (when configured)
     (when (and claude-code-ide-switch-tab-on-ediff
                (not claude-code-ide-ediff-frame)
@@ -658,14 +717,6 @@ ARGUMENTS should contain:
                                    (alist-get 'name current-tab))))
               ;; Switch to the original tab
               (tab-bar-select-tab-by-name (alist-get 'name original-tab)))))))
-
-    ;; Without dedicated frames the diff opens in the selected frame;
-    ;; a dedicated diff frame there holds another review, so use
-    ;; another frame
-    (when (and (not claude-code-ide-ediff-frame)
-               (claude-code-ide-mcp-ediff-frame-p (selected-frame)))
-      (when-let* ((other (claude-code-ide-mcp--other-frame)))
-        (select-frame-set-input-focus other)))
 
     ;; Save current window configuration
     (let* ((frame-label (when claude-code-ide-ediff-frame

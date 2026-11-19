@@ -27,7 +27,7 @@
 ;; instance: the owner.  `claude-code-ide-review-track' records the
 ;; review in a durable file.  When the process ends, Emacs reads the
 ;; result file and puts the result into the inbox of the owner (see
-;; claude-code-ide-control.el), with the review ID as the request ID.
+;; claude-code-ide-control.el), with the request ID "review:<review ID>".
 ;; The state rules of the inbox then decide when the owner gets it, and
 ;; the result counts as delivered only when the owner's CLI reports the
 ;; same prompt.  So the owner gets the result one time, also when the
@@ -62,8 +62,17 @@ registry (`claude-code-ide-session-registry-report-directory')."
 (defcustom claude-code-ide-review-check-interval 5
   "Seconds between two checks of the reviews that are not final.
 A check finds the end of a review process that Emacs knows only by
-its process ID, retries a result whose owner is not known yet, and
-compares the submitted results with the owner's inbox."
+its process ID, retries a result whose owner is not known yet,
+compares the submitted results with the owner's inbox, and takes over
+the reviews of an Emacs that quit."
+  :type 'number
+  :group 'claude-code-ide-review)
+
+(defcustom claude-code-ide-review-retry-seconds 600
+  "Seconds that a result waits for an owner that cannot take it.
+That is an owner that is not known, or a submit that failed.  After
+this time, the result becomes final: `rejected', with a warning that
+names the result file and the record file."
   :type 'number
   :group 'claude-code-ide-review)
 
@@ -83,12 +92,11 @@ rejected.  While the record stays, a review with its ID is a duplicate."
 (defcustom claude-code-ide-review-format-function #'claude-code-ide-review-format-result
   "Function that makes the prompt text of a review result.
 It is called with a plist that has :review-id, :label, :owner,
-:result-file, :exit-status (an integer, or nil when not known),
-:content (the text of the result file, or nil), :error (nil, or a
-symbol that says why the result file cannot be used), :message (the
-text of the error), :length (the length of the full result, when it
-was cut) and :output (the end of the output of a command that Emacs
-started, or nil).  It returns a string."
+:result-file, :record-file, :exit-status (an integer, or nil when not
+known), :content (the text of the result file, or nil), :error (nil,
+or a symbol that says why the result file cannot be used), :message
+\(the text of the error) and :length (the length of the full result,
+when it was cut).  It returns a string."
   :type 'function
   :group 'claude-code-ide-review)
 
@@ -98,8 +106,9 @@ started, or nil).  It returns a string."
 (defconst claude-code-ide-review--max-file-bytes (* 8 1024 1024)
   "Largest result file that Emacs reads.  A larger one is an error result.")
 
-(defconst claude-code-ide-review--output-chars 2000
-  "Characters at the end of the command output that an error result shows.")
+(defconst claude-code-ide-review--request-prefix "review:"
+  "Prefix of the inbox request ID of a review result.
+It keeps the review IDs apart from the request IDs of other prompts.")
 
 ;;; Records
 
@@ -110,13 +119,15 @@ started, or nil).  It returns a string."
   (review-id nil :type string)
   (owner nil :type string :documentation "Instance ID that owns the review.")
   (label nil :type string)
-  (command nil :documentation "The command that Emacs started, a list of strings, or nil.")
+  (program nil :documentation "Name of the program that Emacs started, or nil.
+The arguments of the command are not kept.")
   (directory nil :documentation "Working folder of the command.")
   (pid nil :documentation "Process ID of the review process, or nil.")
   (pid-start nil :documentation "Start time of that process as a float time, or nil.")
   (managed nil :documentation "Non-nil when Emacs started the process.")
   (interrupted nil :documentation "Non-nil when Emacs quit while its process ran.")
   (emacs-pid nil :documentation "Process ID of the Emacs that tracks the review.")
+  (emacs-start nil :documentation "Start time of that Emacs as a float time, or nil.")
   (result-file nil :type string)
   (state 'running :type symbol
          :documentation "`running', `ended', `submitted', `delivered', `unacknowledged' or `rejected'.")
@@ -126,6 +137,8 @@ started, or nil).  It returns a string."
   (destination nil :documentation "Instance ID whose inbox got the result, or nil.")
   (submit-result nil :documentation "The last :result of the inbox, a symbol, or nil.")
   (submit-reason nil :documentation "The last :reason of the inbox, a symbol, or nil.")
+  (attempts 0 :documentation "Failed tries to read the result or to submit it.")
+  (waiting-since nil :documentation "Float time of the first failed try, or nil.")
   (created-at nil)
   (ended-at nil)
   (submitted-at nil)
@@ -133,13 +146,14 @@ started, or nil).  It returns a string."
   (updated-at nil))
 
 (defconst claude-code-ide-review--fields
-  '((review_id . review-id) (owner . owner) (label . label) (command . command)
+  '((review_id . review-id) (owner . owner) (label . label) (program . program)
     (directory . directory) (pid . pid) (pid_start . pid-start) (managed . managed)
-    (interrupted . interrupted) (emacs_pid . emacs-pid) (result_file . result-file)
-    (state . state) (exit_status . exit-status) (error . error) (text . text)
-    (destination . destination) (submit_result . submit-result)
-    (submit_reason . submit-reason) (created_at . created-at) (ended_at . ended-at)
-    (submitted_at . submitted-at) (delivered_at . delivered-at) (updated_at . updated-at))
+    (interrupted . interrupted) (emacs_pid . emacs-pid) (emacs_start . emacs-start)
+    (result_file . result-file) (state . state) (exit_status . exit-status) (error . error)
+    (text . text) (destination . destination) (submit_result . submit-result)
+    (submit_reason . submit-reason) (attempts . attempts) (waiting_since . waiting-since)
+    (created_at . created-at) (ended_at . ended-at) (submitted_at . submitted-at)
+    (delivered_at . delivered-at) (updated_at . updated-at))
   "JSON key and struct slot of each field of a review file.")
 
 (defconst claude-code-ide-review--symbol-slots '(state error submit-result submit-reason)
@@ -152,16 +166,24 @@ started, or nil).  It returns a string."
   "States after which nothing changes.")
 
 (defvar claude-code-ide-review--records (make-hash-table :test 'equal)
-  "The reviews that this Emacs tracks, by review ID.")
+  "The reviews that this Emacs tracks, and the final ones, by review ID.")
 
 (defvar claude-code-ide-review--loaded nil
   "Non-nil when the review files were read into `claude-code-ide-review--records'.")
+
+(defvar claude-code-ide-review--foreign (make-hash-table :test 'equal)
+  "Review files that another running Emacs tracks, by file name.
+The value is (EMACS-PID . EMACS-START) of that Emacs.  A check takes
+the review over when that Emacs is gone.")
+
+(defvar claude-code-ide-review--scan-time nil
+  "Float time of the last read of the review folder, or nil.")
 
 (defvar claude-code-ide-review--processes (make-hash-table :test 'equal)
   "The Emacs process object of each review that has one, by review ID.")
 
 (defvar claude-code-ide-review--warned nil
-  "Review IDs whose wait for an unknown owner was reported.")
+  "Review IDs whose wait for an owner was reported.")
 
 (defun claude-code-ide-review--directory ()
   "Return the directory of the review records."
@@ -176,6 +198,10 @@ started, or nil).  It returns a string."
                                        0 32)
                             ".json")
                     (claude-code-ide-review--directory)))
+
+(defun claude-code-ide-review--request-id (review-id)
+  "Return the inbox request ID of the result of REVIEW-ID."
+  (concat claude-code-ide-review--request-prefix review-id))
 
 (defun claude-code-ide-review--final-p (record)
   "Return non-nil when RECORD is final."
@@ -193,7 +219,6 @@ started, or nil).  It returns a string."
                             (if value t :json-false))
                            ((and value (memq (cdr field) claude-code-ide-review--symbol-slots))
                             (symbol-name value))
-                           ((eq (cdr field) 'command) (and value (vconcat value)))
                            (t value)))))
                 claude-code-ide-review--fields)))
 
@@ -210,7 +235,7 @@ started, or nil).  It returns a string."
                  ((memq (cdr field) claude-code-ide-review--boolean-slots) (eq value t))
                  ((and (memq (cdr field) claude-code-ide-review--symbol-slots) (stringp value))
                   (intern value))
-                 ((eq (cdr field) 'command) (and value (append value nil)))
+                 ((eq (cdr field) 'attempts) (if (integerp value) value 0))
                  (t value)))))
       record)))
 
@@ -226,7 +251,9 @@ started, or nil).  It returns a string."
   "Write RECORD to its file atomically and return RECORD.
 The text goes to a temporary file in the same folder, which is then
 renamed over the file.  The folder is private (mode 0700) and the file
-has mode 0600, because the result text can be private."
+has mode 0600, because the result text can be private.  The record
+format differs from the inbox format, so the inbox writer
+`claude-code-ide-control--write-file' does not fit."
   (setf (claude-code-ide-review--record-updated-at record) (claude-code-ide-control--now))
   (let* ((file (claude-code-ide-review--file (claude-code-ide-review--record-review-id record)))
          (dir (file-name-directory file)))
@@ -264,12 +291,16 @@ another start time is a new process, and does not count."
            (or (null start) (null now-start)
                (< (abs (- (float-time now-start) start)) 2))))))
 
-(defun claude-code-ide-review--emacs-live-p (pid)
-  "Return non-nil when PID is this Emacs, or another running Emacs."
+(defun claude-code-ide-review--emacs-start ()
+  "Return the start time of this Emacs as a float time, or nil."
+  (claude-code-ide-review--pid-start (emacs-pid)))
+
+(defun claude-code-ide-review--emacs-live-p (pid start)
+  "Return non-nil when the Emacs with PID and START time still runs.
+This Emacs runs.  Another one runs when a process with PID and the
+same start time runs; a new process with a reused PID does not count."
   (or (eql pid (emacs-pid))
-      (when-let* ((attributes (and (natnump pid) (process-attributes pid))))
-        (and (not (equal (alist-get 'state attributes) "Z"))
-             (string-match-p "emacs" (downcase (or (alist-get 'comm attributes) "")))))))
+      (claude-code-ide-review--pid-live-p pid start)))
 
 (defun claude-code-ide-review--record-live-p (record)
   "Return non-nil when the process of RECORD still runs."
@@ -280,16 +311,6 @@ another start time is a new process, and does not count."
       (claude-code-ide-review--pid-live-p (claude-code-ide-review--record-pid record)
                                           (claude-code-ide-review--record-pid-start record)))))
 
-(defun claude-code-ide-review--output (process)
-  "Return the end of the output buffer of PROCESS, or nil, and kill the buffer."
-  (let ((buffer (process-buffer process)))
-    (when (buffer-live-p buffer)
-      (prog1 (with-current-buffer buffer
-               (let ((text (string-trim (buffer-string))))
-                 (unless (string-empty-p text)
-                   (substring text (max 0 (- (length text) claude-code-ide-review--output-chars))))))
-        (kill-buffer buffer)))))
-
 (defun claude-code-ide-review--process-ended (process &optional _event)
   "Handle the end of the review PROCESS, when it ended.
 This runs after the sentinel of PROCESS."
@@ -297,12 +318,7 @@ This runs after the sentinel of PROCESS."
     (when-let* ((review-id (process-get process 'claude-code-ide-review-id))
                 (record (gethash review-id claude-code-ide-review--records)))
       (remhash review-id claude-code-ide-review--processes)
-      (let ((output (and (claude-code-ide-review--record-managed record)
-                         (claude-code-ide-review--output process))))
-        (condition-case err
-            (claude-code-ide-review--ended record (process-exit-status process) output)
-          (error (message "Review %s: cannot handle the end of its process: %s"
-                          review-id (error-message-string err))))))))
+      (claude-code-ide-review--ended record (process-exit-status process)))))
 
 ;;; The result
 
@@ -320,7 +336,7 @@ TEXT) when it is not."
   (let ((size (and (file-exists-p file) (file-attribute-size (file-attributes file)))))
     (cond
      ((not (file-exists-p file))
-      (list :error 'missing :message "The result file does not exist."))
+      (list :error 'missing :message "The review ended without a result file."))
      ((file-directory-p file)
       (list :error 'not-a-file :message "The result file is a directory."))
      ((not (file-readable-p file))
@@ -354,59 +370,101 @@ TEXT) when it is not."
   "Return the prompt text of the review result INFO.
 INFO is the plist that `claude-code-ide-review-format-function' gets.
 The text names the review, the result file and the exit status, then
-gives the result, or the error when the result file is not usable."
+gives the result, or the error and the review record when the result
+file is not usable.  It never has the output of the review process."
   (let* ((exit (plist-get info :exit-status))
          (header (format "Result of the review \"%s\" (review ID %s)\nResult file: %s\nExit status: %s"
                          (plist-get info :label) (plist-get info :review-id)
                          (plist-get info :result-file) (if exit exit "unknown"))))
     (if (plist-get info :error)
-        (concat header
-                (format "\n\nError: the review gave no usable result (%s). %s"
-                        (plist-get info :error) (plist-get info :message))
-                (when-let* ((output (plist-get info :output)))
-                  (format "\n\nThe end of the output of the review command:\n%s" output)))
+        (format "%s\nReview record: %s\n\nError: the review gave no usable result (%s). %s"
+                header (plist-get info :record-file)
+                (plist-get info :error) (plist-get info :message))
       (concat header "\n\n" (string-trim-right (plist-get info :content))
               (when-let* ((length (plist-get info :length)))
                 (format "\n\n[The result is cut: these are the first %d of %d characters. Read the full result in the result file.]"
                         (length (plist-get info :content)) length))))))
 
-(defun claude-code-ide-review--result-text (record output)
+(defun claude-code-ide-review--result-text (record)
   "Read the result of RECORD and return its prompt text.
-OUTPUT is the end of the command output, or nil.  Also set the error
-of RECORD."
+Also set the error of RECORD.  This can signal, for example when the
+format function fails."
   (let* ((result (claude-code-ide-review--read-result
                   (claude-code-ide-review--record-result-file record)))
-         (reason (plist-get result :error)))
-    ;; A process that Emacs ended at its quit had no time to write
-    (when (and (eq reason 'missing) (claude-code-ide-review--record-interrupted record))
-      (setq result (list :error 'interrupted
-                         :message "Emacs quit while the review ran, and the review wrote no result file.")
-            reason 'interrupted))
-    (setf (claude-code-ide-review--record-error record) reason)
-    (funcall claude-code-ide-review-format-function
-             (list :review-id (claude-code-ide-review--record-review-id record)
-                   :label (claude-code-ide-review--record-label record)
-                   :owner (claude-code-ide-review--record-owner record)
-                   :result-file (claude-code-ide-review--record-result-file record)
-                   :exit-status (claude-code-ide-review--record-exit-status record)
-                   :content (plist-get result :content)
-                   :error reason
-                   :message (plist-get result :message)
-                   :length (plist-get result :length)
-                   :output output))))
+         (reason (plist-get result :error))
+         (exit (claude-code-ide-review--record-exit-status record)))
+    (when (eq reason 'missing)
+      (setq result
+            (list :error (if (claude-code-ide-review--record-interrupted record) 'interrupted 'missing)
+                  :message
+                  (cond
+                   ((claude-code-ide-review--record-interrupted record)
+                    "Emacs quit while the review ran, and the review wrote no result file.")
+                   ((claude-code-ide-review--record-managed record)
+                    (format "The review command exited without a result file (exit code %s)."
+                            (if exit exit "unknown")))
+                   (t "The review process ended without a result file.")))
+            reason (plist-get result :error)))
+    (let ((text (funcall claude-code-ide-review-format-function
+                         (list :review-id (claude-code-ide-review--record-review-id record)
+                               :label (claude-code-ide-review--record-label record)
+                               :owner (claude-code-ide-review--record-owner record)
+                               :result-file (claude-code-ide-review--record-result-file record)
+                               :record-file (claude-code-ide-review--file
+                                             (claude-code-ide-review--record-review-id record))
+                               :exit-status exit
+                               :content (plist-get result :content)
+                               :error reason
+                               :message (plist-get result :message)
+                               :length (plist-get result :length)))))
+      (unless (and (stringp text) (not (string-empty-p (string-trim text))))
+        (error "The format function gave no text"))
+      (setf (claude-code-ide-review--record-error record) reason)
+      text)))
 
-(defun claude-code-ide-review--ended (record exit-status &optional output)
-  "Handle the end of the process of RECORD with EXIT-STATUS and OUTPUT.
+(defun claude-code-ide-review--failed-try (record reason)
+  "Count a failed try of RECORD with REASON, and write RECORD.
+After `claude-code-ide-review-retry-seconds' since the first failed
+try, RECORD becomes final: `rejected' with REASON.  Return non-nil when
+RECORD became final."
+  (let ((now (float-time)))
+    (cl-incf (claude-code-ide-review--record-attempts record))
+    (unless (numberp (claude-code-ide-review--record-waiting-since record))
+      (setf (claude-code-ide-review--record-waiting-since record) now))
+    (if (>= (- now (claude-code-ide-review--record-waiting-since record))
+            claude-code-ide-review-retry-seconds)
+        (progn
+          (setf (claude-code-ide-review--record-submit-result record) 'rejected)
+          (claude-code-ide-review--finish record 'rejected reason)
+          t)
+      (claude-code-ide-review--write record)
+      nil)))
+
+(defun claude-code-ide-review--ended (record exit-status)
+  "Handle the end of the process of RECORD with EXIT-STATUS.
 Read the result, save it in the record, and put it into the inbox of
-the owner."
+the owner.  When the result text cannot be made, RECORD stays
+`running', and a later check tries again."
   (when (eq (claude-code-ide-review--record-state record) 'running)
-    (setf (claude-code-ide-review--record-state record) 'ended
-          (claude-code-ide-review--record-ended-at record) (claude-code-ide-control--now)
-          (claude-code-ide-review--record-exit-status record) exit-status)
-    (setf (claude-code-ide-review--record-text record)
-          (claude-code-ide-review--result-text record output))
-    (claude-code-ide-review--write record)
-    (claude-code-ide-review--submit record)))
+    (unless (claude-code-ide-review--record-ended-at record)
+      (setf (claude-code-ide-review--record-ended-at record) (claude-code-ide-control--now)
+            (claude-code-ide-review--record-exit-status record) exit-status))
+    (let ((text (condition-case err
+                    (claude-code-ide-review--result-text record)
+                  (error
+                   (message "Review %s: cannot make the result text: %s"
+                            (claude-code-ide-review--record-review-id record)
+                            (error-message-string err))
+                   nil))))
+      (if (not text)
+          (unless (claude-code-ide-review--failed-try record 'no-result-text)
+            (claude-code-ide-review--update-timer))
+        (setf (claude-code-ide-review--record-text record) text
+              (claude-code-ide-review--record-state record) 'ended
+              (claude-code-ide-review--record-attempts record) 0
+              (claude-code-ide-review--record-waiting-since record) nil)
+        (claude-code-ide-review--write record)
+        (claude-code-ide-review--submit record)))))
 
 ;;; Delivery
 
@@ -445,6 +503,44 @@ lost without a word."
              (claude-code-ide-review--file (claude-code-ide-review--record-review-id record)))))
   (claude-code-ide-review--write record))
 
+(defun claude-code-ide-review--set-submitted (record target)
+  "Mark RECORD as submitted to the inbox of TARGET, and write it when it changed."
+  (unless (and (eq (claude-code-ide-review--record-state record) 'submitted)
+               (equal (claude-code-ide-review--record-destination record) target))
+    (setf (claude-code-ide-review--record-state record) 'submitted
+          (claude-code-ide-review--record-destination record) target
+          (claude-code-ide-review--record-attempts record) 0
+          (claude-code-ide-review--record-waiting-since record) nil
+          (claude-code-ide-review--record-submitted-at record)
+          (or (claude-code-ide-review--record-submitted-at record) (claude-code-ide-control--now)))
+    (claude-code-ide-review--write record)))
+
+(defun claude-code-ide-review--follow (record from)
+  "Find the result of RECORD after the inbox of FROM handed it over.
+A handover moves the queued result to the current instance of the
+chain, with the same request ID.  Look it up there and track it.  When
+the current instance does not have it, submit it there.  Return the
+new state of RECORD."
+  (let* ((review-id (claude-code-ide-review--record-review-id record))
+         (current (claude-code-ide-review--current-owner
+                   (claude-code-ide-review--record-owner record))))
+    (if (equal current from)
+        ;; The chain does not name the new instance yet: try again later
+        (progn
+          (unless (member review-id claude-code-ide-review--warned)
+            (push review-id claude-code-ide-review--warned)
+            (message "Review %s: %s handed the result over; the new instance is not known yet"
+                     review-id from))
+          (claude-code-ide-review--set-submitted record from)
+          'submitted)
+      (let ((status (claude-code-ide-control-request-status
+                     current (claude-code-ide-review--request-id review-id))))
+        (if (eq (plist-get status :status) 'error)
+            (progn
+              (setf (claude-code-ide-review--record-state record) 'ended)
+              (claude-code-ide-review--submit record))
+          (claude-code-ide-review--apply-result record current status))))))
+
 (defun claude-code-ide-review--apply-result (record target result)
   "Apply the inbox RESULT of a submit or a status check to RECORD.
 TARGET is the instance ID whose inbox gave RESULT.  Return the new
@@ -454,12 +550,7 @@ state of RECORD."
     (setf (claude-code-ide-review--record-submit-result record) answer
           (claude-code-ide-review--record-submit-reason record) reason)
     (pcase answer
-      ('queued
-       (unless (eq (claude-code-ide-review--record-state record) 'submitted)
-         (setf (claude-code-ide-review--record-state record) 'submitted
-               (claude-code-ide-review--record-destination record) target
-               (claude-code-ide-review--record-submitted-at record) (claude-code-ide-control--now))
-         (claude-code-ide-review--write record)))
+      ('queued (claude-code-ide-review--set-submitted record target))
       ('delivered
        (setf (claude-code-ide-review--record-destination record) target)
        (claude-code-ide-review--finish record 'delivered))
@@ -467,37 +558,50 @@ state of RECORD."
        (setf (claude-code-ide-review--record-destination record) target)
        (claude-code-ide-review--finish record 'unacknowledged))
       ('rejected
-       (if (memq reason '(unknown-instance submit-error))
-           ;; The owner is not known yet, for example before its
-           ;; restore: keep the result and try again later
-           (let ((review-id (claude-code-ide-review--record-review-id record)))
-             (unless (member review-id claude-code-ide-review--warned)
-               (push review-id claude-code-ide-review--warned)
-               (message "Review %s: the result waits until the instance %s is known"
-                        review-id target))
-             (when (eq (claude-code-ide-review--record-state record) 'submitted)
-               (setf (claude-code-ide-review--record-state record) 'ended))
-             (claude-code-ide-review--write record))
+       (cond
+        ((eq reason 'handed-over)
+         (claude-code-ide-review--follow record target))
+        ((memq reason '(unknown-instance submit-error))
+         ;; The owner is not known yet, for example before its
+         ;; restore: keep the result and try again, up to a limit
+         (let ((review-id (claude-code-ide-review--record-review-id record)))
+           (unless (member review-id claude-code-ide-review--warned)
+             (push review-id claude-code-ide-review--warned)
+             (message "Review %s: the result waits until the instance %s can take it"
+                      review-id target))
+           (setf (claude-code-ide-review--record-state record) 'ended
+                 (claude-code-ide-review--record-destination record) target)
+           (claude-code-ide-review--failed-try record reason)))
+        (t
          (setf (claude-code-ide-review--record-destination record) target)
-         (claude-code-ide-review--finish record 'rejected))))
+         (claude-code-ide-review--finish record 'rejected)))))
     (claude-code-ide-review--record-state record)))
 
 (defun claude-code-ide-review--submit (record)
   "Put the result of the ended RECORD into the inbox of its current owner.
-The review ID is the request ID, so a second submit sends nothing.
-Return the new state of RECORD."
+The request ID comes from the review ID, so a second submit sends
+nothing.  A record without its text is not submitted.  Return the new
+state of RECORD."
   (let* ((review-id (claude-code-ide-review--record-review-id record))
-         (target (claude-code-ide-review--current-owner (claude-code-ide-review--record-owner record)))
-         (result (condition-case err
-                     (claude-code-ide-control-submit
-                      target (claude-code-ide-review--record-text record)
-                      :request-id review-id :queue t)
-                   (error
-                    (message "Review %s: the submit to %s failed: %s"
-                             review-id target (error-message-string err))
-                    (list :result 'rejected :reason 'submit-error)))))
-    (prog1 (claude-code-ide-review--apply-result record target result)
-      (claude-code-ide-review--update-timer))))
+         (text (claude-code-ide-review--record-text record))
+         (target (claude-code-ide-review--current-owner (claude-code-ide-review--record-owner record))))
+    (if (not (stringp text))
+        (progn
+          ;; Never a prompt without text: make the text again
+          (setf (claude-code-ide-review--record-state record) 'running)
+          (claude-code-ide-review--ended record (claude-code-ide-review--record-exit-status record))
+          (claude-code-ide-review--record-state record))
+      (let ((result (condition-case err
+                        (claude-code-ide-control-submit
+                         target text
+                         :request-id (claude-code-ide-review--request-id review-id)
+                         :queue t)
+                      (error
+                       (message "Review %s: the submit to %s failed: %s"
+                                review-id target (error-message-string err))
+                       (list :result 'rejected :reason 'submit-error)))))
+        (prog1 (claude-code-ide-review--apply-result record target result)
+          (claude-code-ide-review--update-timer))))))
 
 (defun claude-code-ide-review--sync (record)
   "Compare the submitted RECORD with the inbox, and apply what changed.
@@ -505,49 +609,48 @@ The inbox may have acknowledged the result while no hook ran, or a
 handover may have moved it to the current instance of the chain.  A
 result that no inbox knows is submitted again.  Return the new state."
   (let* ((review-id (claude-code-ide-review--record-review-id record))
+         (request-id (claude-code-ide-review--request-id review-id))
          (destination (claude-code-ide-review--record-destination record))
          (status (progn
                    ;; A sent result whose acknowledgement is overdue
                    ;; becomes unacknowledged here
                    (when (claude-code-ide-control--valid-id-p destination)
                      (claude-code-ide-control--refresh destination))
-                   (claude-code-ide-control-request-status destination review-id))))
-    (when (eq (plist-get status :status) 'error)
-      (let ((current (claude-code-ide-review--current-owner
-                      (claude-code-ide-review--record-owner record))))
-        (unless (equal current destination)
-          (setq status (claude-code-ide-control-request-status current review-id))
-          (unless (eq (plist-get status :status) 'error)
-            (setf (claude-code-ide-review--record-destination record) current
-                  destination current)
-            (claude-code-ide-review--write record)))))
+                   (claude-code-ide-control-request-status destination request-id))))
     (if (eq (plist-get status :status) 'error)
-        (progn
-          (setf (claude-code-ide-review--record-state record) 'ended)
-          (claude-code-ide-review--submit record))
+        (let ((current (claude-code-ide-review--current-owner
+                        (claude-code-ide-review--record-owner record))))
+          (if (equal current destination)
+              (progn
+                (setf (claude-code-ide-review--record-state record) 'ended)
+                (claude-code-ide-review--submit record))
+            (claude-code-ide-review--follow record destination)))
       (claude-code-ide-review--apply-result record destination status))))
 
 (defun claude-code-ide-review--on-delivered (_instance-id request-id)
-  "Mark the review REQUEST-ID delivered, when it is one.
-This runs from `claude-code-ide-control-delivered-functions'.  The
-instance can be another one than the first owner after a handover, so
-only the request ID counts."
-  (when-let* ((record (gethash request-id claude-code-ide-review--records)))
-    (when (eq (claude-code-ide-review--record-state record) 'submitted)
-      (setf (claude-code-ide-review--record-submit-result record) 'delivered
-            (claude-code-ide-review--record-submit-reason record) nil)
-      (claude-code-ide-review--finish record 'delivered)
-      (claude-code-ide-review--update-timer))))
+  "Mark the review of REQUEST-ID delivered, when it is a review result.
+This runs from `claude-code-ide-control-delivered-functions'.  Only a
+request ID with the prefix \"review:\" names a review.  The instance
+can be another one than the first owner after a handover, so only the
+request ID counts."
+  (when (and (stringp request-id)
+             (string-prefix-p claude-code-ide-review--request-prefix request-id))
+    (when-let* ((record (gethash (substring request-id (length claude-code-ide-review--request-prefix))
+                                 claude-code-ide-review--records)))
+      (when (eq (claude-code-ide-review--record-state record) 'submitted)
+        (setf (claude-code-ide-review--record-submit-result record) 'delivered
+              (claude-code-ide-review--record-submit-reason record) nil)
+        (claude-code-ide-review--finish record 'delivered)
+        (claude-code-ide-review--update-timer)))))
 
 (defun claude-code-ide-review--retry-for (instance-id)
   "Submit the waiting results whose current owner is INSTANCE-ID."
-  (maphash (lambda (_id record)
-             (when (and (eq (claude-code-ide-review--record-state record) 'ended)
-                        (equal (claude-code-ide-review--current-owner
-                                (claude-code-ide-review--record-owner record))
-                               instance-id))
-               (claude-code-ide-review--submit record)))
-           claude-code-ide-review--records))
+  (dolist (record (claude-code-ide-review--active))
+    (when (and (eq (claude-code-ide-review--record-state record) 'ended)
+               (equal (claude-code-ide-review--current-owner
+                       (claude-code-ide-review--record-owner record))
+                      instance-id))
+      (claude-code-ide-review--submit record))))
 
 (defun claude-code-ide-review--on-session-start (session _spec)
   "Submit the waiting results of the instance of SESSION, which started."
@@ -566,29 +669,66 @@ Return non-nil when it was deleted."
         (ignore-errors (delete-file file))
         t))))
 
+(defun claude-code-ide-review--take (file record)
+  "Take the RECORD of FILE into this Emacs, unless another Emacs tracks it.
+A final record is only remembered.  A record of another running Emacs
+\(the same process ID and start time) goes into
+`claude-code-ide-review--foreign'.  Any other record that is not final
+becomes a review of this Emacs."
+  (let ((emacs (claude-code-ide-review--record-emacs-pid record))
+        (start (claude-code-ide-review--record-emacs-start record)))
+    (cond
+     ((claude-code-ide-review--prune file record) nil)
+     ((claude-code-ide-review--final-p record)
+      (remhash file claude-code-ide-review--foreign)
+      (puthash (claude-code-ide-review--record-review-id record) record
+               claude-code-ide-review--records))
+     ((and (natnump emacs) (not (eql emacs (emacs-pid)))
+           (claude-code-ide-review--emacs-live-p emacs start))
+      (puthash file (cons emacs start) claude-code-ide-review--foreign))
+     (t
+      (remhash file claude-code-ide-review--foreign)
+      (unless (and (eql emacs (emacs-pid))
+                   (gethash (claude-code-ide-review--record-review-id record)
+                            claude-code-ide-review--records))
+        (setf (claude-code-ide-review--record-emacs-pid record) (emacs-pid)
+              (claude-code-ide-review--record-emacs-start record)
+              (claude-code-ide-review--emacs-start))
+        (claude-code-ide-review--write record))))))
+
+(defun claude-code-ide-review--scan ()
+  "Read the review files that are new or changed, and the foreign ones.
+The first scan reads every file.  A later scan reads a file only when
+it changed since the scan before, or when the Emacs that tracks it is
+gone, so a check reads few files."
+  (let ((dir (claude-code-ide-review--directory))
+        (since claude-code-ide-review--scan-time)
+        (own (let ((files (make-hash-table :test 'equal)))
+               (maphash (lambda (id _record)
+                          (puthash (claude-code-ide-review--file id) t files))
+                        claude-code-ide-review--records)
+               files)))
+    (setq claude-code-ide-review--scan-time (float-time))
+    (when (file-directory-p dir)
+      (dolist (file (directory-files dir t "\\`[0-9a-f]+\\.json\\'" t))
+        (let* ((foreign (gethash file claude-code-ide-review--foreign))
+               (attributes (file-attributes file))
+               (changed (or (null since)
+                            (and attributes
+                                 (>= (float-time (file-attribute-modification-time attributes))
+                                     (- since 1))))))
+          (when (or (and foreign
+                         (or changed
+                             (not (claude-code-ide-review--emacs-live-p (car foreign) (cdr foreign)))))
+                    (and changed (not foreign) (not (gethash file own))))
+            (when-let* ((record (claude-code-ide-review--read-file file)))
+              (claude-code-ide-review--take file record))))))))
+
 (defun claude-code-ide-review--ensure-loaded ()
-  "Read the review files at the first use in this Emacs.
-A review that another running Emacs tracks stays with it.  This Emacs
-takes the other reviews that are not final, also those of an Emacs
-that quit."
+  "Read the review files at the first use in this Emacs."
   (unless claude-code-ide-review--loaded
     (setq claude-code-ide-review--loaded t)
-    (let ((dir (claude-code-ide-review--directory)))
-      (when (file-directory-p dir)
-        (dolist (file (directory-files dir t "\\`[0-9a-f]+\\.json\\'" t))
-          (when-let* ((record (claude-code-ide-review--read-file file)))
-            (unless (claude-code-ide-review--prune file record)
-              (let ((emacs (claude-code-ide-review--record-emacs-pid record)))
-                (cond
-                 ((claude-code-ide-review--final-p record)
-                  (puthash (claude-code-ide-review--record-review-id record) record
-                           claude-code-ide-review--records))
-                 ((and (natnump emacs) (not (eql emacs (emacs-pid)))
-                       (claude-code-ide-review--emacs-live-p emacs))
-                  nil)
-                 (t
-                  (setf (claude-code-ide-review--record-emacs-pid record) (emacs-pid))
-                  (claude-code-ide-review--write record)))))))))))
+    (claude-code-ide-review--scan)))
 
 (defun claude-code-ide-review--active ()
   "Return the reviews of this Emacs that are not final."
@@ -607,11 +747,10 @@ that quit."
      (let ((process (gethash (claude-code-ide-review--record-review-id record)
                              claude-code-ide-review--processes)))
        (unless (claude-code-ide-review--record-live-p record)
+         (remhash (claude-code-ide-review--record-review-id record)
+                  claude-code-ide-review--processes)
          (claude-code-ide-review--ended
-          record
-          (and (processp process) (process-exit-status process))
-          (and (processp process) (claude-code-ide-review--record-managed record)
-               (claude-code-ide-review--output process))))))
+          record (and (processp process) (process-exit-status process))))))
     ('ended (claude-code-ide-review--submit record))
     ('submitted (claude-code-ide-review--sync record))))
 
@@ -619,7 +758,10 @@ that quit."
   "Timer of `claude-code-ide-review--tick'.")
 
 (defun claude-code-ide-review--tick ()
-  "Check each review of this Emacs that is not final."
+  "Read the changed review files, then check each review of this Emacs."
+  (condition-case err
+      (claude-code-ide-review--scan)
+    (error (message "Review: cannot read the review folder: %s" (error-message-string err))))
   (dolist (record (claude-code-ide-review--active))
     (condition-case err
         (claude-code-ide-review--check record)
@@ -629,8 +771,11 @@ that quit."
   (claude-code-ide-review--update-timer))
 
 (defun claude-code-ide-review--update-timer ()
-  "Run the check timer while a review of this Emacs is not final."
-  (if (and (claude-code-ide-review--active)
+  "Run the check timer while a review is not final.
+That is a review of this Emacs, or one of another Emacs that this
+Emacs takes over when the other one is gone."
+  (if (and (or (claude-code-ide-review--active)
+               (> (hash-table-count claude-code-ide-review--foreign) 0))
            (numberp claude-code-ide-review-check-interval)
            (> claude-code-ide-review-check-interval 0))
       (unless (timerp claude-code-ide-review--timer)
@@ -673,11 +818,17 @@ their result file, or gives the owner the error result `interrupted'."
           (when message (list :message message))))
 
 (defun claude-code-ide-review--owner-directory (owner)
-  "Return the worktree or project folder of the running instance OWNER, or nil."
-  (when-let* ((instance (claude-code-ide-instance-by-id owner)))
-    (let ((dir (or (claude-code-ide-instance-worktree instance)
-                   (claude-code-ide-instance-project-root instance))))
-      (and (stringp dir) (file-directory-p dir) dir))))
+  "Return the worktree or project folder of the instance OWNER, or nil.
+A running instance gives the folder of its descriptor.  An instance
+that does not run gives the folder of its session registry entry."
+  (let* ((instance (claude-code-ide-instance-by-id owner))
+         (entry (and (not instance) (claude-code-ide-control--registry-entry owner)))
+         (dir (cond
+               (instance (or (claude-code-ide-instance-worktree instance)
+                             (claude-code-ide-instance-project-root instance)))
+               (entry (or (claude-code-ide-session-registry-entry-worktree entry)
+                          (claude-code-ide-session-registry-entry-project-dir entry))))))
+    (and (stringp dir) (file-directory-p dir) dir)))
 
 (defun claude-code-ide-review-status (review-id)
   "Return the state of the review REVIEW-ID.
@@ -725,34 +876,33 @@ processes alone: their result goes to the next instance of the chain."
     (nreverse pids)))
 
 (defun claude-code-ide-review--start-command (review-id command directory)
-  "Start COMMAND for REVIEW-ID in DIRECTORY and return its process."
-  (let ((default-directory (file-name-as-directory directory))
-        (buffer (generate-new-buffer (format " *cci-review %s*" review-id))))
-    (condition-case err
-        (make-process :name (format "cci-review-%s" review-id)
-                      :buffer buffer
-                      :command command
-                      :connection-type 'pipe
-                      :noquery t
-                      :sentinel #'ignore)
-      (error
-       (kill-buffer buffer)
-       (signal (car err) (cdr err))))))
+  "Start COMMAND for REVIEW-ID in DIRECTORY and return its process.
+The output of the command is dropped: it never goes into a prompt or
+a record."
+  (let ((default-directory (file-name-as-directory directory)))
+    (make-process :name (format "cci-review-%s" review-id)
+                  :buffer nil
+                  :command command
+                  :connection-type 'pipe
+                  :noquery t
+                  :filter #'ignore
+                  :sentinel #'ignore)))
 
 (cl-defun claude-code-ide-review-track (owner &key process command result-file label review-id directory)
   "Track an external review whose result belongs to the instance OWNER.
 Give the review process as PROCESS, an Emacs process object or a
 process ID, or give COMMAND, a list of strings that Emacs starts in
-DIRECTORY (default: the worktree of OWNER).  RESULT-FILE is the file
-that the review writes; a relative name is relative to DIRECTORY.
-LABEL names the review for people.  REVIEW-ID is a string that the
-caller chooses; nil makes a new one.
+DIRECTORY (default: the worktree of OWNER, also when OWNER does not
+run).  RESULT-FILE is the file that the review writes; a relative name
+is relative to DIRECTORY.  LABEL names the review for people.
+REVIEW-ID is a string that the caller chooses; nil makes a new one.
 
 When the process ends, Emacs reads RESULT-FILE and puts the result
 into the inbox of OWNER (or of the current instance of its chain after
-a handover), with REVIEW-ID as the request ID.  A missing or broken
-result file gives an explicit error result.  The result counts as
-delivered only when the owner's CLI reports it.
+a handover), with the request ID \"review:REVIEW-ID\".  A missing or
+broken result file gives an explicit error result.  The result counts
+as delivered only when the owner's CLI reports it.  The output of
+COMMAND is dropped, and the record keeps only the program name.
 
 Return (:status ok :review-id ID :owner OWNER :state running :pid
 PID), the state of the known review with :duplicate t when REVIEW-ID
@@ -761,7 +911,10 @@ signals."
   (claude-code-ide-review--ensure-loaded)
   (let ((review-id (or (claude-code-ide-control--request-id-string review-id)
                        (claude-code-ide-instance-new-id)))
-        (directory (or directory (claude-code-ide-review--owner-directory owner) default-directory)))
+        (directory (or directory
+                       (and (claude-code-ide-control--valid-id-p owner)
+                            (claude-code-ide-review--owner-directory owner))
+                       default-directory)))
     (cond
      ((string-empty-p review-id)
       (claude-code-ide-review--error 'invalid-review-id))
@@ -783,7 +936,9 @@ signals."
                              (not (string-empty-p (car command))))))
       (claude-code-ide-review--error 'invalid-command review-id
                                      "The command is a list of strings"))
-     ((not (and (stringp result-file) (not (string-empty-p result-file))))
+     ((claude-code-ide-control--blank-p result-file)
+      (claude-code-ide-review--error 'no-result-file review-id))
+     ((not (stringp result-file))
       (claude-code-ide-review--error 'no-result-file review-id))
      ((not (and (stringp directory) (file-directory-p directory)))
       (claude-code-ide-review--error 'no-directory review-id
@@ -798,28 +953,30 @@ signals."
            (if command
                (claude-code-ide-review--start-command review-id command directory)
              process)
-           (and command t) command directory
+           (and command (file-name-nondirectory (car command)))
+           directory
            (expand-file-name result-file directory)
-           (if (and (stringp label) (not (string-empty-p label))) label "review"))
+           (if (claude-code-ide-control--blank-p label) "review" label))
         (error
          (claude-code-ide-review--error 'start-failed review-id (error-message-string err))))))))
 
-(defun claude-code-ide-review--track-new (owner review-id process managed command directory result-file label)
+(defun claude-code-ide-review--track-new (owner review-id process program directory result-file label)
   "Record the new review REVIEW-ID of OWNER and return its result.
-PROCESS is a process object or a process ID; MANAGED is non-nil when
-Emacs started it from COMMAND in DIRECTORY.  RESULT-FILE and LABEL are
-those of the review."
+PROCESS is a process object or a process ID.  PROGRAM is the name of
+the program when Emacs started PROCESS from a command in DIRECTORY,
+else nil.  RESULT-FILE and LABEL are those of the review."
   (let* ((pid (if (processp process) (process-id process) process))
          (record (claude-code-ide-review--record-create
                   :review-id review-id
                   :owner owner
                   :label label
-                  :command command
+                  :program program
                   :directory directory
                   :pid pid
                   :pid-start (claude-code-ide-review--pid-start pid)
-                  :managed managed
+                  :managed (and program t)
                   :emacs-pid (emacs-pid)
+                  :emacs-start (claude-code-ide-review--emacs-start)
                   :result-file result-file
                   :state 'running
                   :created-at (claude-code-ide-control--now))))
@@ -844,23 +1001,22 @@ those of the review."
   "MCP tool: track a review of INSTANCE-ID that writes RESULT-FILE.
 LABEL, REVIEW-ID, PID (a process ID), COMMAND (an array of strings) and
 DIRECTORY are optional; give PID or COMMAND."
-  (let ((blank (lambda (value) (or (null value) (and (stringp value) (string-empty-p value))))))
-    (claude-code-ide-control--json
-     (claude-code-ide-review-track
-      instance-id
-      :process (unless (funcall blank pid) pid)
-      :command (when (or (vectorp command) (consp command)) (append command nil))
-      :result-file result-file
-      :label (unless (funcall blank label) label)
-      :review-id (unless (funcall blank review-id) review-id)
-      :directory (unless (funcall blank directory) directory)))))
+  (claude-code-ide-control--json
+   (claude-code-ide-review-track
+    instance-id
+    :process (unless (claude-code-ide-control--blank-p pid) pid)
+    :command (when (or (vectorp command) (consp command)) (append command nil))
+    :result-file result-file
+    :label (unless (claude-code-ide-control--blank-p label) label)
+    :review-id (unless (claude-code-ide-control--blank-p review-id) review-id)
+    :directory (unless (claude-code-ide-control--blank-p directory) directory))))
 
 (claude-code-ide-control-define-operation 'track-review #'claude-code-ide-review-track)
 
 (claude-code-ide-control-define-tool
- :name "track_review"
+ :name "claude-code-ide-control-track-review"
  :function #'claude-code-ide-review--mcp-track
- :description "Track an external review process whose result belongs to an instance. When the process ends, Emacs reads the result file and puts the result into the instance's inbox, with the review ID as the request ID. The instance gets it once, when it can take it. A missing or broken result file gives an explicit error result. Give pid (a running process) or command (Emacs starts it). Returns the review ID."
+ :description "Track an external review process whose result belongs to an instance. When the process ends, Emacs reads the result file and puts the result into the instance's inbox, with the request ID review:<review_id>. The instance gets it once, when it can take it. A missing or broken result file gives an explicit error result. Give pid (a running process) or command (Emacs starts it; its output is dropped). Returns the review ID."
  :args '((:name "instance_id" :type string
                 :description "Instance ID of the owner of the review, from claude-code-ide-control-list-instances.")
          (:name "result_file" :type string
@@ -868,7 +1024,7 @@ DIRECTORY are optional; give PID or COMMAND."
          (:name "label" :type string :optional t
                 :description "Name of the review for people.")
          (:name "review_id" :type string :optional t
-                :description "ID that makes the call idempotent; also the request ID in the inbox. Default: a new ID.")
+                :description "ID that makes the call idempotent. Default: a new ID.")
          (:name "pid" :type integer :optional t
                 :description "Process ID of a running review process.")
          (:name "command" :type array :optional t :items (:type string)

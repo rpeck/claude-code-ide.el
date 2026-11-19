@@ -51,8 +51,11 @@ BODY can refer to the folder of the result files as `results'."
             (claude-code-ide-review--records (make-hash-table :test 'equal))
             (claude-code-ide-review--processes (make-hash-table :test 'equal))
             (claude-code-ide-review--loaded nil)
+            (claude-code-ide-review--foreign (make-hash-table :test 'equal))
+            (claude-code-ide-review--scan-time nil)
             (claude-code-ide-review--warned nil)
             (claude-code-ide-review--timer nil)
+            (claude-code-ide-review-retry-seconds 600)
             (claude-code-ide-review-tests--warnings nil)
             (claude-code-ide-session-start-functions
              (list #'claude-code-ide-review--on-session-start)))
@@ -93,8 +96,20 @@ A deadline, not `with-timeout': the control tests mock `run-at-time'."
   (setq claude-code-ide-review--records (make-hash-table :test 'equal)
         claude-code-ide-review--processes (make-hash-table :test 'equal)
         claude-code-ide-review--loaded nil
+        claude-code-ide-review--foreign (make-hash-table :test 'equal)
+        claude-code-ide-review--scan-time nil
         claude-code-ide-review--warned nil
         claude-code-ide-control--index (make-hash-table :test 'equal)))
+
+(defun claude-code-ide-review-tests--request (review-id)
+  "Return the inbox request ID of REVIEW-ID."
+  (concat "review:" review-id))
+
+(defun claude-code-ide-review-tests--inbox (instance-id review-id)
+  "Return the inbox result of the review REVIEW-ID at INSTANCE-ID."
+  (plist-get (claude-code-ide-control-request-status
+              instance-id (claude-code-ide-review-tests--request review-id))
+             :result))
 
 (defun claude-code-ide-review-tests--ack (instance-id text)
   "Send the prompt-submit event of INSTANCE-ID for TEXT."
@@ -133,8 +148,7 @@ inbox, goes out after the turn, and is delivered at the acknowledgement."
       ;; Ended while the owner works: in the inbox, nothing sent
       (should (eq (claude-code-ide-review-tests--state id) 'submitted))
       (should-not claude-code-ide-tests--control-sent)
-      (let ((inbox (claude-code-ide-control-request-status "cci-test-owner" id)))
-        (should (eq (plist-get inbox :result) 'queued)))
+      (should (eq (claude-code-ide-review-tests--inbox "cci-test-owner" id) 'queued))
       ;; The turn ends: the result goes out one time
       (claude-code-ide-tests--control-set-state "cci-test-owner" 'idle)
       (claude-code-ide-tests--control-event "cci-test-owner" 'turn-end)
@@ -189,8 +203,7 @@ inbox, goes out after the turn, and is delivered at the acknowledgement."
                           "cci-test-owner" results "r.md" "cci-test while away")
                          :review-id)))
       (should (eq (claude-code-ide-review-tests--state id) 'submitted))
-      (should (eq (plist-get (claude-code-ide-control-request-status "cci-test-owner" id) :result)
-                  'queued))
+      (should (eq (claude-code-ide-review-tests--inbox "cci-test-owner" id) 'queued))
       (should-not claude-code-ide-tests--control-sent)
       ;; The owner runs again and becomes idle
       (claude-code-ide-tests--control-add "cci-test-owner" "proj" 'idle)
@@ -288,30 +301,51 @@ inbox, goes out after the turn, and is delivered at the acknowledgement."
         (should (string-match-p "Emacs quit while the review ran" text)))
       (should (eq (plist-get (claude-code-ide-review-status id) :error) 'interrupted)))))
 
+(defun claude-code-ide-review-tests--foreign-record (id emacs-pid emacs-start results)
+  "Write a running review ID of the Emacs EMACS-PID with EMACS-START.
+Its process is gone and its result file in RESULTS exists."
+  (claude-code-ide-review-tests--write (expand-file-name (concat id ".md") results)
+                                       "cci-test foreign result")
+  (claude-code-ide-review--write
+   (claude-code-ide-review--record-create
+    :review-id id :owner "cci-test-owner" :label "x"
+    :pid 999999 :pid-start 1.0 :emacs-pid emacs-pid :emacs-start emacs-start
+    :result-file (expand-file-name (concat id ".md") results)
+    :state 'running :created-at "2026-11-18T00:00:00Z")))
+
 (ert-deftest claude-code-ide-test-review-other-emacs-keeps-its-review ()
-  "A review that another running Emacs tracks is not taken."
+  "A review of another live Emacs stays with it, and is taken when it is gone.
+A live Emacs is a process with the recorded ID and start time, also
+when its name has no \"emacs\"; a reused process ID does not count."
   (claude-code-ide-review-tests--with-review
     (claude-code-ide-tests--control-add "cci-test-owner" "proj" 'idle)
-    (let ((record (claude-code-ide-review--record-create
-                   :review-id "cci-test-other" :owner "cci-test-owner" :label "x"
-                   :pid 999999 :emacs-pid 424242 :result-file "/nonexistent/cci-test"
-                   :state 'running :created-at "2026-11-18T00:00:00Z")))
-      (claude-code-ide-review--write record)
-      (claude-code-ide-review-tests--restart)
-      (cl-letf (((symbol-function 'claude-code-ide-review--emacs-live-p)
-                 (lambda (pid) (memql pid (list 424242 (emacs-pid))))))
-        (claude-code-ide-review-recover))
-      (should-not (gethash "cci-test-other" claude-code-ide-review--records))
-      (should-not claude-code-ide-tests--control-sent)
-      ;; When that Emacs is gone, this Emacs takes the review
-      (claude-code-ide-review-tests--restart)
-      (cl-letf (((symbol-function 'claude-code-ide-review--emacs-live-p)
-                 (lambda (pid) (eql pid (emacs-pid)))))
-        (claude-code-ide-review-recover))
-      (should (eq (claude-code-ide-review-tests--state "cci-test-other") 'submitted))
-      (should (eql (claude-code-ide-review--record-emacs-pid
-                    (gethash "cci-test-other" claude-code-ide-review--records))
-                   (emacs-pid))))))
+    (let* ((other (start-process "cci-test-other-emacs" nil "sleep" "30"))
+           (pid (process-id other))
+           (start (claude-code-ide-review--pid-start pid)))
+      (unwind-protect
+          (progn
+            (claude-code-ide-review-tests--foreign-record "cci-test-other" pid start results)
+            ;; The same process ID with another start time: a reused ID
+            (claude-code-ide-review-tests--foreign-record "cci-test-reused" pid (- start 100) results)
+            (claude-code-ide-review-tests--restart)
+            (claude-code-ide-review-recover)
+            (should-not (gethash "cci-test-other" claude-code-ide-review--records))
+            (should (eq (claude-code-ide-review-tests--state "cci-test-reused") 'submitted))
+            (should (= (length claude-code-ide-tests--control-sent) 1))
+            ;; Later checks keep the review while that Emacs runs
+            (claude-code-ide-review--tick)
+            (should-not (gethash "cci-test-other" claude-code-ide-review--records))
+            ;; That Emacs quits: the next check takes the review over
+            (delete-process other)
+            (claude-code-ide-review-tests--wait
+             (lambda () (not (claude-code-ide-review--pid-live-p pid start))))
+            (claude-code-ide-review--tick)
+            (should (eq (claude-code-ide-review-tests--state "cci-test-other") 'submitted))
+            (let ((record (gethash "cci-test-other" claude-code-ide-review--records)))
+              (should (eql (claude-code-ide-review--record-emacs-pid record) (emacs-pid)))
+              (should (equal (claude-code-ide-review--record-emacs-start record)
+                             (claude-code-ide-review--emacs-start)))))
+        (when (process-live-p other) (delete-process other))))))
 
 ;;; Missing or broken result files
 
@@ -349,23 +383,36 @@ inbox, goes out after the turn, and is delivered at the acknowledgement."
       (delete-directory dir t))))
 
 (ert-deftest claude-code-ide-test-review-missing-result-gives-error ()
-  "A review without a result file gives the owner an explicit error result."
+  "A review without a result file gives the owner an explicit error result.
+The output and the arguments of the command never reach the prompt or
+the record: only the program name, the exit code and the record path."
   (claude-code-ide-review-tests--with-review
     (claude-code-ide-tests--control-add "cci-test-owner" "proj" 'idle)
     (let* ((track (claude-code-ide-review-track
-                   "cci-test-owner" :command '("sh" "-c" "echo cci-test-crash >&2; exit 3")
+                   "cci-test-owner"
+                   :command '("sh" "-c" "echo cci-test-out-secret; echo cci-test-err-secret >&2; exit 3"
+                              "cci-test-arg-secret")
                    :directory results :result-file "missing.md" :label "cci-test crash"))
-           (id (plist-get track :review-id)))
+           (id (plist-get track :review-id))
+           (record-file (claude-code-ide-review--file id)))
       (claude-code-ide-review-tests--wait
        (lambda () (not (eq (claude-code-ide-review-tests--state id) 'running))))
       (let ((text (nth 1 (car claude-code-ide-tests--control-sent))))
         (should (string-match-p "Error: the review gave no usable result (missing)" text))
+        (should (string-match-p "exited without a result file (exit code 3)" text))
         (should (string-match-p "Exit status: 3" text))
-        (should (string-match-p "cci-test-crash" text))
+        (should (string-match-p (regexp-quote record-file) text))
         (should (string-match-p (regexp-quote (expand-file-name "missing.md" results)) text))
+        (should-not (string-match-p "secret" text))
         (claude-code-ide-review-tests--ack "cci-test-owner" text))
       (should (eq (claude-code-ide-review-tests--state id) 'delivered))
-      (should (eq (plist-get (claude-code-ide-review-status id) :error) 'missing)))))
+      (should (eq (plist-get (claude-code-ide-review-status id) :error) 'missing))
+      (let ((saved (claude-code-ide-session-registry--file-string record-file)))
+        (should-not (string-match-p "secret" saved))
+        (should-not (string-match-p "echo" saved)))
+      (should (equal (claude-code-ide-review--record-program
+                      (claude-code-ide-review--read-file record-file))
+                     "sh")))))
 
 (ert-deftest claude-code-ide-test-review-cut-result ()
   "A long result is cut, and the prompt says where the full result is."
@@ -401,32 +448,83 @@ inbox, goes out after the turn, and is delivered at the acknowledgement."
         (should (eq (claude-code-ide-review-tests--state id) 'delivered))
         (should (equal (plist-get (claude-code-ide-review-status id) :owner) "cci-test-source"))))))
 
+(defun claude-code-ide-review-tests--move-inbox (from to)
+  "Move the queued prompts of FROM to TO as the handover does.
+This is `claude-code-ide-control-move-inbox' of feat/handover: TO gets
+a queued copy with the same request ID, and the record of FROM becomes
+final, `rejected' with the reason `handed-over'."
+  (dolist (record (claude-code-ide-control--pending-records from))
+    (unless (claude-code-ide-control--record-sent-at record)
+      (let ((pending (claude-code-ide-control--pending-records to)))
+        (claude-code-ide-control--write-record
+         (claude-code-ide-control--record-create
+          :request-id (claude-code-ide-control--record-request-id record)
+          :instance-id to
+          :seq (1+ (apply #'max 0 (mapcar #'claude-code-ide-control--record-seq pending)))
+          :text-hash (claude-code-ide-control--record-text-hash record)
+          :text (claude-code-ide-control--record-text record)
+          :result 'queued :reason 'handed-over
+          :created-at (claude-code-ide-control--record-created-at record))))
+      (claude-code-ide-control--finish record 'rejected 'handed-over))))
+
 (ert-deftest claude-code-ide-test-review-follows-moved-inbox ()
-  "A result in the inbox of the source follows the inbox move of a handover."
+  "A result in the inbox of the source follows the inbox move of a handover.
+The final `rejected'/`handed-over' record of the source is not a
+rejection of the review: the review tracks the copy at the target."
   (claude-code-ide-review-tests--with-review
     (claude-code-ide-tests--control-add "cci-test-source" "proj" 'working)
     (let* ((id (plist-get (claude-code-ide-review-tests--command-review
                            "cci-test-source" results "r.md" "cci-test moved")
                           :review-id))
-           (record (claude-code-ide-control--find-record "cci-test-source" id))
-           (text (claude-code-ide-control--record-text record)))
+           (text (claude-code-ide-review--record-text (gethash id claude-code-ide-review--records))))
       (should (equal (plist-get (claude-code-ide-review-status id) :destination) "cci-test-source"))
-      ;; The handover moves the queued result to the target's inbox
+      ;; The handover commits and moves the inbox
       (claude-code-ide-tests--control-add "cci-test-target" "proj" 'working)
-      (claude-code-ide-control-submit "cci-test-target" text :request-id id :queue t)
-      (delete-file (claude-code-ide-control--record-file "cci-test-source" id))
-      (remhash (claude-code-ide-control-inbox-directory-of "cci-test-source")
-               claude-code-ide-control--index)
+      (claude-code-ide-review-tests--move-inbox "cci-test-source" "cci-test-target")
+      (should (eq (claude-code-ide-review-tests--inbox "cci-test-source" id) 'rejected))
       (cl-letf (((symbol-function 'claude-code-ide-session-registry-chain-current)
                  (lambda (id) (and (equal id "cci-test-source") "cci-test-target"))))
         (claude-code-ide-review--tick)
+        (should (eq (claude-code-ide-review-tests--state id) 'submitted))
         (should (equal (plist-get (claude-code-ide-review-status id) :destination)
                        "cci-test-target"))
+        (should-not claude-code-ide-review-tests--warnings)
         (claude-code-ide-tests--control-set-state "cci-test-target" 'idle)
         (claude-code-ide-tests--control-event "cci-test-target" 'turn-end)
         (claude-code-ide-review-tests--ack "cci-test-target" text)
         (should (eq (claude-code-ide-review-tests--state id) 'delivered))
         (should (= (length claude-code-ide-tests--control-sent) 1))))))
+
+(ert-deftest claude-code-ide-test-review-handed-over-at-submit ()
+  "A submit that meets the handed-over record of the old owner follows the chain."
+  (claude-code-ide-review-tests--with-review
+    (claude-code-ide-tests--control-add "cci-test-source" "proj" 'working)
+    (claude-code-ide-tests--control-add "cci-test-target" "proj" 'working)
+    (let ((id (plist-get (claude-code-ide-review-track
+                          "cci-test-source" :command '("sleep" "30") :directory results
+                          :result-file "r.md")
+                         :review-id)))
+      ;; A copy of the result was submitted and handed over before the
+      ;; record knew it (for example, a crash after the submit)
+      (claude-code-ide-control-submit "cci-test-source" "cci-test early"
+                                      :request-id (claude-code-ide-review-tests--request id)
+                                      :queue t)
+      (claude-code-ide-review-tests--move-inbox "cci-test-source" "cci-test-target")
+      (let ((record (gethash id claude-code-ide-review--records)))
+        (setf (claude-code-ide-review--record-text record) "cci-test early"
+              (claude-code-ide-review--record-state record) 'ended)
+        (cl-letf (((symbol-function 'claude-code-ide-session-registry-chain-current)
+                   (lambda (_id) nil)))
+          ;; The chain does not know the target yet: the review waits
+          (claude-code-ide-review--submit record)
+          (should (eq (claude-code-ide-review-tests--state id) 'submitted))
+          (should-not claude-code-ide-review-tests--warnings))
+        (cl-letf (((symbol-function 'claude-code-ide-session-registry-chain-current)
+                   (lambda (id) (and (equal id "cci-test-source") "cci-test-target"))))
+          (claude-code-ide-review--tick)
+          (should (equal (plist-get (claude-code-ide-review-status id) :destination)
+                         "cci-test-target"))
+          (should (eq (claude-code-ide-review-tests--inbox "cci-test-target" id) 'queued)))))))
 
 (ert-deftest claude-code-ide-test-review-lost-inbox-record-is-sent-again ()
   "A submitted result that no inbox knows is submitted again, not lost."
@@ -435,13 +533,121 @@ inbox, goes out after the turn, and is delivered at the acknowledgement."
     (let ((id (plist-get (claude-code-ide-review-tests--command-review
                           "cci-test-owner" results "r.md" "cci-test again")
                          :review-id)))
-      (delete-file (claude-code-ide-control--record-file "cci-test-owner" id))
+      (delete-file (claude-code-ide-control--record-file
+                    "cci-test-owner" (claude-code-ide-review-tests--request id)))
       (remhash (claude-code-ide-control-inbox-directory-of "cci-test-owner")
                claude-code-ide-control--index)
       (claude-code-ide-review--tick)
       (should (eq (claude-code-ide-review-tests--state id) 'submitted))
-      (should (eq (plist-get (claude-code-ide-control-request-status "cci-test-owner" id) :result)
-                  'queued)))))
+      (should (eq (claude-code-ide-review-tests--inbox "cci-test-owner" id) 'queued)))))
+
+(ert-deftest claude-code-ide-test-review-request-id-namespace ()
+  "The inbox request ID is review:ID, and only that ID delivers the review."
+  (claude-code-ide-review-tests--with-review
+    (claude-code-ide-tests--control-add "cci-test-owner" "proj" 'working)
+    (let ((id (plist-get (claude-code-ide-review-tests--command-review
+                          "cci-test-owner" results "r.md" "cci-test ns" :review-id "cci-test-ns")
+                         :review-id)))
+      (should (eq (claude-code-ide-review-tests--inbox "cci-test-owner" id) 'queued))
+      (should (eq (plist-get (claude-code-ide-control-request-status "cci-test-owner" id) :status)
+                  'error))
+      ;; Another prompt whose request ID is the bare review ID
+      (claude-code-ide-review--on-delivered "cci-test-owner" "cci-test-ns")
+      (should (eq (claude-code-ide-review-tests--state id) 'submitted))
+      (claude-code-ide-review--on-delivered "cci-test-owner" "other:cci-test-ns")
+      (should (eq (claude-code-ide-review-tests--state id) 'submitted))
+      (claude-code-ide-review--on-delivered "cci-test-owner" "review:cci-test-ns")
+      (should (eq (claude-code-ide-review-tests--state id) 'delivered)))))
+
+(ert-deftest claude-code-ide-test-review-text-failure-keeps-running ()
+  "A result text that cannot be made never submits nil text; a later check retries."
+  (claude-code-ide-review-tests--with-review
+    (claude-code-ide-tests--control-add "cci-test-owner" "proj" 'idle)
+    (let* ((fail t)
+           (claude-code-ide-review-format-function
+            (lambda (info)
+              (if fail (error "cci-test format failed")
+                (claude-code-ide-review-format-result info))))
+           (track (claude-code-ide-review-track
+                   "cci-test-owner"
+                   :command (list "sh" "-c" "printf 'cci-test retry' > r.md")
+                   :directory results :result-file "r.md"))
+           (id (plist-get track :review-id))
+           (record (gethash id claude-code-ide-review--records)))
+      (claude-code-ide-review-tests--wait
+       (lambda () (claude-code-ide-review--record-ended-at record)))
+      (should (eq (claude-code-ide-review-tests--state id) 'running))
+      (should (eql (claude-code-ide-review--record-exit-status record) 0))
+      (should-not claude-code-ide-tests--control-sent)
+      (should (eq (plist-get (claude-code-ide-control-request-status
+                              "cci-test-owner" (claude-code-ide-review-tests--request id))
+                             :status)
+                  'error))
+      ;; The record on disk also says running
+      (claude-code-ide-review--tick)
+      (should (eq (claude-code-ide-review--record-state
+                   (claude-code-ide-review--read-file (claude-code-ide-review--file id)))
+                  'running))
+      ;; The next check after the fix submits the result
+      (setq fail nil)
+      (claude-code-ide-review--tick)
+      (should (eq (claude-code-ide-review-tests--state id) 'submitted))
+      (should (string-match-p "cci-test retry" (nth 1 (car claude-code-ide-tests--control-sent))))
+      (should (string-match-p "Exit status: 0" (nth 1 (car claude-code-ide-tests--control-sent)))))))
+
+(ert-deftest claude-code-ide-test-review-retry-limit ()
+  "A result whose owner stays unknown becomes final after the time limit, with a warning."
+  (claude-code-ide-review-tests--with-review
+    (let ((record (claude-code-ide-review--record-create
+                   :review-id "cci-test-limit" :owner "cci-test-gone" :label "cci-test limit"
+                   :emacs-pid (emacs-pid) :result-file "/nonexistent/cci-test/r.md"
+                   :state 'ended :text "cci-test waiting" :created-at "2026-11-18T00:00:00Z")))
+      (claude-code-ide-review--write record)
+      ;; Within the limit: it waits
+      (claude-code-ide-review--tick)
+      (should (eq (claude-code-ide-review-tests--state "cci-test-limit") 'ended))
+      (should (= (claude-code-ide-review--record-attempts record) 1))
+      (claude-code-ide-review--tick)
+      (should (= (claude-code-ide-review--record-attempts record) 2))
+      (should-not claude-code-ide-review-tests--warnings)
+      ;; After the limit: final, with a warning that names both files
+      (let ((claude-code-ide-review-retry-seconds 0))
+        (claude-code-ide-review--tick))
+      (should (eq (claude-code-ide-review-tests--state "cci-test-limit") 'rejected))
+      (should (eq (plist-get (claude-code-ide-review-status "cci-test-limit") :submit-reason)
+                  'unknown-instance))
+      (let ((warning (car claude-code-ide-review-tests--warnings)))
+        (should (string-match-p "/nonexistent/cci-test/r.md" warning))
+        (should (string-match-p (regexp-quote (claude-code-ide-review--file "cci-test-limit"))
+                                warning)))
+      (should (equal (claude-code-ide-review--record-text record) "cci-test waiting"))
+      ;; Nothing retries a final review
+      (claude-code-ide-review--tick)
+      (should (= (length claude-code-ide-review-tests--warnings) 1)))))
+
+(ert-deftest claude-code-ide-test-review-owner-worktree-when-not-running ()
+  "A command of an owner that does not run starts in the owner's recorded worktree."
+  (claude-code-ide-review-tests--with-review
+    (let ((worktree (file-name-as-directory (make-temp-file "cci-test-review-wt-" t)))
+          (default-directory results))
+      (unwind-protect
+          (progn
+            (setf (alist-get "cci-test-owner" claude-code-ide-tests--control-registry nil nil #'equal)
+                  (claude-code-ide-session-registry-entry-create
+                   :key "cci-test-owner" :state 'open :worktree worktree
+                   :project-dir "/nonexistent/cci-test/"))
+            (let* ((id (plist-get (claude-code-ide-review-track
+                                   "cci-test-owner" :command '("sh" "-c" "pwd > r.md")
+                                   :result-file "r.md")
+                                  :review-id))
+                   (record (gethash id claude-code-ide-review--records)))
+              (should (equal (claude-code-ide-review--record-directory record) worktree))
+              (should (equal (claude-code-ide-review--record-result-file record)
+                             (expand-file-name "r.md" worktree)))
+              (claude-code-ide-review-tests--wait
+               (lambda () (not (eq (claude-code-ide-review-tests--state id) 'running))))
+              (should (file-exists-p (expand-file-name "r.md" worktree)))))
+        (delete-directory worktree t)))))
 
 ;;; Final results that are not deliveries
 
@@ -504,7 +710,7 @@ inbox, goes out after the turn, and is delivered at the acknowledgement."
         (should (eq (plist-get status :state) 'running))
         (should (equal (plist-get status :result-file) (expand-file-name "r.md" results))))
       (let ((record (claude-code-ide-review--read-file file)))
-        (should (equal (claude-code-ide-review--record-command record) '("sleep" "30")))
+        (should (equal (claude-code-ide-review--record-program record) "sleep"))
         (should (eq (claude-code-ide-review--record-managed record) t))
         (should (null (claude-code-ide-review--record-interrupted record)))))))
 
@@ -542,7 +748,7 @@ inbox, goes out after the turn, and is delivered at the acknowledgement."
       (should (= (hash-table-count claude-code-ide-review--processes) 1)))))
 
 (ert-deftest claude-code-ide-test-review-control-slot-and-tool ()
-  "The track-review operation and the track_review coordinator tool work."
+  "The track-review operation and its coordinator tool work."
   (claude-code-ide-review-tests--with-review
     (claude-code-ide-tests--control-add "cci-test-owner" "proj" 'working)
     (should (eq (alist-get 'track-review claude-code-ide-control-operations)
@@ -551,7 +757,10 @@ inbox, goes out after the turn, and is delivered at the acknowledgement."
                                                 :command '("sleep" "30") :directory results
                                                 :result-file "r.md")))
       (should (eq (plist-get result :status) 'ok)))
-    (let ((spec (cl-find "track_review" claude-code-ide-control--extra-tool-specs
+    (should-not (cl-find "track_review" claude-code-ide-control--extra-tool-specs
+                         :key (lambda (s) (plist-get s :name)) :test #'equal))
+    (let ((spec (cl-find "claude-code-ide-control-track-review"
+                         claude-code-ide-control--extra-tool-specs
                          :key (lambda (s) (plist-get s :name)) :test #'equal)))
       (should spec)
       (should (equal (mapcar (lambda (arg) (plist-get arg :name)) (plist-get spec :args))
@@ -562,13 +771,13 @@ inbox, goes out after the turn, and is delivered at the acknowledgement."
                                                     "cci-test-mcp" nil ["sleep" "30"] results))))
       (should (equal (alist-get 'status json) "ok"))
       (should (equal (alist-get 'review_id json) "cci-test-mcp"))
-      (should (equal (claude-code-ide-review--record-command
+      (should (equal (claude-code-ide-review--record-program
                       (gethash "cci-test-mcp" claude-code-ide-review--records))
-                     '("sleep" "30"))))
+                     "sleep")))
     ;; Without the scope check, the setup of the coordinator tools adds it with the scope
     (let ((claude-code-ide-mcp-server-tools nil))
       (let ((tools (claude-code-ide-control-setup-mcp-tools t)))
-        (should (eq (plist-get (cl-find "track_review" tools
+        (should (eq (plist-get (cl-find "claude-code-ide-control-track-review" tools
                                         :key (lambda (s) (plist-get s :name)) :test #'equal)
                                :scope)
                     'coordinator))))))
@@ -617,10 +826,13 @@ inbox, goes out after the turn, and is delivered at the acknowledgement."
          (claude-code-ide-mcp--ediff-queue (make-hash-table :test 'equal))
          (claude-code-ide-mcp--ediff-frame nil)
          (claude-code-ide-mcp--ediff-generation 0)
+         (claude-code-ide-mcp--ediff-queue-timer nil)
          (claude-code-ide-review-tests--ediff-calls nil)
          (frame (selected-frame)))
      (unwind-protect
          (progn ,@body)
+       (when (timerp claude-code-ide-mcp--ediff-queue-timer)
+         (cancel-timer claude-code-ide-mcp--ediff-queue-timer))
        (set-frame-parameter frame 'claude-code-ide-ediff nil))))
 
 (defun claude-code-ide-review-tests--fake-control (name)
@@ -693,6 +905,111 @@ inbox, goes out after the turn, and is delivered at the acknowledgement."
             (puthash "cci-test-proj" '(("/tmp/a" "/tmp/b" nil)) claude-code-ide-mcp--ediff-queue)
             (should (equal (claude-code-ide-mcp--free-ediff-label session) "cci-test-proj <2>")))
         (when (buffer-live-p control) (kill-buffer control))))))
+
+(ert-deftest claude-code-ide-test-ediff-queue-after-unregistered-ediff ()
+  "A diff that waits behind an ediff that this file did not start opens after it.
+The end of any ediff control buffer starts the next waiting diff, and
+the queue timer opens a waiting diff whose frame became free."
+  (claude-code-ide-review-tests--with-ediff-tables
+    (let ((foreign (generate-new-buffer "*cci-test-foreign-ediff*"))
+          (scheduled nil)
+          (timers nil))
+      (unwind-protect
+          (cl-letf (((symbol-function 'ediff-files)
+                     (lambda (a b _hooks) (push (list a b) claude-code-ide-review-tests--ediff-calls)))
+                    ((symbol-function 'select-frame-set-input-focus) #'ignore)
+                    ((symbol-function 'run-at-time)
+                     (lambda (_time _repeat fn &rest args) (push (cons fn args) scheduled) nil))
+                    ((symbol-function 'run-with-timer)
+                     (lambda (&rest args) (push args timers) nil))
+                    ((symbol-function 'message) #'ignore))
+            (puthash "cci-test-U" frame claude-code-ide-mcp--ediff-frames)
+            (delete-other-windows)
+            ;; An ediff that another command started shows in the frame
+            (with-current-buffer foreign (setq major-mode 'ediff-mode))
+            (set-window-buffer (selected-window) foreign)
+            (claude-code-ide-ediff-files-in-frame "cci-test-U" "/tmp/u-a" "/tmp/u-b")
+            (should-not claude-code-ide-review-tests--ediff-calls)
+            (should (gethash "cci-test-U" claude-code-ide-mcp--ediff-queue))
+            (should timers)
+            ;; That ediff quits: its control buffer dies
+            (setq scheduled nil)
+            (set-window-buffer (selected-window) (get-buffer-create "*scratch*"))
+            (kill-buffer foreign)
+            (should scheduled)
+            (dolist (call scheduled) (apply (car call) (cdr call)))
+            (should (equal claude-code-ide-review-tests--ediff-calls '(("/tmp/u-a" "/tmp/u-b"))))
+            ;; The queue timer opens a diff whose frame is free
+            (puthash "cci-test-U" '(("/tmp/v-a" "/tmp/v-b" nil)) claude-code-ide-mcp--ediff-queue)
+            (claude-code-ide-mcp--ediff-queue-tick)
+            (should (equal (car claude-code-ide-review-tests--ediff-calls) '("/tmp/v-a" "/tmp/v-b")))
+            (should-not (gethash "cci-test-U" claude-code-ide-mcp--ediff-queue)))
+        (when (buffer-live-p foreign) (kill-buffer foreign))))))
+
+(ert-deftest claude-code-ide-test-ediff-frame-needs-the-table ()
+  "Only a frame of the table is a diff frame; a copied frame parameter is not."
+  (claude-code-ide-review-tests--with-ediff-tables
+    (set-frame-parameter frame 'claude-code-ide-ediff "cci-test-copy")
+    (should-not (claude-code-ide-mcp-ediff-frame-p frame))
+    (should (eq (claude-code-ide-mcp-call-outside-ediff-frame #'selected-frame) frame))
+    (puthash "cci-test-copy" frame claude-code-ide-mcp--ediff-frames)
+    (should (claude-code-ide-mcp-ediff-frame-p frame))))
+
+(defmacro claude-code-ide-review-tests--with-open-diff (&rest body)
+  "Run BODY with a session, a file, and the selected frame as a diff frame.
+BODY can refer to `session', `file' and `arguments', the arguments of
+an openDiff of `file'."
+  (declare (indent 0))
+  `(claude-code-ide-review-tests--with-ediff-tables
+     (let* ((file (make-temp-file "cci-test-diff-" nil ".txt" "old\n"))
+            (session (claude-code-ide-tests--make-session "/tmp/cci-test-proj/"))
+            (arguments `((old_file_path . ,file) (new_file_path . ,file)
+                         (new_file_contents . "new\n") (tab_name . "cci-test-tab-name")))
+            (claude-code-ide-ediff-frame nil))
+       (puthash "cci-test-L" frame claude-code-ide-mcp--ediff-frames)
+       (unwind-protect
+           (progn ,@body)
+         ;; The cleanup deletes the diff frames without an ediff: the
+         ;; selected frame of the test is not one any more
+         (clrhash claude-code-ide-mcp--ediff-frames)
+         (ignore-errors (claude-code-ide-mcp--cleanup-diff "cci-test-tab-name" session))
+         (when-let* ((buffer (find-buffer-visiting file)))
+           (kill-buffer buffer))
+         (delete-file file)))))
+
+(ert-deftest claude-code-ide-test-ediff-open-diff-leaves-diff-frame-first ()
+  "openDiff leaves the diff frame before it switches the tab, in the target frame."
+  (claude-code-ide-review-tests--with-open-diff
+    (let ((steps nil)
+          (claude-code-ide-switch-tab-on-ediff t)
+          (tab-bar-mode t))
+      (setf (claude-code-ide-mcp-session-original-tab session) '((name . "cci-test-tab")))
+      (cl-letf (((symbol-function 'claude-code-ide-mcp--frame-outside-ediff) (lambda () frame))
+                ((symbol-function 'claude-code-ide-mcp--other-frame) (lambda () frame))
+                ((symbol-function 'select-frame-set-input-focus)
+                 (lambda (&rest _) (push 'leave-diff-frame steps)))
+                ((symbol-function 'tab-bar--current-tab) (lambda () '((name . "cci-test-other"))))
+                ((symbol-function 'tab-bar-select-tab-by-name)
+                 (lambda (&rest _) (push 'switch-tab steps)))
+                ((symbol-function 'ediff-buffers) (lambda (&rest _) (push 'ediff steps))))
+        (claude-code-ide-mcp-handle-open-diff arguments session)
+        (should (equal (reverse steps) '(leave-diff-frame switch-tab ediff)))))))
+
+(ert-deftest claude-code-ide-test-ediff-open-diff-makes-frame-outside ()
+  "Without another frame, openDiff makes one, and never uses the busy diff frame."
+  (claude-code-ide-review-tests--with-open-diff
+    (let ((made nil)
+          (ediffs nil))
+      (cl-letf (((symbol-function 'claude-code-ide-mcp--other-frame) #'ignore)
+                ((symbol-function 'make-frame)
+                 (lambda (&rest _) (setq made t) (error "cci-test: no frame")))
+                ((symbol-function 'select-frame-set-input-focus) #'ignore)
+                ((symbol-function 'ediff-buffers) (lambda (&rest _) (setq ediffs t))))
+        (should-error (claude-code-ide-mcp-handle-open-diff arguments session) :type 'mcp-error)
+        (should made)
+        (should-not ediffs)
+        (should-not (gethash "cci-test-tab-name"
+                             (claude-code-ide-mcp-session-active-diffs session)))))))
 
 (defun claude-code-ide-review-tests--frame-terminal ()
   "Return the terminal of a graphic frame, on which a test can make frames, or nil."
