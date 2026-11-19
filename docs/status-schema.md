@@ -92,15 +92,14 @@ Code: `claude-code-ide-session-status.el`, section "Status snapshot". The common
 
 | State | Reasons | Meaning |
 |---|---|---|
-| `working` | none | The agent works, or starts. |
+| `working` | `starting` | The agent works. `starting`: the CLI starts and reported no event yet. |
 | `idle` | none | The turn ended. The agent waits for the next prompt. |
 | `waiting-for-user` | `approval`, `question`, `dialog` | The agent waits for an answer. Do not type into the terminal. |
 | `waiting-for-task` | `subagent`, `background-task`, `other-instance` | The agent waits for its own background work. |
-| `disconnected` | none | The process is gone, the session ended, or no event comes (no status hooks, or Codex hooks that are not trusted). |
+| `disconnected` | `untracked`, `no-signal` | No status events come. `untracked`: the launch has no status hooks, or its Codex hooks were not trusted at the launch. `no-signal`: the launch has hooks, but no event came since its start. No reason: the process is gone, or the session ended. |
 | `failed` | `quota-limit`, `exit-code`, `error` | The last turn failed. `quota-limit`: the account reached its usage limit. |
 
-- Claude Code: `StopFailure` with `error: "rate_limit"` gives `failed/quota-limit`. Another `StopFailure` gives `failed/error`.
-- Codex: a failed `PostModelRequest` gives `failed/error`, or `failed/quota-limit` when the error text matches the usage-limit pattern. See [status-events.md](status-events.md).
+- `failed/quota-limit` needs a usage limit of the account: a Claude Code `billing_error`, or an error text that says a usage or plan limit was reached. A short rate limit is `failed/error`. [status-events.md](status-events.md), section "Quota limits", has the full table.
 - A guess is not an event. Examples: a reply that ends with a question (`waiting-for-user/question`, guess), and a Codex approval after 10 seconds without a screen check.
 
 ## Freshness rules for readers

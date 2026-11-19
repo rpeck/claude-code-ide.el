@@ -15,7 +15,7 @@ Facts from tests T1 and T2 on Codex 0.164.0.
 
 ## Overview
 
-1. The Codex launch adds the hook arguments of `claude-code-ide-codex-status-hook-args` to the command, and the environment of `claude-code-ide-codex-status-hook-env` to the terminal.
+1. The Codex launch adds the hook arguments of `claude-code-ide-codex-status-hook-args` to the command, and the environment of `claude-code-ide-codex-status-hook-env` to the terminal. It calls them only when they are bound, so the launch also works without this file.
 2. Codex runs the hook script at each hook event. The script writes one event file.
 3. Emacs reads the event files in order, checks the launch identity, and changes the status of the instance.
 4. Emacs passes each current event to `claude-code-ide-dispatch-event`.
@@ -79,10 +79,12 @@ Codex runs a hook only after the user trusts it. `codex exec` and the terminal U
 | Result | Status of an instance without events |
 |---|---|
 | All hooks trusted | Normal (see below). |
-| Some hooks not trusted or disabled | `disconnected`, detail "N of 11 Codex status hooks not trusted: M-x claude-code-ide-codex-trust-hooks". |
+| Some hooks not trusted or disabled | `disconnected/untracked`, detail "N of 11 Codex status hooks not trusted: M-x claude-code-ide-codex-trust-hooks". |
 | No answer, or no Codex program | Normal, and the detail adds "Hook trust unknown: ...". |
 
 When events come, a trust problem is added to the detail only.
+
+A trust does not change a launch that started while its hooks were not trusted. That launch stays `disconnected/untracked`, with the detail "Hooks were not trusted at the launch: restart to get status". A launch that waited for the running check gets its result. A later launch uses the trusted result.
 
 ### The trust command
 
@@ -114,8 +116,10 @@ Emacs reads the files at a file notification, and every 2 seconds. For each file
 1. The instance ID must have a launch record, and the generation must be the generation of that record. The record exists only for the current launch of a running instance.
 2. The content must name the same event, instance ID, and generation as the file name.
 3. The common event must be current (`claude-code-ide-event-current-p`).
-4. The `session_id` of the input must be the first `session_id` of the launch. An event with another `session_id` comes from a nested session.
-5. Emacs applies the event, notes the `model` and the first `session_id` in the descriptor, and dispatches the common event.
+4. The `session_id` of the input must be the conversation of the launch. The first `session_id` that comes sets it.
+   - A `SessionStart` of the main agent with another `session_id` moves the launch to that conversation. This happens after `/new`, or after a switch to another thread in the terminal. The descriptor gets the new native ID.
+   - Another event with an unknown `session_id` is dropped. A nested session has its own `session_id`; its `SessionStart` never comes, because the script drops it (`CODEX_THREAD_ID`).
+5. Emacs applies the event, notes the `model` and the native ID in the descriptor, and dispatches the common event.
 
 Emacs deletes each file, also a file that it does not apply. Locks older than 3 seconds are deleted.
 
@@ -128,12 +132,12 @@ So an event of an earlier launch (for example before a resume) changes nothing, 
 | `SessionStart` | `session-start` | `idle` "Ready". Clears tools, blockers, subagents, and a failure. |
 | `UserPromptSubmit` | `prompt-submit` | `working`. Clears the blockers of the main agent and a failure. |
 | `PreToolUse` | `tool-start` | Records the tool. Main agent: `working`. `request_user_input`: `waiting-for-user/question`, not a guess. |
-| `PermissionRequest` | `approval-request` | `waiting-for-user/approval` for the newest tool in flight with the same agent, name, and input. |
+| `PermissionRequest` | `approval-request` | `waiting-for-user/approval` for its tool (see "Matching an approval to its tool"). |
 | `PostToolUse` | `tool-end` | Ends the tool and its blockers. Main agent: `working`. |
 | `Interrupt` | `interrupt` | `idle` "Interrupted". Ends the tools and blockers of the main agent. |
 | `Stop` | `turn-end` | `idle`, with the first line of `last_assistant_message`. A line that matches `claude-code-ide-session-status-ask-regexps` gives `waiting-for-user/question` as a guess. |
-| `PostModelRequest`, `status: "failed"` | `turn-failed` | `failed/error`, or `failed/quota-limit` when the error matches `claude-code-ide-codex-events-quota-regexp`. No `Stop` follows. |
-| `PostModelRequest`, other | `other` | None. |
+| `PostModelRequest`, `status: "failed"` | `turn-failed` | `failed/error`, or `failed/quota-limit` when the error is a usage limit (see "Quota limits"). No `Stop` follows. |
+| `PostModelRequest`, other | `other` | Main agent after a failure or at the start: `working`. Codex retries a failed request, so a later answer ends the failure. |
 | `SubagentStart` | `subagent-start` | `waiting-for-task/subagent` while the agent runs. |
 | `SubagentStop` | `subagent-end` | Ends the agent, its tools, and its blockers. |
 | `SessionEnd` | `session-end` | `disconnected` "Session ended". |
@@ -142,11 +146,31 @@ Rules:
 
 - **Subagents.** An event with `agent_id` belongs to a subagent. It never changes the turn of the main agent. A subagent's approval or question waits for the user too.
 - **Deny and Esc.** Both give only `Interrupt`. Emacs cannot tell them apart.
-- **Allow.** No event shows it. The approval stays until the `PostToolUse` of the tool. Without a screen read, the approval is a guess after `claude-code-ide-codex-events-approval-guess-time` (10 seconds).
+- **Allow.** No event shows it. The approval stays until the `PostToolUse` of the tool. Without a screen read, the approval is a guess after `claude-code-ide-codex-events-approval-guess-time` (10 seconds). The result of a screen read belongs to each approval of the main agent, so the end of a subagent does not change it.
 - **Automatic review.** It gives the same events as a user dialog.
 - **Background terminals** give no events. So Codex never shows `waiting-for-task/background-task`.
 - **A killed terminal buffer** gives no `SessionEnd`. The process check of `claude-code-ide-instance-state` gives `disconnected`.
-- **The quota regexp** matches `usage limit`, `quota`, `credits depleted`, and `rate limit reached` or `exceeded`, without case. The real usage-limit text is not yet known (T1).
+### Matching an approval to its tool
+
+- A `PermissionRequest` with a `tool_use_id` of a tool in flight belongs to that tool.
+- Codex 0.164.0 sends no `tool_use_id`. Then the request belongs to the newest tool in flight with the same agent and the same tool name, whose `tool_input` fields all have the same values in the request, and that has no approval yet.
+- The request input has fields that the tool input lacks, for example `description`. They do not count.
+- So with parallel tools, the `PostToolUse` of one tool does not end the approval of another tool.
+
+### Quota limits
+
+`claude-code-ide-session-status-quota-regexp` decides whether an error text reports the usage limit of the account. It is matched without case. It matches texts such as "usage limit", "plan limit", "quota", "credits depleted", "out of credits", "hit your limit", and "5-hour limit" or "weekly limit". It does not match a short rate limit such as "Rate limit reached ... tokens per min ... try again in 1.2s".
+
+| Provider | Event | State | Detail |
+|---|---|---|---|
+| Claude Code | `StopFailure`, `error: "billing_error"` | `failed/quota-limit` | "Quota limit: <text>" |
+| Claude Code | `StopFailure`, `error: "rate_limit"`, and `error_details` or `last_assistant_message` matches the regexp | `failed/quota-limit` | "Quota limit: <text>" |
+| Claude Code | `StopFailure`, `error: "rate_limit"`, other | `failed/error` | "Error: rate limit", plus `error_details` when it has text |
+| Claude Code | `StopFailure`, other | `failed/error` | "Error: <error>" |
+| Codex | `PostModelRequest`, `status: "failed"`, and `error` matches the regexp | `failed/quota-limit` | "Quota limit: <error>" |
+| Codex | `PostModelRequest`, `status: "failed"`, other | `failed/error` | "Error: <error>" |
+
+The real Codex usage-limit text is not yet known (T1). `<text>` is `error_details`, else `last_assistant_message`, else `error`.
 
 ### The order of the states
 
@@ -162,16 +186,16 @@ Rules:
 5. A startup dialog on the screen: `waiting-for-user/dialog`.
 6. A subagent runs: `waiting-for-task/subagent`.
 7. No event yet. Codex sends `SessionStart` only with the first prompt:
-   - The hooks are not trusted: `disconnected`.
-   - In the first `claude-code-ide-codex-events-startup-grace` seconds (3): `working` "Starting", a guess.
-   - The screen read found no dialog: `idle`, a guess.
-   - No screen read: `working` "Starting: no event yet", a guess.
+   - The hooks were not trusted at the launch: `disconnected/untracked`.
+   - In the first `claude-code-ide-codex-events-startup-grace` seconds (3): `working/starting` "Starting", a guess.
+   - The screen read found no dialog: `idle`, a guess. The composer waits for the first prompt.
+   - No screen read: `working/starting` "Starting: no event yet", a guess.
 8. The turn ended: `idle`, or `waiting-for-user/question` as a guess.
 9. Else `working`.
 
 ## Startup dialogs
 
-The Codex launch owns `(claude-code-ide-codex-screen-dialog BUFFER)` (PHASE2-CONTRACTS section 2). It returns nil, or `folder-trust`, `update`, `hooks-review`, `approval`, or `other`. It reads only the screen and never sends keys.
+The Codex launch defines `(claude-code-ide-codex-screen-dialog BUFFER)`. It returns nil, or `folder-trust`, `update`, `hooks-review`, `approval`, or `other`. It reads only the visible text of the terminal BUFFER, and it never sends keys.
 
 - Emacs calls it through `fboundp`, every 2 seconds, in two cases:
   - No event came yet, after the startup grace time.
@@ -185,7 +209,7 @@ The Codex launch owns `(claude-code-ide-codex-screen-dialog BUFFER)` (PHASE2-CON
 - A new launch of the same instance ID replaces the record and deletes the files of the old launch.
 - Every 2 seconds, Emacs deletes the records whose instance does not run that launch any more, and their files.
 - The timers stop when no record is left.
-- `claude-code-ide-codex-events--instance-state` is a function of `claude-code-ide-instance-state-functions` for the provider `codex`. An instance without a record has the state `disconnected`, detail "No status hooks".
+- `claude-code-ide-codex-events--instance-state` is a function of `claude-code-ide-instance-state-functions` for the provider `codex`. An instance without a record has the state `disconnected/untracked`, detail "No status hooks".
 - `claude-code-ide-codex-events-map-event` maps the events. The Codex provider can use it as its `map-event` operation.
 
 ## Options
@@ -197,4 +221,4 @@ The Codex launch owns `(claude-code-ide-codex-screen-dialog BUFFER)` (PHASE2-CON
 | `claude-code-ide-codex-events-trust-timeout` | 10 | Seconds that a trust check waits. |
 | `claude-code-ide-codex-events-startup-grace` | 3 | Seconds before the first screen read of a launch. |
 | `claude-code-ide-codex-events-approval-guess-time` | 10 | Seconds after which an unconfirmed approval is a guess. |
-| `claude-code-ide-codex-events-quota-regexp` | see above | The usage-limit pattern of a failed model request. |
+| `claude-code-ide-session-status-quota-regexp` | see above | The usage-limit pattern of both providers. |

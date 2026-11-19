@@ -81,15 +81,6 @@ pending approval."
   :type 'number
   :group 'claude-code-ide)
 
-(defcustom claude-code-ide-codex-events-quota-regexp
-  (concat "usage[_ ]?limit\\|quota\\|credits?[_ ]depleted"
-          "\\|rate[_ ]?limit[_ ]\\(?:reached\\|exceeded\\)")
-  "Regexp for the error of a failed model request that reports a quota limit.
-It is matched without case.  A failed request whose error does not
-match is `failed/error'."
-  :type 'regexp
-  :group 'claude-code-ide)
-
 ;;; Constants
 
 (defconst claude-code-ide-codex-events--events
@@ -183,7 +174,9 @@ exit 0
   (kind 'approval :type symbol :documentation "`approval' or `question'.")
   (tool nil :documentation "(AGENT-ID . TOOL-USE-ID) of the tool, or nil.")
   (detail "" :type string)
-  (since 0.0 :type float))
+  (since 0.0 :type float)
+  (answered nil :documentation "Time when a screen read found no dialog for it, or nil.
+The user answered the approval then, or a reviewer did."))
 
 (cl-defstruct (claude-code-ide-codex-events--launch
                (:constructor claude-code-ide-codex-events--launch-create)
@@ -209,8 +202,6 @@ Events with another session ID come from a nested session.")
              :documentation "Lines of the reply that ended the turn that ask the user.")
   (dialog nil :documentation "Dialog that the last screen read found, or nil.")
   (dialog-checked nil :documentation "Time of the last screen read, or nil.")
-  (answered nil :documentation "Time when a screen read found no approval dialog.
-The user answered the approval then, or a reviewer did.")
   (trust 'unknown :documentation "`unknown', `checking', `trusted', `untrusted' or `error'.")
   (trust-detail nil :documentation "Text that explains the trust, or nil."))
 
@@ -277,19 +268,12 @@ The folder is private (mode 0700).  The script is written to a
 temporary file in that folder and renamed, so Codex never runs a part
 of it.  The content is checked at each launch, because Codex trusts
 the hook command, not the script."
-  (let ((dir (claude-code-ide-codex-events--private-directory
-              (claude-code-ide-codex-events--hooks-directory)))
-        (file (claude-code-ide-codex-events--script-file)))
+  (claude-code-ide-codex-events--private-directory
+   (claude-code-ide-codex-events--hooks-directory))
+  (let ((file (claude-code-ide-codex-events--script-file)))
     (unless (claude-code-ide-codex-events--script-ok-p file)
-      (let ((tmp (make-temp-file (expand-file-name ".hook-" dir))))
-        (unwind-protect
-            (progn
-              (let ((coding-system-for-write 'utf-8-unix))
-                (write-region claude-code-ide-codex-events--script nil tmp nil 'silent))
-              (set-file-modes tmp #o700)
-              (rename-file tmp file t))
-          (when (file-exists-p tmp)
-            (delete-file tmp)))))
+      (claude-code-ide-session-status--write-file-atomically
+       file claude-code-ide-codex-events--script #o700))
     file))
 
 (defun claude-code-ide-codex-events--command (event)
@@ -311,26 +295,22 @@ They do not depend on the instance, so one trust covers all launches."
 
 (defun claude-code-ide-codex-events--remove-launch-files (instance-id generation)
   "Delete the event, counter and lock files of the launch INSTANCE-ID GENERATION."
-  (let ((dir (claude-code-ide-codex-events--events-directory))
-        (launch (format "%s.%d." instance-id generation)))
-    (when (file-directory-p dir)
-      (dolist (file (directory-files dir t (concat "\\`\\.?" (regexp-quote launch))))
-        (ignore-errors
-          (if (file-directory-p file)
-              (delete-directory file t)
-            (delete-file file)))))))
+  (claude-code-ide-session-status--delete-matching-files
+   (claude-code-ide-codex-events--events-directory)
+   (concat "\\`\\.?" (regexp-quote (format "%s.%d." instance-id generation)))))
 
 (defun claude-code-ide-codex-events--remove-stale-locks ()
-  "Delete counter locks older than three seconds."
-  (let ((dir (claude-code-ide-codex-events--events-directory)))
-    (when (file-directory-p dir)
-      (dolist (lock (directory-files dir t "\\`\\..+\\.lock\\'" t))
-        (when-let* ((attributes (file-attributes lock)))
-          (when (> (float-time (time-subtract nil (file-attribute-modification-time attributes)))
-                   3)
-            (ignore-errors (delete-directory lock t))))))))
+  "Delete counter locks older than three seconds.
+See `claude-code-ide-session-status--remove-old-locks'."
+  (claude-code-ide-session-status--remove-old-locks
+   (claude-code-ide-codex-events--events-directory) "\\`\\..+\\.lock\\'"))
 
-;;; Hook arguments (PHASE2-CONTRACTS section 1)
+;;; Hook arguments
+
+;; The Codex launch appends the result of
+;; `claude-code-ide-codex-status-hook-args' to its command and the result
+;; of `claude-code-ide-codex-status-hook-env' to the terminal environment.
+;; It calls them only when they are bound.
 
 (defun claude-code-ide-codex-events--launch-of (instance)
   "Return the launch record of the current launch of INSTANCE, or nil."
@@ -463,35 +443,51 @@ AGENT nil is the main agent."
              tools))
   (claude-code-ide-codex-events--remove-blockers
    launch (lambda (blocker)
-            (equal (car-safe (claude-code-ide-codex-events--blocker-tool blocker)) agent)))
-  (setf (claude-code-ide-codex-events--launch-answered launch) nil))
+            (equal (car-safe (claude-code-ide-codex-events--blocker-tool blocker)) agent))))
+
+(defun claude-code-ide-codex-events--input-matches-p (request-input tool-input)
+  "Return non-nil when REQUEST-INPUT of a PermissionRequest fits TOOL-INPUT.
+TOOL-INPUT is the input of the PreToolUse.  Each of its fields must
+have the same value in REQUEST-INPUT; fields that only the request has,
+such as `description', do not count."
+  (if (and (consp tool-input) (consp (car tool-input)))
+      (and (listp request-input)
+           (cl-every (lambda (field)
+                       (equal (alist-get (car field) request-input) (cdr field)))
+                     tool-input))
+    (equal request-input tool-input)))
 
 (defun claude-code-ide-codex-events--match-tool (launch data)
   "Return the key of the tool in flight that the PermissionRequest DATA is for.
-The request has no tool use id: the newest tool in flight of the same
-agent with the same name and input and no blocker is chosen."
-  (let ((agent (claude-code-ide-codex-events--string data 'agent_id))
-        (name (alist-get 'tool_name data))
-        (input (alist-get 'tool_input data))
-        (blocked (mapcar #'claude-code-ide-codex-events--blocker-tool
-                         (claude-code-ide-codex-events--launch-blockers launch)))
-        (best nil)
-        (best-seq -1))
-    (maphash (lambda (key value)
-               (when (and (equal (car key) agent)
-                          (equal (nth 1 value) name)
-                          (equal (nth 2 value) input)
-                          (not (member key blocked))
-                          (> (car value) best-seq))
-                 (setq best key best-seq (car value))))
-             (claude-code-ide-codex-events--launch-tools launch))
-    best))
+A request with a `tool_use_id' of a tool in flight is for that tool.
+Codex 0.164.0 sends none: then the newest tool in flight of the same
+agent with the same name, whose input fits the request, and that has
+no blocker yet is chosen."
+  (let* ((agent (claude-code-ide-codex-events--string data 'agent_id))
+         (id (alist-get 'tool_use_id data))
+         (tools (claude-code-ide-codex-events--launch-tools launch)))
+    (if (and id (gethash (cons agent id) tools))
+        (cons agent id)
+      (let ((name (alist-get 'tool_name data))
+            (input (alist-get 'tool_input data))
+            (blocked (mapcar #'claude-code-ide-codex-events--blocker-tool
+                             (claude-code-ide-codex-events--launch-blockers launch)))
+            (best nil)
+            (best-seq -1))
+        (maphash (lambda (key value)
+                   (when (and (equal (car key) agent)
+                              (equal (nth 1 value) name)
+                              (claude-code-ide-codex-events--input-matches-p input (nth 2 value))
+                              (not (member key blocked))
+                              (> (car value) best-seq))
+                     (setq best key best-seq (car value))))
+                 tools)
+        best))))
 
 (defun claude-code-ide-codex-events--quota-error-p (error)
-  "Return non-nil when the model request ERROR text reports a quota limit."
-  (and (stringp error)
-       (let ((case-fold-search t))
-         (string-match-p claude-code-ide-codex-events-quota-regexp error))))
+  "Return non-nil when the model request ERROR text reports a quota limit.
+See `claude-code-ide-session-status-quota-regexp'."
+  (claude-code-ide-session-status--quota-text-p error))
 
 (defun claude-code-ide-codex-events--apply (launch event data &optional now)
   "Change LAUNCH for the Codex hook EVENT with the input DATA, at time NOW.
@@ -510,8 +506,7 @@ for the user too."
        (clrhash (claude-code-ide-codex-events--launch-tools launch))
        (clrhash (claude-code-ide-codex-events--launch-subagents launch))
        (setf (claude-code-ide-codex-events--launch-blockers launch) nil
-             (claude-code-ide-codex-events--launch-failure launch) nil
-             (claude-code-ide-codex-events--launch-answered launch) nil)
+             (claude-code-ide-codex-events--launch-failure launch) nil)
        (claude-code-ide-codex-events--set-phase launch 'idle "Ready" now))
       ("UserPromptSubmit"
        (claude-code-ide-codex-events--forget-agent launch nil)
@@ -532,7 +527,6 @@ for the user too."
            (claude-code-ide-codex-events--set-phase
             launch 'working (format "Working: %s" (or name "tool")) now))))
       ("PermissionRequest"
-       (setf (claude-code-ide-codex-events--launch-answered launch) nil)
        (claude-code-ide-codex-events--add-blocker
         launch 'approval
         (or (claude-code-ide-codex-events--match-tool launch data) (cons agent nil))
@@ -546,10 +540,6 @@ for the user too."
           launch (lambda (blocker)
                    (let ((tool (claude-code-ide-codex-events--blocker-tool blocker)))
                      (or (equal tool key) (equal tool (cons agent nil))))))
-         (unless (cl-some (lambda (blocker)
-                            (eq (claude-code-ide-codex-events--blocker-kind blocker) 'approval))
-                          (claude-code-ide-codex-events--launch-blockers launch))
-           (setf (claude-code-ide-codex-events--launch-answered launch) nil))
          (when (and main (memq (claude-code-ide-codex-events--launch-phase launch)
                                '(starting idle)))
            (claude-code-ide-codex-events--set-phase launch 'working "Working" now))))
@@ -584,7 +574,9 @@ for the user too."
             now)
            (setf (claude-code-ide-codex-events--launch-failure launch)
                  (if quota 'quota-limit 'error))))
-        ((and main (eq (claude-code-ide-codex-events--launch-phase launch) 'starting))
+        ;; Codex retries a failed request: a later answer ends the failure
+        ((and main (memq (claude-code-ide-codex-events--launch-phase launch) '(starting failed)))
+         (setf (claude-code-ide-codex-events--launch-failure launch) nil)
          (claude-code-ide-codex-events--set-phase launch 'working "Working" now))))
       ("SubagentStart"
        (when agent
@@ -596,8 +588,7 @@ for the user too."
       ("SessionEnd"
        (clrhash (claude-code-ide-codex-events--launch-tools launch))
        (clrhash (claude-code-ide-codex-events--launch-subagents launch))
-       (setf (claude-code-ide-codex-events--launch-blockers launch) nil
-             (claude-code-ide-codex-events--launch-answered launch) nil)
+       (setf (claude-code-ide-codex-events--launch-blockers launch) nil)
        (claude-code-ide-codex-events--set-phase launch 'ended "Session ended" now)))))
 
 ;;; States
@@ -636,7 +627,7 @@ reports the state."
       (list 'waiting-for-user 'question (claude-code-ide-codex-events--blocker-since blocker)
             nil (claude-code-ide-codex-events--blocker-detail blocker)))
      (blocker
-      (let ((answered (claude-code-ide-codex-events--launch-answered launch))
+      (let ((answered (claude-code-ide-codex-events--blocker-answered blocker))
             (start (claude-code-ide-codex-events--blocker-since blocker))
             (text (claude-code-ide-codex-events--blocker-detail blocker)))
         (cond
@@ -661,12 +652,12 @@ reports the state."
       (cond
        ;; Untrusted hooks never report; an unknown trust may still work
        ((eq (claude-code-ide-codex-events--launch-trust launch) 'untrusted)
-        (list 'disconnected nil registered nil problem))
+        (list 'disconnected 'untracked registered nil problem))
        ((< (- now registered) claude-code-ide-codex-events-startup-grace)
-        (list 'working nil registered t "Starting"))
+        (list 'working 'starting registered t "Starting"))
        ((claude-code-ide-codex-events--launch-dialog-checked launch)
         (list 'idle nil registered t "Ready: Codex reports no event before the first prompt"))
-       (t (list 'working nil registered t "Starting: no event yet"))))
+       (t (list 'working 'starting registered t "Starting: no event yet"))))
      ((eq phase 'idle)
       (let ((questions (claude-code-ide-codex-events--launch-questions launch)))
         (if questions
@@ -690,12 +681,15 @@ reports the state."
 
 (defun claude-code-ide-codex-events--instance-state (instance now)
   "Return the common state of the Codex INSTANCE at NOW, or nil.
-This is a function of `claude-code-ide-instance-state-functions'."
+A Codex instance whose launch has no status hooks is
+`disconnected/untracked'.  This is a function of
+`claude-code-ide-instance-state-functions'."
   (when (eq (claude-code-ide-instance-provider instance) 'codex)
-    (when-let* ((launch (claude-code-ide-codex-events--launch-of instance)))
-      (pcase-let ((`(,state ,reason ,since ,guess ,_detail)
-                   (claude-code-ide-codex-events--state launch now)))
-        (claude-code-ide-instance-make-state state reason since guess)))))
+    (if-let* ((launch (claude-code-ide-codex-events--launch-of instance)))
+        (pcase-let ((`(,state ,reason ,since ,guess ,_detail)
+                     (claude-code-ide-codex-events--state launch now)))
+          (claude-code-ide-instance-make-state state reason since guess))
+      (claude-code-ide-instance-make-state 'disconnected 'untracked))))
 
 (defun claude-code-ide-codex-events--instance-detail (instance now)
   "Return the detail text of the Codex INSTANCE at NOW, or nil.
@@ -725,29 +719,28 @@ This is a function of `claude-code-ide-session-status-detail-functions'."
 
 (defun claude-code-ide-codex-events--read-file (file)
   "Return the record in the event FILE as an alist, or nil when it cannot be read."
-  (condition-case nil
-      (let ((text (claude-code-ide-session-registry--file-string file)))
-        (if (and (fboundp 'json-available-p) (json-available-p))
-            (json-parse-string text :object-type 'alist :array-type 'list
-                               :null-object nil :false-object nil)
-          (claude-code-ide-session-registry--json-decode text)))
-    (error nil)))
+  (claude-code-ide-session-status--read-json-file file))
 
-(defun claude-code-ide-codex-events--note-identity (instance data)
-  "Copy the model and the first conversation ID of the event DATA to INSTANCE."
+(defun claude-code-ide-codex-events--note-identity (instance data &optional switch)
+  "Copy the model and the conversation ID of the event DATA to INSTANCE.
+The conversation ID replaces an unknown one, or any one when SWITCH is
+non-nil: the launch moved to another conversation."
   (when instance
     (when-let* ((model (claude-code-ide-codex-events--string data 'model)))
       (setf (claude-code-ide-instance-model instance) model))
     (when-let* ((native (claude-code-ide-codex-events--string data 'session_id)))
-      (when (claude-code-ide-unknown-p (claude-code-ide-instance-native-id instance))
+      (when (or switch (claude-code-ide-unknown-p (claude-code-ide-instance-native-id instance)))
         (setf (claude-code-ide-instance-native-id instance) native)))))
 
 (defun claude-code-ide-codex-events--handle (instance-id generation event data &optional now)
   "Apply the hook EVENT with DATA of the launch INSTANCE-ID GENERATION.
 The event counts only for the current launch of a running instance,
-and only for the first conversation ID of that launch: a nested session
-that inherited the variables has another one.  Return the common event
-when the event was applied, else nil."
+and only for the conversation ID of that launch.  A SessionStart of
+the main agent with another conversation ID (after /new, or a switch
+to another thread in the terminal) moves the launch, and the
+descriptor, to that conversation.  Other events with another
+conversation ID are dropped.  Return the common event when the event
+was applied, else nil."
   (let ((launch (gethash instance-id claude-code-ide-codex-events--launches)))
     (when (and launch (= generation (claude-code-ide-codex-events--launch-generation launch)))
       (let ((common (claude-code-ide-make-event
@@ -756,14 +749,17 @@ when the event was applied, else nil."
                      event data now))
             (native (claude-code-ide-codex-events--string data 'session_id))
             (known (claude-code-ide-codex-events--launch-session-id launch)))
-        (when (and (claude-code-ide-event-current-p common)
-                   (or (null native) (null known) (equal native known)))
-          (unless known
-            (setf (claude-code-ide-codex-events--launch-session-id launch) native))
-          (claude-code-ide-codex-events--apply launch event data now)
-          (claude-code-ide-codex-events--note-identity
-           (claude-code-ide-instance-by-id instance-id) data)
-          common)))))
+        (let ((switch (and native known (not (equal native known))
+                           (equal event "SessionStart")
+                           (null (claude-code-ide-codex-events--string data 'agent_id)))))
+          (when (and (claude-code-ide-event-current-p common)
+                     (or (null native) (null known) (equal native known) switch))
+            (when (or switch (null known))
+              (setf (claude-code-ide-codex-events--launch-session-id launch) native))
+            (claude-code-ide-codex-events--apply launch event data now)
+            (claude-code-ide-codex-events--note-identity
+             (claude-code-ide-instance-by-id instance-id) data switch)
+            common))))))
 
 (defun claude-code-ide-codex-events--drain ()
   "Apply and delete the waiting Codex event files, at most 500 per call.
@@ -815,7 +811,12 @@ Files of launches that this Emacs does not track are deleted unread."
     (setq claude-code-ide-codex-events--drain-timer
           (run-with-timer 0.1 nil #'claude-code-ide-codex-events--drain))))
 
-;;; Startup dialogs (PHASE2-CONTRACTS section 2)
+;;; Startup dialogs
+
+;; The Codex launch defines `claude-code-ide-codex-screen-dialog' (BUFFER):
+;; it returns nil, or one of `folder-trust', `update', `hooks-review',
+;; `approval' and `other', from the visible text of the terminal only,
+;; and it never sends keys.  This file calls it only when it is bound.
 
 (defun claude-code-ide-codex-events--needs-screen-p (launch now)
   "Return non-nil when the screen of LAUNCH is to be read at NOW.
@@ -841,17 +842,17 @@ non-nil when the state of LAUNCH changed."
                (buffer-live-p buffer)
                (claude-code-ide-codex-events--needs-screen-p launch now))
       (let* ((before (claude-code-ide-codex-events--state launch now))
-             (dialog (funcall 'claude-code-ide-codex-screen-dialog buffer))
-             (approval (cl-some (lambda (blocker)
-                                  (eq (claude-code-ide-codex-events--blocker-kind blocker) 'approval))
-                                (claude-code-ide-codex-events--launch-blockers launch))))
+             (dialog (funcall 'claude-code-ide-codex-screen-dialog buffer)))
         (setf (claude-code-ide-codex-events--launch-dialog launch) dialog
               (claude-code-ide-codex-events--launch-dialog-checked launch) now)
-        (when approval
-          (setf (claude-code-ide-codex-events--launch-answered launch)
-                (if dialog
-                    nil
-                  (or (claude-code-ide-codex-events--launch-answered launch) now))))
+        ;; The screen shows the dialogs of the main agent only
+        (dolist (blocker (claude-code-ide-codex-events--launch-blockers launch))
+          (when (and (eq (claude-code-ide-codex-events--blocker-kind blocker) 'approval)
+                     (null (car-safe (claude-code-ide-codex-events--blocker-tool blocker))))
+            (setf (claude-code-ide-codex-events--blocker-answered blocker)
+                  (if dialog
+                      nil
+                    (or (claude-code-ide-codex-events--blocker-answered blocker) now)))))
         (not (equal (butlast (claude-code-ide-codex-events--state launch now) 3)
                     (butlast before 3)))))))
 
@@ -890,8 +891,7 @@ non-nil when the state of LAUNCH changed."
     (setf (claude-code-ide-codex-events--server-output server) (car (last lines)))
     (dolist (line (butlast lines))
       (let ((message (ignore-errors
-                       (json-parse-string line :object-type 'alist :array-type 'list
-                                          :null-object nil :false-object :false))))
+                       (claude-code-ide-session-status--parse-json line :false))))
         (when (and (consp message) (assq 'id message)
                    (or (assq 'result message) (assq 'error message)))
           (claude-code-ide-codex-events--server-answer server message))))))
@@ -1034,12 +1034,25 @@ The result is a plist: :status is `trusted', `untrusted' or `error';
         (file-attribute-modification-time
          (file-attributes (claude-code-ide-codex-events--config-file)))))
 
+(defconst claude-code-ide-codex-events--restart-detail
+  "Hooks were not trusted at the launch: restart to get status"
+  "Detail of a launch that started before its hooks were trusted.")
+
 (defun claude-code-ide-codex-events--set-trust (result)
-  "Note the trust RESULT in each launch record and update the status."
+  "Note the trust RESULT in each launch record and update the status.
+A launch that started while its hooks were not trusted keeps the
+state `untrusted': Codex read the trust at its start, so only a new
+launch gets status events.  Its detail says so."
   (maphash (lambda (_id launch)
-             (setf (claude-code-ide-codex-events--launch-trust launch) (plist-get result :status)
-                   (claude-code-ide-codex-events--launch-trust-detail launch)
-                   (plist-get result :message)))
+             (let ((status (plist-get result :status)))
+               (if (and (eq (claude-code-ide-codex-events--launch-trust launch) 'untrusted)
+                        (eq status 'trusted))
+                   (setf (claude-code-ide-codex-events--launch-trust-detail launch)
+                         claude-code-ide-codex-events--restart-detail)
+                 (unless (eq (claude-code-ide-codex-events--launch-trust launch) 'trusted)
+                   (setf (claude-code-ide-codex-events--launch-trust launch) status
+                         (claude-code-ide-codex-events--launch-trust-detail launch)
+                         (plist-get result :message))))))
            claude-code-ide-codex-events--launches)
   (claude-code-ide-session-status--refresh))
 
