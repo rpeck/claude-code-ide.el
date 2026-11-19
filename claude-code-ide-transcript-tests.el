@@ -61,11 +61,18 @@
 
 (defmacro claude-code-ide-transcript-tests--with-dir (var &rest body)
   "Run BODY with VAR bound to a new temporary folder, and remove it after.
-Git in BODY uses no user configuration."
+Git in BODY uses no user configuration.  HOME is the folder, and
+CODEX_HOME is the folder codex-home in it, so BODY never reads the
+real configuration of Claude Code or Codex."
   (declare (indent 1))
-  `(let ((,var (file-name-as-directory (make-temp-file "cci-test-transcript-" t)))
-         (process-environment (append claude-code-ide-transcript-tests--git-environment
-                                      process-environment)))
+  `(let* ((,var (file-name-as-directory (make-temp-file "cci-test-transcript-" t)))
+          (process-environment
+           (append claude-code-ide-transcript-tests--git-environment
+                   (list (concat "HOME=" (directory-file-name ,var))
+                         (concat "CODEX_HOME=" ,var "codex-home")
+                         ;; An entry without "=" removes the variable.
+                         "CLAUDE_CONFIG_DIR")
+                   process-environment)))
      (unwind-protect
          (progn ,@body)
        (delete-directory ,var t))))
@@ -319,7 +326,8 @@ A tool call of the import becomes a tool line; its result is left out."
 (defun claude-code-ide-transcript-tests--chain-document (dir &rest args)
   "Return the document of the three-leg chain in the repository DIR.
 The legs are CC, Codex and CC.  The source is an instance of the
-third leg.  ARGS are more keyword arguments."
+third leg.  ARGS are more keyword arguments; they replace the
+arguments of this function."
   (let* ((claude-code-ide-provider--registry nil)
          (source (claude-code-ide-instance-create
                   :id "cci-test-instance-3" :provider 'claude
@@ -328,7 +336,11 @@ third leg.  ARGS are more keyword arguments."
     (claude-code-ide-register-provider
      (claude-code-ide-transcript-tests--stub-provider
       (claude-code-ide-transcript-tests--fixture "claude-leg3.jsonl")))
+    ;; ARGS come first: for a key that is given twice, the first value counts.
     (apply #'claude-code-ide-transcript-handover-document
+           (append
+            args
+            (list
            :source source
            :chain (list (list :provider 'claude :instance-id "cci-test-instance-1"
                               :native-id "cci-test-0000-0000-0000-000000000001"
@@ -346,8 +358,7 @@ third leg.  ARGS are more keyword arguments."
            :context "cci-test-context: the coordinator wants format_summary kept."
            :handover-id "cci-test-h3"
            :target-provider 'codex
-           :time 0
-           args)))
+           :time 0)))))
 
 (ert-deftest claude-code-ide-test-transcript-handover-chain ()
   "A chain of three legs (CC, Codex, CC) gives one document without nesting.
@@ -834,6 +845,231 @@ The Codex start commit comes from the same read."
         (should (equal since "0123456789abcdef0123456789abcdef01234567"))
         ;; 5 turns of leg 1 and 2 of leg 2 (its bootstrap is left out).
         (should (= renders 7))))))
+
+;;; References to the source sessions
+
+(defun claude-code-ide-transcript-tests--json (file object)
+  "Write OBJECT as JSON to FILE."
+  (claude-code-ide-transcript-tests--write file (json-encode object)))
+
+(defconst claude-code-ide-transcript-tests--server
+  '((command . "cci-test-server") (args . ["cci-test"]))
+  "Configuration of a synthetic MCP server.")
+
+(ert-deftest claude-code-ide-test-transcript-budget-default ()
+  "The default budget is 100000 characters."
+  (should (= (eval (car (get 'claude-code-ide-transcript-budget 'standard-value))) 100000))
+  (should (equal (eval (car (get 'claude-code-ide-handover-session-server 'standard-value)))
+                 "claude-sessions"))
+  (should (equal (eval (car (get 'claude-code-ide-handover-session-server-providers
+                                 'standard-value)))
+                 '(claude))))
+
+(ert-deftest claude-code-ide-test-transcript-session-server-claude ()
+  "Claude Code has the server in the user scope, the local scope, or .mcp.json."
+  (claude-code-ide-transcript-tests--with-dir home
+    (let ((work (expand-file-name "cci-test-work" home))
+          (other (expand-file-name "cci-test-other" home))
+          (config (expand-file-name ".claude.json" home))
+          (claude-code-ide-handover-session-server "claude-sessions"))
+      (make-directory work t)
+      (make-directory other t)
+      ;; No configuration file.
+      (should-not (claude-code-ide-transcript-session-server-p 'claude work))
+      ;; A broken file.
+      (claude-code-ide-transcript-tests--write config "{\"mcpServers\": ")
+      (should-not (claude-code-ide-transcript-session-server-p 'claude work))
+      ;; Another server only.
+      (claude-code-ide-transcript-tests--json
+       config `((mcpServers (cci-test-other . ,claude-code-ide-transcript-tests--server))))
+      (should-not (claude-code-ide-transcript-session-server-p 'claude work))
+      ;; The user scope.
+      (claude-code-ide-transcript-tests--json
+       config `((mcpServers (claude-sessions . ,claude-code-ide-transcript-tests--server))))
+      (should (claude-code-ide-transcript-session-server-p 'claude work))
+      (should (claude-code-ide-transcript-session-server-p 'claude nil))
+      ;; The local scope: only in the project entry of the worktree.
+      (claude-code-ide-transcript-tests--json
+       config `((projects (,(intern work)
+                           (mcpServers (claude-sessions . ,claude-code-ide-transcript-tests--server))))))
+      (should (claude-code-ide-transcript-session-server-p 'claude work))
+      (should (claude-code-ide-transcript-session-server-p 'claude (file-name-as-directory work)))
+      (should-not (claude-code-ide-transcript-session-server-p 'claude other))
+      ;; The project scope: .mcp.json of the worktree, unless it is disabled.
+      (claude-code-ide-transcript-tests--json config '((projects)))
+      (claude-code-ide-transcript-tests--json
+       (expand-file-name ".mcp.json" work)
+       `((mcpServers (claude-sessions . ,claude-code-ide-transcript-tests--server))))
+      (should (claude-code-ide-transcript-session-server-p 'claude work))
+      (should-not (claude-code-ide-transcript-session-server-p 'claude other))
+      (claude-code-ide-transcript-tests--json
+       config `((projects (,(intern work) (disabledMcpjsonServers . ["claude-sessions"])))))
+      (should-not (claude-code-ide-transcript-session-server-p 'claude work))
+      ;; Another server name, and no server name.
+      (claude-code-ide-transcript-tests--json
+       config `((mcpServers (claude-sessions . ,claude-code-ide-transcript-tests--server))))
+      (let ((claude-code-ide-handover-session-server "cci-test-other"))
+        (should-not (claude-code-ide-transcript-session-server-p 'claude work)))
+      (let ((claude-code-ide-handover-session-server nil))
+        (should-not (claude-code-ide-transcript-session-server-p 'claude work)))
+      ;; CLAUDE_CONFIG_DIR moves the configuration file.
+      (delete-file (expand-file-name ".mcp.json" work))
+      (let ((process-environment (cons (concat "CLAUDE_CONFIG_DIR=" other) process-environment)))
+        (should-not (claude-code-ide-transcript-session-server-p 'claude work))
+        (claude-code-ide-transcript-tests--json
+         (expand-file-name ".claude.json" other)
+         `((mcpServers (claude-sessions . ,claude-code-ide-transcript-tests--server))))
+        (should (claude-code-ide-transcript-session-server-p 'claude work)))
+      ;; Another provider.
+      (should-not (claude-code-ide-transcript-session-server-p 'cci-test-none work)))))
+
+(ert-deftest claude-code-ide-test-transcript-session-server-codex ()
+  "Codex has the server when config.toml in CODEX_HOME has its table."
+  (claude-code-ide-transcript-tests--with-dir home
+    (let ((config (expand-file-name "codex-home/config.toml" home))
+          (claude-code-ide-handover-session-server "claude-sessions"))
+      (should-not (claude-code-ide-transcript-session-server-p 'codex))
+      (dolist (case
+               '(("[mcp_servers.claude-sessions]\ncommand = \"cci-test\"\n" . t)
+                 ("model = \"cci-test\"\n\n  [ mcp_servers.\"claude-sessions\" ]  # cci-test\ncommand = \"x\"\n" . t)
+                 ("[mcp_servers.'claude-sessions']\ncommand = \"x\"\n" . t)
+                 ("mcp_servers.claude-sessions = { command = \"x\" }\n" . t)
+                 ("[mcp_servers.claude-sessions]\ncommand = \"x\"\nenabled = false\n" . nil)
+                 ("[mcp_servers.claude-sessions]\ncommand = \"x\"\n[mcp_servers.other]\nenabled = false\n" . t)
+                 ("[mcp_servers.cci-test-other]\ncommand = \"x\"\n" . nil)
+                 ("[mcp_servers.claude-sessions-2]\ncommand = \"x\"\n" . nil)
+                 ("# [mcp_servers.claude-sessions]\n" . nil)
+                 ("[MCP_SERVERS.CLAUDE-SESSIONS]\n" . nil)))
+        (claude-code-ide-transcript-tests--write config (car case))
+        (should (eq (and (claude-code-ide-transcript-session-server-p 'codex) t) (cdr case))))
+      ;; Without CODEX_HOME, the file is HOME/.codex/config.toml.
+      (let ((process-environment (cons "CODEX_HOME" process-environment)))
+        (should-not (claude-code-ide-transcript-session-server-p 'codex))
+        (claude-code-ide-transcript-tests--write
+         (expand-file-name ".codex/config.toml" home) "[mcp_servers.claude-sessions]\n")
+        (should (claude-code-ide-transcript-session-server-p 'codex))))))
+
+(ert-deftest claude-code-ide-test-transcript-session-tool-names ()
+  "Each target names the tools in its own form."
+  (let ((claude-code-ide-handover-session-server "claude-sessions"))
+    (should (equal (claude-code-ide-transcript-session-tool 'claude 'get_session_outline)
+                   "mcp__claude-sessions__get_session_outline"))
+    (should (equal (claude-code-ide-transcript-session-tool 'codex 'get_messages)
+                   "mcp__claude_sessions__get_messages"))
+    (should-not (claude-code-ide-transcript-session-tool 'cci-test-none 'get_messages))
+    (should-not (claude-code-ide-transcript-session-tool nil 'get_messages))))
+
+(defun claude-code-ide-transcript-tests--references (doc)
+  "Return the \"Source sessions\" part of DOC."
+  (let ((start (string-search "## Source sessions" doc)))
+    (should start)
+    (substring doc start (string-search "## History of the chain" doc))))
+
+(ert-deftest claude-code-ide-test-transcript-references-every-leg ()
+  "The \"Source sessions\" part has an entry for each leg, and marks the source."
+  (claude-code-ide-transcript-tests--with-repo dir
+    (let* ((doc (claude-code-ide-transcript-tests--chain-document dir :session-server nil))
+           (refs (claude-code-ide-transcript-tests--references doc)))
+      (should (claude-code-ide-transcript-tests--before-p "## Context from the coordinator"
+                                                          "## Source sessions" doc))
+      (dolist (entry
+               `(("### Leg 1: claude\n" "cci-test-0000-0000-0000-000000000001" "claude-leg1.jsonl"
+                  "- Started: 2026-11-17T10:01:00.000Z" "- Ended: 2026-11-17T10:15:00.000Z, at record 23 ")
+                 ("### Leg 2: codex\n" "cci-test-codex-0002" "codex-leg2.jsonl"
+                  "- Started: 2026-11-17T11:03:00.000Z" "- Ended: 2026-11-17T11:11:00.000Z, at record 18 ")
+                 ("### Leg 3: claude (the source: this leg just ended)\n"
+                  "cci-test-0000-0000-0000-000000000003" "claude-leg3.jsonl"
+                  "- Started: 2026-11-17T10:01:00.000Z" "- Ended: 2026-11-17T10:06:00.000Z, at record 8 ")))
+        (dolist (part entry)
+          (should (string-search part refs))))
+      (should (string-search (format "- Transcript: `%s`"
+                                     (claude-code-ide-transcript-tests--fixture "codex-leg2.jsonl"))
+                             refs))
+      (should (= (claude-code-ide-transcript-tests--count "(the source" refs) 1))
+      (should (= (claude-code-ide-transcript-tests--count "- Read it with: the file" refs) 3)))))
+
+(ert-deftest claude-code-ide-test-transcript-references-fallback ()
+  "Without the server, the document names only the files, with safe commands."
+  (claude-code-ide-transcript-tests--with-repo dir
+    ;; The target is Codex, and the temporary CODEX_HOME has no configuration.
+    (let ((refs (claude-code-ide-transcript-tests--references
+                 (claude-code-ide-transcript-tests--chain-document dir))))
+      (should-not (string-search "mcp__" refs))
+      (should-not (string-search "claude-sessions" refs))
+      (should (string-search "Never read a whole file." refs))
+      (should (string-search "grep -n -o" refs))
+      (should (string-search "jq -c 'select(.type==\"user\" or .type==\"assistant\")" refs))
+      (should (string-search "jq -c 'select(.payload.type==\"item_completed\")" refs))
+      (should (= (claude-code-ide-transcript-tests--count "- Read it with: the file" refs) 3)))
+    ;; A nil server name turns the references to the tools off.
+    (let ((claude-code-ide-handover-session-server nil))
+      (should-not (string-search "mcp__" (claude-code-ide-transcript-tests--chain-document
+                                          dir :session-server t))))
+    ;; An unknown target cannot use the tools.
+    (should-not (string-search "mcp__" (claude-code-ide-transcript-tests--chain-document
+                                        dir :session-server t :target-provider nil)))))
+
+(ert-deftest claude-code-ide-test-transcript-references-server ()
+  "With the server, the document asks the target to use its tools for the CC legs.
+A Codex leg uses its file, unless the server reads Codex sessions."
+  (claude-code-ide-transcript-tests--with-repo dir
+    (let ((claude-code-ide-handover-session-server "claude-sessions"))
+      ;; Found in the Codex configuration of the target.
+      (claude-code-ide-transcript-tests--write
+       (expand-file-name "codex-home/config.toml" dir) "[mcp_servers.claude-sessions]\n")
+      (let ((refs (claude-code-ide-transcript-tests--references
+                   (claude-code-ide-transcript-tests--chain-document dir))))
+        (should (string-search "The user asks you to read the source sessions with the claude-sessions tools" refs))
+        (should (string-search "`mcp__claude_sessions__get_session_outline`" refs))
+        (should (string-search "`mcp__claude_sessions__get_messages`" refs))
+        (should (string-search "`limit` 100" refs))
+        (should (string-search "always give `positions`" refs))
+        (should-not (string-search "mcp__claude-sessions__" refs))
+        (should (string-search "the claude-sessions tools (conversation_id cci-test-0000-0000-0000-000000000001), or the file" refs))
+        (should (string-search "the claude-sessions tools (conversation_id cci-test-0000-0000-0000-000000000003), or the file" refs))
+        ;; The Codex leg uses its file.
+        (should (string-search "cci-test-codex-0002" refs))
+        (should-not (string-search "(conversation_id cci-test-codex-0002)" refs))
+        ;; The file reference stays as the fallback.
+        (should (string-search "Without these tools, read the files." refs)))
+      ;; A Claude Code target, found in its configuration.
+      (claude-code-ide-transcript-tests--json
+       (expand-file-name ".claude.json" dir)
+       `((mcpServers (claude-sessions . ,claude-code-ide-transcript-tests--server))))
+      (let ((refs (claude-code-ide-transcript-tests--references
+                   (claude-code-ide-transcript-tests--chain-document dir :target-provider 'claude))))
+        (should (string-search "`mcp__claude-sessions__get_session_outline`" refs)))
+      ;; When the server reads Codex sessions too, the Codex leg uses it.
+      (let ((claude-code-ide-handover-session-server-providers '(claude codex)))
+        (should (string-search "(conversation_id cci-test-codex-0002)"
+                               (claude-code-ide-transcript-tests--chain-document dir)))))))
+
+(ert-deftest claude-code-ide-test-transcript-references-codex-source ()
+  "A Codex source with the server present gets a file reference."
+  (claude-code-ide-transcript-tests--with-dir dir
+    (claude-code-ide-transcript-tests--json
+     (expand-file-name ".claude.json" dir)
+     `((mcpServers (claude-sessions . ,claude-code-ide-transcript-tests--server))))
+    (let* ((doc (claude-code-ide-transcript-handover-document
+                 :source (list :provider 'codex :worktree dir
+                               :transcript (claude-code-ide-transcript-tests--fixture
+                                            "codex-leg2.jsonl"))
+                 :target-provider 'claude :handover-id "cci-test-h10"))
+           (refs (claude-code-ide-transcript-tests--references doc)))
+      ;; The ID comes from the session metadata.
+      (should (string-search "### Leg 1: codex (the source: this leg just ended)" refs))
+      (should (string-search "- Conversation ID: cci-test-codex-0002" refs))
+      (should (string-search "- Read it with: the file" refs))
+      (should-not (string-search "mcp__" refs))
+      (should (string-search "jq -c 'select(.payload.type==\"item_completed\")" refs)))))
+
+(ert-deftest claude-code-ide-test-transcript-references-not-cut ()
+  "The budget never cuts the \"Source sessions\" part."
+  (claude-code-ide-transcript-tests--with-repo dir
+    (let ((doc (claude-code-ide-transcript-tests--chain-document dir :budget 100)))
+      (should (string-search "### Leg 3: claude (the source: this leg just ended)" doc))
+      (should (string-search "Never read a whole file." doc))
+      (should-not (string-search "### Latest turns" doc)))))
 
 (provide 'claude-code-ide-transcript-tests)
 
