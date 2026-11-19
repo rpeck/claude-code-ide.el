@@ -11,7 +11,7 @@ This package integrates coding-agent CLIs with Emacs via the Model Context Proto
 **Core Files:**
 - `claude-code-ide.el` - Main entry: user commands, session management, terminal buffers, the `claude` provider, the generic start of every provider (`claude-code-ide--start-session`), the CC MCP config file, and the current provider (persisted, toggled from the menu)
 - `claude-code-ide-mcp.el` - WebSocket server, JSON-RPC handling, session state. Its `claude-code-ide-mcp--track-active-buffer` is the only active buffer tracker; it also serves the MCP tools server sessions.
-- `claude-code-ide-mcp-handlers.el` - MCP tool implementations (file ops, ediff, diagnostics)
+- `claude-code-ide-mcp-handlers.el` - MCP tool implementations (file ops, ediff, diagnostics), and the dedicated ediff frames with their queue
 
 **Support Files:**
 - `claude-code-ide-provider.el` - Provider interface: the provider struct, the provider registry, and `claude-code-ide-provider-call`. Only a provider with `ide-protocol` gets a WebSocket server and a lock file in `~/.claude/ide/`.
@@ -19,6 +19,7 @@ This package integrates coding-agent CLIs with Emacs via the Model Context Proto
 - `claude-code-ide-codex.el` - The Codex provider: command lines, MCP config and the user's exclude list, approvals, `codex queue` prompts in the background, native ID, and the dialog scan
 - `claude-code-ide-codex-events.el` - Codex status: hook script, hook arguments, the hook trust at each start (cache by the config trust records, one question for a start or a restore of the user, trust command), event mapping, Codex states
 - `claude-code-ide-control.el` - Control operations for coordinators: list, inspect, launch, resume, submit-prompt, stop; the durable prompt inbox; MCP coordinator tools
+- `claude-code-ide-review.el` - Tracked external reviews: durable records, result files, delivery to the owner's inbox, the track-review control operation and coordinator tool
 - `claude-code-ide-transcript.el` - Transcript readers (CC and Codex), workspace state from Git, and the handover document. Format: docs/handover-document.md
 - `claude-code-ide-process.el` - Process trees: records the background process groups of each CLI, ends them at a stop, and lists stray processes in the worktree (docs/process-tree.md). The main file loads it as an optional file and calls it through `fboundp`.
 - `claude-code-ide-mcp-server.el` - HTTP-based MCP tools server framework: sessions, instance secrets, request checks, context from the instance descriptor, tool scopes, coordinator credential
@@ -40,6 +41,7 @@ This package integrates coding-agent CLIs with Emacs via the Model Context Proto
 - `claude-code-ide-codex-events-tests.el` - Codex status, status buffer columns, status snapshot, and shared status file helper tests
 - `claude-code-ide-mcp-routing-tests.el` - MCP routing tests: secrets, request checks, descriptor context, the one active buffer tracker, coordinator scope, get_capabilities
 - `claude-code-ide-control-tests.el` - Control operation, inbox, and coordinator tool tests
+- `claude-code-ide-review-tests.el` - Review tracking and dedicated ediff frame tests; the tests with real frames skip in batch Emacs
 - `claude-code-ide-transcript-tests.el` - Transcript and handover document tests, with fixtures in `test-fixtures/transcripts/` (made by `make-fixtures.py` there)
 - `claude-code-ide-process-tests.el` - Process tree tests; live tests run with `CLAUDE_CODE_IDE_LIVE_TESTS=1`
 - `claude-code-ide-reload-tests.el` - Reload tests; one test reloads a copy of the package in a new batch Emacs
@@ -50,6 +52,7 @@ This package integrates coding-agent CLIs with Emacs via the Model Context Proto
 - Codex: docs/codex.md. Codex status events: docs/status-events.md. Status snapshot: docs/status-schema.md.
 - MCP tools server routing, secrets, request checks and scopes: docs/api-mcp.md.
 - Control operations and the inbox: docs/api-control.md.
+- Reviews and dedicated ediff frames: docs/review.md.
 - The handover document: docs/handover-document.md. Process trees: docs/process-tree.md.
 - Updating the package and reloading it in a running Emacs: docs/updating.md.
 
