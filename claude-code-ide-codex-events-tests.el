@@ -1733,6 +1733,67 @@ Its detail asks for a restart; a new launch is trusted."
         (should-not (file-exists-p old))
         (should (file-exists-p young))))))
 
+;;; The restore of the user
+
+(declare-function claude-code-ide-tests--registry-entry "claude-code-ide-session-registry-tests")
+(declare-function claude-code-ide-tests--registry-project "claude-code-ide-session-registry-tests")
+(declare-function claude-code-ide-tests--run-restore-timers "claude-code-ide-session-registry-tests")
+
+(defmacro claude-code-ide-codex-events-tests--restore (answer-value)
+  "Run M-x claude-code-ide-restore-sessions of two Codex entries.
+It expands inside `claude-code-ide-codex-events-tests--with-lazy-trust',
+whose `registry-dir', `answer' and `asked' it uses.  The user answers
+ANSWER-VALUE to the trust question.  Each start
+builds the Codex hook arguments from the `interactive' slot of its
+spec, as the Codex launch does.  Return (QUESTIONS SLOTS HOOKS) with
+the number of questions, the slot of each start, and whether each
+start got hooks."
+  `(let* ((config-dir (expand-file-name "claude" registry-dir))
+         (process-environment (cons (concat "CLAUDE_CONFIG_DIR=" config-dir) process-environment))
+         (dir (claude-code-ide-tests--registry-project registry-dir "cci-test-restore-proj"))
+         (slots nil)
+         (hooks nil)
+         (timers nil))
+    (setq answer ,answer-value)
+    (claude-code-ide-session-registry--submit
+     "setup"
+     (lambda (_)
+       (list (claude-code-ide-tests--registry-entry
+              "cci-test-restore-cx1" :provider 'codex :session-id "cci-test-restore-n1"
+              :project-dir dir :emacs-pid 999999991)
+             (claude-code-ide-tests--registry-entry
+              "cci-test-restore-cx2" :provider 'codex :session-id "cci-test-restore-n2"
+              :project-dir dir :emacs-pid 999999991 :started-at "2026-11-03T10:01:00Z"))))
+    (cl-letf (((symbol-function 'run-with-timer)
+               (lambda (_secs _repeat fn &rest args) (push (cons fn args) timers)))
+              ((symbol-function 'claude-code-ide--start-session)
+               (lambda (_continue _resume spec &optional _interactive)
+                 (let* ((slot (claude-code-ide-start-spec-interactive spec))
+                        (instance (claude-code-ide-codex-events-tests--instance
+                                   (claude-code-ide-start-spec-instance-id spec) 1)))
+                   (setf (claude-code-ide-instance-project-root instance) dir)
+                   (push slot slots)
+                   (push (and (claude-code-ide-codex-status-hook-args instance slot) t) hooks)))))
+      (call-interactively #'claude-code-ide-restore-sessions)
+      (claude-code-ide-tests--run-restore-timers timers))
+    (list asked (reverse slots) (reverse hooks))))
+
+(ert-deftest claude-code-ide-codex-events-test-restore-asks-once ()
+  "M-x claude-code-ide-restore-sessions asks the hook trust one time for all its starts.
+The registry's call meets `claude-code-ide-codex-prepare-trust'.  After
+a yes, each Codex start of the restore is interactive and gets trusted
+hooks without another question.  After a no, no start asks, and none
+gets hooks; a second restore asks nothing."
+  (claude-code-ide-codex-events-tests--with-lazy-trust (dir "untrusted")
+    (should (equal (claude-code-ide-codex-events-tests--restore t)
+                   '(1 (t t) (t t))))
+    (should (= (claude-code-ide-codex-events-tests--writes dir) 1)))
+  (claude-code-ide-codex-events-tests--with-lazy-trust (dir "untrusted")
+    (should (equal (claude-code-ide-codex-events-tests--restore nil)
+                   '(1 (nil nil) (nil nil))))
+    (should (= (claude-code-ide-codex-events-tests--writes dir) 0))
+    (should (equal (car (claude-code-ide-codex-events-tests--restore nil)) 1))))
+
 (provide 'claude-code-ide-codex-events-tests)
 
 ;; Local Variables:
