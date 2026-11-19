@@ -508,7 +508,8 @@ socket that sent the request — or be dropped, never to its successor."
              ((string= method "ide_connected")
               (when-let* ((pid (alist-get 'pid params)))
                 (claude-code-ide-debug "CLI connected with PID: %s" pid)
-                (when session
+                ;; Only an integer is a PID; another value changes nothing
+                (when (and session (integerp pid))
                   (setf (claude-code-ide-mcp-session-cli-pid session) pid)))
               nil)
              (t
