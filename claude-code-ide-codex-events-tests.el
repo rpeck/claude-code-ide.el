@@ -350,6 +350,12 @@ does not depend on the speed of the machine, as a time would."
                 (directory-files dir nil claude-code-ide-codex-events--file-regexp)))
       (delete-directory bin t))))
 
+(declare-function claude-code-ide-tests--script-lock-budget "claude-code-ide-session-status-tests")
+
+(ert-deftest claude-code-ide-codex-events-test-script-lock-budget ()
+  "The tries of the Codex hook script give 20 parallel writers enough time."
+  (claude-code-ide-tests--script-lock-budget claude-code-ide-codex-events--script))
+
 (ert-deftest claude-code-ide-codex-events-test-script-exits-without-identity ()
   "The script records nothing without CCI_INSTANCE_ID or with CODEX_THREAD_ID."
   (claude-code-ide-codex-events-tests--with-codex
@@ -1199,6 +1205,8 @@ and nothing asks the user."
                               (gethash (claude-code-ide-codex-events--trust-key)
                                        claude-code-ide-codex-events--checks))))
                   (should (timerp timer))
+                  ;; The package activated it
+                  (should (memq timer timer-list))
                   (should (< 0 (- (timer-until timer nil))
                              (1+ claude-code-ide-codex-events--background-limit)))
                   (cancel-timer timer)

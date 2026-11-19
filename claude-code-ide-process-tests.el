@@ -721,9 +721,12 @@ PID now, as a real one does."
     (should (claude-code-ide-tests--wait-until (lambda () (not (eq entries 'pending)))))
     (should (consp entries))
     (should (cl-find (emacs-pid) entries :key (lambda (e) (plist-get e :pid))))
-    ;; The error output pipe can close a moment after the sentinel
-    (claude-code-ide-tests--wait-until
-     (lambda () (not (or (get-buffer "/dev/null") (cl-set-difference (buffer-list) before)))))
+    ;; At once after the sentinel: no buffer is left
+    (should-not (get-buffer "/dev/null"))
+    (should-not (cl-set-difference (buffer-list) before))
+    ;; The error output pipe can close a moment after the sentinel; that
+    ;; makes no buffer either
+    (accept-process-output nil 0.2)
     (should-not (get-buffer "/dev/null"))
     (should-not (cl-set-difference (buffer-list) before))))
 
@@ -845,7 +848,7 @@ PID now, as a real one does."
                      '(100 200)))
       ;; The buffer kill sends SIGHUP, and the CLI exits
       (claude-code-ide-process-tests--remove 100)
-      (should (claude-code-ide-process--wait (lambda () (not (eq result 'pending))) 5))
+      (should (claude-code-ide-tests--wait-until (lambda () (not (eq result 'pending)))))
       (should (eq (plist-get result :status) 'stopped))
       (should (equal (claude-code-ide-process-tests--signal-list) '((-200 SIGTERM))))
       (should-not (claude-code-ide-process--track-of instance)))))
