@@ -20,7 +20,7 @@ This package integrates coding-agent CLIs with Emacs via the Model Context Proto
 - `claude-code-ide-codex-events.el` - Codex status: hook script, hook arguments, trust check and trust command, event mapping, Codex states
 - `claude-code-ide-control.el` - Control operations for coordinators: list, inspect, launch, resume, submit-prompt, stop; the durable prompt inbox; MCP coordinator tools
 - `claude-code-ide-transcript.el` - Transcript readers (CC and Codex), workspace state from Git, and the handover document. Format: docs/handover-document.md
-- `claude-code-ide-process.el` - Process trees: records the background process groups of each CLI, ends them at a stop, and lists stray processes in the worktree (docs/process-tree.md). Optional: the main file calls it only through `fboundp`.
+- `claude-code-ide-process.el` - Process trees: records the background process groups of each CLI, ends them at a stop, and lists stray processes in the worktree (docs/process-tree.md). The main file loads it as an optional file and calls it through `fboundp`.
 - `claude-code-ide-mcp-server.el` - HTTP-based MCP tools server framework: sessions, instance secrets, request checks, context from the instance descriptor, tool scopes, coordinator credential
 - `claude-code-ide-mcp-http-server.el` - HTTP transport: 202 for notifications, Origin and content-type checks, routing by /mcp/<id>[/<secret>]
 - `claude-code-ide-emacs-tools.el` - Emacs tools: xref, project info, imenu, and `get_capabilities`
@@ -29,7 +29,6 @@ This package integrates coding-agent CLIs with Emacs via the Model Context Proto
 - `claude-code-ide-session-status.el` - Live status of each instance of both providers from CLI hooks (working, waiting, idle), the status buffer, the status snapshot, and the file helpers that both providers share
 - `claude-code-ide-transient.el` - Transient menu interface; the header shows the current provider, and `P` toggles it
 - `claude-code-ide-debug.el` - Debug logging utilities
-- `claude-code-ide-reload.el` - `claude-code-ide-reload`: loads the package files again in dependency order in a running Emacs. The main file autoloads the command, because a checkout on `load-path` has no generated autoloads.
 
 **Test Files:**
 - `claude-code-ide-tests.el` - ERT test suite with mocks. It loads every `claude-code-ide-*-tests.el` file of its folder. Each test file must `provide` a feature equal to its file name.
@@ -42,7 +41,6 @@ This package integrates coding-agent CLIs with Emacs via the Model Context Proto
 - `claude-code-ide-control-tests.el` - Control operation, inbox, and coordinator tool tests
 - `claude-code-ide-transcript-tests.el` - Transcript and handover document tests, with fixtures in `test-fixtures/transcripts/` (made by `make-fixtures.py` there)
 - `claude-code-ide-process-tests.el` - Process tree tests; live tests run with `CLAUDE_CODE_IDE_LIVE_TESTS=1`
-- `claude-code-ide-reload-tests.el` - Reload tests; one test reloads a copy of the package in a new batch Emacs
 - `claude-code-ide-wiring-tests.el` - Tests of the core wiring: no IDE server without the IDE protocol, provider texts, flags per provider, forks, secrets in the debug log, the CC MCP config file, the process-tree calls, the prepare hook, and the provider choice. At load, it points the MCP config folder and the provider file at a temporary folder for the whole run.
 
 **Design documents (docs/):**
@@ -51,7 +49,6 @@ This package integrates coding-agent CLIs with Emacs via the Model Context Proto
 - MCP tools server routing, secrets, request checks and scopes: docs/api-mcp.md.
 - Control operations and the inbox: docs/api-control.md.
 - The handover document: docs/handover-document.md. Process trees: docs/process-tree.md.
-- Updating and reloading: docs/updating.md.
 
 ## Hooks
 

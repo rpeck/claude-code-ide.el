@@ -170,10 +170,6 @@ Use a local checkout to run a branch that is not on the package archives, for ex
 
 Sessions that already run when the registry turns on are recorded too, but without status hooks; =M-x claude-code-ide-session-registry-track-sessions= restarts them with hooks (see [[*Session Registry and Restore][Session Registry and Restore]]).
 
-** Updating
-
-To update the installed package, and to load its new Lisp in a running Emacs, see [[file:docs/updating.md][docs/updating.md]]. =M-x claude-code-ide-reload= loads the package files again in a running Emacs after an update; running sessions keep running.
-
 * Usage
 
 ** Basic Commands
@@ -235,12 +231,13 @@ A provider is a coding-agent CLI. The package has two: =claude= (Claude Code) an
 
 *** Codex
 
-- =M-x claude-code-ide-codex= starts a Codex instance in the current project. =claude-code-ide-codex-continue= and =claude-code-ide-codex-resume= continue the last conversation or open the picker.
+- =M-x claude-code-ide-codex= starts a Codex instance in the current project, and makes Codex the current provider. =claude-code-ide-codex-continue= and =claude-code-ide-codex-resume= continue the last conversation or open the picker.
+- A Codex instance with the role =coordinator= may call the coordinator tools that only read (=claude-code-ide-codex-coordinator-approved-tools=: list and inspect) without approval. Launch, resume, stop, submit-prompt and handover ask for approval. Another instance gets no approval for any coordinator tool.
 - Emacs passes its instructions, the MCP tools server, and the approvals with =-c= options. Prompts go through =codex queue=. See [[file:docs/codex.md][docs/codex.md]].
 - A Codex instance gets no IDE server and no lock file in =~/.claude/ide/=, because Codex does not speak that protocol. It uses only the MCP tools server.
 - Codex never gets =claude-code-ide-cli-extra-flags= or the Claude Code model. Its flags and its model come from =claude-code-ide-codex-extra-flags=.
 - You answer the Codex folder trust dialog yourself, one time for each repository.
-- Options: =claude-code-ide-codex-cli-path=, =claude-code-ide-codex-extra-flags=, =claude-code-ide-codex-remove-openai-api-key= (default t), =claude-code-ide-codex-no-alt-screen= (default t), =claude-code-ide-codex-skip-update-check= (default t), =claude-code-ide-codex-config-read-timeout= (5 s), =claude-code-ide-codex-queue-timeout= (30 s).
+- Options: =claude-code-ide-codex-cli-path=, =claude-code-ide-codex-extra-flags=, =claude-code-ide-codex-remove-openai-api-key= (default t), =claude-code-ide-codex-no-alt-screen= (default t), =claude-code-ide-codex-skip-update-check= (default t), =claude-code-ide-codex-config-read-timeout= (5 s), =claude-code-ide-codex-queue-timeout= (30 s), =claude-code-ide-codex-coordinator-approved-tools=.
 
 ** Stopping Instances
 
@@ -786,7 +783,7 @@ Once enabled, Claude can use these tools to navigate your codebase. For example:
 *** Routing, secrets and scopes
 
 - Each instance gets a secret at each launch. =claude-code-ide-mcp-server-secret-placement= (default =header=) says where the generated config puts it: in the =X-Emacs-MCP-Instance-Secret= header, or in the URL path.
-- Claude Code gets its MCP config in a file (=--mcp-config FILE=), not on its command line, so =ps= does not show the secret or other header values. The file has mode 0600, in a private 0700 folder (=claude-code-ide-mcp-config-directory=, default =claude-code-ide-<uid>= in the temporary folder). Emacs deletes it when the instance ends and when Emacs quits.
+- Claude Code gets its MCP config in a file (=--mcp-config FILE=), not on its command line, so =ps= does not show the secret or other header values. The file has mode 0600, in a private 0700 folder (=claude-code-ide-mcp-config-directory=, default =claude-code-ide-<uid>= in the temporary folder). If that folder belongs to another user or cannot be used, Emacs makes a new private folder with =make-temp-file= instead. Emacs deletes the file when the instance ends, when its start fails, and when Emacs quits. The first write in an Emacs also deletes the files of Emacs processes that no longer run.
 - The debug log never shows the secret, the coordinator credential, or another header value.
 - Tools with =:scope coordinator= run only for requests with the coordinator credential, from =claude-code-ide-mcp-server-coordinator-credential-file= (default: =coordinator-credential= in the report directory, mode 0600). =M-x claude-code-ide-mcp-server-rotate-coordinator-credential= replaces it.
 - The tool =get_capabilities= lists the operations of the calling instance.
