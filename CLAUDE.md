@@ -25,7 +25,7 @@ This package integrates coding-agent CLIs with Emacs via the Model Context Proto
 - `claude-code-ide-mcp-http-server.el` - HTTP transport: 202 for notifications, Origin and content-type checks, routing by /mcp/<id>[/<secret>]
 - `claude-code-ide-emacs-tools.el` - Emacs tools: xref, project info, imenu, and `get_capabilities`
 - `claude-code-ide-diagnostics.el` - Flycheck integration
-- `claude-code-ide-session-registry.el` - Session registry: crash-safe JSON state file of started instances, restore and reopen commands
+- `claude-code-ide-session-registry.el` - Session registry: crash-safe JSON state file (schema version 3, in its own `-v3` file; versions 2 and 1 are read and migrated) of started instances, restore and reopen commands
 - `claude-code-ide-session-status.el` - Live status of each instance of both providers from CLI hooks (working, waiting, idle), the status buffer, the status snapshot, and the file helpers that both providers share
 - `claude-code-ide-transient.el` - Transient menu interface; the header shows the current provider, and `P` toggles it
 - `claude-code-ide-debug.el` - Debug logging utilities
@@ -35,7 +35,7 @@ This package integrates coding-agent CLIs with Emacs via the Model Context Proto
 - `claude-code-ide-tests.el` - ERT test suite with mocks. It loads every `claude-code-ide-*-tests.el` file of its folder. Each test file must `provide` a feature equal to its file name.
 - `claude-code-ide-session-registry-tests.el` - Session registry tests
 - `claude-code-ide-session-status-tests.el` - Session status tests
-- `claude-code-ide-provider-tests.el` - Provider, instance, event, state, and registry v2 tests
+- `claude-code-ide-provider-tests.el` - Provider, instance, event, state, and registry file version tests
 - `claude-code-ide-codex-tests.el` - Codex provider tests; process tests run small shell scripts in place of `codex`
 - `claude-code-ide-codex-events-tests.el` - Codex status, status buffer columns, status snapshot, and shared status file helper tests
 - `claude-code-ide-mcp-routing-tests.el` - MCP routing tests: secrets, request checks, descriptor context, the one active buffer tracker, coordinator scope, get_capabilities
