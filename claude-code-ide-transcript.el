@@ -1389,6 +1389,21 @@ It is config.toml in CODEX_HOME when that is set, else in HOME/.codex."
                     (or (getenv "CODEX_HOME")
                         (expand-file-name ".codex" (or (getenv "HOME") "~")))))
 
+(defun claude-code-ide-transcript--codex-config-entries ()
+  "Return the TOML entries of the Codex configuration file, or nil.
+The entries are those of `claude-code-ide-transcript--toml-entries'.
+The file is that of `claude-code-ide-transcript--codex-config-file',
+and it is only read.  A missing or unreadable file, a read error, and
+a TOML form that the reader does not know give nil."
+  (condition-case nil
+      (let ((file (claude-code-ide-transcript--codex-config-file)))
+        (when (and (file-regular-p file) (file-readable-p file))
+          (with-temp-buffer
+            (let ((coding-system-for-read 'utf-8))
+              (insert-file-contents file))
+            (claude-code-ide-transcript--toml-entries))))
+    (error nil)))
+
 (defun claude-code-ide-transcript--codex-server-p (name)
   "Return non-nil when the Codex configuration has the MCP server NAME.
 The server is a key under mcp_servers.NAME, in any TOML form: a table
@@ -1396,21 +1411,14 @@ header, a table [mcp_servers] with an inline table, or dotted keys.
 `enabled = false' turns it off.  Keys of other tables do not count.
 The file is only read.  A missing or unreadable file, a read error,
 and a TOML form that the reader does not know give nil."
-  (condition-case nil
-      (let ((file (claude-code-ide-transcript--codex-config-file)))
-        (when (and (file-regular-p file) (file-readable-p file))
-          (with-temp-buffer
-            (let ((coding-system-for-read 'utf-8))
-              (insert-file-contents file))
-            (let* ((entries (claude-code-ide-transcript--toml-entries))
-                   (present (cl-some (lambda (entry)
-                                       (let ((path (car entry)))
-                                         (and (equal (nth 0 path) "mcp_servers")
-                                              (equal (nth 1 path) name))))
-                                     entries))
-                   (enabled (assoc (list "mcp_servers" name "enabled") entries)))
-              (and present (not (eq (cdr enabled) :false)))))))
-    (error nil)))
+  (let* ((entries (claude-code-ide-transcript--codex-config-entries))
+         (present (cl-some (lambda (entry)
+                             (let ((path (car entry)))
+                               (and (equal (nth 0 path) "mcp_servers")
+                                    (equal (nth 1 path) name))))
+                           entries))
+         (enabled (assoc (list "mcp_servers" name "enabled") entries)))
+    (and present (not (eq (cdr enabled) :false)))))
 
 ;;;; Detection and tool names
 
