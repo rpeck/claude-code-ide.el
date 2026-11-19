@@ -440,6 +440,9 @@ change nothing."
               (dropped nil))
           (dolist (record claude-code-ide-codex-events-tests--t1-records)
             (pcase-let ((`(,index ,event ,id ,generation ,json ,nested) record))
+              (unless (and nested (equal event "SessionStart"))
+              ;; The script drops the SessionStart of the nested session, as
+              ;; it has CODEX_THREAD_ID; the adapter would take it for /new
               (let ((instance (claude-code-ide-instance-by-id id)))
                 (unless (and instance (= (claude-code-ide-instance-generation instance) generation))
                   (setq instance (claude-code-ide-codex-events-tests--instance id generation))
@@ -456,11 +459,18 @@ change nothing."
                         (should (memq (plist-get result :event) claude-code-ide-event-names))
                         (should-not nested))
                     (push index dropped)))
+                ;; Each approval belongs to its tool, though the request
+                ;; input has a description that the tool input lacks
+                (when (equal event "PermissionRequest")
+                  (let* ((launch (claude-code-ide-codex-events--launch-of instance))
+                         (blocker (car (last (claude-code-ide-codex-events--launch-blockers launch)))))
+                    (should (string-prefix-p
+                             "exec-" (cdr (claude-code-ide-codex-events--blocker-tool blocker))))))
                 (when-let* ((expected (alist-get index claude-code-ide-codex-events-tests--t1-expected)))
                   (should (equal (list index (claude-code-ide-codex-events-tests--state instance (+ now 1)))
-                                 (list index expected)))))))
-          ;; Only the five records of the nested session are dropped
-          (should (equal (sort dropped #'<) '(30 31 32 33 34)))
+                                 (list index expected))))))))
+          ;; The other records of the nested session have an unknown conversation ID
+          (should (equal (sort dropped #'<) '(31 32 33 34)))
           (should (= applied (- (length claude-code-ide-codex-events-tests--t1-records) 5)))
           ;; The events tell the model and the conversation ID
           (let ((instance (claude-code-ide-instance-by-id "cci-test-inst-d")))
@@ -545,7 +555,11 @@ dispatches nothing (acceptance check 4)."
            "cci-test-quota" 1 '(("PostModelRequest" "{\"status\":\"failed\",\"error\":\"model_not_found\"}")))
           (should (equal (claude-code-ide-codex-events-tests--state instance) '(failed error nil)))
           (should-not (claude-code-ide-codex-events--quota-error-p nil))
-          (should (claude-code-ide-codex-events--quota-error-p "Rate limit reached for requests"))
+          (should (claude-code-ide-codex-events--quota-error-p "You've hit your usage limit"))
+          (should (claude-code-ide-codex-events--quota-error-p "{\"code\":\"insufficient_quota\"}"))
+          ;; A per-minute limit ends in seconds: no quota limit
+          (should-not (claude-code-ide-codex-events--quota-error-p
+                       "Rate limit reached for gpt-5.6-terra in organization org-cci on tokens per min (TPM): Limit 30000, Used 29500. Please try again in 1.2s."))
           (should-not (claude-code-ide-codex-events--quota-error-p "rate limited, retry")))
       (claude-code-ide-codex-events-tests--kill-instances))))
 
@@ -592,7 +606,7 @@ dispatches nothing (acceptance check 4)."
               (should-not (claude-code-ide-codex-events--read-screen launch instance (+ start 1)))
               (should (= reads 0))
               (should (equal (claude-code-ide-codex-events-tests--state instance (+ start 1))
-                             '(working nil t)))
+                             '(working starting t)))
               ;; A startup dialog before any event
               (should (claude-code-ide-codex-events--read-screen launch instance (+ start 4)))
               (should (equal (claude-code-ide-codex-events-tests--state instance (+ start 4))
@@ -664,7 +678,7 @@ dispatches nothing (acceptance check 4)."
   (claude-code-ide-codex-events-tests--with-codex
     (unwind-protect
         (let ((instance (claude-code-ide-codex-events-tests--instance "cci-test-bare" 2)))
-          (should (equal (claude-code-ide-codex-events-tests--state instance) '(disconnected nil nil)))
+          (should (equal (claude-code-ide-codex-events-tests--state instance) '(disconnected untracked nil)))
           (should (equal (claude-code-ide-codex-events--instance-detail instance 1.0) "No status hooks"))
           ;; Events of an instance that is not tracked are not applied
           (should-not (car (claude-code-ide-codex-events-tests--feed "cci-test-bare" 2 '(("Stop" "{}")))))
@@ -761,7 +775,7 @@ trusted after a write."
               ;; No event comes from untrusted hooks: disconnected, with the reason
               (let ((now (+ (claude-code-ide-codex-events--launch-registered launch) 30)))
                 (should (equal (claude-code-ide-codex-events-tests--state instance now)
-                               '(disconnected nil nil)))
+                               '(disconnected untracked nil)))
                 (should (string-match-p "status hooks not trusted"
                                         (claude-code-ide-codex-events--instance-detail instance now)))))
           (claude-code-ide-codex-events-tests--kill-instances))))))
@@ -782,7 +796,7 @@ trusted after a write."
               ;; An unknown trust is no reason for disconnected; the detail tells it
               (let ((now (+ (claude-code-ide-codex-events--launch-registered launch) 30)))
                 (should (equal (claude-code-ide-codex-events-tests--state instance now)
-                               '(working nil t)))
+                               '(working starting t)))
                 (should (string-match-p "Starting: no event yet · Hook trust unknown"
                                         (claude-code-ide-codex-events--instance-detail instance now))))))
         (claude-code-ide-codex-events-tests--kill-instances)))))
@@ -886,7 +900,7 @@ A model that is not known shows unknown (acceptance check 9)."
             ;; A Claude Code session without a known model shows unknown too
             (should (equal (aref cc-entry 2) "claude"))
             (should (equal (aref cc-entry 3) "unknown"))
-            (should (equal (aref cc-entry 4) "disconnected"))
+            (should (equal (aref cc-entry 4) "disconnected/untracked"))
             ;; The model of the events shows when it is known
             (claude-code-ide-codex-events-tests--feed
              "cci-test-row" 1 '(("PostToolUse" "{\"model\":\"gpt-5.6-terra\",\"tool_name\":\"Bash\",\"tool_use_id\":\"t1\",\"tool_input\":{\"command\":\"make\"}}")))
@@ -914,7 +928,8 @@ A model that is not known shows unknown (acceptance check 9)."
   (dolist (state '((waiting-for-user approval nil waiting) (waiting-for-user question t asks)
                    (failed quota-limit nil quota) (failed exit-code nil error)
                    (waiting-for-task subagent nil tasks) (disconnected nil nil disconnected)
-                   (idle nil nil idle) (working nil nil working)))
+                   (disconnected untracked nil untracked) (disconnected no-signal nil unobserved)
+                   (idle nil nil idle) (working nil nil working) (working starting t starting)))
     (should (eq (claude-code-ide-session-status--common-label-key
                  (claude-code-ide-instance-make-state (nth 0 state) (nth 1 state) nil (nth 2 state)))
                 (nth 3 state)))))
@@ -938,7 +953,29 @@ A model that is not known shows unknown (acceptance check 9)."
     (claude-code-ide-session-status--apply status "UserPromptSubmit" nil 4.0)
     (claude-code-ide-session-status--apply status "StopFailure" '((error . "server_error")) 5.0)
     (should (eq (claude-code-ide-session-status--state status 6.0) 'error))
-    (should (eq (plist-get (claude-code-ide-session-status--common-state status 6.0) :reason) 'error))))
+    (should (eq (plist-get (claude-code-ide-session-status--common-state status 6.0) :reason) 'error))
+    ;; No credits: a quota limit
+    (claude-code-ide-session-status--apply status "UserPromptSubmit" nil 7.0)
+    (claude-code-ide-session-status--apply status "StopFailure" '((error . "billing_error")) 8.0)
+    (should (eq (claude-code-ide-session-status--state status 9.0) 'quota))
+    ;; A short rate limit is an error, with its text
+    (dolist (case '((((error . "rate_limit")) . "Error: rate limit")
+                    (((error . "rate_limit") (error_details . "Too many requests, retry in 3s"))
+                     . "Error: rate limit: Too many requests, retry in 3s")
+                    (((error . "rate_limit")
+                      (error_details . "Rate limit reached for requests per min. Try again in 2s"))
+                     . "Error: rate limit: Rate limit reached for requests per min. Try again in 2s")))
+      (claude-code-ide-session-status--apply status "UserPromptSubmit" nil 10.0)
+      (claude-code-ide-session-status--apply status "StopFailure" (car case) 11.0)
+      (should (equal (list (claude-code-ide-session-status--state status 12.0)
+                           (claude-code-ide-session-status--detail status 'error 12.0))
+                     (list 'error (cdr case)))))
+    ;; The limit in the last message counts too
+    (claude-code-ide-session-status--apply status "UserPromptSubmit" nil 13.0)
+    (claude-code-ide-session-status--apply
+     status "StopFailure"
+     '((error . "rate_limit") (last_assistant_message . "Claude usage limit reached. Your limit will reset at 5pm")) 14.0)
+    (should (eq (claude-code-ide-session-status--state status 15.0) 'quota))))
 
 ;;; Status snapshot
 
@@ -1039,6 +1076,218 @@ A model that is not known shows unknown (acceptance check 9)."
           (should-not (claude-code-ide-session-status--write-snapshot t)))
         (should (string-match-p "snapshot could not be written" (car messages)))
         (should (json-parse-string (claude-code-ide-session-registry--file-string file)))))))
+
+;;; Review fixes
+
+(ert-deftest claude-code-ide-codex-events-test-parallel-tool-approval ()
+  "An approval belongs to its own tool, also among parallel tools.
+The request input has a description that the tool input lacks."
+  (claude-code-ide-codex-events-tests--with-codex
+    (unwind-protect
+        (let ((instance (claude-code-ide-codex-events-tests--instance "cci-test-par" 1)))
+          (claude-code-ide-codex-events--track instance)
+          (claude-code-ide-codex-events-tests--feed
+           "cci-test-par" 1
+           '(("UserPromptSubmit" "{}")
+             ("PreToolUse" "{\"tool_name\":\"Bash\",\"tool_use_id\":\"a\",\"tool_input\":{\"command\":\"ls a\"}}")
+             ("PreToolUse" "{\"tool_name\":\"Bash\",\"tool_use_id\":\"b\",\"tool_input\":{\"command\":\"rm b\"}}")
+             ("PermissionRequest" "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"rm b\",\"description\":\"Allow rm?\"}}")))
+          (let ((launch (claude-code-ide-codex-events--launch-of instance)))
+            (should (equal (claude-code-ide-codex-events--blocker-tool
+                            (car (claude-code-ide-codex-events--launch-blockers launch)))
+                           '(nil . "b"))))
+          ;; The end of tool a leaves the approval of tool b
+          (claude-code-ide-codex-events-tests--feed
+           "cci-test-par" 1
+           '(("PostToolUse" "{\"tool_name\":\"Bash\",\"tool_use_id\":\"a\",\"tool_input\":{\"command\":\"ls a\"}}")))
+          (should (equal (claude-code-ide-codex-events-tests--state instance 906.0)
+                         '(waiting-for-user approval nil)))
+          (should (equal (claude-code-ide-codex-events--instance-detail instance 906.0) "Bash: rm b"))
+          (claude-code-ide-codex-events-tests--feed
+           "cci-test-par" 1
+           '(("PostToolUse" "{\"tool_name\":\"Bash\",\"tool_use_id\":\"b\",\"tool_input\":{\"command\":\"rm b\"}}")))
+          (should (equal (claude-code-ide-codex-events-tests--state instance) '(working nil nil)))
+          ;; A request with a tool use id names its tool
+          (claude-code-ide-codex-events-tests--feed
+           "cci-test-par" 1
+           '(("PreToolUse" "{\"tool_name\":\"Bash\",\"tool_use_id\":\"c\",\"tool_input\":{\"command\":\"x\"}}")
+             ("PreToolUse" "{\"tool_name\":\"Bash\",\"tool_use_id\":\"d\",\"tool_input\":{\"command\":\"x\"}}")
+             ("PermissionRequest" "{\"tool_name\":\"Bash\",\"tool_use_id\":\"c\",\"tool_input\":{\"command\":\"x\"}}")))
+          (should (equal (claude-code-ide-codex-events--blocker-tool
+                          (car (claude-code-ide-codex-events--launch-blockers
+                                (claude-code-ide-codex-events--launch-of instance))))
+                         '(nil . "c")))
+          (should (claude-code-ide-codex-events--input-matches-p
+                   '((command . "x") (description . "y")) '((command . "x"))))
+          (should-not (claude-code-ide-codex-events--input-matches-p
+                       '((command . "x")) '((command . "x") (cwd . "/tmp"))))
+          (should (claude-code-ide-codex-events--input-matches-p nil nil)))
+      (claude-code-ide-codex-events-tests--kill-instances))))
+
+(ert-deftest claude-code-ide-codex-events-test-new-conversation-in-launch ()
+  "A SessionStart with a new conversation ID moves the launch to it.
+After /new or a thread switch the events of the new conversation count;
+other events with an unknown conversation ID still drop."
+  (claude-code-ide-codex-events-tests--with-codex
+    (unwind-protect
+        (let ((instance (claude-code-ide-codex-events-tests--instance "cci-test-new" 1)))
+          (claude-code-ide-codex-events--track instance)
+          (claude-code-ide-codex-events-tests--feed
+           "cci-test-new" 1 '(("SessionStart" "{\"session_id\":\"cci-test-s1\"}")
+                              ("UserPromptSubmit" "{\"session_id\":\"cci-test-s1\"}")
+                              ("Stop" "{\"session_id\":\"cci-test-s1\"}")))
+          (should (equal (claude-code-ide-instance-native-id instance) "cci-test-s1"))
+          ;; An event of an unknown conversation without its SessionStart drops
+          (should-not (car (claude-code-ide-codex-events-tests--feed
+                            "cci-test-new" 1 '(("UserPromptSubmit" "{\"session_id\":\"cci-test-s9\"}")))))
+          ;; A subagent's SessionStart does not move the launch
+          (should-not (car (claude-code-ide-codex-events-tests--feed
+                            "cci-test-new" 1 '(("SessionStart" "{\"session_id\":\"cci-test-s8\",\"agent_id\":\"a1\"}")))))
+          (should (equal (claude-code-ide-codex-events-tests--state instance) '(idle nil nil)))
+          ;; /new: a SessionStart of a new conversation
+          (should (car (claude-code-ide-codex-events-tests--feed
+                        "cci-test-new" 1 '(("SessionStart" "{\"session_id\":\"cci-test-s2\",\"source\":\"startup\"}")))))
+          (should (equal (claude-code-ide-codex-events--launch-session-id
+                          (claude-code-ide-codex-events--launch-of instance))
+                         "cci-test-s2"))
+          (should (equal (claude-code-ide-instance-native-id instance) "cci-test-s2"))
+          (should (car (claude-code-ide-codex-events-tests--feed
+                        "cci-test-new" 1 '(("UserPromptSubmit" "{\"session_id\":\"cci-test-s2\"}")))))
+          (should (equal (claude-code-ide-codex-events-tests--state instance) '(working nil nil)))
+          ;; The old conversation is unknown now
+          (should-not (car (claude-code-ide-codex-events-tests--feed
+                            "cci-test-new" 1 '(("Stop" "{\"session_id\":\"cci-test-s1\"}")))))
+          (should (equal (claude-code-ide-codex-events-tests--state instance) '(working nil nil))))
+      (claude-code-ide-codex-events-tests--kill-instances))))
+
+(ert-deftest claude-code-ide-codex-events-test-retry-after-failure ()
+  "A successful model request after a failed one ends the failure."
+  (claude-code-ide-codex-events-tests--with-codex
+    (unwind-protect
+        (let ((instance (claude-code-ide-codex-events-tests--instance "cci-test-retry" 1)))
+          (claude-code-ide-codex-events--track instance)
+          (claude-code-ide-codex-events-tests--feed
+           "cci-test-retry" 1
+           '(("UserPromptSubmit" "{}")
+             ("PostModelRequest" "{\"status\":\"failed\",\"error\":\"stream disconnected\"}")))
+          (should (equal (claude-code-ide-codex-events-tests--state instance) '(failed error nil)))
+          (claude-code-ide-codex-events-tests--feed
+           "cci-test-retry" 1 '(("PostModelRequest" "{\"status\":\"completed\",\"error\":null}")))
+          (should (equal (claude-code-ide-codex-events-tests--state instance) '(working nil nil)))
+          (should-not (claude-code-ide-codex-events--launch-failure
+                       (claude-code-ide-codex-events--launch-of instance)))
+          ;; A subagent's answer does not end a failure of the main turn
+          (claude-code-ide-codex-events-tests--feed
+           "cci-test-retry" 1
+           '(("PostModelRequest" "{\"status\":\"failed\",\"error\":\"stream disconnected\"}")
+             ("PostModelRequest" "{\"agent_id\":\"a1\",\"status\":\"completed\"}")))
+          (should (equal (claude-code-ide-codex-events-tests--state instance) '(failed error nil))))
+      (claude-code-ide-codex-events-tests--kill-instances))))
+
+(ert-deftest claude-code-ide-codex-events-test-json-without-native-json ()
+  "The app-server answers and the event files parse also without native JSON."
+  (claude-code-ide-codex-events-tests--with-codex
+    (cl-letf (((symbol-function 'json-available-p) (lambda () nil)))
+      (should (equal (claude-code-ide-session-status--parse-json "{\"a\":false,\"b\":null,\"c\":[1]}" :false)
+                     '((a . :false) (b) (c 1))))
+      (let* ((server (claude-code-ide-codex-events--server-create))
+             (answer nil))
+        (puthash 2 (lambda (result error) (setq answer (list result error)))
+                 (claude-code-ide-codex-events--server-pending server))
+        (claude-code-ide-codex-events--server-filter
+         server (concat "{\"method\":\"remoteControl/status/changed\",\"params\":{}}\n{\"id\":2,\"result\":"))
+        (should-not answer)
+        (claude-code-ide-codex-events--server-filter
+         server (concat (claude-code-ide-codex-events-tests--hooks-json "trusted" 'disabled) "}\n"))
+        (should answer)
+        (let ((result (claude-code-ide-codex-events--trust-result (list :result (car answer)))))
+          (should (eq (plist-get result :status) 'untrusted))
+          (should (= (length (plist-get result :hooks)) 1))))
+      (let ((file (expand-file-name "cci-test.json" registry-dir)))
+        (with-temp-file file (insert "{\"event\":\"Stop\",\"input\":{\"x\":false}}"))
+        (should (equal (claude-code-ide-codex-events--read-file file)
+                       '((event . "Stop") (input (x)))))))))
+
+(ert-deftest claude-code-ide-codex-events-test-answered-per-blocker ()
+  "The end of a subagent leaves the screen check of the main approval."
+  (claude-code-ide-codex-events-tests--with-codex
+    (cl-letf (((symbol-function 'claude-code-ide-codex-screen-dialog) (lambda (_buffer) nil)))
+      (unwind-protect
+          (let* ((instance (claude-code-ide-codex-events-tests--instance "cci-test-ans" 1))
+                 (launch (claude-code-ide-codex-events--track instance)))
+            (claude-code-ide-codex-events-tests--feed
+             "cci-test-ans" 1
+             '(("UserPromptSubmit" "{}")
+               ("SubagentStart" "{\"agent_id\":\"a1\",\"agent_type\":\"default\"}")
+               ("PreToolUse" "{\"tool_name\":\"Bash\",\"tool_use_id\":\"t1\",\"tool_input\":{\"command\":\"make\"}}")
+               ("PermissionRequest" "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"make\",\"description\":\"d\"}}"))
+             100.0)
+            ;; The screen shows no dialog: the main approval was answered
+            (should (claude-code-ide-codex-events--read-screen launch instance 110.0))
+            (should (equal (claude-code-ide-codex-events-tests--state instance 111.0) '(working nil t)))
+            ;; The subagent ends: the main approval keeps its answer
+            (claude-code-ide-codex-events-tests--feed
+             "cci-test-ans" 1 '(("SubagentStop" "{\"agent_id\":\"a1\",\"agent_type\":\"default\"}")) 111.0)
+            (should (equal (claude-code-ide-codex-events-tests--state instance 113.0) '(working nil t))))
+        (claude-code-ide-codex-events-tests--kill-instances)))))
+
+(ert-deftest claude-code-ide-codex-events-test-trust-after-launch ()
+  "A launch that started with untrusted hooks stays untracked after the trust.
+Its detail asks for a restart; a new launch is trusted."
+  (claude-code-ide-codex-events-tests--with-codex
+    (unwind-protect
+        (let* ((old (claude-code-ide-codex-events-tests--instance "cci-test-old" 1))
+               (launch (claude-code-ide-codex-events--track old)))
+          (claude-code-ide-codex-events--set-trust '(:status untrusted :message "1 of 11 not trusted"))
+          (should (eq (claude-code-ide-codex-events--launch-trust launch) 'untrusted))
+          ;; The trust command trusts the hooks
+          (setq claude-code-ide-codex-events--trust-cache
+                (cons (claude-code-ide-codex-events--trust-key) '(:status trusted :message nil)))
+          (claude-code-ide-codex-events--set-trust '(:status trusted :message nil))
+          (should (eq (claude-code-ide-codex-events--launch-trust launch) 'untrusted))
+          (let ((now (+ (claude-code-ide-codex-events--launch-registered launch) 30)))
+            (should (equal (claude-code-ide-codex-events-tests--state old now) '(disconnected untracked nil)))
+            (should (string-match-p "restart to get status"
+                                    (claude-code-ide-codex-events--instance-detail old now))))
+          ;; A launch after the trust uses the trusted result
+          (let* ((new (claude-code-ide-codex-events-tests--instance "cci-test-new-launch" 1))
+                 (fresh (claude-code-ide-codex-events--track new)))
+            (should (eq (claude-code-ide-codex-events--launch-trust fresh) 'trusted)))
+          ;; A launch that waited for the check gets its result
+          (let* ((waiting (claude-code-ide-codex-events-tests--instance "cci-test-wait" 1))
+                 (record (claude-code-ide-codex-events--track waiting)))
+            (setf (claude-code-ide-codex-events--launch-trust record) 'checking)
+            (claude-code-ide-codex-events--set-trust '(:status trusted :message nil))
+            (should (eq (claude-code-ide-codex-events--launch-trust record) 'trusted))))
+      (claude-code-ide-codex-events-tests--kill-instances))))
+
+(ert-deftest claude-code-ide-codex-events-test-shared-file-helpers ()
+  "One helper writes files atomically, one deletes launch files, one old locks."
+  (claude-code-ide-codex-events-tests--with-codex
+    (let* ((dir (expand-file-name "cci-test-helpers/sub/" registry-dir))
+           (file (expand-file-name "x.sh" dir)))
+      (claude-code-ide-session-status--write-file-atomically file "echo x\n" #o700 #o700)
+      (should (= (file-modes dir) #o700))
+      (should (= (file-modes file) #o700))
+      (should (equal (claude-code-ide-session-registry--file-string file) "echo x\n"))
+      (should (equal (directory-files dir nil "\\`[^.]") '("x.sh")))
+      (should-not (directory-files dir nil "\\`\\.[^.]"))
+      ;; Launch files and their dot files
+      (dolist (name '("l1.2.00000001.Stop.json" ".l1.2.seq" "l1.20.00000001.Stop.json" "other.json"))
+        (with-temp-file (expand-file-name name dir) (insert "{}")))
+      (make-directory (expand-file-name ".l1.2.lock" dir))
+      (claude-code-ide-session-status--delete-matching-files dir (concat "\\`\\.?" (regexp-quote "l1.2.")))
+      (should (equal (directory-files dir nil "json\\'\\|seq\\'\\|lock\\'")
+                     '("l1.20.00000001.Stop.json" "other.json")))
+      ;; Only old locks go
+      (let ((old (expand-file-name ".a.lock" dir))
+            (young (expand-file-name ".b.lock" dir)))
+        (make-directory old)
+        (make-directory young)
+        (set-file-times old (time-subtract nil 10))
+        (claude-code-ide-session-status--remove-old-locks dir "\\`\\..+\\.lock\\'")
+        (should-not (file-exists-p old))
+        (should (file-exists-p young))))))
 
 (provide 'claude-code-ide-codex-events-tests)
 

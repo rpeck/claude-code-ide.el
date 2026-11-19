@@ -301,6 +301,70 @@ exit 0
   (expand-file-name "claude-code-ide-status-hook.sh"
                     (claude-code-ide-session-registry--report-directory)))
 
+(defun claude-code-ide-session-status--write-file-atomically (file text &optional file-mode dir-mode)
+  "Write TEXT to FILE through a temporary file in its folder and a rename.
+A reader sees the old file or the new one, never a part.  FILE-MODE is
+the mode of the new file, or nil for the default.  A folder that this
+call creates gets DIR-MODE, or the default mode when DIR-MODE is nil.
+The temporary file has a name that starts with a dot."
+  (let ((dir (file-name-directory file)))
+    (unless (file-directory-p dir)
+      (make-directory dir t)
+      (when dir-mode
+        (set-file-modes dir dir-mode)))
+    (let ((tmp (make-temp-file (expand-file-name (concat "." (file-name-nondirectory file) "-") dir))))
+      (unwind-protect
+          (progn
+            (let ((coding-system-for-write 'utf-8-unix))
+              (write-region text nil tmp nil 'silent))
+            (when file-mode
+              (set-file-modes tmp file-mode))
+            (rename-file tmp file t))
+        (when (file-exists-p tmp)
+          (delete-file tmp))))))
+
+(defun claude-code-ide-session-status--delete-matching-files (dir regexp)
+  "Delete the files and folders in DIR whose name matches REGEXP."
+  (when (file-directory-p dir)
+    (dolist (file (directory-files dir t regexp t))
+      (ignore-errors
+        (if (file-directory-p file)
+            (delete-directory file t)
+          (delete-file file))))))
+
+(defun claude-code-ide-session-status--remove-old-locks (dir regexp &optional age)
+  "Delete the lock folders in DIR whose name matches REGEXP, older than AGE.
+AGE is in seconds and defaults to 3.  A hook holds its lock for
+milliseconds; an older lock was left by a hook that the CLI killed,
+and would stop the numbering of its launch."
+  (when (file-directory-p dir)
+    (dolist (lock (directory-files dir t regexp t))
+      (when-let* ((attributes (file-attributes lock)))
+        (when (> (float-time (time-subtract nil (file-attribute-modification-time attributes)))
+                 (or age 3))
+          (ignore-errors (delete-directory lock t)))))))
+
+(defun claude-code-ide-session-status--parse-json (text &optional false-object)
+  "Parse the JSON TEXT into alists with symbol keys and lists.
+null is nil, and false is FALSE-OBJECT (default nil).  Emacs without
+native JSON uses json.el.  An invalid TEXT signals an error."
+  (if (and (fboundp 'json-available-p) (json-available-p))
+      (json-parse-string text :object-type 'alist :array-type 'list
+                         :null-object nil :false-object false-object)
+    (let ((json-object-type 'alist)
+          (json-array-type 'list)
+          (json-key-type 'symbol)
+          (json-false false-object)
+          (json-null nil))
+      (json-read-from-string text))))
+
+(defun claude-code-ide-session-status--read-json-file (file)
+  "Return the JSON in FILE as an alist, or nil when it cannot be read."
+  (condition-case nil
+      (claude-code-ide-session-status--parse-json
+       (claude-code-ide-session-registry--file-string file))
+    (error nil)))
+
 (defun claude-code-ide-session-status--install-script ()
   "Write the hook script when it is missing or differs.
 Several Emacs processes can share it, so it is written to a temporary
@@ -309,15 +373,8 @@ file and renamed."
     (unless (and (file-exists-p file)
                  (equal (claude-code-ide-session-registry--file-string file)
                         claude-code-ide-session-status--script))
-      (make-directory (file-name-directory file) t)
-      (let ((tmp (make-temp-file (concat file "-"))))
-        (unwind-protect
-            (progn
-              (let ((coding-system-for-write 'utf-8-unix))
-                (write-region claude-code-ide-session-status--script nil tmp nil 'silent))
-              (rename-file tmp file t))
-          (when (file-exists-p tmp)
-            (delete-file tmp)))))))
+      (claude-code-ide-session-status--write-file-atomically
+       file claude-code-ide-session-status--script))))
 
 (defun claude-code-ide-session-status--command (nonce event)
   "Return the hook command that records EVENT for the launch NONCE."
@@ -328,13 +385,9 @@ file and renamed."
 
 (defun claude-code-ide-session-status--remove-launch-files (nonce)
   "Delete the event, counter and lock files of the launch NONCE."
-  (let ((dir (claude-code-ide-session-status--events-directory)))
-    (when (file-directory-p dir)
-      (dolist (file (directory-files dir t (concat "\\`\\.?" (regexp-quote nonce) "[-.]")))
-        (ignore-errors
-          (if (file-directory-p file)
-              (delete-directory file t)
-            (delete-file file)))))))
+  (claude-code-ide-session-status--delete-matching-files
+   (claude-code-ide-session-status--events-directory)
+   (concat "\\`\\.?" (regexp-quote nonce) "[-.]")))
 
 (defun claude-code-ide-session-status--sweep-dead-directories ()
   "Delete the events directories of Emacs processes that no longer run."
@@ -349,25 +402,13 @@ file and renamed."
 
 (defun claude-code-ide-session-status--read-event (file)
   "Return the hook input in FILE as an alist, or nil when it cannot be read."
-  (condition-case nil
-      (let ((text (claude-code-ide-session-registry--file-string file)))
-        (if (and (fboundp 'json-available-p) (json-available-p))
-            (json-parse-string text :object-type 'alist :array-type 'list
-                               :null-object nil :false-object nil)
-          (claude-code-ide-session-registry--json-decode text)))
-    (error nil)))
+  (claude-code-ide-session-status--read-json-file file))
 
 (defun claude-code-ide-session-status--remove-stale-locks ()
   "Delete counter locks older than three seconds.
-A hook holds its lock for milliseconds; an older lock was left by a hook
-that the CLI killed, and would stop the numbering of its launch."
-  (let ((dir (claude-code-ide-session-status--events-directory)))
-    (when (file-directory-p dir)
-      (dolist (lock (directory-files dir t "\\`\\.[0-9a-f]+\\.lock\\'" t))
-        (when-let* ((attributes (file-attributes lock)))
-          (when (> (float-time (time-subtract nil (file-attribute-modification-time attributes)))
-                   3)
-            (ignore-errors (delete-directory lock t))))))))
+See `claude-code-ide-session-status--remove-old-locks'."
+  (claude-code-ide-session-status--remove-old-locks
+   (claude-code-ide-session-status--events-directory) "\\`\\.[0-9a-f]+\\.lock\\'"))
 
 ;;; State machine
 
@@ -519,11 +560,35 @@ main agent waits on the subagent that started them."
                      new)))))
     (setf (claude-code-ide-session-status-tasks status) new)))
 
+(defcustom claude-code-ide-session-status-quota-regexp
+  (concat "usage[_ ]?limit\\|plan[_ ]limit\\|quota"
+          "\\|credits?[_ ]\\(?:depleted\\|exhausted\\)\\|out of credits\\|insufficient[_ ]credits"
+          "\\|hit your limit\\|\\(?:5-hour\\|five-hour\\|weekly\\|daily\\|monthly\\) limit")
+  "Regexp for an error text that reports the usage limit of the account.
+It is matched without case.  It must not match a short rate limit,
+such as \"Rate limit reached ... tokens per min\", which ends in
+seconds.  A Claude Code rate limit or a failed Codex model request
+whose text matches it is `failed/quota-limit'."
+  :type 'regexp
+  :group 'claude-code-ide)
+
+(defun claude-code-ide-session-status--quota-text-p (text)
+  "Return non-nil when TEXT reports the usage limit of the account."
+  (and (stringp text)
+       (let ((case-fold-search t))
+         (string-match-p claude-code-ide-session-status-quota-regexp text))))
+
 (defun claude-code-ide-session-status--quota-failure-p (data)
   "Return non-nil when the StopFailure input DATA reports a quota limit.
-Claude Code gives the error type in `error'; `rate_limit' means that
-the account reached its usage limit."
-  (equal (alist-get 'error data) "rate_limit"))
+`billing_error' means that the account has no credits.  `rate_limit'
+covers also short limits of a few seconds, so it counts only when
+`error_details' or the last message says that a usage or plan limit
+was reached; see `claude-code-ide-session-status-quota-regexp'."
+  (pcase (alist-get 'error data)
+    ("billing_error" t)
+    ("rate_limit"
+     (or (claude-code-ide-session-status--quota-text-p (alist-get 'error_details data))
+         (claude-code-ide-session-status--quota-text-p (alist-get 'last_assistant_message data))))))
 
 (defun claude-code-ide-session-status--failure-text (data)
   "Return the text that explains the StopFailure input DATA."
@@ -652,10 +717,16 @@ UserPromptSubmit, so the tool event is its first sign."
          (claude-code-ide-session-status--set-phase
           status 'error
           (claude-code-ide-session-status--one-line
-           (if quota
-               (format "Quota limit: %s"
-                       (claude-code-ide-session-status--failure-text data))
-             (format "Error: %s" (or (alist-get 'error data) (alist-get 'message data) "API error"))))
+           (cond
+            (quota
+             (format "Quota limit: %s" (claude-code-ide-session-status--failure-text data)))
+            ((equal (alist-get 'error data) "rate_limit")
+             (let ((details (alist-get 'error_details data)))
+               (if (and (stringp details) (not (string-blank-p details)))
+                   (format "Error: rate limit: %s" details)
+                 "Error: rate limit")))
+            (t
+             (format "Error: %s" (or (alist-get 'error data) (alist-get 'message data) "API error")))))
           now)
          (setf (claude-code-ide-session-status-failure status)
                (if quota 'quota-limit 'error))))
@@ -1159,8 +1230,9 @@ approval.  An elicitation and the other notifications are dialogs."
 (defun claude-code-ide-session-status--common-state (status now)
   "Return the common state of STATUS at NOW.
 See `claude-code-ide-instance-state' for the result.
-A nil STATUS, a session without status hooks, is `disconnected': no
-event comes from it."
+A nil STATUS, a session without status hooks, is
+`disconnected/untracked'; hooks without an event since the start give
+`disconnected/no-signal', and a start `working/starting'."
   (let* ((state (claude-code-ide-session-status--state status now))
          (since (claude-code-ide-session-status--state-since status state)))
     (pcase state
@@ -1179,9 +1251,12 @@ event comes from it."
       ('idle (claude-code-ide-instance-make-state
               'idle nil since (claude-code-ide-session-status-guessed status)))
       ;; The CLI starts and takes no prompt yet
-      ((or 'starting 'working) (claude-code-ide-instance-make-state 'working nil since))
-      ;; `unobserved' and `untracked': no event comes
-      (_ (claude-code-ide-instance-make-state 'disconnected nil since)))))
+      ('starting (claude-code-ide-instance-make-state 'working 'starting since))
+      ('working (claude-code-ide-instance-make-state 'working nil since))
+      ;; Hooks, but no event since the start
+      ('unobserved (claude-code-ide-instance-make-state 'disconnected 'no-signal since))
+      ;; No status hooks
+      (_ (claude-code-ide-instance-make-state 'disconnected 'untracked since)))))
 
 (defun claude-code-ide-session-status--instance-state (instance now)
   "Return the common state of the Claude Code INSTANCE at NOW, or nil.
@@ -1245,8 +1320,11 @@ Rows of other providers use it; their state comes from
       ('failed (if (eq reason 'quota-limit) 'quota 'error))
       ('waiting-for-task 'tasks)
       ('idle 'idle)
-      ('working 'working)
-      (_ 'disconnected))))
+      ('working (if (eq reason 'starting) 'starting 'working))
+      (_ (pcase reason
+           ('untracked 'untracked)
+           ('no-signal 'unobserved)
+           (_ 'disconnected))))))
 
 (defun claude-code-ide-session-status--other-detail (instance now)
   "Return the detail text of INSTANCE of another provider at NOW."
@@ -1452,23 +1530,6 @@ time alone."
             (cl-remove 'age_seconds instance :key #'car))
           (append (alist-get 'instances data) nil)))
 
-(defun claude-code-ide-session-status--write-file-atomically (file text)
-  "Write TEXT to FILE through a temporary file in its directory and a rename.
-A reader sees the old file or the new one, never a part.  A directory
-that Emacs creates is private to the user."
-  (let ((dir (file-name-directory file)))
-    (unless (file-directory-p dir)
-      (make-directory dir t)
-      (set-file-modes dir #o700))
-    (let ((tmp (make-temp-file (expand-file-name (concat "." (file-name-nondirectory file) "-") dir))))
-      (unwind-protect
-          (progn
-            (let ((coding-system-for-write 'utf-8-unix))
-              (write-region text nil tmp nil 'silent))
-            (rename-file tmp file t))
-        (when (file-exists-p tmp)
-          (delete-file tmp))))))
-
 (defun claude-code-ide-session-status--write-snapshot (&optional force now)
   "Write the status snapshot when it changed, or when FORCE is non-nil.
 NOW is the float time of the snapshot.  A snapshot without a change is
@@ -1488,7 +1549,7 @@ and does not stop the caller."
                     (>= (- now (car last)) claude-code-ide-session-status-snapshot-interval))
             (claude-code-ide-session-status--write-file-atomically
              (claude-code-ide-session-status--snapshot-file)
-             (concat (json-encode data) "\n"))
+             (concat (json-encode data) "\n") nil #o700)
             (setq claude-code-ide-session-status--snapshot-last (cons now key))
             (add-hook 'kill-emacs-hook #'claude-code-ide-session-status--remove-snapshot)
             t))
