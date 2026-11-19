@@ -71,33 +71,52 @@ Codex runs a hook only after the user trusts it. `codex exec` and the terminal U
 
 Emacs settles the trust before a Codex instance spawns, so that the user never needs to remember a trust command.
 
-1. **The cache.** Emacs keeps the last result under a SHA-256 hash of the hook definitions (the hook arguments, which contain the script path).
-   - A `trusted` result holds for each later start in this Emacs. That start needs no app-server.
-   - An `untrusted` result holds while `config.toml` keeps the time of the check, because `/hooks` in a terminal can trust the hooks.
-   - Other hook definitions, for example of a new package version, give another hash. They miss the cache, and the next interactive start asks again.
-2. **The check.** Without a valid cache entry, Emacs starts `codex app-server` with the hook arguments, over stdio, and sends `initialize`, `initialized`, and `hooks/list` with the project folder in `cwds`.
+1. **The interactive flag.** The start spec has the slot `interactive` (the last slot of `claude-code-ide-start-spec`). It is non-nil only for a start that the user asked for now.
+   - `claude-code-ide`, `claude-code-ide-continue`, `claude-code-ide-resume` (also from the menu), `claude-code-ide-codex`, `claude-code-ide-codex-continue`, and `claude-code-ide-codex-resume` pass `called-interactively-p` as the 4th argument INTERACTIVE of `claude-code-ide--start-session`. The start puts it in the slot of the launch spec. A spec whose slot is set wins over the argument.
+   - The Codex launch, resume, and fork operations pass the slot to `claude-code-ide-codex-status-hook-args`, as its optional 2nd argument.
+   - Other starts (a restore at Emacs start, a coordinator launch, a timer, a call from Lisp) have nil.
+2. **The cache.** The key holds a SHA-256 hash of the hook definitions (the hook arguments, which contain the script path) and the path of the Codex config file (in `CODEX_HOME`, else `~/.codex`).
+   - Each result (`trusted`, `untrusted`, or `disabled`) holds only while `config.toml` keeps the modification time and the size of the check. Otherwise the next start checks again.
+   - Other hook definitions (a new package version) or another `CODEX_HOME` give another key. They miss the cache, and the next interactive start asks again.
+3. **The check.** On a cache miss, Emacs starts `codex app-server` with the hook arguments, over stdio, in the project folder, and sends `initialize`, `initialized`, and `hooks/list` with the project folder in `cwds`.
+   - Starts of the same key share one running check and one app-server.
    - The status hooks of the package are the hooks with `source` `sessionFlags` whose command runs the script.
    - A hook counts as trusted when `trustStatus` is `trusted` or `managed`, and `enabled` is not false.
-   - The start waits at most `claude-code-ide-codex-events-trust-timeout` seconds (5). After that, the start goes on, and the check goes on in the background for at most 30 seconds. Its result goes to the cache and to the launch records.
-3. **The decision:**
+   - Results: `trusted`; `untrusted` (some hooks are enabled and not trusted); `disabled` (the hooks that Codex does not run are all disabled with `/hooks`); `error`.
+   - The check ends with its answer, or after 30 seconds. Its result goes to the cache and to the launches without hooks.
+4. **The wait.**
+   - An interactive start waits for the check at most `claude-code-ide-codex-events-trust-timeout` seconds (5). The limit holds for all the app-server calls of the start, also the trust write. The time of the question does not count.
+   - Another start never waits. On a cache miss it starts without hooks at once, and the check fills the cache for the next start.
+5. **The decision.** A launch gets hooks only when the trust is confirmed:
 
 | Result | Interactive start | Other start |
 |---|---|---|
-| Trusted | Hooks. | Hooks. |
-| Not trusted | The start offers the trust (see the trust command). Yes: the trust is written, and the instance starts with its trusted hooks. No: no hooks, and no start asks again in this Emacs. C-g: no hooks, and the next start asks again. | No question. No hooks. Detail "Hooks not trusted; the next interactive start asks". |
+| Trusted (cache or check) | Hooks. | Hooks. |
+| Not trusted | Emacs shows the hooks and asks. It uses the result of the check and the app-server of the check. Yes: the trust is written, and the instance starts with its trusted hooks. No: no hooks, and no start asks again in this Emacs. C-g: no hooks, and the next start asks again. | No question. No hooks. Detail "Hooks not trusted; the next interactive start asks". |
 | Declined before in this Emacs | No question. No hooks. Detail "Hooks not trusted; M-x claude-code-ide-codex-trust-hooks trusts them". | The same. |
-| No answer in time, or no app-server | Hooks, because they can be trusted. Detail "Hook trust unknown: ...". No question. | The same. |
+| Disabled with `/hooks` | No question. No hooks. Detail "Hooks disabled in Codex (/hooks)". | The same. |
+| Not known in time | No question. No hooks. Detail "Hook trust unknown: no answer in 5 s; the check goes on for the next start". | No hooks. Detail "Hook trust not known at the start; a check runs for the next start". |
+| Error (for example no Codex program) | No hooks. Detail "Hook trust unknown: ...". | The same. |
 
-- **An interactive start** is a start from a command that the user called: `claude-code-ide`, `claude-code-ide-continue`, `claude-code-ide-resume` (also from the menu), `claude-code-ide-codex`, `claude-code-ide-codex-continue`, and `claude-code-ide-codex-resume`. They bind `claude-code-ide-interactive-start` from `called-interactively-p`.
-- **Other starts** never ask and never wait for the user. Examples are a registry restore, a coordinator launch, a timer, and a call of a command from Lisp.
 - **No hooks** means no hook arguments and no hook environment. So Codex shows no "Hooks need review" dialog for them.
-- **A launch without hooks** has no status events. Its state is `disconnected/untracked`. A trust later does not change it: its detail becomes "Hooks were not trusted at the launch: restart to get status".
+- **A launch without hooks** has no status events. Its state is `disconnected/untracked`, whatever a later check says. When a later check finds the hooks trusted, its detail becomes "Hooks were not trusted at the launch: restart to get status".
+- **A launch with hooks** keeps them. Codex read the trust at its start.
 - **Never without a yes.** Emacs writes the trust only after the yes of `yes-or-no-p`.
-- When events come, a trust problem is added to the detail only.
+
+### A restore of the user
+
+`M-x claude-code-ide-restore-sessions` asks at most one time for the whole restore. The automatic restore at Emacs start never asks.
+
+- Before its starts, when it starts at least one Codex instance, the restore command calls `(claude-code-ide-codex-prepare-trust DIRECTORY)` one time.
+  - It returns non-nil when the hooks are trusted: from the cache, or after one question and a yes.
+  - It asks nothing when the user declined in this Emacs.
+- The restore puts the value in the `interactive` slot of each start spec.
+  - After a yes, the starts are interactive. They check again when the cache is not valid, and get trusted hooks; they do not ask again, because the hooks are trusted.
+  - After a no, the starts are not interactive. They never ask, and get no hooks.
 
 ### The trust command
 
-`M-x claude-code-ide-codex-trust-hooks` trusts the hooks by hand, for example after a no. An interactive start uses the same steps:
+`M-x claude-code-ide-codex-trust-hooks` trusts the hooks by hand, for example after a no. It lists the hooks in the home folder. An interactive start and `claude-code-ide-codex-prepare-trust` use the same steps, with the result of their check:
 
 1. It starts the app-server with the hook arguments and calls `hooks/list`.
 2. It shows the hooks that Codex does not run yet, with their event, command, trust status, and key, in the buffer `*Codex status hooks*`.
