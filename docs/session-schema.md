@@ -6,7 +6,7 @@ This document describes the data that all providers share:
 - The launch generation.
 - The common event.
 - The common states.
-- The session registry file, version 3, and the migration of versions 2 and 1.
+- The session registry file, version 4, and the migration of versions 3, 2 and 1.
 - The states of a record, provisional records, Codex records, and the restore of both providers.
 
 Code: `claude-code-ide-instance.el` and `claude-code-ide-session-registry.el`.
@@ -223,13 +223,16 @@ Notes on the mapping:
 
 ## The registry file
 
-The session registry has three files, one for each version:
+The session registry has four files, one for each version:
 
 | File | Name (default) | Use |
 |---|---|---|
-| Version 3 | `claude-code-ide-state-file` with `-v3` before the extension: `~/.emacs-claude-code-ide-state-v3.json` | Emacs reads and writes it. Its backup is `<v3 file>.bak` and its lock is `<v3 file>.lock`. |
-| Version 2 | `claude-code-ide-state-file` with `-v2` before the extension: `~/.emacs-claude-code-ide-state-v2.json` | Emacs reads it only while the version 3 file does not exist. Emacs never writes or moves it. |
-| Version 1 | `claude-code-ide-state-file`: `~/.emacs-claude-code-ide-state.json` | Emacs reads it only while neither the version 3 nor the version 2 file exists. Emacs never writes or moves it. |
+| Version 4 | `claude-code-ide-state-file` with `-v4` before the extension: `~/.emacs-claude-code-ide-state-v4.json` | Emacs reads and writes it. Its backup is `<v4 file>.bak` and its lock is `<v4 file>.lock`. |
+| Version 3 | `claude-code-ide-state-file` with `-v3` before the extension: `~/.emacs-claude-code-ide-state-v3.json` | Emacs reads it only while the version 4 file does not exist. Emacs never writes or moves it. |
+| Version 2 | `claude-code-ide-state-file` with `-v2` before the extension: `~/.emacs-claude-code-ide-state-v2.json` | Emacs reads it only while neither the version 4 nor the version 3 file exists. Emacs never writes or moves it. |
+| Version 1 | `claude-code-ide-state-file`: `~/.emacs-claude-code-ide-state.json` | Emacs reads it only while no newer file exists. Emacs never writes or moves it. |
+
+**Why version 4 (decision D3 of the orchestrator).** Version 4 adds the handover fields `chain` and `handover` of each record ([handover.md](handover.md), "The registry"). A package that knows only version 3 would drop them when it writes. So version 4 has its own file. A version 3 record reads as a version 4 record without these fields. The rest of this document describes the fields of version 3, which version 4 keeps.
 
 The report directory stays `<version 1 name without extension>-reports`, so all versions of the package use the same reports.
 

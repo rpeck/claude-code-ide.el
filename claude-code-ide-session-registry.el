@@ -24,7 +24,7 @@
 
 ;; `claude-code-ide-session-registry-mode' records every instance that
 ;; Emacs starts, of each provider (Claude Code and Codex), in a JSON
-;; file: `claude-code-ide-state-file' with "-v3" before the extension.
+;; file: `claude-code-ide-state-file' with "-v4" before the extension.
 ;; After a crash, `claude-code-ide-restore-sessions' starts every
 ;; instance that was still open again, in its directory, with its
 ;; provider, its instance name and its native conversation ID.  Each
@@ -53,12 +53,12 @@
 ;; lock directory, writes a temporary file and renames it over the state
 ;; file, and keeps the previous version as a ".bak" file.
 ;;
-;; The file has version 3: each record holds its provider, its launch
-;; generation, its role, its owner process and its failures, and the
-;; entry key is the instance ID of `claude-code-ide-instance'.  While
-;; the version 3 file does not exist, the version 2 file (with "-v2"),
-;; else the version 1 file `claude-code-ide-state-file', is read and
-;; migrated in memory.  The registry never writes or moves the files of
+;; The file has version 4: each record holds its provider, its launch
+;; generation, its role, its owner process, its failures and its
+;; handover chain and stage, and the entry key is the instance ID of
+;; `claude-code-ide-instance'.  While the version 4 file does not
+;; exist, the newest older file (with "-v3" or "-v2"), else the version
+;; 1 file `claude-code-ide-state-file', is read and migrated in memory.  The registry never writes or moves the files of
 ;; older versions, so an older version of the package can go on using
 ;; its own file.  docs/session-schema.md describes all versions.
 
@@ -80,12 +80,13 @@
 (defcustom claude-code-ide-state-file
   (expand-file-name "~/.emacs-claude-code-ide-state.json")
   "File of the version 1 session registry.
-`claude-code-ide-session-registry-mode' records sessions in version 3,
-in a file with the same name plus \"-v3\" before the extension, for
-example ~/.emacs-claude-code-ide-state-v3.json.  The previous version
+`claude-code-ide-session-registry-mode' records sessions in version 4,
+in a file with the same name plus \"-v4\" before the extension, for
+example ~/.emacs-claude-code-ide-state-v4.json.  The previous version
 is kept next to that file, with the suffix \".bak\".  When the
-version 3 file does not exist yet, the registry reads the version 2
-file (\"-v2\"), else this file, and migrates it.  The registry never
+version 4 file does not exist yet, the registry reads the version 3
+file (\"-v3\"), else the version 2 file (\"-v2\"), else this file,
+and migrates it.  The registry never
 writes these files, so an older version of the package can still use
 them."
   :type 'file
@@ -128,14 +129,15 @@ Emacs that died while it wrote, and is removed."
 
 ;;; Data
 
-(defconst claude-code-ide-session-registry--version 3
+(defconst claude-code-ide-session-registry--version 4
   "Version of the state file format that Emacs writes.")
 
-(defconst claude-code-ide-session-registry--read-versions '(1 2 3)
+(defconst claude-code-ide-session-registry--read-versions '(1 2 3 4)
   "Versions of the state file format that Emacs reads.
 A version 1 file is migrated in memory; see
-`claude-code-ide-session-registry--migrate-v1'.  A version 2 record
-reads as a version 3 record whose new fields are empty.")
+`claude-code-ide-session-registry--migrate-v1'.  A version 2 or 3
+record reads as a version 4 record whose new fields are empty.
+Version 4 adds the handover fields `chain' and `handover'.")
 
 (defconst claude-code-ide-session-registry--states '(pending open closed failed archived)
   "States of a registry entry.
@@ -192,7 +194,15 @@ with a reused PID has another start time.")
                  :documentation "Restores or reopens that failed in a row since the last good start.")
   (native-id-generation nil :type (or null integer)
                         :documentation "Launch generation whose report set the native ID, or nil.")
-  (failed-at nil :type (or null string)))
+  (failed-at nil :type (or null string))
+  (chain nil :type list
+         :documentation "The legs of the handover chain that ends with this entry.
+Each leg is an alist with JSON keys; see
+`claude-code-ide-session-registry-leg-from-alist'.  nil for an
+instance that no handover started.")
+  (handover nil :type list
+            :documentation "The last handover with this entry as its source, as an alist.
+Its stage and status say how far it came; see docs/handover.md."))
 
 (defconst claude-code-ide-session-registry--fields
   '((instance_id . key)
@@ -221,8 +231,10 @@ with a reused PID has another start time.")
     (failure . failure)
     (failure_count . failure-count)
     (failed_at . failed-at)
-    (native_id_generation . native-id-generation))
-  "JSON key and struct slot of each field of an entry, in version 3.")
+    (native_id_generation . native-id-generation)
+    (chain . chain)
+    (handover . handover))
+  "JSON key and struct slot of each field of an entry, in version 4.")
 
 (defconst claude-code-ide-session-registry--v1-renames
   '((key . instance_id)
@@ -425,12 +437,20 @@ It is `claude-code-ide-state-file' with \"-vVERSION\" before the extension."
 
 (defun claude-code-ide-session-registry--v2-file ()
   "Return the absolute name of the version 2 state file.
-The registry reads it only while the version 3 file does not exist."
+The registry reads it only while no newer state file exists."
   (claude-code-ide-session-registry--versioned-file 2))
 
+(defun claude-code-ide-session-registry--older-file ()
+  "Return the newest existing state file of a version from 2 to the last one.
+The registry reads it only while the state file of its own version
+does not exist; nil when there is none."
+  (cl-loop for version downfrom (1- claude-code-ide-session-registry--version) to 2
+           for file = (claude-code-ide-session-registry--versioned-file version)
+           when (file-exists-p file) return file))
+
 (defun claude-code-ide-session-registry--state-file ()
-  "Return the absolute name of the state file, which has version 3.
-It is `claude-code-ide-state-file' with \"-v3\" before the extension."
+  "Return the absolute name of the state file, which has version 4.
+It is `claude-code-ide-state-file' with \"-v4\" before the extension."
   (claude-code-ide-session-registry--versioned-file
    claude-code-ide-session-registry--version))
 
@@ -522,7 +542,21 @@ Return nil when it has no instance ID."
       (dolist (slot '(worktree failure failed-at))
         (unless (stringp (cl-struct-slot-value 'claude-code-ide-session-registry-entry slot entry))
           (setf (cl-struct-slot-value 'claude-code-ide-session-registry-entry slot entry) nil)))
+      ;; The handover fields: a list of objects, and one object
+      (let ((chain (claude-code-ide-session-registry-entry-chain entry)))
+        (setf (claude-code-ide-session-registry-entry-chain entry)
+              (and (listp chain)
+                   (cl-every #'claude-code-ide-session-registry--json-object-p chain)
+                   chain)))
+      (unless (claude-code-ide-session-registry--json-object-p
+               (claude-code-ide-session-registry-entry-handover entry))
+        (setf (claude-code-ide-session-registry-entry-handover entry) nil))
       entry)))
+
+(defun claude-code-ide-session-registry--json-object-p (value)
+  "Return non-nil when VALUE is a JSON object read as an alist with symbol keys."
+  (and (consp value)
+       (cl-every (lambda (pair) (and (consp pair) (symbolp (car pair)))) value)))
 
 (defun claude-code-ide-session-registry--encode (entries)
   "Return the JSON text of the state file for ENTRIES."
@@ -549,7 +583,7 @@ Signal `claude-code-ide-session-registry-error' when FILE is unreadable."
                    (memql (alist-get 'version data) claude-code-ide-session-registry--read-versions)
                    (listp (alist-get 'sessions data)))
         (signal 'claude-code-ide-session-registry-error
-                (list file "not a version 1, 2 or 3 session registry")))
+                (list file "not a version 1, 2, 3 or 4 session registry")))
       (let ((v1 (eql (alist-get 'version data) 1)))
         (delq nil (mapcar (lambda (record)
                             (claude-code-ide-session-registry--entry-from-alist
@@ -561,19 +595,20 @@ Signal `claude-code-ide-session-registry-error' when FILE is unreadable."
 (defun claude-code-ide-session-registry--load ()
   "Return the entries of the state file.
 When the state file is unreadable, use its backup and report it.  When
-the version 3 state file does not exist yet, read the version 2 file,
-else the version 1 file (or the backup of either), and migrate it.
-The registry never writes or moves the files of the older versions."
+the version 4 state file does not exist yet, read the newest older file
+\(version 3, else version 2), else the version 1 file (or the backup of
+any of them), and migrate it.  The registry never writes or moves the
+files of the older versions."
   (setq claude-code-ide-session-registry--loaded-from-backup nil)
-  (let ((v2 (claude-code-ide-session-registry--v2-file)))
+  (let ((older (claude-code-ide-session-registry--older-file)))
     (cond
      ((file-exists-p (claude-code-ide-session-registry--state-file))
       (claude-code-ide-session-registry--read-with-backup
        (claude-code-ide-session-registry--state-file)
        (claude-code-ide-session-registry--backup-file)
        t))
-     ((file-exists-p v2)
-      (claude-code-ide-session-registry--read-with-backup v2 (concat v2 ".bak") nil))
+     (older
+      (claude-code-ide-session-registry--read-with-backup older (concat older ".bak") nil))
      (t
       (claude-code-ide-session-registry--read-with-backup
        (claude-code-ide-session-registry--v1-file)
@@ -827,7 +862,7 @@ the only way the state file changes."
           entries))
 
 (defconst claude-code-ide-session-registry--kept-at-start
-  '(started-at failure failure-count failed-at native-id-generation)
+  '(started-at failure failure-count failed-at native-id-generation chain handover)
   "Slots that a start of a known entry keeps.
 The failures count until a start is confirmed good; see
 `claude-code-ide-session-registry--change-confirmed'.")
@@ -1035,6 +1070,298 @@ change."
   "Return a change that removes the entry KEY."
   (lambda (entries)
     (cl-remove key entries :key #'claude-code-ide-session-registry-entry-key :test #'equal)))
+
+;;; Handover chains and stages
+;;
+;; A handover (claude-code-ide-handover.el) moves the work of an
+;; instance to a new conversation.  The registry keeps two values for
+;; it, so that a handover survives a crash of Emacs:
+;;
+;; - The `handover' of the source entry: the stage that the handover
+;;   reached, saved before each step, and its status.
+;; - The `chain' of each entry that a handover started: the legs of the
+;;   chain, oldest first, with this entry's own leg last.
+;;
+;; docs/handover.md describes both.
+
+(defconst claude-code-ide-session-registry--leg-keys
+  '((provider . :provider)
+    (instance_id . :instance-id)
+    (native_id . :native-id)
+    (transcript . :transcript)
+    (worktree . :worktree)
+    (handover_id . :handover-id)
+    (document_hash . :document-hash)
+    (summary_file . :summary-file)
+    (start_commit . :start-commit)
+    (end_record . :end-record)
+    (pending . :pending))
+  "JSON key and plist key of each value of a leg of a chain.
+The plist is the leg of docs/handover-document.md, plus :pending, which
+is non-nil while the handover that started the leg is not committed.")
+
+(defun claude-code-ide-session-registry-leg-to-alist (leg)
+  "Return the leg plist LEG as an alist for the state file."
+  (delq nil
+        (mapcar (lambda (pair)
+                  (let ((value (plist-get leg (cdr pair))))
+                    (when value
+                      (cons (car pair)
+                            (if (and (symbolp value) (not (eq value t)))
+                                (symbol-name value)
+                              value)))))
+                claude-code-ide-session-registry--leg-keys)))
+
+(defun claude-code-ide-session-registry-leg-from-alist (alist)
+  "Return the leg plist of the state file ALIST.
+The provider becomes a symbol.  A value of a wrong type is left out."
+  (let ((leg nil))
+    (dolist (pair claude-code-ide-session-registry--leg-keys)
+      (let ((value (alist-get (car pair) alist)))
+        (pcase (car pair)
+          ('provider (when (and (stringp value) (not (string-empty-p value)))
+                       (setq leg (plist-put leg :provider (intern value)))))
+          ('end_record (when (natnump value)
+                         (setq leg (plist-put leg :end-record value))))
+          ('pending (when value
+                      (setq leg (plist-put leg :pending t))))
+          (_ (when (stringp value)
+               (setq leg (plist-put leg (cdr pair) value)))))))
+    leg))
+
+(defun claude-code-ide-session-registry-entry-legs (entry)
+  "Return the chain of ENTRY as a list of leg plists, oldest first."
+  (mapcar #'claude-code-ide-session-registry-leg-from-alist
+          (claude-code-ide-session-registry-entry-chain entry)))
+
+(defconst claude-code-ide-session-registry--handover-early-stages
+  '("requested" "quiescing")
+  "Stages of a handover before the source is stopped.
+Recovery cancels such a handover, and the source stays current.")
+
+(defun claude-code-ide-session-registry-handover-unfinished-p (handover)
+  "Return non-nil when the HANDOVER alist is neither committed nor ended.
+Its status is then \"running\" or \"needs-user\"."
+  (member (alist-get 'status handover) '("running" "needs-user")))
+
+(defun claude-code-ide-session-registry--handover-blocks-p (entry)
+  "Return non-nil when a handover keeps ENTRY from a plain restore.
+That is a source whose handover is committed, or is unfinished and
+past the stage quiescing: the target of the chain is current, or
+recovery decides.  It is also an entry whose own leg waits for the
+commit of the handover that started it.  Only the handover recovery
+starts such an entry, so that the source and the target never run
+both."
+  (let ((handover (claude-code-ide-session-registry-entry-handover entry))
+        (own-leg (car (last (claude-code-ide-session-registry-entry-chain entry)))))
+    (or (equal (alist-get 'status handover) "committed")
+        (and (claude-code-ide-session-registry-handover-unfinished-p handover)
+             (not (member (alist-get 'stage handover)
+                          claude-code-ide-session-registry--handover-early-stages)))
+        (and own-leg (alist-get 'pending own-leg) t))))
+
+(defun claude-code-ide-session-registry--change-handover (key handover &optional done)
+  "Return a change that sets the handover of the entry KEY to the alist HANDOVER.
+DONE, when given, is a cons whose car becomes t when the entry exists."
+  (lambda (entries)
+    (claude-code-ide-session-registry--update
+     entries (list key)
+     (lambda (entry)
+       (when done (setcar done t))
+       (setf (claude-code-ide-session-registry-entry-handover entry) handover)))))
+
+(defun claude-code-ide-session-registry--change-chain (key chain &optional done)
+  "Return a change that sets the chain of the entry KEY to CHAIN.
+CHAIN is a list of leg alists.  DONE is as for
+`claude-code-ide-session-registry--change-handover'."
+  (lambda (entries)
+    (claude-code-ide-session-registry--update
+     entries (list key)
+     (lambda (entry)
+       (when done (setcar done t))
+       (setf (claude-code-ide-session-registry-entry-chain entry) chain)))))
+
+(defun claude-code-ide-session-registry--submit-checked (label change-fn &optional drop)
+  "Submit the change that CHANGE-FN makes, named LABEL, and report the result.
+CHANGE-FN takes a cons DONE and returns the change; the change sets the
+car of DONE when it finds its entry.  Return the car of DONE when the
+state file holds the change now.  Return `:missing' when the change was
+written but did not find its entry: a retry cannot help then.  Return
+nil when the lock was busy: the change stays queued, so that a later
+drain writes it, unless DROP is non-nil: then the change leaves the
+queue and is never written."
+  (let* ((done (list nil))
+         (cell (cons label (funcall change-fn done))))
+    (setq claude-code-ide-session-registry--queue
+          (nconc claude-code-ide-session-registry--queue (list cell)))
+    (claude-code-ide-session-registry--drain)
+    (if (memq cell claude-code-ide-session-registry--queue)
+        (progn
+          (when drop
+            (setq claude-code-ide-session-registry--queue
+                  (delq cell claude-code-ide-session-registry--queue)))
+          nil)
+      (or (car done) :missing))))
+
+(defun claude-code-ide-session-registry-save-handover (key handover &optional drop)
+  "Save the HANDOVER alist as the handover of the entry KEY.
+Return t when the state file holds it, `:missing' when the entry does
+not exist, and nil when the write waits for the lock.  DROP non-nil removes a
+change that waits for the lock, so that it is never written: the first
+save of a handover uses it, so that a refused handover leaves no
+record."
+  (let ((result (claude-code-ide-session-registry--submit-checked
+                 "handover" (lambda (done)
+                              (claude-code-ide-session-registry--change-handover key handover done))
+                 drop)))
+    (if (eq result :missing) :missing (and result t))))
+
+(defun claude-code-ide-session-registry--host-id-file ()
+  "Return the file that holds the host ID, in the report directory."
+  (expand-file-name "host-id" (claude-code-ide-session-registry--report-directory)))
+
+(defun claude-code-ide-session-registry--read-host-id (file)
+  "Return the host ID in FILE, or nil when FILE holds none."
+  (when (file-readable-p file)
+    (let ((id (string-trim (claude-code-ide-session-registry--file-string file))))
+      (and (string-match-p "\\`[0-9a-f-]\\{36\\}\\'" id) id))))
+
+(defun claude-code-ide-session-registry-host-id ()
+  "Return the ID of this host: a random UUID in a file of the report directory.
+The first call makes the file (mode 0600); the host name is not used,
+because it can change.  Two Emacs that make the file at the same time
+get the same ID: the rename does not replace a file that exists."
+  (let ((file (claude-code-ide-session-registry--host-id-file)))
+    (or (claude-code-ide-session-registry--read-host-id file)
+        (let ((dir (file-name-directory file))
+              (id (claude-code-ide-session-registry--uuid)))
+          (with-file-modes #o700 (make-directory dir t))
+          (let ((tmp (with-file-modes #o600
+                       (make-temp-file (expand-file-name ".host-id-" dir)))))
+            (unwind-protect
+                (progn
+                  (write-region (concat id "\n") nil tmp nil 'silent)
+                  (condition-case nil
+                      (rename-file tmp file nil)
+                    (file-already-exists nil)))
+              (when (file-exists-p tmp) (delete-file tmp))))
+          (or (claude-code-ide-session-registry--read-host-id file) id)))))
+
+(defun claude-code-ide-session-registry--owner-here (pid start)
+  "Return the owner of a handover on this host: `self', `other', or nil.
+PID and START are the process ID and the start time of the owning
+Emacs.  `other' is another Emacs that still runs with them."
+  (cond
+   ((and (eql pid (emacs-pid))
+         (or (not (numberp start))
+             (< (abs (- start (or (claude-code-ide-session-registry--emacs-start-time) 0))) 1)))
+    'self)
+   ((numberp start)
+    (and (claude-code-ide-session-registry--same-start-p pid start) 'other))
+   (t
+    (let ((command (alist-get 'comm (claude-code-ide-session-registry--process-attributes pid))))
+      (and command (string-match-p "emacs" (downcase command)) 'other)))))
+
+(defun claude-code-ide-session-registry--handover-owner (handover)
+  "Return the owner of the HANDOVER alist: `self', `other', or nil.
+`self' is this Emacs (its process ID and start time).  `other' is
+another Emacs that still runs.  nil is an owner that ended, or no
+owner.
+- A record with `host_id' of another host is `other': its Emacs cannot
+  be checked from here.
+- A record with this host ID, and an older record with only a host
+  name (also another name: the host is then unknown), is checked here:
+  the owner PID with its start time."
+  (let ((pid (alist-get 'emacs_pid handover))
+        (start (alist-get 'emacs_start_time handover))
+        (host-id (alist-get 'host_id handover)))
+    (cond
+     ((not (integerp pid)) nil)
+     ((and (stringp host-id) (not (equal host-id (claude-code-ide-session-registry-host-id))))
+      'other)
+     (t (claude-code-ide-session-registry--owner-here pid start)))))
+
+(defun claude-code-ide-session-registry-claim-handover (key handover-id &optional force)
+  "Make this Emacs the owner of the handover HANDOVER-ID of the entry KEY.
+The check and the claim are one change under the lock of the state
+file.  The claim fails when the entry has another handover, or when
+another Emacs that still runs owns it; FORCE non-nil claims it also
+then (a person decided).  Return the claimed handover alist when the
+state file holds the claim, `:missing' without the entry, else nil."
+  (pcase (claude-code-ide-session-registry--submit-checked
+          "claim handover"
+          (lambda (done)
+            (lambda (entries)
+              (claude-code-ide-session-registry--update
+               entries (list key)
+               (lambda (entry)
+                 (let ((handover (claude-code-ide-session-registry-entry-handover entry)))
+                   ;; Found, but not claimed (yet): not a missing entry
+                   (setcar done 'refused)
+                   (when (and (equal (alist-get 'id handover) handover-id)
+                              (or force
+                                  (not (eq (claude-code-ide-session-registry--handover-owner handover)
+                                           'other))))
+                     (let ((claimed (copy-alist handover)))
+                       (setf (alist-get 'emacs_pid claimed) (emacs-pid)
+                             (alist-get 'emacs_start_time claimed)
+                             (claude-code-ide-session-registry--emacs-start-time)
+                             (alist-get 'host_id claimed) (claude-code-ide-session-registry-host-id)
+                             (alist-get 'host claimed) (system-name))
+                       (setf (claude-code-ide-session-registry-entry-handover entry) claimed)
+                       (setcar done claimed))))))))
+          'drop)
+    ((and (pred consp) claimed) claimed)
+    (:missing :missing)
+    (_ nil)))
+
+
+
+(defun claude-code-ide-session-registry-save-chain (key legs)
+  "Save LEGS, a list of leg plists oldest first, as the chain of the entry KEY.
+Return t, `:missing' or nil, as for
+`claude-code-ide-session-registry-save-handover'."
+  (let* ((chain (mapcar #'claude-code-ide-session-registry-leg-to-alist legs))
+         (result (claude-code-ide-session-registry--submit-checked
+                  "chain" (lambda (done)
+                            (claude-code-ide-session-registry--change-chain key chain done)))))
+    (if (eq result :missing) :missing (and result t))))
+
+(defun claude-code-ide-session-registry-entry-of (key)
+  "Return the entry KEY of the state file, or nil."
+  (claude-code-ide-session-registry--find (claude-code-ide-session-registry--entries) key))
+
+(defun claude-code-ide-session-registry-unfinished-handovers ()
+  "Return the entries whose handover is unfinished, oldest first."
+  (cl-remove-if-not (lambda (entry)
+                      (claude-code-ide-session-registry-handover-unfinished-p
+                       (claude-code-ide-session-registry-entry-handover entry)))
+                    (claude-code-ide-session-registry--entries)))
+
+(defun claude-code-ide-session-registry-chain-current (instance-id)
+  "Return the instance ID of the current leg of the chain of INSTANCE-ID.
+The current leg is the one after the last committed handover: each
+committed handover leads from its source to its target.  An instance
+whose entry has no chain and no committed handover gives nil, and so
+does an unknown INSTANCE-ID.  The review tracking calls this, so that
+a review result goes to the current owner after a handover."
+  (let* ((entries (claude-code-ide-session-registry--entries))
+         (entry (claude-code-ide-session-registry--find entries instance-id))
+         (seen nil))
+    (when (and entry
+               (or (claude-code-ide-session-registry-entry-chain entry)
+                   (equal (alist-get 'status (claude-code-ide-session-registry-entry-handover entry))
+                          "committed")))
+      (while (let* ((handover (claude-code-ide-session-registry-entry-handover entry))
+                    (target (alist-get 'target_instance_id handover))
+                    (next (and (equal (alist-get 'status handover) "committed")
+                               (stringp target)
+                               (not (member target seen))
+                               (claude-code-ide-session-registry--find entries target))))
+               (when next
+                 (push (claude-code-ide-session-registry-entry-key entry) seen)
+                 (setq entry next))))
+      (claude-code-ide-session-registry-entry-key entry))))
 
 ;;; Flags
 
@@ -1646,6 +1973,8 @@ Emacs, entries whose process still runs (its ID and start time), and
 entries whose session id a running Claude Code CLI has are left alone.
 A `failed' entry that failed `claude-code-ide-session-registry-restore-attempts'
 times in a row is left alone too, until a reopen by hand starts it.
+So are the entries that a handover holds; see
+`claude-code-ide-session-registry--handover-blocks-p'.
 CONTEXT is a `claude-code-ide-session-registry--restore-context'; nil
 computes one."
   (let* ((context (or context
@@ -1663,6 +1992,8 @@ computes one."
                      (claude-code-ide-session-registry--restore-context-exit-keys context)))
          (not (member (claude-code-ide-session-registry-entry-key entry)
                       (claude-code-ide-session-registry--restore-context-live-keys context)))
+         ;; The handover recovery starts the legs of an unfinished chain
+         (not (claude-code-ide-session-registry--handover-blocks-p entry))
          (not (claude-code-ide-session-registry--owner-live-p entry cache))
          (not (and (claude-code-ide-session-registry-entry-session-id entry)
                    (member (claude-code-ide-session-registry-entry-session-id entry)
@@ -1880,10 +2211,18 @@ are skipped, unless FORCE (the prefix argument) is non-nil."
                                                (error-message-string err)))))))
           (setq delay (+ delay 2))))))))
 
+(defvar claude-code-ide-session-registry--handover-start nil
+  "Key of the entry that the handover itself starts now, or nil.
+`claude-code-ide-session-registry--start-entry' refuses an entry that a
+handover holds, except this one.")
+
 (defun claude-code-ide-session-registry--reopenable-p (entry)
-  "Return non-nil when ENTRY can be started again by hand."
+  "Return non-nil when ENTRY can be started again by hand.
+An entry that a handover holds cannot: see
+`claude-code-ide-session-registry--handover-blocks-p'."
   (and (not (eq (claude-code-ide-session-registry-entry-state entry) 'archived))
-       (not (claude-code-ide-session-registry--live-p entry))))
+       (not (claude-code-ide-session-registry--live-p entry))
+       (not (claude-code-ide-session-registry--handover-blocks-p entry))))
 
 ;;; Transcripts
 
@@ -2048,11 +2387,22 @@ entry is recorded once, by `claude-code-ide-session-registry--on-start-failed'.
 A start that still runs after `claude-code-ide-session-registry-restore-grace'
 seconds counts as good and clears the failures of ENTRY.  INTERACTIVE
 non-nil marks the start as one that the user asked for, in the
-`interactive' slot of the start spec when that slot exists."
+`interactive' slot of the start spec when that slot exists.
+An entry that a handover holds is refused with a `user-error' (a
+committed source must never run next to its target), unless it is
+`claude-code-ide-session-registry--handover-start'."
   (let ((id (claude-code-ide-session-registry-entry-session-id entry))
         (dir (claude-code-ide-session-registry-entry-project-dir entry))
         (key (claude-code-ide-session-registry-entry-key entry))
         (provider (claude-code-ide-session-registry-entry-provider entry)))
+    (when (and (claude-code-ide-session-registry--handover-blocks-p entry)
+               (not (equal key claude-code-ide-session-registry--handover-start)))
+      (user-error "%s belongs to a handover chain; %s"
+                  (claude-code-ide-session-registry--describe entry)
+                  (if-let* ((current (claude-code-ide-session-registry-chain-current key))
+                            ((not (equal current key))))
+                      (format "its current instance is %s" current)
+                    "the handover recovery starts it")))
     (unless id
       (user-error "No conversation is known for %s, so nothing can be resumed"
                   (claude-code-ide-session-registry--describe entry)))
@@ -2231,7 +2581,9 @@ reports the result."
 These are the `open' and `pending' entries of an Emacs that crashed,
 the entries that the last Emacs closed at its exit, and the entries
 whose last restore failed; see
-`claude-code-ide-session-registry--restorable-p'.  Sessions that run
+`claude-code-ide-session-registry--restorable-p'.  An interrupted
+handover continues first, with `claude-code-ide-handover-recover'.
+Sessions that run
 again already, or whose process still runs, are skipped.  Each
 instance resumes its conversation with its own provider (Claude Code
 or Codex), in its directory, with its instance name, and gets
@@ -2249,6 +2601,13 @@ The starts are never interactive: after a yes they find the trusted
 result in the cache.  A call from Lisp, such as an automatic restore
 at the start of Emacs, never asks."
   (interactive "P")
+  ;; An interrupted handover continues first.  The restore plan leaves
+  ;; out the legs of its chain, so that its source and its target never
+  ;; run both.
+  (when (fboundp 'claude-code-ide-handover-recover)
+    (condition-case err
+        (funcall 'claude-code-ide-handover-recover)
+      (error (message "Handover recovery failed: %s" (error-message-string err)))))
   (pcase-let ((`(,entries . ,unknown) (claude-code-ide-session-registry--restore-plan)))
     (if (and (null entries) (null unknown))
         (message "No sessions to restore")
@@ -2420,7 +2779,7 @@ reason.
 ;;;###autoload
 (define-minor-mode claude-code-ide-session-registry-mode
   "Record the sessions of each provider in the session registry.
-The file is `claude-code-ide-state-file' with \"-v3\" before the
+The file is `claude-code-ide-state-file' with \"-v4\" before the
 extension.  Each instance that Emacs starts is recorded before its CLI
 starts, with its provider, native conversation ID, directory, worktree,
 names and flags.  A normal exit of Emacs marks them `closed'; after a

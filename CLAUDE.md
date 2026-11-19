@@ -19,6 +19,7 @@ This package integrates coding-agent CLIs with Emacs via the Model Context Proto
 - `claude-code-ide-codex.el` - The Codex provider: command lines, MCP config and the user's exclude list, approvals, `codex queue` prompts in the background, native ID, and the dialog scan
 - `claude-code-ide-codex-events.el` - Codex status: hook script, hook arguments, the hook trust at each start (cache by the config trust records, one question for a start or a restore of the user, trust command), event mapping, Codex states
 - `claude-code-ide-control.el` - Control operations for coordinators: list, inspect, launch, resume, submit-prompt, stop; the durable prompt inbox; MCP coordinator tools
+- `claude-code-ide-handover.el` - Handover of an instance to a new conversation of either provider: the preflight, the stages saved before each step, the stop with stray checks, the document and the pointer prompt, the delivery watch, recovery with claims, the one writer rule, the control operation and tools, and `request_handover`. See docs/handover.md
 - `claude-code-ide-review.el` - Tracked external reviews: durable records, result files, delivery to the owner's inbox, the track-review control operation and coordinator tool
 - `claude-code-ide-transcript.el` - Transcript readers (CC and Codex), workspace state from Git, and the handover document. Format: docs/handover-document.md
 - `claude-code-ide-process.el` - Process trees: records the background process groups of each CLI, ends them at a stop, and lists stray processes in the worktree (docs/process-tree.md). The main file loads it as an optional file and calls it through `fboundp`.
@@ -26,7 +27,7 @@ This package integrates coding-agent CLIs with Emacs via the Model Context Proto
 - `claude-code-ide-mcp-http-server.el` - HTTP transport: 202 for notifications, Origin and content-type checks, routing by /mcp/<id>[/<secret>]
 - `claude-code-ide-emacs-tools.el` - Emacs tools: xref, project info, imenu, and `get_capabilities`
 - `claude-code-ide-diagnostics.el` - Flycheck integration
-- `claude-code-ide-session-registry.el` - Session registry: crash-safe JSON state file (schema version 3, in its own `-v3` file; versions 2 and 1 are read and migrated) of started instances, restore and reopen commands
+- `claude-code-ide-session-registry.el` - Session registry: crash-safe JSON state file (schema version 4, in its own `-v4` file; versions 3, 2 and 1 are read and migrated) of started instances, restore and reopen commands, and the handover chain and stages (`claude-code-ide-session-registry-chain-current`)
 - `claude-code-ide-session-status.el` - Live status of each instance of both providers from CLI hooks (working, waiting, idle), the status buffer, the status snapshot, and the file helpers that both providers share
 - `claude-code-ide-transient.el` - Transient menu interface; the header shows the current provider, and `P` toggles it
 - `claude-code-ide-debug.el` - Debug logging utilities
@@ -41,6 +42,7 @@ This package integrates coding-agent CLIs with Emacs via the Model Context Proto
 - `claude-code-ide-codex-events-tests.el` - Codex status, status buffer columns, status snapshot, and shared status file helper tests
 - `claude-code-ide-mcp-routing-tests.el` - MCP routing tests: secrets, request checks, descriptor context, the one active buffer tracker, coordinator scope, get_capabilities
 - `claude-code-ide-control-tests.el` - Control operation, inbox, and coordinator tool tests
+- `claude-code-ide-handover-tests.el` - Handover tests: stages, preflight, quiescing and the inbox hold, strays, the delivery watch, recovery at each stage and its claims, two writers, the inbox move, the chain, the version 4 registry file, control states, approvals, the status key, and a real review process
 - `claude-code-ide-review-tests.el` - Review tracking and dedicated ediff frame tests; the tests with real frames skip in batch Emacs
 - `claude-code-ide-transcript-tests.el` - Transcript and handover document tests, with fixtures in `test-fixtures/transcripts/` (made by `make-fixtures.py` there)
 - `claude-code-ide-process-tests.el` - Process tree tests; live tests run with `CLAUDE_CODE_IDE_LIVE_TESTS=1`
@@ -53,7 +55,7 @@ This package integrates coding-agent CLIs with Emacs via the Model Context Proto
 - MCP tools server routing, secrets, request checks and scopes: docs/api-mcp.md.
 - Control operations and the inbox: docs/api-control.md.
 - Reviews and dedicated ediff frames: docs/review.md.
-- The handover document: docs/handover-document.md. Process trees: docs/process-tree.md.
+- Handover: docs/handover.md. The handover document: docs/handover-document.md. Process trees: docs/process-tree.md.
 - Updating the package and reloading it in a running Emacs: docs/updating.md.
 
 ## Hooks

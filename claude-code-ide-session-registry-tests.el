@@ -181,7 +181,7 @@ BODY can refer to that directory as `registry-dir'."
         (should (equal (mapcar #'claude-code-ide-session-registry-entry-key
                                (claude-code-ide-session-registry--entries))
                        '("a")))
-        (should (string-match-p "using .*state-v3\\.json\\.bak" (car warnings)))
+        (should (string-match-p "using .*state-v4\\.json\\.bak" (car warnings)))
         (claude-code-ide-session-registry--submit "c" (claude-code-ide-tests--registry-add "c"))))
     (should (equal (claude-code-ide-tests--registry-file-keys) '("a" "c")))
     ;; The good backup survived, and the unreadable file was kept
@@ -1797,9 +1797,9 @@ model.  A Codex record takes the model of the descriptor."
     process))
 
 (ert-deftest claude-code-ide-test-registry-v3-file-migrates-v2 ()
-  "Version 3 goes to its own file.  While it does not exist, the version 2
-file is read and migrated.  The version 2 and version 1 files are never
-written."
+  "The newest version goes to its own file (version 4 since the handover).
+While it does not exist, the version 2 file is read and migrated.  The
+version 2 and version 1 files are never written."
   (claude-code-ide-tests--with-registry
     (let ((v1 (claude-code-ide-session-registry--v1-file))
           (v2 (expand-file-name "state-v2.json" registry-dir))
@@ -1822,7 +1822,7 @@ written."
       (let ((data (claude-code-ide-session-registry--json-decode
                    (claude-code-ide-session-registry--file-string
                     (claude-code-ide-session-registry--state-file)))))
-        (should (= (alist-get 'version data) 3))
+        (should (= (alist-get 'version data) 4))
         (let ((record (car (alist-get 'sessions data))))
           (should (equal (alist-get 'instance_id record) "cci-test-v2rec"))
           (should (assq 'failure_count record))
@@ -1831,9 +1831,9 @@ written."
       (should (equal (claude-code-ide-session-registry--file-string v1) v1-text))
       (should-not (file-exists-p (concat v2 ".bak")))
       (should (equal (claude-code-ide-session-registry--state-file)
-                     (expand-file-name "state-v3.json" registry-dir)))
+                     (expand-file-name "state-v4.json" registry-dir)))
       (should (equal (claude-code-ide-session-registry--v2-file) v2))
-      ;; From now on only the version 3 file counts
+      ;; From now on only the version 4 file counts
       (with-temp-file v2 (insert (replace-regexp-in-string "cci-test-v2rec" "cci-test-later" v2-text)))
       (should (equal (claude-code-ide-tests--registry-file-keys) '("cci-test-v2rec"))))))
 
