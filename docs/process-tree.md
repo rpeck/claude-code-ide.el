@@ -34,7 +34,9 @@ This document describes how claude-code-ide.el records that work, ends it at a s
 - A common event `prompt-submit`, `tool-start`, `tool-end`, `turn-end`, `subagent-start`, or `subagent-end` of the instance also starts a record, at most one per second. The file adds itself to `claude-code-ide-event-functions` for this.
 - Groups and processes that are gone are dropped at each record. A process group cannot get new members after its last member is gone.
 - The group of Emacs, and the groups of Emacs's ancestors, are never recorded.
-- The timer stops when no tracked CLI runs. The records stay until a stop or `claude-code-ide-process-untrack`.
+- Each `ps` run builds one snapshot: the table, a PID index, the children of each PID, and the protected set (see "Safety"). All records of that run use it.
+- The timer stops when no tracked CLI runs now. The check uses the current records, so a `ps` run that started before a new CLI existed does not stop the timer.
+- The records stay until a stop or `claude-code-ide-process-untrack`.
 
 Other functions:
 
@@ -52,7 +54,12 @@ Other functions:
    - If the CLI still runs, send SIGTERM to its group. Wait `:kill-wait` seconds (`claude-code-ide-process-kill-wait`, default 2). Then send SIGKILL.
    - With `:escalate nil`, skip this. A CLI that still runs then keeps its groups, and the result is `timeout`.
 4. **End the recorded groups that still run:** SIGTERM to the group, then SIGKILL after the kill wait. Up to three rounds catch members that start during a round.
-5. **Scan the worktree** (unless `:scan nil`): list the processes whose working folder is inside it (`lsof -a -u UID -d cwd -Fpcn`, about 0.6 s).
+5. **Scan the worktree** (unless `:scan nil`): list the processes whose working folder is inside it (`lsof -n -P -w -a -u UID -d cwd -Fpcn`).
+   - The full scan runs only when a worktree of the stop exists as a folder.
+   - It takes about 0.6 s on an idle Mac, and 20 to 30 s under heavy load (load average 23, measured). `claude-code-ide-process-lsof-timeout` (default 30 s) limits it; then the result is `error`.
+   - The working folders of the strays that the records found come from one `lsof -p PID,PID,...` call for all instances.
+
+`ps` runs have a limit of 10 s. If `ps` fails in any step, the stop sends nothing more, keeps the records, and returns `error`.
 
 The keys of ARGS:
 
@@ -60,6 +67,7 @@ The keys of ARGS:
 |---|---|
 | `:timeout` | Seconds for step 3. |
 | `:kill-wait` | Seconds between SIGTERM and SIGKILL, and after SIGKILL. |
+| `:budget` | Seconds for all waits together, or nil for no limit. A wait that has no time left is skipped, but its signals still go out. |
 | `:soft-end` | A signal symbol, a function of `(INSTANCE PROCESS)`, or `none` when the caller already did the soft end. Default: the provider's. |
 | `:escalate` | nil skips SIGTERM and SIGKILL of the CLI. Default t. |
 | `:scan` | nil skips step 5. Default t. |
@@ -71,7 +79,7 @@ The result is a plist:
 
 | Key | Value |
 |---|---|
-| `:status` | `stopped`: nothing is left. `strays`: only processes that the stop did not end are left (step 5, or unproven groups). `timeout`: the CLI or a recorded process survived SIGKILL, or the CLI still runs after `:escalate nil`. |
+| `:status` | `stopped`: nothing is left. `strays`: only processes that the stop did not end are left (step 5, or unproven groups). `error`: `ps` or the scan failed, and `:reason` says why; the records stay. `timeout`: the CLI or a recorded process survived SIGKILL, or the CLI still runs after `:escalate nil`. |
 | `:strays` | A list of plists `(:pid :command :cwd :reason ...)`. |
 | `:ended` | The group IDs that got a signal in step 4. |
 | `:escalated` | nil, `SIGTERM`, or `SIGKILL`: the last signal to the CLI in step 3. |
@@ -80,22 +88,26 @@ Each stray has a `:reason`:
 
 - `cli`: the CLI itself still runs.
 - `survivor`: a process of a recorded group survived SIGKILL.
-- `unverified`: a process is in a recorded group, but no recorded process proves that it is the same group (see "Safety"). It got no signal.
+- `unverified`: a process is in a recorded group, but no recorded process proves that it is the same group (see "Safety"). Or the CLI has no known start time and its PID runs. It got no signal.
 - `worktree`: step 5 found it.
 
 A stray can also have `:pgid`, `:ppid`, `:instance-id` (it belongs to the tree of another running instance), and `:emacs-process` (Emacs runs it, for example a shell buffer).
 
-After a result other than `timeout`, the records of the instance are dropped. After `timeout`, they stay, so that a later stop can end what is left.
+After `stopped` or `strays`, the records of the instance are dropped. After `timeout` or `error`, they stay, so that a later stop can end what is left.
+
+When `:process` has another PID than the records (a new launch of the instance), the new records take over the old ones, so the stop also ends the groups of the old CLI. A `:process` without a PID keeps the records.
 
 ### Stop of several instances
 
 `(claude-code-ide-process-stop-many INSTANCES &rest ARGS)` stops each instance with one shared wait: all soft ends first, then one wait, then the escalation and the group ends.
 It returns an alist `(INSTANCE-ID . RESULT)` in the order of INSTANCES.
-The quit of Emacs uses it, so that N instances wait once and not N times.
+The quit of Emacs uses it with `:budget`, so that N instances wait once and not N times, and all waits together stay within the budget.
 
 ### Stop from kill-buffer-hook
 
-`(claude-code-ide-process-stop-later INSTANCE &rest ARGS)` records the groups at once, and runs the stop from a timer with `:soft-end none`.
+`(claude-code-ide-process-stop-later INSTANCE &rest ARGS)` records the groups at once, and runs the stop from timers with `:soft-end none`. The key `:callback` gives a function that gets the result.
+
+- The stop is a chain of steps. Each wait is a poll every 0.05 s from a new timer, so the command loop runs between the steps. One step takes about one `ps` run (60 ms on an idle Mac).
 
 - A wait inside `kill-buffer-hook` is unsafe: a sentinel that runs during the wait can kill the buffer again while its hooks still run.
 - The buffer kill itself sends SIGHUP to the CLI after the hook. That is the soft end.
@@ -113,12 +125,16 @@ The quit of Emacs uses it, so that N instances wait once and not N times.
 
 The stop sends signals only to processes that it can prove are the work of the CLI.
 
-- **The CLI.** Its process ID must run with the start time that the records (or the descriptor) hold.
+- **The CLI.** Its process ID must run with the recorded start time.
+  - The start time comes from the descriptor (`process-start-time`) when the descriptor holds the same PID.
+  - Else it comes from the live process only for a live process object of this Emacs with that PID: Emacs has not reaped it, so the PID cannot belong to another process.
+  - A live process with another start time never replaces the recorded one: the CLI is then gone, and its PID belongs to another process.
+  - Without a known start time, the CLI cannot be verified. It gets no signal, and its descendants are not recorded.
 - **A recorded group.** It gets a signal only when one of its live processes is the recorded leader with the same start time, or a recorded process with the same start time.
   - `ps` gives whole seconds, so start times within 1.5 seconds count as the same.
   - So a group ID that the system gave again to an unrelated process gets no signal.
 - **Never:**
-  - process 0 or 1, Emacs, an ancestor of Emacs, or their process groups;
+  - process 0 or 1, Emacs, any ancestor of Emacs, or their process groups. The protected set comes from the full `ps` table of the snapshot. A CLI in a protected group gets a signal alone, never its group;
   - a group with a process of another user;
   - the tree of another running instance.
 - **Strays are never ended.** The worktree scan, and processes of unproven groups, only go into the result.
@@ -154,4 +170,4 @@ The orchestrator adds these calls. Each call checks `fboundp`, so the package wo
   - The CLI ended by itself: `claude-code-ide-process-untrack`. What it left running was its own choice, for example "Move to background and exit".
   - Called from `kill-buffer-hook` (BUFFER-DYING): `claude-code-ide-process-stop-later` with `:scan nil`.
   - Else: `claude-code-ide-process-stop` with `:scan nil`, and then the buffer kill.
-- **`kill-emacs-hook`:** `claude-code-ide-process-stop-many` for all instances with `:timeout claude-code-ide-process-quit-timeout`, `:kill-wait 0.5`, and `:scan nil`, before the cleanup of each session. The hook must run before the ghostel hook, which sends SIGKILL to its native children.
+- **`kill-emacs-hook`:** `claude-code-ide-process-stop-many` for all instances with `:budget claude-code-ide-process-quit-timeout` (1.5 s for all waits together), `:timeout 1`, `:kill-wait 0.25`, and `:scan nil`, before the cleanup of each session. The hook must run before the ghostel hook, which sends SIGKILL to its native children.
