@@ -741,6 +741,7 @@ Codex instances are in the same buffer. Each line shows the provider, the model 
 
 - A Codex start asks you to trust its status hooks when they are not trusted yet (see Codex). =M-x claude-code-ide-codex-trust-hooks= is the manual way, for example after a no: it shows the hooks and, after a confirmation, trusts them in =~/.codex/config.toml=. An instance that started without hooks gets status after its restart.
 - =claude-code-ide-codex-events-trust-timeout= (default 5) is the number of seconds that a start from a command waits for the hook trust check.
+- =claude-code-ide-session-status-hook-time-limit= (default 10) is the number of seconds that a status hook waits for its lock under a heavy load. After that, it drops its event, writes a line to =hook-errors.log= in the events folder, and exits, so that it never holds up the CLI for longer.
 - =claude-code-ide-session-status-snapshot= (default =t=) writes =<report directory>/status/<emacs pid>.json= for coordinators; see [[file:docs/status-schema.md][docs/status-schema.md]].
 
 Each state says who waits for whom. They are listed in the order of the buffer: what needs you first.
