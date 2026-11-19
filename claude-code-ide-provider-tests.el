@@ -557,6 +557,17 @@ cdr of its :cleanup key."
   (should-error (claude-code-ide-instance-make-state 'idle 'approval))
   (should-error (claude-code-ide-instance-make-state 'waiting-for-task 'approval)))
 
+(ert-deftest claude-code-ide-test-instance-make-state-start-and-signal-reasons ()
+  "A start is working/starting; a session without events is disconnected."
+  (should (eq (plist-get (claude-code-ide-instance-make-state 'working 'starting) :reason)
+              'starting))
+  (should (eq (plist-get (claude-code-ide-instance-make-state 'disconnected 'untracked) :reason)
+              'untracked))
+  (should (eq (plist-get (claude-code-ide-instance-make-state 'disconnected 'no-signal) :reason)
+              'no-signal))
+  (should-error (claude-code-ide-instance-make-state 'idle 'starting))
+  (should-error (claude-code-ide-instance-make-state 'working 'untracked)))
+
 ;;; Registry schema
 
 (ert-deftest claude-code-ide-test-registry-v1-and-v2-files ()
