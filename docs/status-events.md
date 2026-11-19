@@ -42,6 +42,16 @@ The script does these steps:
 4. It writes the record to a temporary file: `{"event": EVENT, "instance_id": ID, "generation": "N", "input": STDIN}`.
 5. It takes a lock for the launch, increments the counter of the launch, and renames the file to its final name.
 
+### The time limit of the lock
+
+The Claude Code hook script and the Codex hook script share one lock loop. Emacs writes it into both scripts when it installs them (`claude-code-ide-session-status--lock-loop`).
+
+- **Real time, not tries.** The loop reads the time with `date +%s` (POSIX, so it works under `/bin/sh` on macOS). It gives up when more than `claude-code-ide-session-status-hook-time-limit` seconds (default 10) have passed, however slow the machine is. So the real wait is between the limit and the limit plus one second. If `date` gives no number, a count of the tries (100 a second) stands in.
+- **Giving up.** The hook removes its temporary file, drops its event, writes one line to `hook-errors.log` in the events folder (only while that file is smaller than 64 KiB), and exits with 0. So it never fails or holds up the tool call of the CLI for longer.
+- **A dead holder.** From 2 seconds of waiting on (earlier for a limit under 3 seconds), the hook checks once a second whether the process in the `pid` file of the lock runs. It breaks the lock of a holder that is gone. Emacs also removes locks older than 3 seconds.
+- **One value.** The limit is a defcustom. Emacs writes it into the scripts (`limit=10`), and the content check at each launch rewrites a script with another value. A change applies to the next start.
+- **No new trust.** The limit is in the script, not in the hook command. The hook arguments, and so the Codex trust hash and the trust key, do not change with it.
+
 ## Hook arguments and environment
 
 `(claude-code-ide-codex-status-hook-args INSTANCE)` returns the list `("-c" "hooks.SessionStart=[...]" "-c" "hooks.SessionEnd=[...]" ...)`.

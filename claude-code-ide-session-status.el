@@ -223,6 +223,78 @@ A sign of work, such as a tool event, ends it.")
   "[Request interrupted by user"
   "Text that the CLI writes to the transcript after an interrupt.")
 
+(defcustom claude-code-ide-session-status-hook-time-limit 10
+  "Seconds of real time that a status hook waits at most for its lock.
+The status hooks of Claude Code and of Codex number the events of a
+launch under a lock.  A hook that does not get the lock in this time
+gives up: it drops its event, writes one line to hook-errors.log in the
+events folder, and exits 0, so it never fails or holds up a tool call
+of the CLI for longer.  Emacs writes the value into the hook scripts
+when it installs them, so a change applies to the next start."
+  :type 'natnum
+  :group 'claude-code-ide)
+
+(defconst claude-code-ide-session-status--hook-break-after 2
+  "Seconds after which a waiting hook checks whether the lock holder died.
+A hook breaks the lock of a holder whose process is gone; it checks
+once a second from then on.")
+
+(defun claude-code-ide-session-status--hook-limit ()
+  "Return the time limit of the status hooks as a whole number of seconds."
+  (max 1 (round claude-code-ide-session-status-hook-time-limit)))
+
+(defun claude-code-ide-session-status--lock-loop ()
+  "Return the shell text that waits for the lock $lock of a status hook.
+The text runs in the subshell of a hook script, which sets $dir, $tmp,
+$lock and $event.  It measures real time with `date +%s', so a slow
+machine does not make the wait longer: after more than
+`claude-code-ide-session-status-hook-time-limit' seconds it removes
+$tmp, writes one line to $dir/hook-errors.log (at most 64 KiB), and
+exits 0.  From `claude-code-ide-session-status--hook-break-after'
+seconds on (earlier for a short limit), it breaks the lock of a holder
+whose process is gone, once a second.  When `date' gives no number, a
+count of the tries stands in for the seconds."
+  (let* ((limit (claude-code-ide-session-status--hook-limit))
+         (break (max 0 (min claude-code-ide-session-status--hook-break-after (1- limit)))))
+    (format "  # Wait for the lock at most %d s of real time, however slow the
+  # machine is.  Break the lock of a holder that died; Emacs removes old
+  # locks too.
+  limit=%d
+  start=$(date +%%s)
+  case $start in ''|*[!0-9]*) start=0 ;; esac
+  tries=0
+  checked=-1
+  until mkdir \"$lock\"; do
+    tries=$((tries + 1))
+    now=$(date +%%s)
+    case $now in ''|*[!0-9]*) now=$((start + tries / 100)) ;; esac
+    waited=$((now - start))
+    if [ \"$waited\" -ge %d ] && [ \"$waited\" -ne \"$checked\" ]; then
+      checked=$waited
+      holder=$(cat \"$lock/pid\")
+      if [ -n \"$holder\" ] && ! kill -0 \"$holder\"; then rm -rf \"$lock\"; continue; fi
+    fi
+    if [ \"$waited\" -gt \"$limit\" ]; then
+      rm -f \"$tmp\"
+      log=\"$dir/hook-errors.log\"
+      size=$(wc -c < \"$log\" | tr -d ' ')
+      case $size in ''|*[!0-9]*) size=0 ;; esac
+      if [ \"$size\" -lt 65536 ]; then
+        echo \"$(date +%%Y-%%m-%%dT%%H:%%M:%%S) $event: no lock after $waited s ($lock); event dropped\" >> \"$log\"
+      fi
+      exit 0
+    fi
+    sleep 0.01
+  done
+" limit limit break)))
+
+(defun claude-code-ide-session-status--fill-script (template)
+  "Return the hook script TEMPLATE with its lock loop and time limit.
+TEMPLATE has the mark @LOCK_LOOP@ where the loop of
+`claude-code-ide-session-status--lock-loop' goes."
+  (replace-regexp-in-string "^@LOCK_LOOP@\n" (claude-code-ide-session-status--lock-loop)
+                            template t t))
+
 (defconst claude-code-ide-session-status--script
   "#!/bin/sh
 # claude-code-ide session status: stores the input of one Claude Code hook
@@ -238,17 +310,7 @@ exec 2>/dev/null >/dev/null
   cat > \"$tmp\" || { rm -f \"$tmp\"; exit 0; }
   # Number the events of this launch in the order they are published
   lock=\"$dir/.$nonce.lock\"
-  tries=0
-  until mkdir \"$lock\"; do
-    tries=$((tries + 1))
-    # Break only the lock of a holder that died; Emacs removes old locks
-    if [ \"$tries\" -eq 50 ]; then
-      holder=$(cat \"$lock/pid\")
-      if [ -n \"$holder\" ] && ! kill -0 \"$holder\"; then rm -rf \"$lock\"; fi
-    fi
-    if [ \"$tries\" -gt 400 ]; then rm -f \"$tmp\"; exit 0; fi
-    sleep 0.01
-  done
+@LOCK_LOOP@
   echo $$ > \"$lock/pid\"
   seq=$(cat \"$dir/.$nonce.seq\")
   case $seq in ''|*[!0-9]*) seq=0 ;; esac
@@ -260,7 +322,12 @@ exec 2>/dev/null >/dev/null
 cat >/dev/null
 exit 0
 "
-  "Script that each status hook runs.")
+  "Template of the script that each status hook runs.
+`claude-code-ide-session-status--script-text' fills in the lock loop.")
+
+(defun claude-code-ide-session-status--script-text ()
+  "Return the status hook script, with the current time limit."
+  (claude-code-ide-session-status--fill-script claude-code-ide-session-status--script))
 
 ;;; State
 
@@ -372,9 +439,9 @@ file and renamed."
   (let ((file (claude-code-ide-session-status--script-file)))
     (unless (and (file-exists-p file)
                  (equal (claude-code-ide-session-registry--file-string file)
-                        claude-code-ide-session-status--script))
+                        (claude-code-ide-session-status--script-text)))
       (claude-code-ide-session-status--write-file-atomically
-       file claude-code-ide-session-status--script))))
+       file (claude-code-ide-session-status--script-text)))))
 
 (defun claude-code-ide-session-status--command (nonce event)
   "Return the hook command that records EVENT for the launch NONCE."

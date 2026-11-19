@@ -302,14 +302,14 @@ source is listed too, and must not count."
       (should (= (file-modes dir) #o700))
       (should (zerop (logand (file-modes file) #o022)))
       (should (equal (claude-code-ide-session-registry--file-string file)
-                     claude-code-ide-codex-events--script))
+                     (claude-code-ide-codex-events--script-text)))
       ;; No temporary file stays
       (should (equal (directory-files dir nil "\\`[^.]") (list (file-name-nondirectory file))))
       ;; A changed script is replaced at the next launch
       (with-temp-file file (insert "#!/bin/sh\necho changed\n"))
       (claude-code-ide-codex-events--install-script)
       (should (equal (claude-code-ide-session-registry--file-string file)
-                     claude-code-ide-codex-events--script))
+                     (claude-code-ide-codex-events--script-text)))
       ;; A folder that others can use gets the private mode again
       (set-file-modes dir #o755)
       (claude-code-ide-codex-events--install-script)
@@ -353,8 +353,8 @@ does not depend on the speed of the machine, as a time would."
 (declare-function claude-code-ide-tests--script-lock-budget "claude-code-ide-session-status-tests")
 
 (ert-deftest claude-code-ide-codex-events-test-script-lock-budget ()
-  "The tries of the Codex hook script give 20 parallel writers enough time."
-  (claude-code-ide-tests--script-lock-budget claude-code-ide-codex-events--script))
+  "The time limit of the Codex hook script gives 20 parallel writers enough time."
+  (claude-code-ide-tests--script-lock-budget (claude-code-ide-codex-events--script-text)))
 
 (ert-deftest claude-code-ide-codex-events-test-script-exits-without-identity ()
   "The script records nothing without CCI_INSTANCE_ID or with CODEX_THREAD_ID."
@@ -2006,6 +2006,97 @@ the entries of a good one."
           (unless (file-readable-p file)
             (should-not (claude-code-ide-transcript--codex-config-entries)))
         (set-file-modes file #o600)))))
+
+;;; The time limit of the hook script
+
+(declare-function claude-code-ide-tests--held-lock-run "claude-code-ide-session-status-tests")
+
+(defun claude-code-ide-codex-events-tests--script-env (dir id generation)
+  "Return the environment of a Codex hook for the launch ID GENERATION in DIR."
+  (list (concat "CCI_EVENTS_DIR=" dir) (concat "CCI_INSTANCE_ID=" id)
+        (format "CCI_GENERATION=%d" generation) "CODEX_THREAD_ID"))
+
+(ert-deftest claude-code-ide-codex-events-test-script-time-limit ()
+  "A Codex hook whose lock stays held gives up after about the time limit.
+Real time with a generous bound: the script is a shell process."
+  (claude-code-ide-codex-events-tests--with-codex
+    (let ((claude-code-ide-session-status-hook-time-limit 1))
+      (claude-code-ide-codex-events--install-script)
+      (let* ((dir (claude-code-ide-codex-events--private-directory
+                   (claude-code-ide-codex-events--events-directory)))
+             (result (claude-code-ide-tests--held-lock-run
+                      (claude-code-ide-codex-events--script-file) '("Stop")
+                      (expand-file-name ".cci-test-held.1.lock" dir)
+                      (claude-code-ide-codex-events-tests--script-env dir "cci-test-held" 1))))
+        (should (equal (butlast result) '(0 "")))
+        (should (>= (nth 2 result) 0.9))
+        (should (< (nth 2 result) 20))
+        (should-not (directory-files dir nil claude-code-ide-codex-events--file-regexp))
+        (should-not (directory-files dir nil "\\.in\\."))
+        (should (string-match-p "Stop: no lock after"
+                                (claude-code-ide-session-registry--file-string
+                                 (expand-file-name "hook-errors.log" dir))))))))
+
+(ert-deftest claude-code-ide-codex-events-test-script-dead-holder-and-writers ()
+  "The Codex hook breaks the lock of a dead holder, and serves 20 parallel writers."
+  (claude-code-ide-codex-events-tests--with-codex
+    (claude-code-ide-codex-events--install-script)
+    (let* ((dir (claude-code-ide-codex-events--private-directory
+                 (claude-code-ide-codex-events--events-directory)))
+           (script (claude-code-ide-codex-events--script-file))
+           (lock (expand-file-name ".cci-test-dead.1.lock" dir)))
+      ;; A holder that is not running
+      (make-directory lock t)
+      (with-temp-file (expand-file-name "pid" lock) (insert "999999\n"))
+      (let ((process-environment (append (claude-code-ide-codex-events-tests--script-env
+                                          dir "cci-test-dead" 1)
+                                         process-environment)))
+        (with-temp-buffer
+          (insert "{}")
+          (should (zerop (call-process-region (point-min) (point-max) "/bin/sh" nil nil nil
+                                              script "Stop")))))
+      (should (equal (directory-files dir nil "\\`cci-test-dead\\.")
+                     '("cci-test-dead.1.00000001.Stop.json")))
+      (should-not (file-exists-p lock))
+      ;; 20 writers at the same time: all events, numbered without gaps
+      (let ((process-environment (append (claude-code-ide-codex-events-tests--script-env
+                                          dir "cci-test-many" 2)
+                                         process-environment)))
+        (with-temp-buffer
+          (should (zerop (call-process
+                          "/bin/sh" nil t nil "-c"
+                          (format "i=0; while [ $i -lt 20 ]; do echo '{}' | /bin/sh %s Stop & i=$((i+1)); done; wait"
+                                  (shell-quote-argument script)))))
+          (should (equal (buffer-string) ""))))
+      (should (equal (mapcar (lambda (file) (string-to-number (nth 2 (split-string file "\\."))))
+                             (directory-files dir nil "\\`cci-test-many\\.2\\.[0-9]+\\.Stop\\.json\\'"))
+                     (number-sequence 1 20))))))
+
+(ert-deftest claude-code-ide-codex-events-test-script-limit-needs-no-trust ()
+  "The time limit is in the Codex script, not in the hook command.
+So the hook arguments and the trust key do not change with it: a new
+limit needs no new trust."
+  (claude-code-ide-codex-events-tests--with-codex
+    (let ((args (let ((claude-code-ide-session-status-hook-time-limit 3))
+                  (list (claude-code-ide-codex-events--hook-args)
+                        (claude-code-ide-codex-events--trust-key)
+                        (claude-code-ide-codex-events--script-text))))
+          (other (let ((claude-code-ide-session-status-hook-time-limit 10))
+                   (list (claude-code-ide-codex-events--hook-args)
+                         (claude-code-ide-codex-events--trust-key)
+                         (claude-code-ide-codex-events--script-text)))))
+      (should (equal (nth 0 args) (nth 0 other)))
+      (should (equal (nth 1 args) (nth 1 other)))
+      (should-not (equal (nth 2 args) (nth 2 other)))
+      (should-not (string-match-p "limit" (string-join (nth 0 args) " ")))
+      ;; The installed script holds the limit; the launch check rewrites another one
+      (let ((claude-code-ide-session-status-hook-time-limit 4))
+        (let ((file (claude-code-ide-codex-events--install-script)))
+          (should (string-match-p "^  limit=4$" (claude-code-ide-session-registry--file-string file)))
+          (let ((claude-code-ide-session-status-hook-time-limit 10))
+            (should-not (claude-code-ide-codex-events--script-ok-p file))
+            (claude-code-ide-codex-events--install-script)
+            (should (claude-code-ide-codex-events--script-ok-p file))))))))
 
 (provide 'claude-code-ide-codex-events-tests)
 
