@@ -27,7 +27,10 @@ Rules for all readers:
 - Tool results are left out.
 - A tool line is at most `claude-code-ide-transcript-tool-line-limit` characters.
 - With a ROOT folder, a path inside ROOT becomes relative, and a leading `cd DIR &&` is removed from a command.
+  - ROOT counts only as a whole path, with case: for ROOT `/a/proj`, the paths `/a/proj-other`, `/a/proj.bak`, and `/b/a/proj` do not change.
 - A broken line, a line that is not a JSON object, and a record of an unknown type are skipped. The read continues.
+- A record whose handling signals an error is skipped. One bad record cannot stop the read.
+- Markers in large texts are found with string positions, not with one large regexp. A tool result of 1 MB does not overflow the regexp stack.
 
 ## The readers
 
@@ -37,7 +40,7 @@ Rules for all readers:
 | `(claude-code-ide-transcript-read-claude FILE &optional ROOT)` | A CC transcript in `~/.claude/projects/`. |
 | `(claude-code-ide-transcript-read-codex FILE &optional ROOT)` | A Codex rollout in `~/.codex/sessions/`. |
 | `(claude-code-ide-transcript-format FILE)` | Returns `claude`, `codex`, or nil, from the first records. |
-| `(claude-code-ide-transcript-codex-meta FILE)` | Returns `(:id :cwd :commit :branch :time)` from the `session_meta` record of a rollout. |
+| `(claude-code-ide-transcript-codex-meta FILE)` | Returns `(:id :cwd :commit :branch :time)` from the `session_meta` record of a rollout. It reads only the start of the file. |
 
 `claude-code-ide-transcript-readers` maps a format to its reader. A new provider can add its reader there.
 
@@ -48,7 +51,9 @@ Rules for all readers:
   - `isMeta`, `isSidechain`, or `isCompactSummary` is true.
   - The record has `toolUseResult` (a tool result).
   - `promptSource` is `"system"` (for example a task notification).
-  - The text starts with a tag that the CLI writes, for example `<local-command-stdout>` or `<system-reminder>`.
+- Each text block of a prompt is cleaned on its own. A block of the CLI drops only itself, and the text of the person stays. A block is from the CLI when:
+  - It starts with a tag that the CLI writes, for example `<local-command-stdout>` or `<system-reminder>`.
+  - It is an interrupt marker, for example `[Request interrupted by user]` or `[Request interrupted by user for tool use]`.
 - A slash command becomes `/NAME ARGS`. A shell escape (`<bash-input>`) becomes `! COMMAND`.
 - An image in a prompt becomes `[image]`.
 - In an `assistant` record, `text` blocks give the text, and `tool_use` blocks give the tool lines. `thinking` blocks are left out.
@@ -63,13 +68,18 @@ Rules for all readers:
   - `McpToolCall` gives `mcp: SERVER/TOOL`. `CollabAgentToolCall` and `SubAgentActivity` give `agent:` and `subagent:` lines.
   - `Reasoning` and unknown item types are left out.
 - `response_item` records are not read. Their `custom_tool_call` "exec" records hold code-mode wrappers, not the commands.
-- A rollout without `item_completed` records (an imported one, with `history_mode: legacy`) gives its turns from the `user_message` and `agent_message` events.
+- An imported rollout (`history_mode: legacy`) has its history only in the `user_message` and `agent_message` events.
+  - The events give the turns up to the turn with the first `item_completed` record (its `task_started` record, else the first item). From there on, only the items give turns, because a resume can write an event and an item for the same message.
+  - The first item is left out when it repeats the last event turn.
+  - A rollout without `item_completed` records gives all its turns from the events. A legacy rollout that `codex exec resume` continued is such a rollout.
   - `[external_agent_tool_call: NAME] ... [/external_agent_tool_call]` text becomes a tool line.
   - `[external_agent_tool_result] ...` text and the `<EXTERNAL SESSION IMPORTED>` marker are left out.
 
 ### Speed
 
 - A reader reads the whole file. It parses only the lines that can hold a turn.
+- The document reads each transcript one time. The Codex reader returns the session metadata from the same read.
+- The document renders each turn one time. Only a user turn whose prompt the budget left out of the prompt list is rendered again, with its text.
 - Measured on Emacs 30.1: a 400 MB CC transcript takes about 8 seconds. Transcripts below 1 MB take less than 0.1 seconds.
 
 ## Workspace state
@@ -140,6 +150,7 @@ A leg is a plist, or an instance descriptor that becomes a plist:
 3. **Context from the coordinator**, when CONTEXT is given.
 4. **History of the chain:**
    - **Original task:** the first user prompt of the first leg, marked "it can be out of date". When a handover document started the first leg, the original task of that document is used.
+     - When no original task is found, the part says "Not found in the transcripts.". The next document reads this as no original task, not as a prompt. The prompt list then starts at P1.
    - **State summary of the previous target:** the summary file of the source, verbatim. The file comes from `:summary-file`, or from the document that started the source. The part is left out when no handover started the source.
    - **User prompts of the chain:** every other user prompt, oldest first, with the numbers P2, P3, and so on. P1 is the original task. Each prompt is cut to `claude-code-ide-transcript-prompt-limit` characters.
    - **Latest turns:** the turns of all legs, oldest first. Each turn text is cut to `claude-code-ide-transcript-turn-limit` characters. A user turn whose prompt is already in the document shows only its number, for example "(P5 in the list of user prompts above.)".
@@ -158,7 +169,7 @@ All transcript text (prompts, turns, and the state summary) is in Markdown block
 
 Test S7 showed that a document that copies the previous document doubles in size at each leg, and that it carries old instructions.
 
-- A user turn that holds the marker of a handover document is a document turn.
+- A user turn whose first line is the marker of a handover document is a document turn. A marker in a later line, for example in a quoted text, does not count.
 - A document turn and the assistant turns after it, up to the next user turn, are the bootstrap of a leg. The bootstrap is left out of the prompts and of the latest turns. This also leaves out the turn that wrote the state summary and the "ready" reply.
 - The document names each earlier document only by its handover ID and hash, in the header.
 - `(claude-code-ide-transcript-document-id TEXT)`, `(claude-code-ide-transcript-document-summary-file TEXT)`, and `(claude-code-ide-transcript-document-original-task TEXT)` read these values from a document.
@@ -167,7 +178,7 @@ Test S7 showed that a document that copies the previous document doubles in size
 
 - The budget never cuts the header, the workspace state, the coordinator context, the original task, the "not carried over" list, or the instructions. When these parts are larger than the budget, the document is larger than the budget.
 - The rest of the budget goes to the other parts, in this order:
-  1. The state summary. It is cut at the end when it does not fit.
+  1. The state summary. It is cut at the end when it does not fit, and its last line is `> [... cut]`. The size counts the `> ` of each quoted line.
   2. The user prompts. They get half of the rest, or more when the latest turns need less. The oldest prompts are left out first.
   3. The latest turns. They get what remains. The oldest turns are left out first.
 - A note counts what is left out, for example "(84 earlier prompts are left out because of the size budget.)".
