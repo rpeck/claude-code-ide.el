@@ -127,12 +127,17 @@ The stop sends signals only to processes that it can prove are the work of the C
 
 - **The CLI.** Its process ID must run with the recorded start time.
   - The start time comes from the descriptor (`process-start-time`) when the descriptor holds the same PID.
-  - Else it comes from the live process only for a live process object of this Emacs with that PID: Emacs has not reaped it, so the PID cannot belong to another process.
+  - Else it comes from the live process only when the process object is the real child: a live process object of this Emacs whose own process ID is that PID. Emacs has not reaped it, so the PID cannot belong to another process.
+  - A ghostel pipe is not the real child. ghostel's native thread reaps the child before the pipe closes, so the PID of a live pipe can belong to an unrelated process. For ghostel, the launch must record the native PID and its start time in the descriptor.
   - A live process with another start time never replaces the recorded one: the CLI is then gone, and its PID belongs to another process.
   - Without a known start time, the CLI cannot be verified. It gets no signal, and its descendants are not recorded.
+  - The CLI's whole group gets the signal only when the CLI leads it, the group is not protected, and every member of the group has the user ID of Emacs. Else the CLI gets the signal alone. Example: a child that runs `sudo` (effective user ID 0) never gets the signal of the group.
 - **A recorded group.** It gets a signal only when one of its live processes is the recorded leader with the same start time, or a recorded process with the same start time.
   - `ps` gives whole seconds, so start times within 1.5 seconds count as the same.
   - So a group ID that the system gave again to an unrelated process gets no signal.
+  - Only processes that a record saw before the stop prove a group. The proof does not grow during a stop, because a later member could be a reused PID within the 1.5 seconds.
+  - SIGKILL comes from a new check. Right before SIGKILL, a fresh `ps` table checks each group again in full: a proving process, no protected process or group, and the user ID of Emacs for every member. Between SIGTERM and SIGKILL the group can end and its ID can go to an unrelated group.
+  - A nil start time never matches in a check that leads to a signal. Only the end of a wait counts a nil start time as "still there", so that a wait does not end too early.
 - **Never:**
   - process 0 or 1, Emacs, any ancestor of Emacs, or their process groups. The protected set comes from the full `ps` table of the snapshot. A CLI in a protected group gets a signal alone, never its group;
   - a group with a process of another user;
