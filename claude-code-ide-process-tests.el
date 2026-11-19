@@ -189,9 +189,11 @@ The default is provider `claude', pid 100 and ID cci-test-process."
                      (claude-code-ide-process-tests--entry 201 200 200)
                      (claude-code-ide-process-tests--entry 900 1 900))))
     (should (equal (mapcar (lambda (e) (plist-get e :pid))
-                           (claude-code-ide-process--descendants table 100))
+                           (claude-code-ide-process--descendants
+                            (claude-code-ide-process--snapshot table) 100))
                    '(100 110 200 201)))
-    (should-not (claude-code-ide-process--descendants table 999))))
+    (should-not (claude-code-ide-process--descendants
+                 (claude-code-ide-process--snapshot table) 999))))
 
 (ert-deftest claude-code-ide-test-process-track-records-groups ()
   "Tracking records each descendant group with its leader, never the group of Emacs."
@@ -420,7 +422,8 @@ The default is provider `claude', pid 100 and ID cci-test-process."
     (let* ((instance (claude-code-ide-process-tests--instance))
            (track (claude-code-ide-process--new-track instance nil)))
       (puthash "cci-test-process" track claude-code-ide-process--tracks)
-      (claude-code-ide-process--record track (funcall claude-code-ide-process-list-function) 1)
+      (claude-code-ide-process--record
+       track (claude-code-ide-process--snapshot (funcall claude-code-ide-process-list-function)) 1)
       ;; A forged record of the group of Emacs must not matter
       (puthash 50 (list :pgid 50 :leader-start claude-code-ide-process-tests--start)
                (claude-code-ide-process--track-groups track))
@@ -481,6 +484,7 @@ The default is provider `claude', pid 100 and ID cci-test-process."
                         :worktree worktree :project-root worktree))
                 (second (claude-code-ide-instance-create
                          :id "cci-test-process-2" :provider 'codex :pid 400
+                   :process-start-time claude-code-ide-process-tests--start
                          :worktree worktree)))
             (claude-code-ide-process-track first nil)
             (claude-code-ide-process-track second nil)
@@ -536,19 +540,245 @@ The default is provider `claude', pid 100 and ID cci-test-process."
                 'stopped))
     (should-not claude-code-ide-process-tests--signals)))
 
-(ert-deftest claude-code-ide-test-process-stop-wrong-start-time ()
-  "A PID whose start time differs from the descriptor's is another process: no signal."
+;;; Review fixes: no signal to a process that the package did not start
+
+(ert-deftest claude-code-ide-test-process-stop-reused-root-pid ()
+  "A reused PID with a new start time is another process: no signal, no record.
+The entry function gives the start time of the process that holds the
+PID now, as a real one does."
   (claude-code-ide-process-tests--with-table
-      (list (claude-code-ide-process-tests--entry 100 1 100 9000.0))
-    (let ((claude-code-ide-process-entry-function
-           ;; The entry function gives no start time, so the descriptor's counts
-           (lambda (pid)
-             (when-let* ((e (copy-sequence (claude-code-ide-process-tests--find pid))))
-               (if (eql pid 100) (plist-put e :start nil) e)))))
-      (let ((result (claude-code-ide-process-stop
-                     (claude-code-ide-process-tests--instance) :scan nil)))
-        (should (eq (plist-get result :status) 'stopped))
+      (list (claude-code-ide-process-tests--entry 100 1 100 9000.0)
+            (claude-code-ide-process-tests--entry 200 100 200 9001.0))
+    (let* ((instance (claude-code-ide-process-tests--instance))
+           (result (claude-code-ide-process-stop instance :scan nil)))
+      (should (eq (plist-get result :status) 'stopped))
+      (should-not claude-code-ide-process-tests--signals)
+      (should (claude-code-ide-process-tests--find 100))
+      (should (claude-code-ide-process-tests--find 200)))
+    ;; Tracking does not record the descendants of the other process
+    (let ((instance (claude-code-ide-process-tests--instance)))
+      (claude-code-ide-process-track instance nil)
+      (should-not (claude-code-ide-process-groups instance)))))
+
+(ert-deftest claude-code-ide-test-process-stop-unverifiable-root ()
+  "A root without a known start time cannot be verified: no signal, no record."
+  (should-not (claude-code-ide-process--entry-alive-p (emacs-pid) nil))
+  (claude-code-ide-process-tests--with-table
+      (list (claude-code-ide-process-tests--entry 100 1 100)
+            (claude-code-ide-process-tests--entry 200 100 200))
+    (let ((instance (claude-code-ide-instance-create
+                     :id "cci-test-process" :provider 'claude :pid 100)))
+      (claude-code-ide-process-track instance nil)
+      (should-not (claude-code-ide-process-groups instance))
+      (let ((result (claude-code-ide-process-stop instance :scan nil)))
+        ;; Its PID runs, but nobody can tell whether it is the CLI
+        (should (eq (plist-get result :status) 'strays))
+        (should (equal (mapcar (lambda (s) (list (plist-get s :pid) (plist-get s :reason)))
+                               (plist-get result :strays))
+                       '((100 unverified))))
         (should-not claude-code-ide-process-tests--signals)))))
+
+(ert-deftest claude-code-ide-test-process-stop-spares-emacs-ancestor-root ()
+  "A root that is an ancestor of Emacs, or in the group of one, gets no signal."
+  ;; 50 is the parent of Emacs in the synthetic table, and 40 its parent
+  (claude-code-ide-process-tests--with-table
+      (list (claude-code-ide-process-tests--entry 40 1 40))
+    (plist-put (claude-code-ide-process-tests--find 50) :ppid 40)
+    (dolist (pid '(40 50))
+      (setq claude-code-ide-process-tests--signals nil)
+      (let ((result (claude-code-ide-process-stop
+                     (claude-code-ide-instance-create
+                      :id "cci-test-ancestor" :provider 'claude :pid pid
+                      :process-start-time claude-code-ide-process-tests--start)
+                     :scan nil :timeout 0.01 :kill-wait 0.01)))
+        (should-not claude-code-ide-process-tests--signals)
+        (should (eq (plist-get result :status) 'timeout))
+        (should (claude-code-ide-process-tests--find pid)))))
+  ;; A root in the group of an ancestor gets the signal alone, never the group
+  (claude-code-ide-process-tests--with-table
+      (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 50))
+    (claude-code-ide-process-stop (claude-code-ide-process-tests--instance) :scan nil)
+    (should (equal (car (claude-code-ide-process-tests--signal-list)) '(100 SIGHUP)))
+    (should-not (cl-find -50 claude-code-ide-process-tests--signals :key #'car))))
+
+(ert-deftest claude-code-ide-test-process-stop-ps-failure ()
+  "When ps fails, the stop sends nothing, keeps the records, and reports error."
+  (claude-code-ide-process-tests--with-table
+      (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+            (claude-code-ide-process-tests--entry 200 100 200))
+    (let ((instance (claude-code-ide-process-tests--instance)))
+      (claude-code-ide-process-track instance nil)
+      (let* ((claude-code-ide-process-list-function #'ignore)
+             (result (claude-code-ide-process-stop instance :scan nil)))
+        (should (eq (plist-get result :status) 'error))
+        (should (stringp (plist-get result :reason))))
+      (should-not claude-code-ide-process-tests--signals)
+      (should (equal (mapcar (lambda (g) (plist-get g :pgid))
+                             (claude-code-ide-process-groups instance))
+                     '(100 200)))))
+  ;; ps fails in the middle, before the groups are ended
+  (claude-code-ide-process-tests--with-table
+      (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+            (claude-code-ide-process-tests--entry 200 100 200))
+    (let* ((instance (claude-code-ide-process-tests--instance))
+           (calls 0)
+           (list-function claude-code-ide-process-list-function))
+      (claude-code-ide-process-track instance nil)
+      (add-hook 'claude-code-ide-process-tests--reactions
+                (claude-code-ide-process-tests--cli-exits-on 'SIGHUP))
+      (let* ((claude-code-ide-process-list-function
+              (lambda () (when (<= (cl-incf calls) 1) (funcall list-function))))
+             (result (claude-code-ide-process-stop instance :scan nil)))
+        (should (eq (plist-get result :status) 'error)))
+      (should (equal (claude-code-ide-process-tests--signal-list) '((-100 SIGHUP))))
+      (should (claude-code-ide-process-tests--find 200))
+      (should (claude-code-ide-process--track-of instance)))))
+
+(ert-deftest claude-code-ide-test-process-timer-survives-old-ps ()
+  "A ps run that started before a new CLI existed does not stop the timer."
+  (claude-code-ide-process-tests--with-table
+      (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100))
+    (let* ((pending nil)
+           (claude-code-ide-process-list-async-function
+            (lambda (callback)
+              (push (cons callback (mapcar #'copy-sequence
+                                           claude-code-ide-process-tests--table))
+                    pending))))
+      (claude-code-ide-process-track (claude-code-ide-process-tests--instance) nil)
+      ;; The first CLI ends; a new one starts while the old ps still runs
+      (claude-code-ide-process-tests--remove 100)
+      (let ((old-table (cl-remove 100 (cdar pending)
+                                  :key (lambda (e) (plist-get e :pid)))))
+        (push (claude-code-ide-process-tests--entry 300 (emacs-pid) 300)
+              claude-code-ide-process-tests--table)
+        (claude-code-ide-process-track
+         (claude-code-ide-instance-create
+          :id "cci-test-process-new" :provider 'claude :pid 300
+          :process-start-time claude-code-ide-process-tests--start)
+         nil)
+        (funcall (caar pending) old-table))
+      (should (timerp claude-code-ide-process--timer)))))
+
+(ert-deftest claude-code-ide-test-process-stop-new-process-merges-records ()
+  "A stop with a process of another PID also ends the groups of the old records."
+  (claude-code-ide-process-tests--with-table
+      (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+            (claude-code-ide-process-tests--entry 200 100 200)
+            (claude-code-ide-process-tests--entry 300 (emacs-pid) 300))
+    (let ((instance (claude-code-ide-process-tests--instance))
+          (pipe (make-pipe-process :name "cci-test-new-cli" :noquery t)))
+      (unwind-protect
+          (progn
+            (claude-code-ide-process-track instance nil)
+            ;; The old CLI is gone; its background group runs on
+            (claude-code-ide-process-tests--remove 100)
+            (process-put pipe 'ghostel--native-pid 300)
+            (add-hook 'claude-code-ide-process-tests--reactions
+                      (lambda (target signal)
+                        (when (and (eql target -300) (eq signal 'SIGHUP))
+                          (claude-code-ide-process-tests--remove 300))))
+            (let ((result (claude-code-ide-process-stop instance :process pipe :scan nil)))
+              (should (eq (plist-get result :status) 'stopped))
+              (should (equal (plist-get result :ended) '(200))))
+            (should (equal (claude-code-ide-process-tests--signal-list)
+                           '((-300 SIGHUP) (-200 SIGTERM))))
+            (should-not (claude-code-ide-process--track-of instance)))
+        (delete-process pipe))))
+  ;; A process without a PID keeps the records
+  (claude-code-ide-process-tests--with-table
+      (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+            (claude-code-ide-process-tests--entry 200 100 200))
+    (let ((instance (claude-code-ide-process-tests--instance))
+          (pipe (make-pipe-process :name "cci-test-no-pid" :noquery t)))
+      (unwind-protect
+          (progn
+            (claude-code-ide-process-track instance nil)
+            (add-hook 'claude-code-ide-process-tests--reactions
+                      (claude-code-ide-process-tests--cli-exits-on 'SIGHUP))
+            (should (equal (plist-get (claude-code-ide-process-stop
+                                       instance :process pipe :scan nil)
+                                      :ended)
+                           '(200))))
+        (delete-process pipe)))))
+
+(ert-deftest claude-code-ide-test-process-ps-async-buffers ()
+  "The asynchronous ps leaves no buffer behind, and none named /dev/null."
+  (when (get-buffer "/dev/null")
+    (kill-buffer "/dev/null"))
+  (let ((before (buffer-list))
+        (entries 'pending))
+    (claude-code-ide-process--ps-list-async (lambda (table) (setq entries table)))
+    (should (claude-code-ide-process--wait (lambda () (not (eq entries 'pending))) 10))
+    (should (consp entries))
+    (should (cl-find (emacs-pid) entries :key (lambda (e) (plist-get e :pid))))
+    ;; The error output pipe can close a moment after the sentinel
+    (claude-code-ide-process--wait (lambda () nil) 0.2)
+    (should-not (get-buffer "/dev/null"))
+    (should-not (cl-set-difference (buffer-list) before))))
+
+(ert-deftest claude-code-ide-test-process-stop-many-budget ()
+  "With :budget, all waits together stay within it, and the signals still go out."
+  (claude-code-ide-process-tests--with-table
+      (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+            (claude-code-ide-process-tests--entry 200 100 200))
+    (setq claude-code-ide-process-tests--ignore '((100 SIGHUP SIGTERM) (200 SIGTERM)))
+    (let* ((start (float-time))
+           (results (claude-code-ide-process-stop-many
+                     (list (claude-code-ide-process-tests--instance))
+                     :budget 0.3 :timeout 5 :kill-wait 5 :scan nil))
+           (elapsed (- (float-time) start)))
+      (should (< elapsed 0.6))
+      (should (eq (plist-get (cdar results) :escalated) 'SIGKILL))
+      (should-not (claude-code-ide-process-tests--find 100))
+      (should (member '(-200 SIGKILL) claude-code-ide-process-tests--signals)))))
+
+(ert-deftest claude-code-ide-test-process-stop-lsof-calls ()
+  "No full lsof scan without a worktree; one lsof call for all missing folders."
+  (claude-code-ide-process-tests--with-table
+      (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+            (claude-code-ide-process-tests--entry 200 100 200)
+            (claude-code-ide-process-tests--entry 400 (emacs-pid) 400)
+            (claude-code-ide-process-tests--entry 500 400 500))
+    (setq claude-code-ide-process-tests--ignore '((200 SIGTERM SIGKILL) (500 SIGTERM SIGKILL)))
+    (add-hook 'claude-code-ide-process-tests--reactions
+              (lambda (target signal)
+                (when (and (memq target '(-100 -400)) (eq signal 'SIGHUP))
+                  (claude-code-ide-process-tests--remove (- target)))))
+    (let* ((calls nil)
+           (cwd-function claude-code-ide-process-cwd-function)
+           (claude-code-ide-process-cwd-function
+            (lambda (&optional pids)
+              (push pids calls)
+              (funcall cwd-function pids)))
+           (results (claude-code-ide-process-stop-many
+                     (list (claude-code-ide-process-tests--instance)
+                           (claude-code-ide-instance-create
+                            :id "cci-test-process-2" :provider 'codex :pid 400
+                            :process-start-time claude-code-ide-process-tests--start
+                            :worktree "/nonexistent/cci-test-2"))
+                     :kill-wait 0.01)))
+      (should (cl-every (lambda (r) (eq (plist-get (cdr r) :status) 'timeout)) results))
+      ;; One call, for the two survivors, and no full scan
+      (should (equal (length calls) 1))
+      (should (equal (sort (copy-sequence (car calls)) #'<) '(200 500))))))
+
+(ert-deftest claude-code-ide-test-process-record-all-one-snapshot ()
+  "One record of all tracks builds one snapshot."
+  (claude-code-ide-process-tests--with-table
+      (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+            (claude-code-ide-process-tests--entry 400 (emacs-pid) 400))
+    (claude-code-ide-process-track (claude-code-ide-process-tests--instance) nil)
+    (claude-code-ide-process-track
+     (claude-code-ide-instance-create
+      :id "cci-test-process-2" :provider 'codex :pid 400
+      :process-start-time claude-code-ide-process-tests--start)
+     nil)
+    (let ((count 0)
+          (snapshot (symbol-function 'claude-code-ide-process--snapshot)))
+      (cl-letf (((symbol-function 'claude-code-ide-process--snapshot)
+                 (lambda (table) (cl-incf count) (funcall snapshot table))))
+        (claude-code-ide-process--tick))
+      (should (= count 1)))))
 
 (ert-deftest claude-code-ide-test-process-stop-many ()
   "Several instances stop with one shared wait, each with its own result."
@@ -559,7 +789,8 @@ The default is provider `claude', pid 100 and ID cci-test-process."
             (claude-code-ide-process-tests--entry 500 400 500))
     (let ((first (claude-code-ide-process-tests--instance))
           (second (claude-code-ide-instance-create
-                   :id "cci-test-process-2" :provider 'codex :pid 400)))
+                   :id "cci-test-process-2" :provider 'codex :pid 400
+                   :process-start-time claude-code-ide-process-tests--start)))
       (claude-code-ide-process-track first nil)
       (claude-code-ide-process-track second nil)
       (add-hook 'claude-code-ide-process-tests--reactions
@@ -583,22 +814,60 @@ The default is provider `claude', pid 100 and ID cci-test-process."
       (should-not (claude-code-ide-process-tests--find 500)))))
 
 (ert-deftest claude-code-ide-test-process-stop-later ()
-  "The kill-buffer path records at once and stops from a timer, without its own soft end."
+  "The kill-buffer path records at once and stops from timers, without its own soft end."
   (claude-code-ide-process-tests--with-table
       (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
             (claude-code-ide-process-tests--entry 200 100 200))
     (let* ((instance (claude-code-ide-process-tests--instance))
-           (timer (claude-code-ide-process-stop-later instance :scan nil)))
+           (result 'pending)
+           (timer (claude-code-ide-process-stop-later
+                   instance :scan nil :callback (lambda (r) (setq result r)))))
       (should (timerp timer))
+      (should (eq result 'pending))
       (should (equal (mapcar (lambda (g) (plist-get g :pgid))
                              (claude-code-ide-process-groups instance))
                      '(100 200)))
       ;; The buffer kill sends SIGHUP, and the CLI exits
       (claude-code-ide-process-tests--remove 100)
-      (cancel-timer timer)
-      (funcall (timer--function timer))
+      (should (claude-code-ide-process--wait (lambda () (not (eq result 'pending))) 5))
+      (should (eq (plist-get result :status) 'stopped))
       (should (equal (claude-code-ide-process-tests--signal-list) '((-200 SIGTERM))))
       (should-not (claude-code-ide-process--track-of instance)))))
+
+(ert-deftest claude-code-ide-test-process-stop-later-does-not-block ()
+  "Each timer step of a later stop is short; the waits are between the timers."
+  (claude-code-ide-process-tests--with-table
+      (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+            (claude-code-ide-process-tests--entry 200 100 200))
+    (setq claude-code-ide-process-tests--ignore '((100 SIGTERM) (200 SIGTERM)))
+    (let* ((longest 0)
+           (steps 0)
+           (timing (lambda (fn &rest args)
+                     (let ((start (float-time)))
+                       (prog1 (apply fn args)
+                         (cl-incf steps)
+                         (setq longest (max longest (- (float-time) start)))))))
+           (result 'pending)
+           (start (float-time)))
+      (advice-add 'claude-code-ide-process--async-poll :around timing)
+      (unwind-protect
+          (let ((returned
+                 (progn
+                   (claude-code-ide-process-stop-later
+                    (claude-code-ide-process-tests--instance)
+                    :scan nil :timeout 0.3 :kill-wait 0.2
+                    :callback (lambda (r) (setq result r)))
+                   (- (float-time) start))))
+            (should (< returned 0.1))
+            (should (claude-code-ide-process--wait (lambda () (not (eq result 'pending))) 5))
+            (should (> (- (float-time) start) 0.6))
+            (should (> steps 5))
+            ;; A step that polls again returns at once; the longest one
+            ;; runs the next step without its wait
+            (should (< longest 0.15))
+            (should (eq (plist-get result :status) 'stopped))
+            (should (eq (plist-get result :escalated) 'SIGKILL)))
+        (advice-remove 'claude-code-ide-process--async-poll timing)))))
 
 ;;; Worktree scan
 
@@ -633,6 +902,36 @@ The default is provider `claude', pid 100 and ID cci-test-process."
               (should (equal (plist-get stray :pgid) 300)))
             (should-not (claude-code-ide-process-worktree-strays "/nonexistent/cci-test"))))
       (ignore-errors (delete-file link))
+      (delete-directory worktree t))))
+
+;;; Bounded runs of ps and lsof
+
+(ert-deftest claude-code-ide-test-process-run-timeout ()
+  "A program that takes too long is ended, and gives nil; output comes whole."
+  (let ((before (length (process-list)))
+        (start (float-time)))
+    (should-not (claude-code-ide-process--run "/bin/sleep" (list "5") 0.2))
+    (should (< (- (float-time) start) 2))
+    (should (= (length (process-list)) before)))
+  (should (equal (claude-code-ide-process--run "/bin/echo" (list "cci-test") 5) "cci-test\n"))
+  (should-not (claude-code-ide-process--run "/usr/bin/false" nil 5))
+  (should (equal (claude-code-ide-process--run "/usr/bin/false" nil 5 t) "")))
+
+(ert-deftest claude-code-ide-test-process-scan-failure ()
+  "A failed scan of working folders gives error, never a false stopped."
+  (let ((worktree (make-temp-file "cci-test-wt-" t)))
+    (unwind-protect
+        (claude-code-ide-process-tests--with-table
+            (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100))
+          (let ((claude-code-ide-process-cwd-function (lambda (&optional _pids) (quote failed))))
+            (add-hook (quote claude-code-ide-process-tests--reactions)
+                      (claude-code-ide-process-tests--cli-exits-on (quote SIGHUP)))
+            (let ((result (claude-code-ide-process-stop
+                           (claude-code-ide-process-tests--instance
+                            :worktree worktree :project-root worktree))))
+              (should (eq (plist-get result :status) (quote error)))
+              (should (stringp (plist-get result :reason))))
+            (should-error (claude-code-ide-process-worktree-strays worktree))))
       (delete-directory worktree t))))
 
 ;;; Live tests
