@@ -50,7 +50,7 @@ Each command has these parts, in this order:
 3. `--no-alt-screen`, when `claude-code-ide-codex-no-alt-screen` is on.
 4. `-c check_for_update_on_startup=false`, when `claude-code-ide-codex-skip-update-check` is on.
 5. `-c developer_instructions="..."`.
-6. The status hook arguments, from `claude-code-ide-codex-status-hook-args` (the `codex-status` part). They are added only when that function is defined and the descriptor has its launch generation.
+6. The status hook arguments, from `claude-code-ide-codex-status-hook-args` (the `codex-status` part). They are added only when that function is defined and the descriptor has its launch generation, and only when the hooks are trusted or their trust is unknown. Before the spawn, that function settles the trust: an interactive start offers it once (see [status-events.md](status-events.md), "The trust at each start").
 7. `claude-code-ide-codex-extra-flags`, as they are.
 8. The caller's ARGS, shell-quoted.
 9. The MCP arguments (see below). They come after the flags, so that they win over a `-c` of the same key in the flags.
@@ -234,3 +234,10 @@ codex queue --thread=<native-id> --message=<text>
 - **The MCP connection fails** until the HTTP server replies `202 Accepted` to notifications (`feat/mcp-routing`).
 - **A launch with MCP headers waits** for `codex app-server` (0.3 to 1.3 s on this machine).
 - **Folder trust:** Codex asks for it one time for each new repository root. Emacs never answers it.
+
+## Hook trust at the start
+
+- Codex runs the status hooks only after the user trusts them. The user does not need to remember a command: the first interactive Codex start asks.
+- The Codex commands (`claude-code-ide-codex`, `-continue`, `-resume`) and the generic start commands bind `claude-code-ide-interactive-start`. A start from Lisp, a restore, or a coordinator never asks.
+- After a no, the instance runs without status, and no start asks again in this Emacs. `M-x claude-code-ide-codex-trust-hooks` trusts the hooks later.
+- The rules and the cache are in [status-events.md](status-events.md), section "Hook trust".

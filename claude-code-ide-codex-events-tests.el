@@ -752,33 +752,206 @@ trusted after a write."
                ,@body))
          (delete-directory ,dir t)))))
 
-(ert-deftest claude-code-ide-codex-events-test-trust-check-at-launch ()
-  "The launch check runs hooks/list in the background and shows untrusted hooks."
+(defmacro claude-code-ide-codex-events-tests--with-lazy-trust (spec &rest body)
+  "Run BODY with a fake Codex app-server and the real trust check.
+SPEC is (DIR TRUST), as for
+`claude-code-ide-codex-events-tests--with-fake-codex'.
+In BODY, `asked' counts the questions, `answer' is the answer of
+`yes-or-no-p', and `servers' counts the app-server starts.  No
+question changes the real ~/.codex: the fake writes to DIR only."
+  (declare (indent 1))
+  `(claude-code-ide-codex-events-tests--with-codex
+     (claude-code-ide-codex-events-tests--with-fake-codex ,spec
+       (let ((asked 0)
+             (answer t)
+             (servers 0)
+             (claude-code-ide-codex-events--declined nil)
+             (start-server (symbol-function 'claude-code-ide-codex-events--server-start)))
+         (cl-letf (((symbol-function 'claude-code-ide-codex-events--start-trust-check)
+                    claude-code-ide-codex-events-tests--real-trust-check)
+                   ((symbol-function 'claude-code-ide-codex-events--server-start)
+                    (lambda (&rest args) (cl-incf servers) (apply start-server args)))
+                   ((symbol-function 'yes-or-no-p) (lambda (_prompt) (cl-incf asked) answer))
+                   ((symbol-function 'display-buffer) #'ignore)
+                   ((symbol-function 'message) #'ignore))
+           (unwind-protect
+               (progn ,@body)
+             (claude-code-ide-codex-events-tests--kill-instances)
+             (when (get-buffer "*Codex status hooks*")
+               (kill-buffer "*Codex status hooks*"))))))))
+
+(defun claude-code-ide-codex-events-tests--writes (dir)
+  "Return the number of trust writes that the fake app-server in DIR got."
+  (let ((file (expand-file-name "writes.log" dir)))
+    (if (file-exists-p file)
+        (length (split-string (claude-code-ide-session-registry--file-string file) "\n" t))
+      0)))
+
+(defun claude-code-ide-codex-events-tests--start (id &optional interactive)
+  "Start the Codex launch ID as a start does; INTERACTIVE as a user command.
+Return (ARGS ENV LAUNCH)."
+  (let* ((claude-code-ide-interactive-start interactive)
+         (instance (claude-code-ide-codex-events-tests--instance id 1))
+         (args (claude-code-ide-codex-status-hook-args instance))
+         (env (claude-code-ide-codex-status-hook-env instance)))
+    (list args env (claude-code-ide-codex-events--launch-of instance))))
+
+(ert-deftest claude-code-ide-codex-events-test-lazy-trust-not-interactive ()
+  "A start that no user command made never asks and never waits for the user.
+It gets no hooks, and its detail says that the next interactive start
+asks.  The next interactive start asks."
+  (claude-code-ide-codex-events-tests--with-lazy-trust (dir "untrusted")
+    (pcase-let ((`(,args ,env ,launch) (claude-code-ide-codex-events-tests--start "cci-test-bg")))
+      (should (= asked 0))
+      (should-not args)
+      (should-not env)
+      (should (eq (claude-code-ide-codex-events--launch-trust launch) 'untrusted))
+      (should-not claude-code-ide-codex-events--trust-check)
+      (let* ((instance (claude-code-ide-instance-by-id "cci-test-bg"))
+             (now (+ (claude-code-ide-codex-events--launch-registered launch) 30)))
+        (should (equal (claude-code-ide-codex-events-tests--state instance now)
+                       '(disconnected untracked nil)))
+        (should (string-match-p "the next interactive start asks"
+                                (claude-code-ide-codex-events--instance-detail instance now)))))
+    ;; A second start without a user reuses the untrusted result
+    (let ((before servers))
+      (should-not (car (claude-code-ide-codex-events-tests--start "cci-test-bg2")))
+      (should (= servers before)))
+    (should (= (claude-code-ide-codex-events-tests--writes dir) 0))
+    ;; The next interactive start asks
+    (should (car (claude-code-ide-codex-events-tests--start "cci-test-user" t)))
+    (should (= asked 1))))
+
+(ert-deftest claude-code-ide-codex-events-test-lazy-trust-interactive-yes ()
+  "An interactive start with untrusted hooks asks once; after yes it gets trusted hooks."
+  (claude-code-ide-codex-events-tests--with-lazy-trust (dir "untrusted")
+    (pcase-let ((`(,args ,env ,launch) (claude-code-ide-codex-events-tests--start "cci-test-yes" t)))
+      (should (= asked 1))
+      (should (= (claude-code-ide-codex-events-tests--writes dir) 1))
+      (should args)
+      (should env)
+      (should (eq (claude-code-ide-codex-events--launch-trust launch) 'trusted))
+      (should-not (claude-code-ide-codex-events--launch-trust-detail launch)))
+    (should (eq (plist-get (cdr claude-code-ide-codex-events--trust-cache) :status) 'trusted))
+    ;; The next start needs no question and no app-server
+    (let ((before servers))
+      (should (car (claude-code-ide-codex-events-tests--start "cci-test-yes2" t)))
+      (should (car (claude-code-ide-codex-events-tests--start "cci-test-yes3")))
+      (should (= servers before))
+      (should (= asked 1)))))
+
+(ert-deftest claude-code-ide-codex-events-test-lazy-trust-interactive-no ()
+  "After a no, the start goes on without status, and no start asks again.
+The trust command still trusts the hooks."
+  (claude-code-ide-codex-events-tests--with-lazy-trust (dir "untrusted")
+    (setq answer nil)
+    (pcase-let ((`(,args ,env ,launch) (claude-code-ide-codex-events-tests--start "cci-test-no" t)))
+      (should (= asked 1))
+      (should-not args)
+      (should-not env)
+      (should (eq (claude-code-ide-codex-events--launch-trust launch) 'untrusted))
+      (should (string-match-p "claude-code-ide-codex-trust-hooks trusts them"
+                              (claude-code-ide-codex-events--launch-trust-detail launch))))
+    (should (= (claude-code-ide-codex-events-tests--writes dir) 0))
+    ;; Not asked again in this Emacs
+    (should-not (car (claude-code-ide-codex-events-tests--start "cci-test-no2" t)))
+    (should (= asked 1))
+    ;; The command asks, and trusts after yes
+    (setq answer t)
+    (claude-code-ide-codex-trust-hooks)
+    (should (= asked 2))
+    (should (= (claude-code-ide-codex-events-tests--writes dir) 1))
+    (should-not claude-code-ide-codex-events--declined)
+    (should (car (claude-code-ide-codex-events-tests--start "cci-test-no3" t)))
+    (should (= asked 2))
+    ;; The launch that started untrusted keeps no status until its restart
+    (should (string-match-p "restart to get status"
+                            (claude-code-ide-codex-events--launch-trust-detail
+                             (gethash "cci-test-no" claude-code-ide-codex-events--launches))))))
+
+(ert-deftest claude-code-ide-codex-events-test-lazy-trust-quit ()
+  "C-g at the question starts without hooks and asks again at the next start."
+  (claude-code-ide-codex-events-tests--with-lazy-trust (dir "untrusted")
+    (cl-letf (((symbol-function 'yes-or-no-p) (lambda (_prompt) (cl-incf asked) (signal 'quit nil))))
+      (should-not (car (claude-code-ide-codex-events-tests--start "cci-test-quit" t)))
+      (should-not claude-code-ide-codex-events--declined)
+      (should-not (car (claude-code-ide-codex-events-tests--start "cci-test-quit2" t)))
+      (should (= asked 2)))
+    (should (= (claude-code-ide-codex-events-tests--writes dir) 0))))
+
+(ert-deftest claude-code-ide-codex-events-test-lazy-trust-cache ()
+  "A trusted cache entry of the same hook definitions needs no app-server."
+  (claude-code-ide-codex-events-tests--with-lazy-trust (dir "untrusted")
+    (claude-code-ide-codex-events--install-script)
+    (setq claude-code-ide-codex-events--trust-cache
+          (cons (claude-code-ide-codex-events--trust-key) '(:status trusted :message nil)))
+    (pcase-let ((`(,args ,_env ,launch) (claude-code-ide-codex-events-tests--start "cci-test-cache" t)))
+      (should args)
+      (should (eq (claude-code-ide-codex-events--launch-trust launch) 'trusted)))
+    (should (= servers 0))
+    (should (= asked 0))
+    ;; The key is a hash of the hook definitions
+    (should (= (length (claude-code-ide-codex-events--trust-key)) 64))))
+
+(ert-deftest claude-code-ide-codex-events-test-lazy-trust-changed-definitions ()
+  "Other hook definitions miss the cache and the next interactive start asks again."
+  (claude-code-ide-codex-events-tests--with-lazy-trust (dir "untrusted")
+    (setq answer nil)
+    (claude-code-ide-codex-events-tests--start "cci-test-v1" t)
+    (should (= asked 1))
+    (let ((old-key (claude-code-ide-codex-events--trust-key))
+          (claude-code-ide-codex-events--events '("SessionStart" "Stop")))
+      (should-not (equal (claude-code-ide-codex-events--trust-key) old-key))
+      (claude-code-ide-codex-events-tests--start "cci-test-v2" t)
+      (should (= asked 2)))
+    ;; A trusted result of the old definitions does not count either
+    (setq claude-code-ide-codex-events--trust-cache
+          (cons (claude-code-ide-codex-events--trust-key) '(:status trusted :message nil)))
+    (let ((claude-code-ide-codex-events--events '("SessionStart")))
+      (should-not (claude-code-ide-codex-events--cached-trust)))))
+
+(ert-deftest claude-code-ide-codex-events-test-lazy-trust-timeout ()
+  "An app-server that does not answer in time does not hold the start.
+The start gets its hooks, the detail says that the trust is unknown,
+and nothing asks the user."
   (claude-code-ide-codex-events-tests--with-codex
-    (claude-code-ide-codex-events-tests--with-fake-codex (dir "untrusted")
-      (ignore dir)
-      (cl-letf (((symbol-function 'claude-code-ide-codex-events--start-trust-check)
-                 claude-code-ide-codex-events-tests--real-trust-check))
-        (unwind-protect
-            (let* ((instance (claude-code-ide-codex-events-tests--instance "cci-test-trust" 1))
-                   (args (claude-code-ide-codex-status-hook-args instance))
-                   (launch (claude-code-ide-codex-events--launch-of instance))
-                   (deadline (+ (float-time) 5)))
-              ;; The launch does not wait for the check
-              (should args)
-              (should (eq (claude-code-ide-codex-events--launch-trust launch) 'checking))
-              (while (and (eq (claude-code-ide-codex-events--launch-trust launch) 'checking)
-                          (< (float-time) deadline))
-                (accept-process-output nil 0.05))
-              (should (eq (claude-code-ide-codex-events--launch-trust launch) 'untrusted))
-              (should-not claude-code-ide-codex-events--trust-check)
-              ;; No event comes from untrusted hooks: disconnected, with the reason
-              (let ((now (+ (claude-code-ide-codex-events--launch-registered launch) 30)))
-                (should (equal (claude-code-ide-codex-events-tests--state instance now)
-                               '(disconnected untracked nil)))
-                (should (string-match-p "status hooks not trusted"
-                                        (claude-code-ide-codex-events--instance-detail instance now)))))
-          (claude-code-ide-codex-events-tests--kill-instances))))))
+    (let* ((dir (make-temp-file "cci-test-codex-" t))
+           (program (expand-file-name "codex" dir))
+           (asked 0))
+      (unwind-protect
+          (progn
+            (with-temp-file program
+              (insert "#!/bin/sh\n"
+                      "while IFS= read -r line; do\n"
+                      "  case $line in\n"
+                      "    *'\"initialize\"'*) printf '{\"id\":1,\"result\":{}}\\n' ;;\n"
+                      "  esac\n"
+                      "done\n"))
+            (set-file-modes program #o700)
+            (let ((claude-code-ide-codex-events-program program)
+                  (claude-code-ide-codex-events-trust-timeout 0.3)
+                  (claude-code-ide-codex-events--background-limit 0.6)
+                  (start (float-time)))
+              (cl-letf (((symbol-function 'claude-code-ide-codex-events--start-trust-check)
+                         claude-code-ide-codex-events-tests--real-trust-check)
+                        ((symbol-function 'yes-or-no-p) (lambda (_prompt) (cl-incf asked) t)))
+                (pcase-let ((`(,args ,_env ,launch)
+                             (claude-code-ide-codex-events-tests--start "cci-test-slow" t)))
+                  (should (< (- (float-time) start) 2))
+                  (should args)
+                  (should (= asked 0))
+                  (should (eq (claude-code-ide-codex-events--launch-trust launch) 'error))
+                  (should (string-match-p "Hook trust unknown: no answer"
+                                          (claude-code-ide-codex-events--launch-trust-detail launch)))
+                  ;; The background check ends by itself
+                  (let ((deadline (+ (float-time) 3)))
+                    (while (and claude-code-ide-codex-events--trust-check (< (float-time) deadline))
+                      (accept-process-output nil 0.05)))
+                  (should-not claude-code-ide-codex-events--trust-check)
+                  (should (string-match-p "Hook trust unknown"
+                                          (claude-code-ide-codex-events--launch-trust-detail launch)))))))
+        (claude-code-ide-codex-events-tests--kill-instances)
+        (delete-directory dir t)))))
 
 (ert-deftest claude-code-ide-codex-events-test-trust-check-without-codex ()
   "Without a Codex program the trust is unknown and the launch still gets hooks."

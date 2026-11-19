@@ -821,6 +821,25 @@ The texts follow the captures and the reports of the T1 and T2 tests.")
     (should (eq (claude-code-ide-current-provider) 'codex))
     (ignore-errors (delete-file claude-code-ide-provider-file))))
 
+(ert-deftest claude-code-ide-test-codex-commands-mark-interactive-starts ()
+  "The start commands mark a start of the user; a call from Lisp is not one.
+The Codex hook trust asks the user only in such a start."
+  (let ((claude-code-ide-default-provider 'claude)
+        (claude-code-ide--current-provider nil)
+        (claude-code-ide--current-provider-read t)
+        (claude-code-ide-provider-file (make-temp-name
+                                        (expand-file-name "cci-test-provider-" temporary-file-directory)))
+        (seen nil))
+    (cl-letf (((symbol-function 'claude-code-ide--start-session)
+               (lambda (&rest _) (push claude-code-ide-interactive-start seen))))
+      (dolist (command '(claude-code-ide-codex claude-code-ide-codex-continue claude-code-ide-codex-resume
+                                               claude-code-ide claude-code-ide-continue claude-code-ide-resume))
+        (call-interactively command)
+        (funcall command)))
+    (should (equal (reverse seen) '(t nil t nil t nil t nil t nil t nil)))
+    (should-not claude-code-ide-interactive-start)
+    (ignore-errors (delete-file claude-code-ide-provider-file))))
+
 (provide 'claude-code-ide-codex-tests)
 
 ;;; claude-code-ide-codex-tests.el ends here

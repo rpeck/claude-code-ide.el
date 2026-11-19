@@ -67,28 +67,37 @@ The script does these steps:
 
 Codex runs a hook only after the user trusts it. `codex exec` and the terminal UI skip an untrusted hook without a message.
 
-### The check at each launch
+### The trust at each start
 
-- The tracking of a launch starts `codex app-server` with the hook arguments, over stdio, in the background. The launch does not wait.
-- Emacs sends `initialize`, then `initialized`, then `hooks/list` with the project folder in `cwds`.
-- The status hooks of the package are the hooks with `source` `sessionFlags` whose command runs the script.
-- A hook counts as trusted when `trustStatus` is `trusted` or `managed`, and `enabled` is not false.
-- The time limit is `claude-code-ide-codex-events-trust-timeout` (10 seconds).
-- Emacs keeps the last result. The next launch uses it without a process, while the hook arguments and the time of `config.toml` are the same, and the result was `trusted`.
+Emacs settles the trust before a Codex instance spawns, so that the user never needs to remember a trust command.
 
-| Result | Status of an instance without events |
-|---|---|
-| All hooks trusted | Normal (see below). |
-| Some hooks not trusted or disabled | `disconnected/untracked`, detail "N of 11 Codex status hooks not trusted: M-x claude-code-ide-codex-trust-hooks". |
-| No answer, or no Codex program | Normal, and the detail adds "Hook trust unknown: ...". |
+1. **The cache.** Emacs keeps the last result under a SHA-256 hash of the hook definitions (the hook arguments, which contain the script path).
+   - A `trusted` result holds for each later start in this Emacs. That start needs no app-server.
+   - An `untrusted` result holds while `config.toml` keeps the time of the check, because `/hooks` in a terminal can trust the hooks.
+   - Other hook definitions, for example of a new package version, give another hash. They miss the cache, and the next interactive start asks again.
+2. **The check.** Without a valid cache entry, Emacs starts `codex app-server` with the hook arguments, over stdio, and sends `initialize`, `initialized`, and `hooks/list` with the project folder in `cwds`.
+   - The status hooks of the package are the hooks with `source` `sessionFlags` whose command runs the script.
+   - A hook counts as trusted when `trustStatus` is `trusted` or `managed`, and `enabled` is not false.
+   - The start waits at most `claude-code-ide-codex-events-trust-timeout` seconds (5). After that, the start goes on, and the check goes on in the background for at most 30 seconds. Its result goes to the cache and to the launch records.
+3. **The decision:**
 
-When events come, a trust problem is added to the detail only.
+| Result | Interactive start | Other start |
+|---|---|---|
+| Trusted | Hooks. | Hooks. |
+| Not trusted | The start offers the trust (see the trust command). Yes: the trust is written, and the instance starts with its trusted hooks. No: no hooks, and no start asks again in this Emacs. C-g: no hooks, and the next start asks again. | No question. No hooks. Detail "Hooks not trusted; the next interactive start asks". |
+| Declined before in this Emacs | No question. No hooks. Detail "Hooks not trusted; M-x claude-code-ide-codex-trust-hooks trusts them". | The same. |
+| No answer in time, or no app-server | Hooks, because they can be trusted. Detail "Hook trust unknown: ...". No question. | The same. |
 
-A trust does not change a launch that started while its hooks were not trusted. That launch stays `disconnected/untracked`, with the detail "Hooks were not trusted at the launch: restart to get status". A launch that waited for the running check gets its result. A later launch uses the trusted result.
+- **An interactive start** is a start from a command that the user called: `claude-code-ide`, `claude-code-ide-continue`, `claude-code-ide-resume` (also from the menu), `claude-code-ide-codex`, `claude-code-ide-codex-continue`, and `claude-code-ide-codex-resume`. They bind `claude-code-ide-interactive-start` from `called-interactively-p`.
+- **Other starts** never ask and never wait for the user. Examples are a registry restore, a coordinator launch, a timer, and a call of a command from Lisp.
+- **No hooks** means no hook arguments and no hook environment. So Codex shows no "Hooks need review" dialog for them.
+- **A launch without hooks** has no status events. Its state is `disconnected/untracked`. A trust later does not change it: its detail becomes "Hooks were not trusted at the launch: restart to get status".
+- **Never without a yes.** Emacs writes the trust only after the yes of `yes-or-no-p`.
+- When events come, a trust problem is added to the detail only.
 
 ### The trust command
 
-`M-x claude-code-ide-codex-trust-hooks`:
+`M-x claude-code-ide-codex-trust-hooks` trusts the hooks by hand, for example after a no. An interactive start uses the same steps:
 
 1. It starts the app-server with the hook arguments and calls `hooks/list`.
 2. It shows the hooks that Codex does not run yet, with their event, command, trust status, and key, in the buffer `*Codex status hooks*`.
@@ -103,7 +112,9 @@ A trust does not change a launch that started while its hooks were not trusted. 
   ```
 - The upsert merges the keys. Other keys in `hooks.state` stay, for example `enabled = false`.
 - A hook that `/hooks` disabled stays disabled. The command says so.
-- If `config/batchWrite` fails, the command tells the user to run `/hooks` in a Codex terminal.
+- If `config/batchWrite` fails, the command tells the user to run `/hooks` in a Codex terminal. In a start, the failure gives no hooks and that text in the detail.
+- After a yes, a start does not count as declined any more, also after an earlier no.
+- Instances that run already get status only after a restart.
 
 ## Event files
 
@@ -218,7 +229,7 @@ The Codex launch defines `(claude-code-ide-codex-screen-dialog BUFFER)`. It retu
 |---|---|---|
 | `claude-code-ide-session-status-tracking` | t | Off: no hooks for new launches (both providers). |
 | `claude-code-ide-codex-events-program` | `"codex"` | The program for the app-server. |
-| `claude-code-ide-codex-events-trust-timeout` | 10 | Seconds that a trust check waits. |
+| `claude-code-ide-codex-events-trust-timeout` | 5 | Seconds that a start waits for the trust check. |
 | `claude-code-ide-codex-events-startup-grace` | 3 | Seconds before the first screen read of a launch. |
 | `claude-code-ide-codex-events-approval-guess-time` | 10 | Seconds after which an unconfirmed approval is a guess. |
 | `claude-code-ide-session-status-quota-regexp` | see above | The usage-limit pattern of both providers. |

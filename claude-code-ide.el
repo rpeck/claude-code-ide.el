@@ -2690,6 +2690,13 @@ Return its name."
                                   names nil t nil nil (symbol-name current))))
     (intern (if (string-empty-p choice) (symbol-name current) choice))))
 
+(defvar claude-code-ide-interactive-start nil
+  "Non-nil while a command that the user called starts an instance.
+The start commands bind it from `called-interactively-p'.  A provider
+may ask the user a question during such a start, for example whether
+to trust the Codex status hooks.  A registry restore, a coordinator
+launch or a timer leaves it nil, and then nothing asks the user.")
+
 (defun claude-code-ide--start-current-provider (&optional continue resume)
   "Start an instance of the current provider; CONTINUE and RESUME as usual.
 With a prefix argument, ask for the provider first, and make it the
@@ -2713,7 +2720,8 @@ prompts for an optional instance name.  Use `claude-code-ide-toggle',
 `claude-code-ide-switch-to-buffer' or `claude-code-ide-list-sessions'
 to reach running instances."
   (interactive)
-  (claude-code-ide--start-current-provider))
+  (let ((claude-code-ide-interactive-start (called-interactively-p 'any)))
+    (claude-code-ide--start-current-provider)))
 
 ;;;###autoload
 (defun claude-code-ide-resume ()
@@ -2722,7 +2730,8 @@ This starts the CLI with its conversation picker (Claude Code: -r).
 With a prefix argument, ask for the provider first.  Always creates a
 new instance."
   (interactive)
-  (claude-code-ide--start-current-provider nil t))
+  (let ((claude-code-ide-interactive-start (called-interactively-p 'any)))
+    (claude-code-ide--start-current-provider nil t)))
 
 ;;;###autoload
 (defun claude-code-ide-continue ()
@@ -2732,7 +2741,8 @@ current directory).  With a prefix argument, ask for the provider
 first.  Always creates a new instance; a second continued instance
 forks the same conversation."
   (interactive)
-  (claude-code-ide--start-current-provider t))
+  (let ((claude-code-ide-interactive-start (called-interactively-p 'any)))
+    (claude-code-ide--start-current-provider t)))
 
 ;;;###autoload
 (defun claude-code-ide-check-status ()

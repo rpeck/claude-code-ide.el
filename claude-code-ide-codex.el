@@ -823,21 +823,25 @@ Codex becomes the current provider, as the menu toggle makes it."
   "Start a Codex instance for the current project.
 A project can run Codex and Claude Code instances at the same time.
 With a prefix argument, or when the project has instances, ask for an
-instance name."
+instance name.  When the Codex status hooks are not trusted yet, the
+start offers to trust them."
   (interactive)
-  (claude-code-ide-codex--start))
+  (let ((claude-code-ide-interactive-start (called-interactively-p 'any)))
+    (claude-code-ide-codex--start)))
 
 ;;;###autoload
 (defun claude-code-ide-codex-continue ()
   "Start a Codex instance that continues the most recent conversation."
   (interactive)
-  (claude-code-ide-codex--start t))
+  (let ((claude-code-ide-interactive-start (called-interactively-p 'any)))
+    (claude-code-ide-codex--start t)))
 
 ;;;###autoload
 (defun claude-code-ide-codex-resume ()
   "Start a Codex instance with the picker of earlier conversations."
   (interactive)
-  (claude-code-ide-codex--start nil t))
+  (let ((claude-code-ide-interactive-start (called-interactively-p 'any)))
+    (claude-code-ide-codex--start nil t)))
 
 ;;; The provider
 
