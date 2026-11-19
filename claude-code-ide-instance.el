@@ -257,11 +257,11 @@ Return non-nil when EVENT was passed on, nil when it was dropped."
 ;;; States
 
 (defconst claude-code-ide-instance-states
-  '((working)
+  '((working starting)
     (idle)
     (waiting-for-user approval question dialog)
     (waiting-for-task subagent background-task other-instance)
-    (disconnected)
+    (disconnected untracked no-signal)
     (failed quota-limit exit-code error))
   "The common states, each with the reasons it can have.")
 

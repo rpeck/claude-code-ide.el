@@ -158,11 +158,15 @@ The status drain builds one common event for each event file. The `map-event` op
 
 | State | Reasons |
 |---|---|
-| `working` | none |
+| `working` | `starting` |
 | `idle` | none |
 | `waiting-for-user` | `approval`, `question`, `dialog` |
 | `waiting-for-task` | `subagent`, `background-task`, `other-instance` |
-| `disconnected` | none |
+| `disconnected` | `untracked`, `no-signal` |
+
+- `working/starting`: the CLI starts and has not yet reported that it is ready.
+- `disconnected/untracked`: the process runs, but it has no status hooks (for example, it started before the status hooks existed).
+- `disconnected/no-signal`: the process runs and has hooks, but no event came.
 | `failed` | `quota-limit`, `exit-code`, `error` |
 
 ### The state accessor
