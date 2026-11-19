@@ -51,6 +51,7 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'claude-code-ide-instance)
+(require 'claude-code-ide-debug)
 
 ;;; Options
 
@@ -377,13 +378,29 @@ hold is asked for with `claude-code-ide-process-entry-function'."
   "Return the entry of PID in SNAPSHOT, or nil."
   (gethash pid (plist-get snapshot :index)))
 
+(defun claude-code-ide-process--descendant-start-p (start root-start)
+  "Return non-nil when START can be the start time of a descendant.
+ROOT-START is the start time of the root.  A real descendant never
+starts before the root, so START must be known and not earlier than
+ROOT-START minus the tolerance of `claude-code-ide-process--same-start-p'."
+  (and (numberp start) (numberp root-start)
+       (>= start (- root-start 1.5))))
+
 (defun claude-code-ide-process--descendants (snapshot root)
   "Return the entries of ROOT and of all its descendants in SNAPSHOT.
-ROOT is a process ID.  The result is empty when ROOT is not in SNAPSHOT."
+ROOT is a process ID.  The result is empty when ROOT is not in SNAPSHOT,
+or when its start time is unknown.
+
+A process that started before ROOT, or whose start time is unknown,
+is not a descendant, and the walk does not go through it.  On macOS a
+debugger that attaches to a process becomes its parent: after `lldb
+-p X' in the CLI's tree, ps shows X, and all its children, under the
+CLI.  X can be any process, also Emacs itself."
   (let ((children (plist-get snapshot :children))
         (seen (make-hash-table))
         result queue)
-    (when-let* ((root-entry (claude-code-ide-process--entry-of snapshot root)))
+    (when-let* ((root-entry (claude-code-ide-process--entry-of snapshot root))
+                (root-start (plist-get root-entry :start)))
       (setq queue (list root-entry))
       (while queue
         (let ((entry (pop queue)))
@@ -391,7 +408,12 @@ ROOT is a process ID.  The result is empty when ROOT is not in SNAPSHOT."
           (unless (gethash (plist-get entry :pid) seen)
             (puthash (plist-get entry :pid) t seen)
             (push entry result)
-            (setq queue (append queue (gethash (plist-get entry :pid) children)))))))
+            (setq queue (append queue
+                                (cl-remove-if-not
+                                 (lambda (child)
+                                   (claude-code-ide-process--descendant-start-p
+                                    (plist-get child :start) root-start))
+                                 (gethash (plist-get entry :pid) children))))))))
     (nreverse result)))
 
 ;;; Records
@@ -555,9 +577,31 @@ track that was added after this ps run started is not in TABLE."
     (cancel-timer claude-code-ide-process--timer))
   (setq claude-code-ide-process--timer nil))
 
+(defun claude-code-ide-process--accept-process (instance process)
+  "Return PROCESS when it belongs to INSTANCE, else nil.
+PROCESS belongs to INSTANCE when it is the process of the instance's
+terminal buffer, or when its PID is the PID in the descriptor.  Any
+other process, also a live child of this Emacs, is ignored with a
+debug message: it must never become the root of the records."
+  (when process
+    (let ((buffer (claude-code-ide-instance-buffer instance))
+          (pid (claude-code-ide-process--process-pid process))
+          (known-pid (claude-code-ide-known-or-nil (claude-code-ide-instance-pid instance))))
+      (if (or (and (buffer-live-p buffer)
+                   (or (eq (get-buffer-process buffer) process)
+                       (eq (process-buffer process) buffer)))
+              (and (integerp pid) (eql pid known-pid)))
+          process
+        (claude-code-ide-debug "Process tree: ignore process %s (PID %s) for instance %s: not its process"
+                               (and (processp process) (process-name process)) pid
+                               (claude-code-ide-instance-id instance))
+        nil))))
+
 (defun claude-code-ide-process--new-track (instance process)
   "Return new records for INSTANCE, whose terminal process is PROCESS.
 PROCESS nil means the process of the descriptor's buffer, else its PID.
+A PROCESS that does not belong to INSTANCE is ignored; see
+`claude-code-ide-process--accept-process'.
 
 The start time of the root comes from a record made at launch: the
 descriptor, when it holds the same PID.  A live entry gives it only
@@ -567,7 +611,7 @@ so the PID cannot belong to another process.  A ghostel pipe is not
 the real child: ghostel's native thread reaps the child before the
 pipe closes, so a lookup of its PID can find an unrelated process.
 Else the start time stays nil, and the root never gets a signal."
-  (let* ((process (or process
+  (let* ((process (or (claude-code-ide-process--accept-process instance process)
                       (let ((buffer (claude-code-ide-instance-buffer instance)))
                         (and (buffer-live-p buffer) (get-buffer-process buffer)))))
          (process-pid (claude-code-ide-process--process-pid process))
@@ -1252,12 +1296,15 @@ After `timeout' or `error', keep TRACK, so that a later stop can use it."
 INSTANCE is a descriptor or an instance ID.  When PROCESS has another
 PID than the records, the new records take over the old ones, so that
 the stop also ends the old groups.  A PROCESS without a PID keeps the
-records.  Without records, make new ones.  Return nil when nothing is
-known."
+records.  A PROCESS that does not belong to the instance is ignored,
+and the records stay.  Without records, make new ones.  Return nil
+when nothing is known."
   (let* ((track (claude-code-ide-process--track-of instance))
          (descriptor (cond ((claude-code-ide-instance-p instance) instance)
                            (track (claude-code-ide-process--track-instance track))
                            (t (claude-code-ide-instance-by-id instance))))
+         (process (and descriptor
+                       (claude-code-ide-process--accept-process descriptor process)))
          (process-pid (claude-code-ide-process--process-pid process)))
     (cond
      ((and track process-pid
