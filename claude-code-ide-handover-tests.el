@@ -32,6 +32,7 @@
 (require 'claude-code-ide-session-status)
 (require 'claude-code-ide-codex)
 
+(declare-function claude-code-ide-tests--wait-until "claude-code-ide-tests")
 (defvar claude-code-ide-session-registry-mode)
 (defvar claude-code-ide-handover-tests--states nil
   "Alist of instance ID and the state that the test state function gives.")
@@ -202,6 +203,8 @@ BODY can use `worktree', the folder of a Git repository."
           (claude-code-ide-handover--allowed nil)
           (claude-code-ide-handover-session-server-detection nil)
           (claude-code-ide-handover-stray-wait 0)
+          ;; Longer than any test; the tests of the limit bind it to 0
+          (claude-code-ide-handover-ack-wait 600)
           (claude-code-ide-handover-tests--states nil)
           (claude-code-ide-handover-tests--timers nil)
           (claude-code-ide-handover-tests--starts nil)
@@ -1198,7 +1201,8 @@ When that Emacs ends, the recovery claims the run in the registry first."
                          pid))
             ;; That Emacs ends: this Emacs claims the run, then recovers it
             (delete-process other)
-            (sleep-for 0.2)
+            (should (claude-code-ide-tests--wait-until
+                     (lambda () (not (claude-code-ide-session-registry--same-start-p pid start)))))
             (claude-code-ide-handover-recover)
             (should (= (length claude-code-ide-handover-tests--starts) 1))
             (should (eql (alist-get 'emacs_pid (claude-code-ide-handover-tests--record "cci-test-src"))
@@ -1508,12 +1512,10 @@ needs a person, and nothing starts."
                   claude-code-ide-review--processes)))))
 
 (defun claude-code-ide-handover-tests--wait-for (predicate)
-  "Run the process sentinels until PREDICATE is true, up to 10 seconds."
-  (let ((deadline (+ (float-time) 10)))
-    (while (not (funcall predicate))
-      (when (> (float-time) deadline)
-        (error "Timeout in a handover test"))
-      (accept-process-output nil 0.05))))
+  "Run the process sentinels until PREDICATE is true.
+Signal an error after `claude-code-ide-tests--wait-limit' seconds."
+  (unless (claude-code-ide-tests--wait-until predicate)
+    (error "Timeout in a handover test")))
 
 (ert-deftest claude-code-ide-test-handover-with-review-process ()
   "A real review process in the worktree is left alone by the stop and the scan.

@@ -19,6 +19,8 @@
 
 (declare-function claude-code-ide-tests--make-session "claude-code-ide-tests")
 (declare-function claude-code-ide-tests--clear-processes "claude-code-ide-tests")
+(declare-function claude-code-ide-tests--wait-until "claude-code-ide-tests")
+(defvar claude-code-ide-tests--wait-limit)
 
 (defmacro claude-code-ide-tests--with-registry (&rest body)
   "Run BODY with an empty session registry in a temporary directory.
@@ -109,6 +111,8 @@ BODY can refer to that directory as `registry-dir'."
   "A change submitted while the drain waits for the lock is in the same write."
   (claude-code-ide-tests--with-registry
     (let ((lock (claude-code-ide-session-registry--lock-directory))
+          ;; The wait ends with the lock, never with this limit
+          (claude-code-ide-session-registry-lock-wait claude-code-ide-tests--wait-limit)
           (waits 0))
       (make-directory lock)
       (cl-letf (((symbol-function 'sleep-for)
@@ -1349,10 +1353,7 @@ process ID with another start time does not block the restore."
                         'open))
             ;; The process ended: the record is restorable
             (delete-process process)
-            (let ((tries 0))
-              (while (and (process-attributes pid) (< tries 100))
-                (sleep-for 0.05)
-                (cl-incf tries)))
+            (claude-code-ide-tests--wait-until (lambda () (not (process-attributes pid))))
             (should (member "cci-test-owned"
                             (mapcar #'claude-code-ide-session-registry-entry-key
                                     (claude-code-ide-session-registry--restorable-entries)))))

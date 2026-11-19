@@ -34,6 +34,7 @@
 
 (declare-function claude-code-ide-tests--make-session "claude-code-ide-tests")
 (declare-function claude-code-ide-tests--clear-processes "claude-code-ide-tests")
+(declare-function claude-code-ide-tests--wait-until "claude-code-ide-tests")
 
 ;;; Helpers
 
@@ -74,13 +75,11 @@ BODY can refer to the folder of the result files as `results'."
          (delete-directory claude-code-ide-review-directory t)))))
 
 (defun claude-code-ide-review-tests--wait (predicate)
-  "Run the process filters and sentinels until PREDICATE is true, up to 10 s.
-A deadline, not `with-timeout': the control tests mock `run-at-time'."
-  (let ((deadline (+ (float-time) 10)))
-    (while (not (funcall predicate))
-      (when (> (float-time) deadline)
-        (error "Timeout in a review test"))
-      (accept-process-output nil 0.05))))
+  "Run the process filters and sentinels until PREDICATE is true.
+Signal an error after `claude-code-ide-tests--wait-limit' seconds.  A
+deadline, not `with-timeout': the control tests mock `run-at-time'."
+  (unless (claude-code-ide-tests--wait-until predicate)
+    (error "Timeout in a review test")))
 
 (defun claude-code-ide-review-tests--state (review-id)
   "Return the state of REVIEW-ID."
