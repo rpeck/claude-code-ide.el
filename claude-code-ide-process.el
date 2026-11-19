@@ -326,14 +326,17 @@ then nil, so that it never gets a signal."
     (when (claude-code-ide-process--same-start-p start (plist-get entry :start))
       entry)))
 
-(defun claude-code-ide-process--still-there-p (pid start)
+(defun claude-code-ide-process--still-there-p (pid start pgid)
   "Return non-nil when PID may still be the process that started at START.
-Only for waits: a nil start time on either side counts as the same,
-so that a wait never ends too early.  It never allows a signal."
+It must also still be in the process group PGID.  Only for the end of
+a wait: a nil start time on either side counts as the same, so that a
+wait never ends too early.  No choice of a signal target may use it;
+those use `claude-code-ide-process--classify', where nil never matches."
   (when-let* ((entry (and (integerp pid)
                           (funcall claude-code-ide-process-entry-function pid))))
-    (or (null start) (null (plist-get entry :start))
-        (claude-code-ide-process--same-start-p start (plist-get entry :start)))))
+    (and (eql (plist-get entry :pgid) pgid)
+         (or (null start) (null (plist-get entry :start))
+             (claude-code-ide-process--same-start-p start (plist-get entry :start))))))
 
 ;;; Snapshots
 ;;
@@ -556,11 +559,14 @@ track that was added after this ps run started is not in TABLE."
   "Return new records for INSTANCE, whose terminal process is PROCESS.
 PROCESS nil means the process of the descriptor's buffer, else its PID.
 
-The start time of the root comes from the descriptor when it holds the
-same PID.  A live entry gives it only for a live process object of
-this Emacs with that PID: Emacs has not reaped it, so the PID cannot
-belong to another process.  Else the start time stays nil, and the
-root never gets a signal."
+The start time of the root comes from a record made at launch: the
+descriptor, when it holds the same PID.  A live entry gives it only
+when PROCESS is the real child: a live process object of this Emacs
+whose own process ID is that PID.  Emacs has not reaped such a child,
+so the PID cannot belong to another process.  A ghostel pipe is not
+the real child: ghostel's native thread reaps the child before the
+pipe closes, so a lookup of its PID can find an unrelated process.
+Else the start time stays nil, and the root never gets a signal."
   (let* ((process (or process
                       (let ((buffer (claude-code-ide-instance-buffer instance)))
                         (and (buffer-live-p buffer) (get-buffer-process buffer)))))
@@ -576,7 +582,9 @@ root never gets a signal."
        :pid pid
        :start (cond
                ((and (numberp known-start) (eql known-pid pid)) known-start)
-               ((and process-pid (process-live-p process))
+               ((and (processp process)
+                     (eql (process-id process) pid)
+                     (process-live-p process))
                 (plist-get (funcall claude-code-ide-process-entry-function pid) :start)))))))
 
 ;;;###autoload
@@ -647,24 +655,36 @@ Return non-nil on success."
                  claude-code-ide-process-soft-end)
       'SIGHUP))
 
-(defun claude-code-ide-process--signal-root (track signal protected)
+(defun claude-code-ide-process--signal-root (track signal snapshot)
   "Send SIGNAL to the process group of the root of TRACK.
-The root must run with its recorded start time.  PROTECTED is the
-(PIDS . PGIDS) of a snapshot.  A protected root gets nothing.  A root
-in a protected group, or that is not the leader of its group, gets
-SIGNAL alone, never its group."
+The root must run with its recorded start time.  SNAPSHOT is a fresh
+snapshot; its :protected set and its table decide:
+
+- A protected root gets nothing.
+- The root gets SIGNAL alone, never its group, when it is not the
+  leader of its group, when its group is protected, when a member of
+  its group has another (effective) user ID, for example a child that
+  runs sudo, or when SNAPSHOT has no table to check the group."
   (when-let* ((pid (claude-code-ide-process--track-pid track))
               (entry (claude-code-ide-process--entry-alive-p
                       pid (claude-code-ide-process--track-start track))))
-    (unless (memq pid (car protected))
-      (if (and (eql (plist-get entry :pgid) pid)
-               (not (memq pid (cdr protected))))
-          (claude-code-ide-process--send (- pid) signal)
-        (claude-code-ide-process--send pid signal)))))
+    (let ((protected (plist-get snapshot :protected))
+          (uid (user-uid)))
+      (unless (memq pid (car protected))
+        (if (and (eql (plist-get entry :pgid) pid)
+                 (not (memq pid (cdr protected)))
+                 ;; Without a table the group cannot be checked
+                 (plist-get snapshot :table)
+                 (cl-every (lambda (e)
+                             (or (not (eql (plist-get e :pgid) pid))
+                                 (eql (plist-get e :uid) uid)))
+                           (plist-get snapshot :table)))
+            (claude-code-ide-process--send (- pid) signal)
+          (claude-code-ide-process--send pid signal))))))
 
-(defun claude-code-ide-process--soft-end (track end protected)
+(defun claude-code-ide-process--soft-end (track end snapshot)
   "Run the soft end END for TRACK: a signal, a function, or `none'.
-PROTECTED is as for `claude-code-ide-process--signal-root'."
+SNAPSHOT is as for `claude-code-ide-process--signal-root'."
   (cond
    ((eq end 'none) nil)
    ((functionp end)
@@ -674,7 +694,7 @@ PROTECTED is as for `claude-code-ide-process--signal-root'."
       (error (message "claude-code-ide-process: soft end failed: %s"
                       (error-message-string err)))))
    ((symbolp end)
-    (claude-code-ide-process--signal-root track end protected))))
+    (claude-code-ide-process--signal-root track end snapshot))))
 
 (defun claude-code-ide-process--ledger (tracks)
   "Return (GROUPS . MEMBERS), the union of the records of TRACKS.
@@ -734,11 +754,12 @@ them never gets a signal, and protected processes are not listed."
     (cons verified unverified)))
 
 (defun claude-code-ide-process--groups-left (groups)
-  "Return the entries of GROUPS, an alist (PGID . ENTRIES), that may still run."
+  "Return the groups of GROUPS, an alist (PGID . ENTRIES), that may still run.
+Only for the end of a wait; see `claude-code-ide-process--still-there-p'."
   (cl-remove-if-not (lambda (group)
                       (cl-some (lambda (e)
                                  (claude-code-ide-process--still-there-p
-                                  (plist-get e :pid) (plist-get e :start)))
+                                  (plist-get e :pid) (plist-get e :start) (car group)))
                                (cdr group)))
                     groups))
 
@@ -916,17 +937,25 @@ The records stay, so that a later stop can use them."
              track (claude-code-ide-process--soft-end-of
                     (claude-code-ide-process--track-instance track)
                     (plist-get (claude-code-ide-process--job-options job) :soft-end))
-             (plist-get snapshot :protected))))
+             snapshot)))
         (list :wait (lambda () (null (claude-code-ide-process--running job)))
               (claude-code-ide-process--job-timeout job)
               #'claude-code-ide-process--step-term)))))
 
 (defun claude-code-ide-process--escalate (job signal)
-  "Send SIGNAL to each CLI of JOB that still runs; return those CLIs."
-  (let ((running (claude-code-ide-process--running job))
-        (protected (plist-get (claude-code-ide-process--job-snapshot job) :protected)))
+  "Send SIGNAL to each CLI of JOB that still runs; return those CLIs.
+A fresh table shows the members of each CLI's group now.  When ps
+fails, the snapshot of step 1 gives the protected set, and each CLI
+gets SIGNAL alone, because its group cannot be checked."
+  (let* ((running (claude-code-ide-process--running job))
+         (table (and running (funcall claude-code-ide-process-list-function)))
+         (snapshot (if table
+                       (claude-code-ide-process--snapshot table)
+                     (list :table nil
+                           :protected (plist-get (claude-code-ide-process--job-snapshot job)
+                                                 :protected)))))
     (dolist (track running)
-      (claude-code-ide-process--signal-root track signal protected)
+      (claude-code-ide-process--signal-root track signal snapshot)
       (puthash track signal (claude-code-ide-process--job-escalated job)))
     running))
 
@@ -988,13 +1017,10 @@ A CLI that still runs keeps its groups: they are its work."
         (if (null live)
             (progn (setf (claude-code-ide-process--job-survivors job) nil)
                    (claude-code-ide-process--step-finish job))
-          ;; Live members of a verified group belong to it; remember
-          ;; them, so the next round still verifies the group after its
-          ;; recorded members are gone
-          (dolist (group live)
-            (dolist (entry (cdr group))
-              (when (numberp (plist-get entry :start))
-                (puthash (plist-get entry :pid) (plist-get entry :start) (cdr ledger)))))
+          ;; The ledger does not grow during a stop: only processes that
+          ;; a record saw before the stop prove a group.  A member that
+          ;; joined later could be a reused PID within the 1.5 s of
+          ;; `claude-code-ide-process--same-start-p'.
           (dolist (group live)
             (when (claude-code-ide-process--send (- (car group)) 'SIGTERM)
               (cl-pushnew (car group) (claude-code-ide-process--job-ended job))))
@@ -1003,15 +1029,26 @@ A CLI that still runs keeps its groups: they are its work."
                 #'claude-code-ide-process--step-reap-kill))))))
 
 (defun claude-code-ide-process--step-reap-kill (job)
-  "Step 4, the end of a round of JOB: SIGKILL to the groups that still run."
+  "Step 4, the end of a round of JOB: SIGKILL to the groups that still run.
+Since the SIGTERM, a group can have ended and its group ID can belong
+to an unrelated group.  So a fresh table checks each group again, in
+full, right before the SIGKILL; only groups that pass get it."
   (let ((left (claude-code-ide-process--groups-left (claude-code-ide-process--job-live job))))
     (if (null left)
         (claude-code-ide-process--step-reap-next job)
-      (dolist (group left)
-        (claude-code-ide-process--send (- (car group)) 'SIGKILL))
-      (list :wait (lambda () (null (claude-code-ide-process--groups-left left)))
-            (min (claude-code-ide-process--job-kill-wait job) 1)
-            #'claude-code-ide-process--step-reap-next))))
+      (let ((table (funcall claude-code-ide-process-list-function)))
+        (if (null table)
+            (claude-code-ide-process--error-done job "ps failed: no process table")
+          (let ((targets (cl-remove-if-not
+                          (lambda (group) (assq (car group) left))
+                          (car (claude-code-ide-process--classify
+                                (claude-code-ide-process--job-ledger job) table
+                                (claude-code-ide-process--job-protected job))))))
+            (dolist (group targets)
+              (claude-code-ide-process--send (- (car group)) 'SIGKILL))
+            (list :wait (lambda () (null (claude-code-ide-process--groups-left targets)))
+                  (min (claude-code-ide-process--job-kill-wait job) 1)
+                  #'claude-code-ide-process--step-reap-next)))))))
 
 (defun claude-code-ide-process--step-reap-next (job)
   "Step 4 of JOB: run another round, up to three, while time is left."
