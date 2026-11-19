@@ -170,6 +170,10 @@ Use a local checkout to run a branch that is not on the package archives, for ex
 
 Sessions that already run when the registry turns on are recorded too, but without status hooks; =M-x claude-code-ide-session-registry-track-sessions= restarts them with hooks (see [[*Session Registry and Restore][Session Registry and Restore]]).
 
+** Updating
+
+To update the installed package, and to load its new Lisp in a running Emacs, see [[file:docs/updating.md][docs/updating.md]]. =M-x claude-code-ide-reload= loads the package files again in a running Emacs after an update; running sessions keep running.
+
 * Usage
 
 ** Basic Commands
@@ -180,7 +184,9 @@ The easiest way to interact with Claude Code IDE is through the transient menu i
 |-----------------------------------------+---------------------------------------------------|
 | =M-x claude-code-ide-menu=                | Open transient menu with all Claude Code commands |
 | =M-x claude-code-ide-emacs-tools-setup=   | Set up built-in MCP tools (e.g. xref, project)    |
-| =M-x claude-code-ide=                     | Start a new Claude Code instance for the project  |
+| =M-x claude-code-ide=                     | Start a new instance of the current provider      |
+| =M-x claude-code-ide-toggle-provider=     | Make the next provider the current provider       |
+| =M-x claude-code-ide-codex=               | Start a new Codex instance for the project        |
 | =M-x claude-code-ide-send-prompt=         | Send prompt to Claude from minibuffer input       |
 | =M-x claude-code-ide-continue=            | Continue most recent conversation in new instance |
 | =M-x claude-code-ide-resume=              | Resume a previous conversation in new instance    |
@@ -210,10 +216,37 @@ Claude Code IDE automatically detects your project using Emacs' built-in =projec
 - The first instance of a project gets the plain buffer name =*claude-code[project-name]*=.
 - Running =M-x claude-code-ide= again starts an /additional/ instance and prompts for an optional name: entering =refactor= yields =*claude-code[project-name:refactor]*=, while empty input auto-numbers (=*claude-code[project-name:2]*=, =*claude-code[project-name:3]*=, ...). Auto numbers are positional and get reused after an instance exits.
 - =M-x claude-code-ide-rename-session= renames an instance later; names show up in buffer names, session lists and prompts.
-- Each instance runs its own MCP server, so cursor/selection context is shared with /every/ instance of the project, while explicit actions (prompts, at-mentions, diffs) target exactly one.
+- Each Claude Code instance runs its own IDE server, so cursor/selection context is shared with /every/ Claude Code instance of the project, while explicit actions (prompts, at-mentions, diffs) target exactly one.
 - Use =claude-code-ide-list-sessions= to see all instances across all projects and switch between them.
 
 Note for =claude-code-ide-continue=: starting a second continued instance in the same directory forks the same "most recent" conversation — that is CLI behavior.
+
+** Providers: Claude Code and Codex
+
+A provider is a coding-agent CLI. The package has two: =claude= (Claude Code) and =codex= (Codex). Codex and Claude Code instances can run in one project at the same time.
+
+*** The current provider
+
+- =M-x claude-code-ide=, =claude-code-ide-continue= and =claude-code-ide-resume=, and their keys =s=, =c= and =r= in =claude-code-ide-menu=, start an instance of the /current provider/.
+- The menu shows the current provider in its header. Its key =P= toggles the current provider between the registered providers, and the menu stays open.
+- =C-u= before one of the three commands asks for the provider, with completion and the current one as the default. Then it asks for the instance name, as =C-u= always does.
+- The current provider is the one that you used last. It persists across Emacs restarts, in the file =current-provider= in the report directory of the session registry (=claude-code-ide-provider-file= changes the file). A missing or broken file gives =claude-code-ide-default-provider= (default =claude=).
+- A restore or a reopen of a saved session uses the provider of that session, never the current provider.
+
+*** Codex
+
+- =M-x claude-code-ide-codex= starts a Codex instance in the current project. =claude-code-ide-codex-continue= and =claude-code-ide-codex-resume= continue the last conversation or open the picker.
+- Emacs passes its instructions, the MCP tools server, and the approvals with =-c= options. Prompts go through =codex queue=. See [[file:docs/codex.md][docs/codex.md]].
+- A Codex instance gets no IDE server and no lock file in =~/.claude/ide/=, because Codex does not speak that protocol. It uses only the MCP tools server.
+- Codex never gets =claude-code-ide-cli-extra-flags= or the Claude Code model. Its flags and its model come from =claude-code-ide-codex-extra-flags=.
+- You answer the Codex folder trust dialog yourself, one time for each repository.
+- Options: =claude-code-ide-codex-cli-path=, =claude-code-ide-codex-extra-flags=, =claude-code-ide-codex-remove-openai-api-key= (default t), =claude-code-ide-codex-no-alt-screen= (default t), =claude-code-ide-codex-skip-update-check= (default t), =claude-code-ide-codex-config-read-timeout= (5 s), =claude-code-ide-codex-queue-timeout= (30 s).
+
+** Stopping Instances
+
+When Emacs stops an instance, or quits, it sends the CLI its soft end (SIGHUP), waits, and then ends the background commands that the CLI started and that still run. At an Emacs quit, all CLIs share one short wait. When a CLI exits by its own choice (for example "Move to background and exit"), Emacs leaves its background work running.
+
+The options are in the group =claude-code-ide-process=: =claude-code-ide-process-stop-timeout= (5 s), =claude-code-ide-process-quit-timeout= (1.5 s), =claude-code-ide-process-kill-wait= (2 s), =claude-code-ide-process-soft-end=, and =claude-code-ide-process-lsof-timeout= (30 s), which limits the scan of working folders. See [[file:docs/process-tree.md][docs/process-tree.md]].
 
 ** Editor Context
 
@@ -257,6 +290,9 @@ This allows you to refine Claude's suggestions before they're applied, ensuring 
 | Variable                                      | Description                                 | Default                              |
 |-----------------------------------------------+---------------------------------------------+--------------------------------------|
 | ~claude-code-ide-cli-path~                      | Path to Claude Code CLI                     | ~"claude"~                             |
+| ~claude-code-ide-default-provider~              | Provider of a new instance without a choice | ~claude~                               |
+| ~claude-code-ide-provider-file~                 | File of the current provider                | ~nil~ (report directory)               |
+| ~claude-code-ide-mcp-config-directory~          | Private folder of the CC MCP config files   | ~nil~ (temporary folder)               |
 | ~claude-code-ide-buffer-name-function~          | Function for buffer naming                  | ~claude-code-ide--default-buffer-name~ |
 | ~claude-code-ide-cli-debug~                     | Enable CLI debug mode (-d flag)             | ~nil~                                  |
 | ~claude-code-ide-cli-extra-flags~               | Additional CLI flags (e.g. "--model")       | ~""~                                   |
@@ -629,11 +665,14 @@ The state file holds only what Emacs knows. The conversation, its title and its 
 
 #+begin_src json
 {
-  "version": 1,
+  "version": 2,
   "sessions": [
     {
-      "key": "5afe576e-88a4-4ecf-b317-1cd4b509ca6d",
-      "session_id": "5afe576e-88a4-4ecf-b317-1cd4b509ca6d",
+      "instance_id": "5afe576e-88a4-4ecf-b317-1cd4b509ca6d",
+      "provider": "claude",
+      "native_id": "5afe576e-88a4-4ecf-b317-1cd4b509ca6d",
+      "generation": 1,
+      "role": null,
       "transcript_path": "/home/me/.claude/projects/-home-me-src-app/5afe576e-88a4-4ecf-b317-1cd4b509ca6d.jsonl",
       "project_dir": "/home/me/src/app/",
       "buffer_name": "*claude-code[app:refactor]*",
@@ -653,8 +692,10 @@ The state file holds only what Emacs knows. The conversation, its title and its 
 }
 #+end_src
 
-- =key= is the id of the entry and never changes.
-- =session_id= is the current Claude CLI session id. Emacs starts a new conversation with =--session-id <key>=. A SessionStart hook, passed with =--settings=, reports a new id after =/clear=, =/resume=, or a start with =-c= or =-r=. The reports go to a directory next to the state file (=claude-code-ide-session-registry-report-directory=).
+- The state file is now =~/.emacs-claude-code-ide-state-v2.json= (=-v2= before the extension of =claude-code-ide-state-file=). The old version 1 file is read and migrated one time, while the version 2 file does not exist. Emacs never writes the version 1 file.
+- =instance_id= is the instance ID, which never changes.
+- =native_id= is the current CLI session id. Emacs starts a new conversation with =--session-id <new UUID>=. A SessionStart hook, passed with =--settings=, reports a new id after =/clear=, =/resume=, or a start with =-c= or =-r=. The reports go to a directory next to the state file (=claude-code-ide-session-registry-report-directory=).
+- =provider=, =generation= and =role= say which CLI runs the instance, how often it was launched, and its optional role.
 - If =claude-code-ide-cli-extra-flags= has its own =--settings=, the registry does not add its hook, because a second =--settings= replaces the first. Then a new id after =/clear= or =/resume= is not recorded.
 - =model= and =extra_flags= come from =claude-code-ide-cli-extra-flags= at start. Session flags (=-c=, =-r=, =--resume=, =--session-id=, =--fork-session=) are not stored.
 - =closed_by= is =exited= (the CLI ended), =killed= (Emacs ended a running CLI) or =emacs-exit=.
@@ -663,13 +704,18 @@ Every change goes through one queue. The queue writes under a lock directory (=<
 
 ** Session Status
 
-The status buffer shows what each running instance does, grouped by project (the directory that Claude Code works in). The projects and instances that need you come first. Keep it open to see at a glance which sessions are blocked, and press =RET= to go to one; on a project line, =RET= goes to the first instance of that project.
+The status buffer, =*Coding Agents Sessions*=, shows what each running instance does, grouped by project (the directory that the agent works in). The projects and instances that need you come first. Keep it open to see at a glance which sessions are blocked, and press =RET= to go to one; on a project line, =RET= goes to the first instance of that project.
 
 #+begin_src elisp
 (claude-code-ide-session-status-mode 1)   ; also turns on the session registry
 #+end_src
 
 Turn the mode off to close the buffer. =M-x claude-code-ide-show-session-status= shows it again.
+
+Codex instances are in the same buffer. Each line shows the provider, the model (=unknown= when not known), and the common state with its reason (a =?= marks a guess).
+
+- =M-x claude-code-ide-codex-trust-hooks= shows the Codex status hooks and, after a confirmation, trusts them in =~/.codex/config.toml=. Codex runs a hook only after you trust it.
+- =claude-code-ide-session-status-snapshot= (default =t=) writes =<report directory>/status/<emacs pid>.json= for coordinators; see [[file:docs/status-schema.md][docs/status-schema.md]].
 
 Each state says who waits for whom. They are listed in the order of the buffer: what needs you first.
 
@@ -736,6 +782,23 @@ Once enabled, Claude can use these tools to navigate your codebase. For example:
 - "Analyze the parse tree of this entire file"
 - "List all functions and variables in this file"
 - "How many files are in this project?"
+
+*** Routing, secrets and scopes
+
+- Each instance gets a secret at each launch. =claude-code-ide-mcp-server-secret-placement= (default =header=) says where the generated config puts it: in the =X-Emacs-MCP-Instance-Secret= header, or in the URL path.
+- Claude Code gets its MCP config in a file (=--mcp-config FILE=), not on its command line, so =ps= does not show the secret or other header values. The file has mode 0600, in a private 0700 folder (=claude-code-ide-mcp-config-directory=, default =claude-code-ide-<uid>= in the temporary folder). Emacs deletes it when the instance ends and when Emacs quits.
+- The debug log never shows the secret, the coordinator credential, or another header value.
+- Tools with =:scope coordinator= run only for requests with the coordinator credential, from =claude-code-ide-mcp-server-coordinator-credential-file= (default: =coordinator-credential= in the report directory, mode 0600). =M-x claude-code-ide-mcp-server-rotate-coordinator-credential= replaces it.
+- The tool =get_capabilities= lists the operations of the calling instance.
+- =claude-code-ide-mcp-server-extra-headers= adds headers (for example a global token) to the generated MCP config. A value can be a function that returns it.
+- The server refuses requests with an =Origin= header, requests that are not =application/json=, and requests without a known session.
+- See [[file:docs/api-mcp.md][docs/api-mcp.md]].
+
+** Control for Coordinators
+
+- The control operations list, inspect, launch, resume, prompt, and stop an instance by its instance ID. Each is an Elisp function (=claude-code-ide-control-...=) and an MCP coordinator tool. See [[file:docs/api-control.md][docs/api-control.md]].
+- A prompt goes through the instance's inbox in =<report directory>/inbox/=. It is sent only when the instance is idle, and it counts as delivered when the CLI reports the same prompt.
+- Options: =claude-code-ide-control-inbox-directory=, =claude-code-ide-control-ack-timeout=, =claude-code-ide-control-retry-interval=, =claude-code-ide-control-enable-mcp-tools=, =claude-code-ide-control-done-days= (default 7).
 
 ** Creating Custom MCP Tools
 
