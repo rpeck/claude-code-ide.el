@@ -757,10 +757,9 @@ CONTENT is a JSON value as text; FIELDS are extra \"key\":value texts."
     (claude-code-ide-session-status--install-script)
     (let* ((script (claude-code-ide-session-status--script-file))
            (dir (expand-file-name "events" registry-dir))
-           ;; The script gives up after a number of tries for the lock.
-           ;; On a loaded machine the holder can be slow, so its `sleep'
-           ;; returns only when the lock is free: each writer tries once
-           ;; per release, however slow the machine is.
+           ;; The script gives up after a time limit.  Here `sleep'
+           ;; returns only when the lock is free, so each writer tries
+           ;; once per release, however slow the machine is.
            (bin (expand-file-name "bin" registry-dir))
            (process-environment
             (progn
@@ -802,29 +801,30 @@ idle machine.")
 
 (defun claude-code-ide-tests--script-lock-budget (script)
   "Check the lock loop of the hook SCRIPT text for parallel writers.
-The loop sleeps a fixed time between tries and gives up after a number
-of tries.  A dead holder's lock must break before the end, and the
-tries must last at least as long as all other writers hold the lock."
-  (let ((limit (and (string-match "\"\\$tries\" -gt \\([0-9]+\\)" script)
+The loop measures real time, not tries: it gives up after the time
+limit of `claude-code-ide-session-status-hook-time-limit', and breaks a
+dead holder's lock before that.  The limit must also outlast the time
+that all other writers hold the lock."
+  (let ((limit (and (string-match "^  limit=\\([0-9]+\\)$" script)
                     (string-to-number (match-string 1 script))))
-        (break (and (string-match "\"\\$tries\" -eq \\([0-9]+\\)" script)
-                    (string-to-number (match-string 1 script))))
-        (pause (and (string-match "^ *sleep \\([0-9.]+\\)$" script)
+        (break (and (string-match "\"\\$waited\" -ge \\([0-9]+\\)" script)
                     (string-to-number (match-string 1 script)))))
-    (should (natnump limit))
+    (should (equal limit (claude-code-ide-session-status--hook-limit)))
     (should (natnump break))
-    (should (and (numberp pause) (> pause 0)))
     (should (< break limit))
-    ;; Each try sleeps at least PAUSE, so the tries last at least this long
-    (should (>= (* limit pause)
-                (* (1- claude-code-ide-tests--script-writers)
-                   claude-code-ide-tests--script-hold)))))
+    (should (string-match-p "start=\\$(date \\+%s)" script))
+    (should (string-match-p "now=\\$(date \\+%s)" script))
+    (should (string-match-p "\"\\$waited\" -gt \"\\$limit\"" script))
+    ;; No limit of the number of tries is left
+    (should-not (string-match-p "\"\\$tries\" -\\(gt\\|eq\\) [0-9]" script))
+    (should (>= limit (* (1- claude-code-ide-tests--script-writers)
+                         claude-code-ide-tests--script-hold)))))
 
 (ert-deftest claude-code-ide-test-status-hook-script-lock-budget ()
-  "The tries of the status hook script give 20 parallel writers enough time.
+  "The time limit of the status hook script gives 20 parallel writers enough time.
 The parallel test above makes the waits independent of the speed of
 the machine; this test checks the numbers of the real loop."
-  (claude-code-ide-tests--script-lock-budget claude-code-ide-session-status--script))
+  (claude-code-ide-tests--script-lock-budget (claude-code-ide-session-status--script-text)))
 
 (ert-deftest claude-code-ide-test-status-drain-applies-in-order ()
   "Events are applied in sequence order; unknown launches are deleted."
@@ -977,6 +977,64 @@ project line."
           (claude-code-ide-session-registry-mode -1))
         (mapc #'kill-buffer buffers)
         (claude-code-ide-tests--clear-processes)))))
+
+;;; The time limit of the hook scripts
+
+(defun claude-code-ide-tests--held-lock-run (script args lock environment)
+  "Run the hook SCRIPT with ARGS while a live process holds LOCK.
+ENVIRONMENT holds more \"NAME=VALUE\" entries.  The holder is this
+Emacs, which runs.  Return (EXIT OUTPUT SECONDS) of the run."
+  (make-directory lock t)
+  (with-temp-file (expand-file-name "pid" lock) (insert (format "%d\n" (emacs-pid))))
+  (let ((process-environment (append environment process-environment))
+        (start (float-time)))
+    (with-temp-buffer
+      (insert "{\"session_id\":\"cci-test-held\"}")
+      (let ((exit (apply #'call-process-region (point-min) (point-max) "/bin/sh" t t nil
+                         script args)))
+        (list exit (buffer-string) (- (float-time) start))))))
+
+(ert-deftest claude-code-ide-test-status-hook-script-time-limit ()
+  "A hook whose lock stays held gives up after about the time limit, and exits 0.
+The script is a shell process, so the virtual clock of the tests cannot
+drive it; the check uses real time with a generous bound.  The hook
+drops its event, removes its temporary file, and writes one line to
+hook-errors.log in the events folder."
+  (claude-code-ide-tests--with-status
+    (let ((claude-code-ide-session-status-hook-time-limit 1))
+      (claude-code-ide-session-status--install-script)
+      (let* ((script (claude-code-ide-session-status--script-file))
+             (dir (expand-file-name "events" registry-dir))
+             (result (claude-code-ide-tests--held-lock-run
+                      script (list dir "n4" "Stop") (expand-file-name ".n4.lock" dir) nil)))
+        (should (equal (butlast result) '(0 "")))
+        ;; More than the limit, and far less than a count of tries on a slow machine
+        (should (>= (nth 2 result) 0.9))
+        (should (< (nth 2 result) 20))
+        (should-not (directory-files dir nil "\\`n4-"))
+        (should-not (directory-files dir nil "\\`\\.n4\\.in\\."))
+        (let ((log (claude-code-ide-session-registry--file-string
+                    (expand-file-name "hook-errors.log" dir))))
+          (should (string-match-p "Stop: no lock after [0-9]+ s .*\\.n4\\.lock); event dropped\n\\'" log))
+          (should (= 1 (length (split-string log "\n" t)))))))))
+
+(ert-deftest claude-code-ide-test-status-hook-script-holds-the-limit ()
+  "Emacs writes the time limit into the installed script, and the launch check sees it."
+  (claude-code-ide-tests--with-status
+    (let ((file (claude-code-ide-session-status--script-file)))
+      (let ((claude-code-ide-session-status-hook-time-limit 7))
+        (claude-code-ide-session-status--install-script)
+        (should (string-match-p "^  limit=7$" (claude-code-ide-session-registry--file-string file)))
+        (claude-code-ide-tests--script-lock-budget (claude-code-ide-session-status--script-text)))
+      ;; Another value: the next install writes it
+      (let ((claude-code-ide-session-status-hook-time-limit 10))
+        (claude-code-ide-session-status--install-script)
+        (should (equal (claude-code-ide-session-registry--file-string file)
+                       (claude-code-ide-session-status--script-text)))
+        (should (string-match-p "^  limit=10$" (claude-code-ide-session-registry--file-string file))))
+      ;; The default is 10 seconds, and the hook command has no limit in it
+      (should (= (default-value 'claude-code-ide-session-status-hook-time-limit) 10))
+      (should-not (string-match-p "limit" (claude-code-ide-session-status--command "n5" "Stop"))))))
 
 (provide 'claude-code-ide-session-status-tests)
 
