@@ -905,6 +905,15 @@ reported and do not stop the start.
 The session registry adds its provisional record here; this file
 itself adds no function.")
 
+(defvar claude-code-ide-session-start-failed-functions nil
+  "Functions called when the start of an instance fails after its prepare hook.
+Each function is called with SESSION, LAUNCH (the start spec of the
+launch) and ERR, the error or quit of the start.  They run for every
+start that ran `claude-code-ide-session-prepare-functions', also when
+no terminal buffer exists, before the cleanup of the start.  Errors
+are reported and do not stop the cleanup.
+The session registry resolves its provisional record here.")
+
 (defvar claude-code-ide-session-end-functions nil
   "Functions called when a Claude Code instance ends.
 Each function is called with SESSION and REASON: `exited' when the
@@ -2448,6 +2457,7 @@ messages."
          (session-id (claude-code-ide--generate-session-id working-dir))
          (session nil)
          (instance nil)
+         (prepared nil)
          (registered nil))
     (condition-case err
         (progn
@@ -2484,6 +2494,7 @@ messages."
           (claude-code-ide-mcp-server-session-started session-id working-dir nil)
           (setq registered t)
           ;; The last step before the spawn, for every provider
+          (setq prepared t)
           (claude-code-ide--run-session-hook 'claude-code-ide-session-prepare-functions
                                              session launch)
           (let* ((port (claude-code-ide-mcp-session-port session))
@@ -2601,6 +2612,11 @@ messages."
             ;; Delayed so the startup message above stays readable first
             (run-with-timer 2 nil #'claude-code-ide--maybe-recommend-ghostel)))
       ((error quit)
+       ;; Before the cleanup, while the descriptor is still registered:
+       ;; the functions resolve what the prepare hook recorded
+       (when prepared
+         (claude-code-ide--run-session-hook 'claude-code-ide-session-start-failed-functions
+                                            session launch err))
        ;; Session creation failed (or was quit) - tear down only THIS
        ;; instance; a directory-wide stop would kill sibling instances'
        ;; servers.  Once a terminal buffer exists, the full per-session

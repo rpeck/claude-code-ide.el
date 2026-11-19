@@ -24,7 +24,7 @@
 
 ;; `claude-code-ide-session-registry-mode' records every instance that
 ;; Emacs starts, of each provider (Claude Code and Codex), in a JSON
-;; file: `claude-code-ide-state-file' with "-v2" before the extension.
+;; file: `claude-code-ide-state-file' with "-v3" before the extension.
 ;; After a crash, `claude-code-ide-restore-sessions' starts every
 ;; instance that was still open again, in its directory, with its
 ;; provider, its instance name and its native conversation ID.  Each
@@ -53,14 +53,14 @@
 ;; lock directory, writes a temporary file and renames it over the state
 ;; file, and keeps the previous version as a ".bak" file.
 ;;
-;; The file has version 2: each record also holds its provider, its
-;; launch generation and its role, and the entry key is the instance ID
-;; of `claude-code-ide-instance'.  While the version 2 file does not
-;; exist, the version 1 file `claude-code-ide-state-file', which held
-;; only Claude Code records, is read and migrated in memory.  The
-;; registry never writes or moves the version 1 file, so an older
-;; version of the package can go on using it.  docs/session-schema.md
-;; describes both versions.
+;; The file has version 3: each record holds its provider, its launch
+;; generation, its role, its owner process and its failures, and the
+;; entry key is the instance ID of `claude-code-ide-instance'.  While
+;; the version 3 file does not exist, the version 2 file (with "-v2"),
+;; else the version 1 file `claude-code-ide-state-file', is read and
+;; migrated in memory.  The registry never writes or moves the files of
+;; older versions, so an older version of the package can go on using
+;; its own file.  docs/session-schema.md describes all versions.
 
 ;;; Code:
 
@@ -80,13 +80,14 @@
 (defcustom claude-code-ide-state-file
   (expand-file-name "~/.emacs-claude-code-ide-state.json")
   "File of the version 1 session registry.
-`claude-code-ide-session-registry-mode' records sessions in version 2,
-in a file with the same name plus \"-v2\" before the extension, for
-example ~/.emacs-claude-code-ide-state-v2.json.  The previous version
+`claude-code-ide-session-registry-mode' records sessions in version 3,
+in a file with the same name plus \"-v3\" before the extension, for
+example ~/.emacs-claude-code-ide-state-v3.json.  The previous version
 is kept next to that file, with the suffix \".bak\".  When the
-version 2 file does not exist yet, the registry reads this file and
-migrates it.  The registry never writes this file, so an older version
-of the package can still use it."
+version 3 file does not exist yet, the registry reads the version 2
+file (\"-v2\"), else this file, and migrates it.  The registry never
+writes these files, so an older version of the package can still use
+them."
   :type 'file
   :group 'claude-code-ide)
 
@@ -127,13 +128,14 @@ Emacs that died while it wrote, and is removed."
 
 ;;; Data
 
-(defconst claude-code-ide-session-registry--version 2
+(defconst claude-code-ide-session-registry--version 3
   "Version of the state file format that Emacs writes.")
 
-(defconst claude-code-ide-session-registry--read-versions '(1 2)
+(defconst claude-code-ide-session-registry--read-versions '(1 2 3)
   "Versions of the state file format that Emacs reads.
 A version 1 file is migrated in memory; see
-`claude-code-ide-session-registry--migrate-v1'.")
+`claude-code-ide-session-registry--migrate-v1'.  A version 2 record
+reads as a version 3 record whose new fields are empty.")
 
 (defconst claude-code-ide-session-registry--states '(pending open closed failed archived)
   "States of a registry entry.
@@ -187,7 +189,9 @@ with a reused PID has another start time.")
   (failure nil :type (or null string)
            :documentation "Why the last restore or reopen failed, or nil.")
   (failure-count 0 :type integer
-                 :documentation "Restores or reopens that failed in a row since the last start.")
+                 :documentation "Restores or reopens that failed in a row since the last good start.")
+  (native-id-generation nil :type (or null integer)
+                        :documentation "Launch generation whose report set the native ID, or nil.")
   (failed-at nil :type (or null string)))
 
 (defconst claude-code-ide-session-registry--fields
@@ -216,8 +220,9 @@ with a reused PID has another start time.")
     (emacs_start_time . emacs-start-time)
     (failure . failure)
     (failure_count . failure-count)
-    (failed_at . failed-at))
-  "JSON key and struct slot of each field of an entry, in version 2.")
+    (failed_at . failed-at)
+    (native_id_generation . native-id-generation))
+  "JSON key and struct slot of each field of an entry, in version 3.")
 
 (defconst claude-code-ide-session-registry--v1-renames
   '((key . instance_id)
@@ -304,17 +309,20 @@ Only their end changes an entry; a start that failed does not.")
   "Sessions whose provisional entry is saved and whose start is not recorded.
 The value is `new' for a new entry and `reopen' for an entry that
 existed before.  A new entry of a start that fails is removed.  The
-table holds its sessions strongly, so that the check of a start that
-failed before its terminal existed still finds it; the start, the end
-or that check removes it.")
+table holds its sessions strongly: the start, or the hook
+`claude-code-ide-session-start-failed-functions', removes them.")
 
-(defvar claude-code-ide-session-registry--pending-timer nil
-  "Timer that looks for starts that failed before their terminal existed.")
+(defvar claude-code-ide-session-registry--failed-starts (make-hash-table :test 'equal)
+  "Keys of the entries whose failed start the start-failed hook recorded.
+`claude-code-ide-session-registry--start-entry' then records no second
+failure for the same start.")
 
 (defvar claude-code-ide-session-registry--restoring
   (make-hash-table :test 'eq :weakness 'key)
   "Float time of the start of each session that a restore or a reopen made.
-When such a CLI exits with an error soon after, its entry is `failed'.")
+When such a CLI exits with an error soon after, its entry is `failed'.
+When it still runs after `claude-code-ide-session-registry-restore-grace'
+seconds, the start counts as good.")
 
 (defcustom claude-code-ide-session-registry-restore-grace 60
   "Seconds after a restore in which an exit with an error fails the entry.
@@ -337,9 +345,6 @@ starts it by hand, and a start that works counts from zero again."
 
 (defvar claude-code-ide-session-registry--adopt-timer nil
   "Timer that reads the session ids of adopted sessions again.")
-
-(defvar claude-code-ide-session-registry--start-key nil
-  "Key for the next instance that starts, when it reopens an entry.")
 
 (defvar claude-code-ide-session-registry--exiting nil
   "Non-nil after Emacs started to exit and closed the open entries.")
@@ -397,27 +402,37 @@ A process with a reused PID has another start time.  CACHE is as for
               (now (claude-code-ide-session-registry--process-start-time pid cache)))
     (< (abs (- now start)) 1.0)))
 
-(defun claude-code-ide-session-registry--data-get (data key)
-  "Return the string value of KEY (a symbol) in the event DATA, or nil.
-DATA is an alist with symbol or string keys, or a hash table."
-  (let ((value (cond
-                ((hash-table-p data)
-                 (or (gethash (symbol-name key) data) (gethash key data)))
-                ((consp data)
-                 (cdr (or (assq key data) (assoc (symbol-name key) data)))))))
-    (and (stringp value) (not (string-empty-p value)) value)))
+(declare-function claude-code-ide-codex-events--string "claude-code-ide-codex-events" (data field))
+
+(defun claude-code-ide-session-registry--event-string (data field)
+  "Return the non-empty string FIELD of the Codex hook DATA, or nil.
+The getter of the Codex event adapter reads it; the events of a Codex
+instance come from that adapter, so it is loaded."
+  (and (fboundp 'claude-code-ide-codex-events--string)
+       (claude-code-ide-codex-events--string data field)))
 
 (defun claude-code-ide-session-registry--v1-file ()
   "Return the absolute name of the version 1 state file.
 The registry reads it only while the version 2 file does not exist."
   (expand-file-name claude-code-ide-state-file))
 
-(defun claude-code-ide-session-registry--state-file ()
-  "Return the absolute name of the state file, which has version 2.
-It is `claude-code-ide-state-file' with \"-v2\" before the extension."
+(defun claude-code-ide-session-registry--versioned-file (version)
+  "Return the name of the state file of VERSION, 2 or more.
+It is `claude-code-ide-state-file' with \"-vVERSION\" before the extension."
   (let* ((v1 (claude-code-ide-session-registry--v1-file))
          (extension (file-name-extension v1 t)))
-    (concat (file-name-sans-extension v1) "-v2" extension)))
+    (concat (file-name-sans-extension v1) (format "-v%d" version) extension)))
+
+(defun claude-code-ide-session-registry--v2-file ()
+  "Return the absolute name of the version 2 state file.
+The registry reads it only while the version 3 file does not exist."
+  (claude-code-ide-session-registry--versioned-file 2))
+
+(defun claude-code-ide-session-registry--state-file ()
+  "Return the absolute name of the state file, which has version 3.
+It is `claude-code-ide-state-file' with \"-v3\" before the extension."
+  (claude-code-ide-session-registry--versioned-file
+   claude-code-ide-session-registry--version))
 
 (defun claude-code-ide-session-registry--backup-file ()
   "Return the name of the backup of the state file."
@@ -471,7 +486,7 @@ It is `claude-code-ide-state-file' with \"-v2\" before the extension."
           claude-code-ide-session-registry--fields))
 
 (defun claude-code-ide-session-registry--entry-from-alist (alist)
-  "Return the entry that the version 2 record ALIST describes.
+  "Return the entry that the version 2 or 3 record ALIST describes.
 Return nil when it has no instance ID."
   (when (stringp (alist-get 'instance_id alist))
     (let ((entry (claude-code-ide-session-registry-entry-create)))
@@ -502,6 +517,8 @@ Return nil when it has no instance ID."
           (setf (cl-struct-slot-value 'claude-code-ide-session-registry-entry slot entry) nil)))
       (unless (natnump (claude-code-ide-session-registry-entry-failure-count entry))
         (setf (claude-code-ide-session-registry-entry-failure-count entry) 0))
+      (unless (natnump (claude-code-ide-session-registry-entry-native-id-generation entry))
+        (setf (claude-code-ide-session-registry-entry-native-id-generation entry) nil))
       (dolist (slot '(worktree failure failed-at))
         (unless (stringp (cl-struct-slot-value 'claude-code-ide-session-registry-entry slot entry))
           (setf (cl-struct-slot-value 'claude-code-ide-session-registry-entry slot entry) nil)))
@@ -532,7 +549,7 @@ Signal `claude-code-ide-session-registry-error' when FILE is unreadable."
                    (memql (alist-get 'version data) claude-code-ide-session-registry--read-versions)
                    (listp (alist-get 'sessions data)))
         (signal 'claude-code-ide-session-registry-error
-                (list file "not a version 1 or 2 session registry")))
+                (list file "not a version 1, 2 or 3 session registry")))
       (let ((v1 (eql (alist-get 'version data) 1)))
         (delq nil (mapcar (lambda (record)
                             (claude-code-ide-session-registry--entry-from-alist
@@ -544,18 +561,24 @@ Signal `claude-code-ide-session-registry-error' when FILE is unreadable."
 (defun claude-code-ide-session-registry--load ()
   "Return the entries of the state file.
 When the state file is unreadable, use its backup and report it.  When
-the version 2 state file does not exist yet, read the version 1 file
-\(or its backup) and migrate it; that file is never written."
+the version 3 state file does not exist yet, read the version 2 file,
+else the version 1 file (or the backup of either), and migrate it.
+The registry never writes or moves the files of the older versions."
   (setq claude-code-ide-session-registry--loaded-from-backup nil)
-  (if (file-exists-p (claude-code-ide-session-registry--state-file))
+  (let ((v2 (claude-code-ide-session-registry--v2-file)))
+    (cond
+     ((file-exists-p (claude-code-ide-session-registry--state-file))
       (claude-code-ide-session-registry--read-with-backup
        (claude-code-ide-session-registry--state-file)
        (claude-code-ide-session-registry--backup-file)
-       t)
-    (claude-code-ide-session-registry--read-with-backup
-     (claude-code-ide-session-registry--v1-file)
-     (concat (claude-code-ide-session-registry--v1-file) ".bak")
-     nil)))
+       t))
+     ((file-exists-p v2)
+      (claude-code-ide-session-registry--read-with-backup v2 (concat v2 ".bak") nil))
+     (t
+      (claude-code-ide-session-registry--read-with-backup
+       (claude-code-ide-session-registry--v1-file)
+       (concat (claude-code-ide-session-registry--v1-file) ".bak")
+       nil)))))
 
 (defun claude-code-ide-session-registry--read-with-backup (file backup mark)
   "Return the entries of FILE, or of BACKUP when FILE is unreadable.
@@ -803,12 +826,20 @@ the only way the state file changes."
               entry))
           entries))
 
+(defconst claude-code-ide-session-registry--kept-at-start
+  '(started-at failure failure-count failed-at native-id-generation)
+  "Slots that a start of a known entry keeps.
+The failures count until a start is confirmed good; see
+`claude-code-ide-session-registry--change-confirmed'.")
+
 (defun claude-code-ide-session-registry--change-started (new &optional new-conversation)
   "Return a change that records the start of the entry NEW.
 A new key adds NEW.  A known key, an entry that is reopened, takes the
-values of NEW but keeps its first start time, and keeps its session id
-when NEW has none.  NEW-CONVERSATION non-nil (a fork) keeps no old
-session id: the new conversation gets its own ID from its report."
+values of NEW but keeps its first start time and its failures, and
+keeps its session id when NEW has none.  NEW-CONVERSATION non-nil (a
+fork) keeps no old session id, because the new conversation gets its
+own ID from its report; only an ID that a report of this launch
+generation set stays."
   (lambda (entries)
     (let ((key (claude-code-ide-session-registry-entry-key new)))
       (if-let* ((old (claude-code-ide-session-registry--find entries key)))
@@ -816,14 +847,16 @@ session id: the new conversation gets its own ID from its report."
            entries (list key)
            (lambda (entry)
              (let ((old-id (claude-code-ide-session-registry-entry-session-id old))
-                   (old-path (claude-code-ide-session-registry-entry-transcript-path old)))
+                   (old-path (claude-code-ide-session-registry-entry-transcript-path old))
+                   (reported-now (eql (claude-code-ide-session-registry-entry-native-id-generation old)
+                                      (claude-code-ide-session-registry-entry-generation new))))
                (cl-loop for (_ . slot) in claude-code-ide-session-registry--fields
-                        unless (eq slot 'started-at)
+                        unless (memq slot claude-code-ide-session-registry--kept-at-start)
                         do (setf (cl-struct-slot-value 'claude-code-ide-session-registry-entry
                                                        slot entry)
                                  (cl-struct-slot-value 'claude-code-ide-session-registry-entry
                                                        slot new)))
-               (unless (or new-conversation
+               (unless (or (and new-conversation (not reported-now))
                            (claude-code-ide-session-registry-entry-session-id entry))
                  (setf (claude-code-ide-session-registry-entry-session-id entry) old-id))
                (when (equal (claude-code-ide-session-registry-entry-session-id entry) old-id)
@@ -889,12 +922,51 @@ entry."
                      (and same (claude-code-ide-session-registry-entry-transcript-path entry))))
            (when model
              (setf (claude-code-ide-session-registry-entry-model entry) model))
+           (when (integerp generation)
+             (setf (claude-code-ide-session-registry-entry-native-id-generation entry) generation))
            (when (eq (claude-code-ide-session-registry-entry-state entry) 'pending)
-             (setf (claude-code-ide-session-registry-entry-state entry) 'open))))))))
+             (setf (claude-code-ide-session-registry-entry-state entry) 'open))
+           ;; The conversation runs: the start is good
+           (when (eql generation (claude-code-ide-session-registry-entry-generation entry))
+             (claude-code-ide-session-registry--clear-failures entry))))))))
 
-(defun claude-code-ide-session-registry--change-failed (key reason)
+(defun claude-code-ide-session-registry--clear-failures (entry)
+  "Clear the failures of ENTRY, a copy that a change may modify."
+  (setf (claude-code-ide-session-registry-entry-failure entry) nil
+        (claude-code-ide-session-registry-entry-failure-count entry) 0
+        (claude-code-ide-session-registry-entry-failed-at entry) nil))
+
+(defun claude-code-ide-session-registry--change-confirmed (key generation)
+  "Return a change that confirms the start GENERATION of the entry KEY as good.
+Its failures are cleared, so that the next failure counts from one.
+A newer launch of the entry, or an entry that failed since, does not
+change."
+  (lambda (entries)
+    (claude-code-ide-session-registry--update
+     entries (list key)
+     (lambda (entry)
+       (when (and (eql generation (claude-code-ide-session-registry-entry-generation entry))
+                  (memq (claude-code-ide-session-registry-entry-state entry) '(open pending)))
+         (claude-code-ide-session-registry--clear-failures entry))))))
+
+(defun claude-code-ide-session-registry--may-fail-p (entry generation)
+  "Return non-nil when a failed start of GENERATION can make ENTRY `failed'.
+That is an entry that is `open', `pending' or `failed', or that the
+last Emacs closed at its exit, and whose launch generation is
+GENERATION (nil: any).  An archived entry, and an entry that the user
+closed, never become `failed'."
+  (and (or (memq (claude-code-ide-session-registry-entry-state entry) '(open pending failed))
+           (and (eq (claude-code-ide-session-registry-entry-state entry) 'closed)
+                (equal (claude-code-ide-session-registry-entry-closed-by entry) "emacs-exit")))
+       (or (null generation)
+           (eql generation (claude-code-ide-session-registry-entry-generation entry)))))
+
+(defun claude-code-ide-session-registry--change-failed (key reason &optional generation)
   "Return a change that marks the entry KEY `failed' with REASON.
-The count of failures in a row goes up by one; see
+GENERATION is the launch generation of the start that failed, or nil
+for a start that failed before its launch got one.  Only an entry that
+`claude-code-ide-session-registry--may-fail-p' allows changes.  The
+count of failures in a row goes up by one; see
 `claude-code-ide-session-registry-restore-attempts'.  This Emacs owns
 the entry then, so that a restore here or after this Emacs ends tries
 it again.  The native ID and the names stay."
@@ -903,20 +975,21 @@ it again.  The native ID and the names stay."
       (claude-code-ide-session-registry--update
        entries (list key)
        (lambda (entry)
-         (setf (claude-code-ide-session-registry-entry-state entry) 'failed
-               (claude-code-ide-session-registry-entry-failure entry) reason
-               (claude-code-ide-session-registry-entry-failure-count entry)
-               (1+ (or (claude-code-ide-session-registry-entry-failure-count entry) 0))
-               (claude-code-ide-session-registry-entry-failed-at entry) now
-               (claude-code-ide-session-registry-entry-last-seen-at entry) now
-               (claude-code-ide-session-registry-entry-emacs-pid entry) (emacs-pid)
-               (claude-code-ide-session-registry-entry-emacs-start-time entry)
-               (claude-code-ide-session-registry--emacs-start-time)
-               (claude-code-ide-session-registry-entry-host entry) (system-name)
-               (claude-code-ide-session-registry-entry-pid entry) nil
-               (claude-code-ide-session-registry-entry-process-start-time entry) nil
-               (claude-code-ide-session-registry-entry-closed-at entry) nil
-               (claude-code-ide-session-registry-entry-closed-by entry) nil))))))
+         (when (claude-code-ide-session-registry--may-fail-p entry generation)
+           (setf (claude-code-ide-session-registry-entry-state entry) 'failed
+                 (claude-code-ide-session-registry-entry-failure entry) reason
+                 (claude-code-ide-session-registry-entry-failure-count entry)
+                 (1+ (or (claude-code-ide-session-registry-entry-failure-count entry) 0))
+                 (claude-code-ide-session-registry-entry-failed-at entry) now
+                 (claude-code-ide-session-registry-entry-last-seen-at entry) now
+                 (claude-code-ide-session-registry-entry-emacs-pid entry) (emacs-pid)
+                 (claude-code-ide-session-registry-entry-emacs-start-time entry)
+                 (claude-code-ide-session-registry--emacs-start-time)
+                 (claude-code-ide-session-registry-entry-host entry) (system-name)
+                 (claude-code-ide-session-registry-entry-pid entry) nil
+                 (claude-code-ide-session-registry-entry-process-start-time entry) nil
+                 (claude-code-ide-session-registry-entry-closed-at entry) nil
+                 (claude-code-ide-session-registry-entry-closed-by entry) nil)))))))
 
 (defun claude-code-ide-session-registry--change-closed (keys closed-by)
   "Return a change that closes the open and pending entries with KEYS.
@@ -1101,52 +1174,50 @@ descriptor and stores no flags."
      :process-start-time (and instance (funcall known (claude-code-ide-instance-process-start-time instance)
                                                 #'numberp)))))
 
-(defun claude-code-ide-session-registry--session-key (session)
-  "Return the entry key of SESSION, and remember it.
-That is the key of the entry that a restore or a reopen starts, else
-the instance ID of SESSION's descriptor."
+(defun claude-code-ide-session-registry--session-key (session spec)
+  "Return and remember the entry key of SESSION, which starts as SPEC says.
+That is SPEC's instance ID, else the instance ID of SESSION's
+descriptor.  The key comes only from the start itself, so a start
+inside another start never takes the other's key."
   (or (gethash session claude-code-ide-session-registry--keys)
       (puthash session
-               (or claude-code-ide-session-registry--start-key
+               (or (and spec (claude-code-ide-start-spec-instance-id spec))
                    (claude-code-ide-session-registry--instance-key session)
                    (claude-code-ide-session-registry--uuid))
                claude-code-ide-session-registry--keys)))
+
+(defun claude-code-ide-session-registry--pending-kind (session spec)
+  "Return `reopen' when SESSION, started as SPEC says, reopens an entry.
+Else return `new'.
+A start of a saved entry passes the entry's generation as SPEC's
+`last-generation', and an instance that ran before in this Emacs has
+a launch generation above 1.  `reopen' keeps the entry when the start
+fails; `new' removes it.  No file is read."
+  (let ((instance (claude-code-ide-instance-of-session session)))
+    (if (or (claude-code-ide-start-spec-last-generation spec)
+            (and instance (> (claude-code-ide-instance-generation instance) 1)))
+        'reopen
+      'new)))
 
 (defun claude-code-ide-session-registry--record-pending (session spec)
   "Save the provisional entry of SESSION before its CLI starts, and return its key.
 SPEC describes the start.  The entry has the state `pending' and the
 values of the descriptor, so that a crash during the start leaves a
-record.  A second call for SESSION saves nothing."
-  (let ((key (claude-code-ide-session-registry--session-key session)))
+record.  A second call for SESSION saves nothing.  The start resolves
+the entry: `claude-code-ide-session-registry--on-start' when it works,
+`claude-code-ide-session-registry--on-start-failed' when it fails."
+  (let ((key (claude-code-ide-session-registry--session-key session spec)))
     (unless (or (gethash session claude-code-ide-session-registry--pending)
                 (gethash session claude-code-ide-session-registry--started))
-      ;; Decided now, before the change is queued: the queue can write
-      ;; it later, when the lock is busy
-      (let ((kind (claude-code-ide-session-registry--pending-kind key))
-            (entry (claude-code-ide-session-registry--launch-entry
+      (let ((entry (claude-code-ide-session-registry--launch-entry
                     session spec key
                     (claude-code-ide-session-registry--launch-native-id session spec))))
         (setf (claude-code-ide-session-registry-entry-state entry) 'pending)
-        (puthash session kind claude-code-ide-session-registry--pending)
+        (puthash session (claude-code-ide-session-registry--pending-kind session spec)
+                 claude-code-ide-session-registry--pending)
         (claude-code-ide-session-registry--submit
-         "pending" (claude-code-ide-session-registry--change-pending entry))
-        (claude-code-ide-session-registry--schedule-pending-check)))
+         "pending" (claude-code-ide-session-registry--change-pending entry))))
     key))
-
-(defun claude-code-ide-session-registry--pending-kind (key)
-  "Return `reopen' when the state file has an entry KEY, else `new'.
-A queued change that adds KEY counts too.  `reopen' keeps the entry
-when the start fails; `new' removes it."
-  (if (or claude-code-ide-session-registry--start-key
-          (claude-code-ide-session-registry--find
-           ;; The file, after the changes that the queue has not written
-           (claude-code-ide-session-registry--apply
-            (let ((claude-code-ide-session-registry--loaded-from-backup nil))
-              (claude-code-ide-session-registry--load))
-            (copy-sequence claude-code-ide-session-registry--queue))
-           key))
-      'reopen
-    'new))
 
 (defun claude-code-ide-session-registry--on-prepare (session spec)
   "Save the provisional entry of SESSION, which starts as SPEC describes.
@@ -1182,7 +1253,7 @@ of another provider gets its key here when the start did not save a
 provisional entry."
   (when-let* ((key (or (gethash session claude-code-ide-session-registry--keys)
                        (unless (eq (claude-code-ide-session-registry--spec-provider spec) 'claude)
-                         (claude-code-ide-session-registry--session-key session)))))
+                         (claude-code-ide-session-registry--session-key session spec)))))
     (let ((instance (claude-code-ide-instance-of-session session))
           (session-id (claude-code-ide-session-registry--launch-native-id session spec)))
       (remhash session claude-code-ide-session-registry--pending)
@@ -1195,24 +1266,72 @@ provisional entry."
         (claude-code-ide-session-registry--launch-entry session spec key session-id)
         (claude-code-ide-session-registry--spec-fork-p spec))))))
 
+(defun claude-code-ide-session-registry--session-generation (session)
+  "Return the launch generation of SESSION's descriptor, or nil."
+  (when-let* ((instance (claude-code-ide-instance-of-session session)))
+    (claude-code-ide-instance-generation instance)))
+
+(defun claude-code-ide-session-registry--on-start-failed (session _launch err)
+  "Resolve the provisional entry of SESSION, whose start failed with ERR.
+This runs from `claude-code-ide-session-start-failed-functions', also
+when the start failed before its terminal existed.  A new entry is
+removed, and an entry that existed before becomes `failed' with the
+error.  A session whose start was recorded is left to its end."
+  (when-let* ((key (gethash session claude-code-ide-session-registry--keys))
+              (kind (gethash session claude-code-ide-session-registry--pending))
+              ((not (gethash session claude-code-ide-session-registry--started))))
+    (let ((generation (claude-code-ide-session-registry--session-generation session)))
+      (remhash session claude-code-ide-session-registry--keys)
+      (remhash session claude-code-ide-session-registry--pending)
+      (remhash session claude-code-ide-session-registry--new-native-ids)
+      (remhash session claude-code-ide-session-registry--restoring)
+      (puthash key t claude-code-ide-session-registry--failed-starts)
+      (claude-code-ide-session-registry--resolve-failed-start
+       key kind (if (eq (car-safe err) 'quit) "quit" (error-message-string err)) generation))))
+
+(defun claude-code-ide-session-registry--exit-code (process)
+  "Return the exit code of the CLI that the terminal PROCESS ran, or nil.
+nil means that the CLI did not exit on its own with a code: it still
+runs, or a signal ended it.  vterm and eat run the CLI in PROCESS, so
+its exit status is the code.  ghostel runs it in a native child, and
+PROCESS is an event pipe: the code is its `ghostel--exit-status'
+property."
+  (when (processp process)
+    (let ((ghostel (process-get process 'ghostel--exit-status)))
+      (cond
+       ((integerp ghostel) ghostel)
+       ((eq (process-status process) 'exit) (process-exit-status process))))))
+
 (defun claude-code-ide-session-registry--restore-failure (session reason)
   "Return why the restore or reopen of SESSION failed, or nil.
 REASON is the end reason.  A CLI that a restore started and that
 exited with an error within `claude-code-ide-session-registry-restore-grace'
-seconds failed: it could not resume its conversation."
+seconds failed: it could not resume its conversation.  The exit code
+comes from `claude-code-ide-session-registry--exit-code'."
   (when-let* (((eq reason 'exited))
               (start (gethash session claude-code-ide-session-registry--restoring))
               (age (- (float-time) start))
               ((< age claude-code-ide-session-registry-restore-grace))
-              (process (claude-code-ide-mcp-session-process session))
-              ((processp process))
-              ((eq (process-status process) 'exit))
-              (code (process-exit-status process))
+              (code (claude-code-ide-session-registry--exit-code
+                     (claude-code-ide-mcp-session-process session)))
               ((/= code 0)))
     (format "The CLI exited with code %d, %.0f seconds after the start" code age)))
 
-(defun claude-code-ide-session-registry--resolve-failed-start (key kind reason)
-  "Record that the start of the entry KEY failed before it was recorded.
+(defun claude-code-ide-session-registry--confirm-start (session)
+  "Count the restore or reopen of SESSION as good: it ran for the grace time.
+The failures of its entry are cleared.  A session that ended before
+the grace time does not count."
+  (when-let* (((gethash session claude-code-ide-session-registry--restoring))
+              (key (gethash session claude-code-ide-session-registry--keys))
+              ((not (claude-code-ide-mcp-session-cleanup-done session))))
+    (remhash session claude-code-ide-session-registry--restoring)
+    (claude-code-ide-session-registry--submit
+     "start confirmed"
+     (claude-code-ide-session-registry--change-confirmed
+      key (claude-code-ide-session-registry--session-generation session)))))
+
+(defun claude-code-ide-session-registry--resolve-failed-start (key kind reason &optional generation)
+  "Record that the start GENERATION of the entry KEY failed before it was recorded.
 KIND is `new' for an entry that the start made: it is removed.  An
 entry that existed before becomes `failed' with REASON."
   (if (eq kind 'new)
@@ -1221,20 +1340,18 @@ entry that existed before becomes `failed' with REASON."
          "start failed" (claude-code-ide-session-registry--change-forgotten key))
         (ignore-errors (delete-file (claude-code-ide-session-registry--report-file key))))
     (claude-code-ide-session-registry--submit
-     "start failed" (claude-code-ide-session-registry--change-failed key reason))))
+     "start failed" (claude-code-ide-session-registry--change-failed key reason generation))))
 
 (defun claude-code-ide-session-registry--on-end (session reason)
   "Record that SESSION ended for REASON (`exited' or `killed').
-A session whose start failed has only its provisional entry: a new
-entry is removed, and an entry that a restore or a reopen started
-becomes `failed'.  When `claude-code-ide-session-registry--start-entry'
-runs that start, it marks the failure itself, with the error, so that
-one failed start counts once.  A restored CLI that exits with an error
-soon after its start also makes its entry `failed'."
-  (when-let* ((key (gethash session claude-code-ide-session-registry--keys)))
-    (let ((pending (gethash session claude-code-ide-session-registry--pending))
-          (started (gethash session claude-code-ide-session-registry--started))
-          (failure (claude-code-ide-session-registry--restore-failure session reason)))
+A session whose start was not recorded is left alone: its start
+failed, and `claude-code-ide-session-registry--on-start-failed'
+resolves its provisional entry.  A restored CLI that exits with an
+error soon after its start makes its entry `failed'."
+  (when-let* ((key (gethash session claude-code-ide-session-registry--keys))
+              ((gethash session claude-code-ide-session-registry--started)))
+    (let ((failure (claude-code-ide-session-registry--restore-failure session reason))
+          (generation (claude-code-ide-session-registry--session-generation session)))
       (remhash session claude-code-ide-session-registry--keys)
       (remhash session claude-code-ide-session-registry--adopted)
       (remhash session claude-code-ide-session-registry--pending)
@@ -1242,60 +1359,11 @@ soon after its start also makes its entry `failed'."
       (remhash session claude-code-ide-session-registry--started)
       (remhash session claude-code-ide-session-registry--new-native-ids)
       (unless claude-code-ide-session-registry--exiting
-        (cond
-         ((and started failure)
-          (claude-code-ide-session-registry--submit
-           "restore failed" (claude-code-ide-session-registry--change-failed key failure)))
-         (started
-          (claude-code-ide-session-registry--submit
-           "ended"
-           (claude-code-ide-session-registry--change-closed (list key) (symbol-name reason))))
-         ((and pending (not (equal key claude-code-ide-session-registry--start-key)))
-          (claude-code-ide-session-registry--resolve-failed-start
-           key pending "The CLI ended during its start")))))))
-
-(defun claude-code-ide-session-registry--forget-pending (key)
-  "Forget the provisional sessions of the entry KEY, whose start failed.
-The caller records the failure, so the check of pending starts must not
-record it again."
-  (let ((sessions '()))
-    (maphash (lambda (session pending-key)
-               (when (and (equal pending-key key)
-                          (gethash session claude-code-ide-session-registry--pending))
-                 (push session sessions)))
-             claude-code-ide-session-registry--keys)
-    (dolist (session sessions)
-      (remhash session claude-code-ide-session-registry--pending)
-      (remhash session claude-code-ide-session-registry--keys))))
-
-(defun claude-code-ide-session-registry--check-pending ()
-  "Resolve the provisional entries of starts that failed before their terminal.
-Such a start removes its MCP session and runs no end functions."
-  (let ((failed '()))
-    (maphash (lambda (session kind)
-               (unless (or (gethash session claude-code-ide-session-registry--started)
-                           (claude-code-ide-mcp-session-buffer session)
-                           (claude-code-ide-mcp--get-session-by-id
-                            (claude-code-ide-mcp-session-session-id session)))
-                 (push (cons session kind) failed)))
-             claude-code-ide-session-registry--pending)
-    (dolist (pair failed)
-      (let ((key (gethash (car pair) claude-code-ide-session-registry--keys)))
-        (remhash (car pair) claude-code-ide-session-registry--pending)
-        (remhash (car pair) claude-code-ide-session-registry--keys)
-        (when key
-          (claude-code-ide-session-registry--resolve-failed-start
-           key (cdr pair) "The start failed before the CLI ran"))))
-    (when (and (zerop (hash-table-count claude-code-ide-session-registry--pending))
-               (timerp claude-code-ide-session-registry--pending-timer))
-      (cancel-timer claude-code-ide-session-registry--pending-timer)
-      (setq claude-code-ide-session-registry--pending-timer nil))))
-
-(defun claude-code-ide-session-registry--schedule-pending-check ()
-  "Check the provisional entries every five seconds while there are any."
-  (unless (timerp claude-code-ide-session-registry--pending-timer)
-    (setq claude-code-ide-session-registry--pending-timer
-          (run-with-timer 5 5 #'claude-code-ide-session-registry--check-pending))))
+        (claude-code-ide-session-registry--submit
+         (if failure "restore failed" "ended")
+         (if failure
+             (claude-code-ide-session-registry--change-failed key failure generation)
+           (claude-code-ide-session-registry--change-closed (list key) (symbol-name reason))))))))
 
 (defun claude-code-ide-session-registry--on-event (event)
   "Record the native ID that the common EVENT of a Codex instance reports.
@@ -1308,14 +1376,14 @@ Applying one report twice gives the same entry."
                 (session (claude-code-ide-instance-session instance))
                 (key (gethash session claude-code-ide-session-registry--keys))
                 (data (plist-get event :data))
-                ((not (claude-code-ide-session-registry--data-get data 'agent_id)))
-                (native (claude-code-ide-session-registry--data-get data 'session_id)))
+                ((not (claude-code-ide-session-registry--event-string data 'agent_id)))
+                (native (claude-code-ide-session-registry--event-string data 'session_id)))
       (claude-code-ide-session-registry--submit
        "report"
        (claude-code-ide-session-registry--change-reported
         key native
-        (claude-code-ide-session-registry--data-get data 'transcript_path)
-        (claude-code-ide-session-registry--data-get data 'model)
+        (claude-code-ide-session-registry--event-string data 'transcript_path)
+        (claude-code-ide-session-registry--event-string data 'model)
         (plist-get event :generation))))))
 
 (defun claude-code-ide-session-registry--on-rename (session)
@@ -1535,6 +1603,38 @@ It reads the live sessions once, and each process once, for all entries."
      :exit-keys (claude-code-ide-session-registry--exit-keys entries attributes)
      :live-keys (claude-code-ide-session-registry--live-keys)
      :attributes attributes)))
+
+(defun claude-code-ide-session-registry--entry-context (entry)
+  "Return a restore context for ENTRY alone.
+A restore checks each planned entry again when its timer fires.  The
+plan found ENTRY restorable, and ENTRY did not change since, so a
+closed ENTRY is still an entry of the last exit.  Only a Claude Code
+entry with a native ID needs the running Claude Code CLIs."
+  (claude-code-ide-session-registry--restore-context-create
+   :live-ids (when (and (eq (claude-code-ide-session-registry-entry-provider entry) 'claude)
+                        (claude-code-ide-session-registry-entry-session-id entry))
+               (delq nil (mapcar #'claude-code-ide-session-registry--cli-session-session-id
+                                 (claude-code-ide-session-registry--live-cli-sessions))))
+   :exit-keys (list (claude-code-ide-session-registry-entry-key entry))
+   :live-keys (claude-code-ide-session-registry--live-keys)
+   :attributes (make-hash-table :test 'eql)))
+
+(defun claude-code-ide-session-registry--unchanged-p (planned current)
+  "Return non-nil when the entry CURRENT is still the entry PLANNED of the plan.
+Its state, its close, its owning Emacs, its launch generation and its
+native ID are the same."
+  (cl-every (lambda (slot)
+              (equal (cl-struct-slot-value 'claude-code-ide-session-registry-entry slot planned)
+                     (cl-struct-slot-value 'claude-code-ide-session-registry-entry slot current)))
+            '(state closed-at closed-by emacs-pid generation session-id)))
+
+(defun claude-code-ide-session-registry--still-restorable-p (planned current)
+  "Return non-nil when a restore can start CURRENT, the entry PLANNED of its plan.
+CURRENT must be unchanged since the plan, and must not run now."
+  (and current
+       (claude-code-ide-session-registry--unchanged-p planned current)
+       (claude-code-ide-session-registry--restorable-p
+        current (claude-code-ide-session-registry--entry-context current))))
 
 (defun claude-code-ide-session-registry--restorable-p (entry &optional context)
   "Return non-nil when ENTRY ran when its Emacs ended, and runs no more.
@@ -1933,7 +2033,10 @@ ID is refused with a `user-error'.  An entry whose instance or process
 still runs is refused with `claude-code-ide-session-registry-running'.
 Neither changes the entry.  When the start fails (for example, the CLI
 or the directory is missing), ENTRY becomes `failed' with the reason,
-and the error is signaled again."
+and the error is signaled again.  A failure after the provisional
+entry is recorded once, by `claude-code-ide-session-registry--on-start-failed'.
+A start that still runs after `claude-code-ide-session-registry-restore-grace'
+seconds counts as good and clears the failures of ENTRY."
   (let ((id (claude-code-ide-session-registry-entry-session-id entry))
         (dir (claude-code-ide-session-registry-entry-project-dir entry))
         (key (claude-code-ide-session-registry-entry-key entry))
@@ -1950,42 +2053,51 @@ and the error is signaled again."
               (list (format "%s still runs as process %d"
                             (claude-code-ide-session-registry--describe entry)
                             (claude-code-ide-session-registry-entry-pid entry)))))
+    (remhash key claude-code-ide-session-registry--failed-starts)
     (condition-case err
         (progn
           (unless (claude-code-ide-get-provider provider)
             (user-error "The provider %s is not loaded" provider))
           (unless (and (stringp dir) (file-directory-p dir))
             (user-error "Directory %s does not exist" dir))
-          (let ((claude-code-ide-session-registry--start-key key))
-            (claude-code-ide--start-session
-             nil nil
-             (claude-code-ide-start-spec-create
-              :directory dir
-              :instance-name (claude-code-ide-session-registry-entry-instance-name entry)
-              :resume-id id
-              :extra-flags (claude-code-ide-session-registry--restore-flags entry)
-              :prompt prompt
-              :provider provider
-              :instance-id key
-              :last-generation (claude-code-ide-session-registry-entry-generation entry)
-              :role (claude-code-ide-session-registry-entry-role entry))))
+          (claude-code-ide--start-session
+           nil nil
+           (claude-code-ide-start-spec-create
+            :directory dir
+            :instance-name (claude-code-ide-session-registry-entry-instance-name entry)
+            :resume-id id
+            :extra-flags (claude-code-ide-session-registry--restore-flags entry)
+            :prompt prompt
+            :provider provider
+            :instance-id key
+            :last-generation (claude-code-ide-session-registry-entry-generation entry)
+            :role (claude-code-ide-session-registry-entry-role entry)))
           (when-let* ((instance (claude-code-ide-instance-by-id key))
                       (session (claude-code-ide-instance-session instance)))
-            (puthash session (float-time) claude-code-ide-session-registry--restoring))
+            (puthash session (float-time) claude-code-ide-session-registry--restoring)
+            (run-with-timer claude-code-ide-session-registry-restore-grace nil
+                            #'claude-code-ide-session-registry--confirm-start session))
           t)
       ((error quit)
-       (claude-code-ide-session-registry--forget-pending key)
        ;; Another start of the instance won the race: the entry belongs
        ;; to it, and this start did not fail
-       (if (claude-code-ide-session-registry--instance-runs-p key)
-           (signal 'claude-code-ide-session-registry-running
-                   (list (format "%s runs already"
-                                 (claude-code-ide-session-registry--describe entry))))
+       (cond
+        ((claude-code-ide-session-registry--instance-runs-p key)
+         (remhash key claude-code-ide-session-registry--failed-starts)
+         (signal 'claude-code-ide-session-registry-running
+                 (list (format "%s runs already"
+                               (claude-code-ide-session-registry--describe entry)))))
+        ;; The start-failed hook recorded it already
+        ((prog1 (gethash key claude-code-ide-session-registry--failed-starts)
+           (remhash key claude-code-ide-session-registry--failed-starts))
+         (signal (car err) (cdr err)))
+        (t
          (claude-code-ide-session-registry--submit
           "restore failed"
           (claude-code-ide-session-registry--change-failed
-           key (if (eq (car err) 'quit) "quit" (error-message-string err))))
-         (signal (car err) (cdr err)))))))
+           key (if (eq (car err) 'quit) "quit" (error-message-string err))
+           (claude-code-ide-session-registry-entry-generation entry)))
+         (signal (car err) (cdr err))))))))
 
 (defun claude-code-ide-session-registry--instance-runs-p (key)
   "Return non-nil when a live instance of this Emacs has the instance ID KEY."
@@ -2059,9 +2171,10 @@ and the error is signaled again."
 An error or a quit in one start does not stop the others, and Emacs
 stays usable between the starts.  A failed start marks only its own
 entry `failed'.  When its timer fires, each start reads its entry
-again: an entry that runs now, or that is no longer restorable (for
-example, the user closed or archived it), is skipped, and so is an
-instance that runs already.  UNKNOWN is the list of entries without a
+again: an entry that changed since the plan (for example, the user
+closed or archived it), or that runs now, is skipped, and so is an
+instance that runs already.  The check uses a context of that entry
+alone.  UNKNOWN is the list of entries without a
 conversation, which start nothing and are only reported.  The last
 start reports the result."
   (let ((run (claude-code-ide-session-registry--restore-run-create
@@ -2078,7 +2191,7 @@ start reports the result."
                (let ((current (claude-code-ide-session-registry--find
                                (claude-code-ide-session-registry--entries)
                                (claude-code-ide-session-registry-entry-key entry))))
-                 (if (not (and current (claude-code-ide-session-registry--restorable-p current)))
+                 (if (not (claude-code-ide-session-registry--still-restorable-p entry current))
                      (push (claude-code-ide-session-registry--describe entry)
                            (claude-code-ide-session-registry--restore-run-skipped run))
                    (claude-code-ide-session-registry--start-entry current prompt)
@@ -2272,7 +2385,7 @@ reason.
 ;;;###autoload
 (define-minor-mode claude-code-ide-session-registry-mode
   "Record the sessions of each provider in the session registry.
-The file is `claude-code-ide-state-file' with \"-v2\" before the
+The file is `claude-code-ide-state-file' with \"-v3\" before the
 extension.  Each instance that Emacs starts is recorded before its CLI
 starts, with its provider, native conversation ID, directory, worktree,
 names and flags.  A normal exit of Emacs marks them `closed'; after a
@@ -2283,6 +2396,8 @@ them again."
   (if claude-code-ide-session-registry-mode
       (progn
         (add-hook 'claude-code-ide-session-prepare-functions #'claude-code-ide-session-registry--on-prepare)
+        (add-hook 'claude-code-ide-session-start-failed-functions
+                  #'claude-code-ide-session-registry--on-start-failed)
         (add-hook 'claude-code-ide-cli-args-functions #'claude-code-ide-session-registry--cli-args)
         (add-hook 'claude-code-ide-event-functions #'claude-code-ide-session-registry--on-event)
         (add-hook 'claude-code-ide-session-start-functions #'claude-code-ide-session-registry--on-start)
@@ -2303,6 +2418,8 @@ them again."
             (message "%d session%s can be restored: M-x claude-code-ide-restore-sessions"
                      count (if (= count 1) "" "s")))))
     (remove-hook 'claude-code-ide-session-prepare-functions #'claude-code-ide-session-registry--on-prepare)
+    (remove-hook 'claude-code-ide-session-start-failed-functions
+                 #'claude-code-ide-session-registry--on-start-failed)
     (remove-hook 'claude-code-ide-cli-args-functions #'claude-code-ide-session-registry--cli-args)
     (remove-hook 'claude-code-ide-event-functions #'claude-code-ide-session-registry--on-event)
     (remove-hook 'claude-code-ide-session-start-functions #'claude-code-ide-session-registry--on-start)
@@ -2313,9 +2430,6 @@ them again."
     (when (timerp claude-code-ide-session-registry--adopt-timer)
       (cancel-timer claude-code-ide-session-registry--adopt-timer)
       (setq claude-code-ide-session-registry--adopt-timer nil))
-    (when (timerp claude-code-ide-session-registry--pending-timer)
-      (cancel-timer claude-code-ide-session-registry--pending-timer)
-      (setq claude-code-ide-session-registry--pending-timer nil))
     (when (fboundp 'claude-code-ide-session-status--set-tracking)
       (claude-code-ide-session-status--set-tracking nil))))
 

@@ -6,7 +6,7 @@ This document describes the data that all providers share:
 - The launch generation.
 - The common event.
 - The common states.
-- The session registry file, version 2, and the migration of version 1.
+- The session registry file, version 3, and the migration of versions 2 and 1.
 - The states of a record, provisional records, Codex records, and the restore of both providers.
 
 Code: `claude-code-ide-instance.el` and `claude-code-ide-session-registry.el`.
@@ -223,20 +223,23 @@ Notes on the mapping:
 
 ## The registry file
 
-The session registry has two files:
+The session registry has three files, one for each version:
 
 | File | Name (default) | Use |
 |---|---|---|
-| Version 2 | `claude-code-ide-state-file` with `-v2` before the extension: `~/.emacs-claude-code-ide-state-v2.json` | Emacs reads and writes it. Its backup is `<v2 file>.bak` and its lock is `<v2 file>.lock`. |
-| Version 1 | `claude-code-ide-state-file`: `~/.emacs-claude-code-ide-state.json` | Emacs reads it only while the version 2 file does not exist. Emacs never writes or moves it. |
+| Version 3 | `claude-code-ide-state-file` with `-v3` before the extension: `~/.emacs-claude-code-ide-state-v3.json` | Emacs reads and writes it. Its backup is `<v3 file>.bak` and its lock is `<v3 file>.lock`. |
+| Version 2 | `claude-code-ide-state-file` with `-v2` before the extension: `~/.emacs-claude-code-ide-state-v2.json` | Emacs reads it only while the version 3 file does not exist. Emacs never writes or moves it. |
+| Version 1 | `claude-code-ide-state-file`: `~/.emacs-claude-code-ide-state.json` | Emacs reads it only while neither the version 3 nor the version 2 file exists. Emacs never writes or moves it. |
 
-The report directory stays `<version 1 name without extension>-reports`, so both versions of the package use the same reports.
+The report directory stays `<version 1 name without extension>-reports`, so all versions of the package use the same reports.
 
-### Version 2
+**Why version 3 (decision D1 of the orchestrator).** Version 3 adds the states `pending` and `failed` and the fields from `worktree` on. A package that knows only version 2 would read `pending` and `failed` as `closed`, and would drop the new fields when it writes. So version 3 has its own file, as version 2 did. A package of version 2 keeps working with the version 2 file.
+
+### Version 3
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "sessions": [
     {
       "instance_id": "5afe576e-88a4-4ecf-b317-1cd4b509ca6d",
@@ -264,13 +267,14 @@ The report directory stays `<version 1 name without extension>-reports`, so both
       "emacs_start_time": 1794190002.0,
       "failure": null,
       "failure_count": 0,
-      "failed_at": null
+      "failed_at": null,
+      "native_id_generation": null
     }
   ]
 }
 ```
 
-These fields are new or have a new name in version 2:
+These fields are new or have a new name since version 1 (the first five came with version 2, the others with version 3):
 
 | Field | Struct slot | Value |
 |---|---|---|
@@ -284,10 +288,11 @@ These fields are new or have a new name in version 2:
 | `process_start_time` | `process-start-time` | The start time of that process, as seconds since the epoch (a float), or null. |
 | `emacs_start_time` | `emacs-start-time` | The start time of the Emacs process `emacs_pid`, or null. |
 | `failure` | `failure` | Why the last restore or reopen failed, or null. |
-| `failure_count` | `failure-count` | The restores or reopens that failed in a row since the last start that worked. |
+| `failure_count` | `failure-count` | The restores or reopens that failed in a row since the last start that was confirmed good. |
 | `failed_at` | `failed-at` | When it failed, or null. |
+| `native_id_generation` | `native-id-generation` | The launch generation whose SessionStart report set `native_id`, or null. |
 
-The fields from `worktree` to `failed_at` came after the first version 2 release. A record without them reads as before, with null values. A value of a wrong type also reads as null. The version number stays 2, because an older version 2 reader ignores the new fields.
+A version 2 record reads as a version 3 record whose new fields are null (and `failure_count` 0). A value of a wrong type also reads as null.
 
 The other fields keep their version 1 meaning:
 
@@ -320,12 +325,14 @@ The transitions:
 - Every provider: `claude-code-ide--start-session` runs `claude-code-ide-session-prepare-functions` before the spawn, and `claude-code-ide-session-registry--on-prepare` saves the record there. A start that does not run the hook saves the record at the session start, after the spawn.
 - **Flags and model come later.** The provisional record sees only the flags of the start spec (none for a start without a spec) and no model. The Claude Code launch writes the flags that it uses (`claude-code-ide-cli-extra-flags`) back into the launch spec. The start record then takes those flags, their model, and their permission mode. A Codex record takes the model of the descriptor, which the Codex launch sets from `claude-code-ide-codex-extra-flags`.
 - A start saves the record one time. A second call does nothing.
-- **A new instance whose start fails** loses its record:
-  - The end functions of a start that fails after the terminal exists remove it.
-  - A start that fails before the terminal exists runs no end functions. A timer checks the provisional records every 5 seconds. It removes a record whose MCP session is gone and whose start was never recorded.
-- **A known record whose start fails** (a restore or a reopen) becomes `failed`. Its native ID and names stay. One failed start counts one time: when `claude-code-ide-session-registry--start-entry` runs the start, it records the failure with the error, and the end functions and the check do not record it again.
-- **The kind of the record** (`new` or `reopen`) is decided before the change is queued, from the file and the changes in the queue. A busy lock does not change it.
-- **The tables** of started and pending sessions hold their sessions strongly. The start, the end, or the check removes them.
+- **The key** is the instance ID of the start spec, else the instance ID of the descriptor. Nothing else gives it, so a start inside another start (for example, from a hook of a restore) never takes the other start's key.
+- **A failed start** resolves its record through the hook `claude-code-ide-session-start-failed-functions` (SESSION LAUNCH ERR). `claude-code-ide--start-session` runs it in its error handler, for every start whose prepare hook ran, also when no terminal buffer exists, and before its cleanup. The registry adds `claude-code-ide-session-registry--on-start-failed` to it. No timer polls the records.
+  - **A new instance** loses its record.
+  - **A known record** (a restore or a reopen) becomes `failed` with the error. Its native ID and names stay.
+  - **One failed start counts one time.** The end functions of a start that failed change nothing. When `claude-code-ide-session-registry--start-entry` runs the start, it records only a failure that came before the provisional record (for example, a missing CLI or folder).
+  - **A reload** turns the mode off and on. The provisional records stay in memory, and the hook still resolves them.
+- **The kind of the record** (`new` or `reopen`) comes from the start, not from the file: a start of a saved record passes its generation as `last-generation`, and an instance that ran before in this Emacs has a launch generation above 1. A start that names an existing instance ID must pass `last-generation`; else a failed start of it removes the record.
+- **The tables** of started and pending sessions hold their sessions strongly. The start, the end, or the start-failed hook removes them.
 
 ### Codex records
 
@@ -359,20 +366,26 @@ Each record restores alone:
 - **The flags of each provider** come from `claude-code-ide-session-registry-restore-flags-functions`, an alist of a provider name and a function of the record. A provider without an entry gets no flags. The provider struct has no slot for restore flags, so the registry keeps this table.
 - **The start spec** has the record's `instance_id`, `provider`, `generation` as `last-generation`, `role`, `project_dir`, and `instance_name`. So the instance keeps its instance ID, its name, its buffer name, and its worktree, and gets the next generation.
 - **Each start runs from its own timer.** An error or a quit in one start does not stop the others.
-- **Each timer reads its record again.** A record that runs now, or that is no longer restorable (for example, you closed or archived it after the plan), is skipped. An instance whose ID runs already in this Emacs is skipped too. A skip is not a failure, and the record does not change.
+- **Each timer reads its record again.** A record that changed since the plan (its state, its close, its Emacs, its generation, or its native ID; for example, you closed or archived it), or that runs now, is skipped. An instance whose ID runs already in this Emacs is skipped too. A skip is not a failure, and the record does not change. The check uses a context of that record alone; it does not rebuild the context of all records.
 - **A failure marks only its own record `failed`**, with the reason:
   - The provider CLI is missing (for example "Codex CLI not available").
   - The directory is missing.
   - The start signals an error.
   - The CLI exits with an error within `claude-code-ide-session-registry-restore-grace` seconds (default 60) of its start, for example for a conversation ID that the CLI does not know. The reason gives the exit code.
-- **A failed record restores again** at the next restore, up to `claude-code-ide-session-registry-restore-attempts` (default 3) failures in a row. Then it stays `failed` and a restore no longer tries it. `claude-code-ide-reopen-session` still starts it by hand. A start that works sets `failure_count` to 0. The Emacs that marks a record owns it, so another running Emacs leaves it alone.
+- **The exit code** comes from one helper for all terminal backends: the exit status of the process for vterm and eat, and the `ghostel--exit-status` property of the event pipe for ghostel.
+- **A failed record restores again** at the next restore, up to `claude-code-ide-session-registry-restore-attempts` (default 3) failures in a row. Then it stays `failed` and a restore no longer tries it. `claude-code-ide-reopen-session` still starts it by hand. The Emacs that marks a record owns it, so another running Emacs leaves it alone.
+- **The failures stay across a restart** of the same record. A start does not clear `failure` and `failure_count`. Only a start that is confirmed good clears them:
+  - the CLI still runs after the grace time (`claude-code-ide-session-registry-restore-grace`), or
+  - a SessionStart report of the current launch generation arrives.
+  So a CLI that exits with an error after each start reaches the limit.
+- **Only some records become `failed`:** a record that is `open`, `pending`, or `failed`, or that the last Emacs closed at its exit, and whose launch generation is the generation of the start that failed. An archived record, and a record that you closed, never become `failed`.
 - **Refusals are not failures.** A record without a native ID, or whose owner process still runs, is refused and does not change.
 - **The message** names the number of started sessions, each failure with its reason, each skipped record, and each unknown record.
 - **The restore context** reads the live sessions of this Emacs, the running Claude Code CLIs, and each process ID one time for all records.
 
 `claude-code-ide-reopen-session` starts one record in the same way, with the same failure handling.
 
-### Migration of version 1
+### Migration of versions 1 and 2
 
 A version 1 file holds only Claude Code records. When Emacs reads it, it migrates each record in memory:
 
@@ -382,24 +395,26 @@ A version 1 file holds only Claude Code records. When Emacs reads it, it migrate
 4. `generation` becomes 0.
 5. `role` stays null.
 
-The next write makes the version 2 file. The version 1 file stays as it is. From then on, Emacs reads only the version 2 file.
+A version 1 record goes through version 2 to version 3. The next write makes the version 3 file. The version 1 and version 2 files stay as they are. From then on, Emacs reads only the version 3 file.
 
 When the version 1 file is unreadable, Emacs reads its `.bak` file. It does not move the unreadable version 1 file.
 
-A version 2 file of another version is unreadable. Then the registry uses the version 2 backup, and moves the unreadable version 2 file aside on the next write.
+When the version 2 file is unreadable (and no version 3 file exists), Emacs reads its `.bak` file. It does not move the unreadable version 2 file.
 
-**Older packages.** An older package reads and writes only the version 1 file. It never sees the version 2 file, so it cannot overwrite version 2 records.
+A version 3 file with an unknown version is unreadable. Then the registry uses the version 3 backup. On the next write, it copies the unreadable version 3 file aside (`.corrupt-<time>`) and then renames the new file over it.
+
+**Older packages.** A package of version 1 reads and writes only the version 1 file, and a package of version 2 only the version 2 file. Neither sees the version 3 file, so neither can overwrite version 3 records.
 
 The cost of two files:
 
-- After the first version 2 write, a session that an older package starts goes only to the version 1 file. A restore in the new package does not see it.
-- A session of the new package goes only to the version 2 file. A restore in an older package does not see it.
-- To start again from the version 1 file, delete the version 2 file. The next read migrates the version 1 file again.
+- After the first version 3 write, a session that an older package starts goes only to its own file. A restore in the new package does not see it.
+- A session of the new package goes only to the version 3 file. A restore in an older package does not see it.
+- To start again from the version 2 file, delete the version 3 file. Without both, the next read migrates the version 1 file again.
 
 ### Records and descriptors
 
 - The entry key is the instance ID.
 - A new Claude Code conversation gets a new UUID as its `--session-id`. The record stores it as `native_id`. It is never the instance ID, so a new conversation of an existing instance never reuses a native ID.
-- A fork gets no `--session-id`, and its record has no native ID until the report. The record never takes the native ID of the parent conversation, also when it had that ID before. The start spec's `fork` slot tells a fork; the CLI flag (`--fork-session`) is in the launch arguments, not in the stored flags.
+- A fork gets no `--session-id`, and its record has no native ID until the report. The record never takes the native ID of the parent conversation, also when it had that ID before. A native ID that a report of the fork's own launch generation set before the start was recorded stays (`native_id_generation`). The start spec's `fork` slot tells a fork; the CLI flag (`--fork-session`) is in the launch arguments, not in the stored flags.
 - A start records the provider, the generation, the role, the worktree, and the process of the descriptor.
 - The list buffer (`M-x claude-code-ide-list-session-registry`) shows the provider of each record. The state is `live` for a record that runs in this Emacs, and `unknown` for a record without a native ID. For a `failed` record, the Title column shows the reason.
