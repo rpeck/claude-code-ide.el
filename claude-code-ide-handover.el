@@ -112,13 +112,26 @@ nil uses `claude-code-ide-transcript-budget'."
   :type '(choice (const :tag "The transcript default" nil) integer)
   :group 'claude-code-ide-handover)
 
-(defcustom claude-code-ide-handover-recover-at-start nil
+(defcustom claude-code-ide-handover-recover-at-start t
   "When non-nil, continue interrupted handovers when the registry starts.
-A handover that a crash cut off before its source stopped is always
-cancelled at that time; that only changes the registry.  A later one
-starts a CLI, so by default it waits for `claude-code-ide-restore-sessions'
-or `claude-code-ide-handover-recover'."
+A handover that a crash cut off before its source stopped is cancelled,
+and its source stays current.  A later one resumes or starts again
+only its target, never the source.  With nil, only the early ones are
+cancelled at the start, and the later ones wait for
+`claude-code-ide-restore-sessions' or `claude-code-ide-handover-recover'."
   :type 'boolean
+  :group 'claude-code-ide-handover)
+
+(defcustom claude-code-ide-handover-delivery-timeout 600
+  "Seconds that a started target has to get its handover document.
+Without the delivery in that time, the handover needs a person, who
+can wait again or cancel it."
+  :type 'number
+  :group 'claude-code-ide-handover)
+
+(defcustom claude-code-ide-handover-watch-interval 5
+  "Seconds between two checks of a target that waits for its document."
+  :type 'number
   :group 'claude-code-ide-handover)
 
 (defcustom claude-code-ide-handover-enable-request-tool t
@@ -168,7 +181,10 @@ Emacs asks you whether to hand over."
   (summary-file nil :documentation "State summary file of the target.")
   (interrupted nil :documentation "Non-nil after the interrupt was sent.")
   (deadline nil :documentation "Float time when the quiescing gives up.")
+  (delivery-deadline nil :documentation "Float time when the wait for the delivery ends.")
   (timer nil :documentation "The timer of the next step, or nil.")
+  (watch nil :documentation "The timer that watches the target, or nil.")
+  (owner nil :documentation "Owner in the registry: `self', `other', or nil (ended).")
   (created-at nil)
   (updated-at nil))
 
@@ -209,6 +225,7 @@ while a handover holds the worktree.")
 (defun claude-code-ide-handover--stray-to-alist (stray)
   "Return the STRAY plist as an alist for the registry."
   (list (cons 'pid (plist-get stray :pid))
+        (cons 'start (plist-get stray :start))
         (cons 'command (plist-get stray :command))
         (cons 'cwd (plist-get stray :cwd))
         (cons 'reason (claude-code-ide-handover--name (plist-get stray :reason)))))
@@ -216,6 +233,7 @@ while a handover holds the worktree.")
 (defun claude-code-ide-handover--stray-from-alist (alist)
   "Return the stray plist of the registry ALIST."
   (list :pid (alist-get 'pid alist)
+        :start (alist-get 'start alist)
         :command (alist-get 'command alist)
         :cwd (alist-get 'cwd alist)
         :reason (claude-code-ide-handover--symbol (alist-get 'reason alist))))
@@ -253,7 +271,9 @@ while a handover holds the worktree.")
              (cons 'strays (vconcat (mapcar #'claude-code-ide-handover--stray-to-alist
                                             (claude-code-ide-handover--run-strays run)))))
            (cons 'interactive (and (claude-code-ide-handover--run-interactive run) t))
+           ;; The owner of the run: this Emacs
            (cons 'emacs_pid (emacs-pid))
+           (cons 'emacs_start_time (claude-code-ide-session-registry--emacs-start-time))
            (cons 'host (system-name))
            (cons 'created_at (claude-code-ide-handover--run-created-at run))
            (cons 'updated_at (claude-code-ide-handover--run-updated-at run))))))
@@ -289,15 +309,18 @@ while a handover holds the worktree.")
      :chain (claude-code-ide-session-registry-entry-legs entry)
      :strays (mapcar #'claude-code-ide-handover--stray-from-alist (alist-get 'strays alist))
      :interactive (alist-get 'interactive alist)
+     :owner (claude-code-ide-session-registry--handover-owner alist)
      :created-at (alist-get 'created_at alist)
      :updated-at (alist-get 'updated_at alist))))
 
-(defun claude-code-ide-handover--save (run)
-  "Save RUN in the registry entry of its source.  Return non-nil when saved."
+(defun claude-code-ide-handover--save (run &optional drop)
+  "Save RUN in the registry entry of its source.  Return non-nil when saved.
+DROP is as for `claude-code-ide-session-registry-save-handover'."
   (setf (claude-code-ide-handover--run-updated-at run) (claude-code-ide-handover--now))
   (claude-code-ide-session-registry-save-handover
    (claude-code-ide-handover--run-source-id run)
-   (claude-code-ide-handover--to-alist run)))
+   (claude-code-ide-handover--to-alist run)
+   drop))
 
 ;;; Results
 
@@ -438,7 +461,11 @@ sessions folder of the Codex home."
 It is the :transcript of LEG, else the transcript path of the registry
 ENTRY, else for Codex the rollout file of NATIVE-ID."
   (let ((candidates (list (plist-get leg :transcript)
-                          (and entry (claude-code-ide-session-registry-entry-transcript-path entry)))))
+                          (and entry (claude-code-ide-session-registry-entry-transcript-path entry))
+                          ;; A Claude Code entry finds its file from its ID and folder
+                          (and entry (eq provider 'claude)
+                               (ignore-errors
+                                 (claude-code-ide-session-registry--transcript-file entry))))))
     (or (cl-find-if (lambda (file) (and (stringp file) (file-readable-p file))) candidates)
         (and (eq provider 'codex) (claude-code-ide-handover--codex-rollout native-id)))))
 
@@ -515,6 +542,80 @@ answer to a question at the end of its turn."
       (and (eq (plist-get state :state) 'waiting-for-user)
            (eq (plist-get state :reason) 'question))))
 
+(declare-function claude-code-ide-codex-prepare-trust "claude-code-ide-codex-events" (&optional directory))
+(declare-function claude-code-ide-codex-events--trust-key "claude-code-ide-codex-events" ())
+(declare-function claude-code-ide-codex-events--cached-trust "claude-code-ide-codex-events" (key))
+(declare-function claude-code-ide-codex-events--result-status "claude-code-ide-codex-events" (result))
+(declare-function claude-code-ide-codex-events--start-trust-check "claude-code-ide-codex-events" (key directory))
+(declare-function claude-code-ide-codex-events--release-check "claude-code-ide-codex-events" (check))
+
+(defun claude-code-ide-handover--target-available-p (provider)
+  "Return non-nil when the CLI of the target PROVIDER is found and can start."
+  (let ((detected (ignore-errors (claude-code-ide-provider-call provider 'detect))))
+    (and (not (claude-code-ide-provider-unavailable-p detected))
+         (plist-get detected :available))))
+
+(defun claude-code-ide-handover--other-instances (instance)
+  "Return the other live instances in the working tree of INSTANCE."
+  (let ((key (claude-code-ide-handover--directory-key
+              (claude-code-ide-known-or-nil (claude-code-ide-instance-project-root instance)))))
+    (cl-remove-if-not
+     (lambda (other)
+       (and (not (eq other instance))
+            (claude-code-ide-instance-live-p other)
+            (equal (claude-code-ide-handover--directory-key
+                    (claude-code-ide-known-or-nil (claude-code-ide-instance-project-root other)))
+                   key)))
+     (claude-code-ide-instances))))
+
+(defun claude-code-ide-handover--codex-trusted-p (directory interactive)
+  "Return non-nil when the Codex status hooks are trusted for a start in DIRECTORY.
+A target without trusted hooks sends no events, so a handover could
+never see its delivery.  INTERACTIVE non-nil asks the user for the
+trust when needed (`claude-code-ide-codex-prepare-trust').  Else only
+a cached result counts; on a cache miss, a check starts in the
+background, so that a later call knows the answer."
+  (cond
+   ((not (fboundp 'claude-code-ide-codex-events--trust-key)) nil)
+   (interactive (and (fboundp 'claude-code-ide-codex-prepare-trust)
+                     (claude-code-ide-codex-prepare-trust directory)))
+   (t
+    (let* ((key (claude-code-ide-codex-events--trust-key))
+           (cached (claude-code-ide-codex-events--cached-trust key)))
+      (unless cached
+        (ignore-errors
+          (claude-code-ide-codex-events--release-check
+           (claude-code-ide-codex-events--start-trust-check key directory))))
+      (eq (claude-code-ide-codex-events--result-status cached) 'trusted)))))
+
+(defun claude-code-ide-handover--preflight (instance target-provider force interactive)
+  "Return an error result when the handover of INSTANCE cannot start, else nil.
+The checks run before anything of the source changes:
+- the CLI of TARGET-PROVIDER is found (`target-unavailable');
+- no other live instance runs in the working tree, unless FORCE
+  (`other-instance');
+- a Codex target has trusted status hooks (`hooks-not-trusted'); with
+  INTERACTIVE, the user is asked for the trust first."
+  (let ((id (claude-code-ide-instance-id instance))
+        (directory (claude-code-ide-known-or-nil (claude-code-ide-instance-project-root instance))))
+    (cond
+     ((not (claude-code-ide-handover--target-available-p target-provider))
+      (claude-code-ide-handover--error
+       'target-unavailable (format "The %s CLI is not available" target-provider) id))
+     ((and (not force) (claude-code-ide-handover--other-instances instance))
+      (claude-code-ide-handover--error
+       'other-instance
+       (format "Other instances run in this working tree (%s); give :force to hand over anyway"
+               (mapconcat #'claude-code-ide-instance-id
+                          (claude-code-ide-handover--other-instances instance) ", "))
+       id))
+     ((and (eq target-provider 'codex)
+           (not (claude-code-ide-handover--codex-trusted-p directory interactive)))
+      (claude-code-ide-handover--error
+       'hooks-not-trusted
+       "The Codex status hooks are not trusted, so the handover could not see the delivery: M-x claude-code-ide-codex-trust-hooks"
+       id)))))
+
 (defun claude-code-ide-handover--missing-feature ()
   "Return the name of a function that a handover needs and that is missing."
   (cl-find-if-not #'fboundp '(claude-code-ide-process-stop-later
@@ -585,6 +686,7 @@ plist of `claude-code-ide-handover-status', or an error result
          'handover-running
          (format "Handover %s holds this working tree" (claude-code-ide-handover--run-id run))
          instance-id)))
+     ((claude-code-ide-handover--preflight instance target-provider force interactive))
      ((and (not force)
            (claude-code-ide-handover--busy-state-p (claude-code-ide-instance-state instance)))
       (claude-code-ide-handover--error
@@ -636,7 +738,9 @@ REQUEST-ID, INTERACTIVE and CHAIN are as for
                :role (claude-code-ide-instance-role instance)
                :chain chain
                :created-at (claude-code-ide-handover--now))))
-    (if (not (claude-code-ide-handover--save run))
+    ;; A first save that waits for the lock is dropped: a refused
+    ;; handover leaves no record
+    (if (not (claude-code-ide-handover--save run 'drop))
         (claude-code-ide-handover--error
          'registry-write-failed "The session registry could not save the handover"
          (claude-code-ide-instance-id instance))
@@ -653,34 +757,47 @@ REQUEST-ID, INTERACTIVE and CHAIN are as for
   (setf (claude-code-ide-handover--run-timer run)
         (run-at-time seconds nil #'claude-code-ide-handover--step run)))
 
+(defun claude-code-ide-handover--busy-registry (run)
+  "Tell the user that the registry is busy, and run the step of RUN again soon."
+  (message "Handover %s: the registry is busy; trying again"
+           (claude-code-ide-handover--run-id run))
+  (claude-code-ide-handover--schedule run 1)
+  nil)
+
 (defun claude-code-ide-handover--enter (run stage)
   "Move RUN to STAGE and save it before the step of STAGE runs.
 Return non-nil when the registry holds the stage.  When it does not,
-the step waits and is tried again."
+the step of STAGE runs again a moment later, from
+`claude-code-ide-handover--step'."
   (setf (claude-code-ide-handover--run-stage run) stage)
   (or (claude-code-ide-handover--save run)
-      (progn
-        (message "Handover %s: the registry is busy; trying again"
-                 (claude-code-ide-handover--run-id run))
-        (claude-code-ide-handover--schedule run 1)
-        nil)))
+      (claude-code-ide-handover--busy-registry run)))
+
+(defun claude-code-ide-handover--cancel-timers (run)
+  "Cancel the step timer and the watch timer of RUN."
+  (dolist (timer (list (claude-code-ide-handover--run-timer run)
+                       (claude-code-ide-handover--run-watch run)))
+    (when (timerp timer) (cancel-timer timer)))
+  (setf (claude-code-ide-handover--run-timer run) nil
+        (claude-code-ide-handover--run-watch run) nil))
 
 (defun claude-code-ide-handover--finish (run status reason &optional text)
-  "End RUN with STATUS, REASON and TEXT, save it, and tell the user."
-  (when (timerp (claude-code-ide-handover--run-timer run))
-    (cancel-timer (claude-code-ide-handover--run-timer run)))
+  "End RUN with STATUS, REASON and TEXT, save it, and tell the user.
+The inbox delivery to the source is no longer held."
+  (claude-code-ide-handover--cancel-timers run)
   (setf (claude-code-ide-handover--run-status run) status
         (claude-code-ide-handover--run-reason run) reason
-        (claude-code-ide-handover--run-message run) text
-        (claude-code-ide-handover--run-timer run) nil)
+        (claude-code-ide-handover--run-message run) text)
   (claude-code-ide-handover--save run)
+  (claude-code-ide-control-release (claude-code-ide-handover--run-source-id run))
   (message "Handover %s %s%s" (claude-code-ide-handover--run-id run) status
            (if text (concat ": " text) "")))
 
 (defun claude-code-ide-handover--step (run)
   "Run the step of the current stage of RUN.
-An error in a step gives the status `needs-user', so that a person
-can try again or cancel."
+Each stage has a step, so that a retry after a busy registry, or a
+person's retry, always goes on.  An error in a step gives the status
+`needs-user', so that a person can try again or cancel."
   (setf (claude-code-ide-handover--run-timer run) nil)
   (when (eq (claude-code-ide-handover--run-status run) 'running)
     (condition-case err
@@ -692,6 +809,13 @@ can try again or cancel."
           ('source-stopped (claude-code-ide-handover--stop run))
           ('document-written (claude-code-ide-handover--write-document run))
           ('target-started (claude-code-ide-handover--start-target run))
+          ('target-identified
+           (when (claude-code-ide-handover--enter run 'target-identified)
+             (claude-code-ide-handover--start-watch run)))
+          ('delivered
+           (when (claude-code-ide-handover--enter run 'delivered)
+             (claude-code-ide-handover--commit run)))
+          ('committed (claude-code-ide-handover--commit run))
           (_ nil))
       (error
        (claude-code-ide-handover--needs-user
@@ -711,10 +835,13 @@ can try again or cancel."
 
 (defun claude-code-ide-handover--quiesce (run)
   "Wait until the source of RUN is quiet, then go to the stop.
-With the interrupt key, interrupt a busy source one time.  Subagents
-or background tasks cancel the handover, unless it is forced.  After
+The inbox delivery to the source is held from now on, so that no
+queued prompt is sent to it.  With the interrupt key, interrupt a
+busy source one time.  Subagents or background tasks cancel the
+handover, unless it is forced.  After
 `claude-code-ide-handover-quiesce-timeout' the handover is cancelled,
 and the source stays current."
+  (claude-code-ide-control-hold (claude-code-ide-handover--run-source-id run))
   (let* ((instance (claude-code-ide-instance-by-id (claude-code-ide-handover--run-source-id run)))
          (live (and instance (claude-code-ide-instance-live-p instance)))
          (state (and live (claude-code-ide-instance-state instance))))
@@ -771,6 +898,20 @@ alone too."
                         (memql (plist-get stray :pid) reviews)))
                   strays)))
 
+(defun claude-code-ide-handover--process-start (pid)
+  "Return the start time of the process PID as a float, or nil."
+  (when-let* (((integerp pid))
+              (attributes (ignore-errors (process-attributes pid)))
+              (start (alist-get 'start attributes)))
+    (float-time start)))
+
+(defun claude-code-ide-handover--with-start (stray)
+  "Return STRAY with :start, the start time of its process now, when it lacks one."
+  (if (plist-get stray :start)
+      stray
+    (append stray (list :start (claude-code-ide-handover--process-start
+                                (plist-get stray :pid))))))
+
 (defun claude-code-ide-handover--stop (run)
   "End the source of RUN with its process tree, then check the worktree."
   (let ((instance (claude-code-ide-instance-by-id (claude-code-ide-handover--run-source-id run))))
@@ -794,14 +935,29 @@ Return a result plist like that of `claude-code-ide-process-stop'."
         (list :status (if strays 'strays 'stopped) :strays strays))
     (error (list :status 'error :reason (error-message-string err)))))
 
+(defun claude-code-ide-handover--after-scan (run)
+  "Go on with RUN after a stop or a scan that found nothing.
+At the stage target-started (a recovery), start the target; else the
+source stopped, and the document comes next."
+  (if (eq (claude-code-ide-handover--run-stage run) 'target-started)
+      (progn
+        (setf (claude-code-ide-handover--run-strays run) nil
+              (claude-code-ide-handover--run-reason run) nil
+              (claude-code-ide-handover--run-message run) nil)
+        (claude-code-ide-handover--start-target run))
+    (claude-code-ide-handover--source-stopped run)))
+
 (defun claude-code-ide-handover--after-stop (run result)
   "Go on with RUN after the stop or the scan that gave RESULT.
-Strays, a source that survived, and a failed scan need a person."
+Strays, a source that survived, and a failed scan need a person.  Each
+stray gets the start time of its process now, so that a later signal
+reaches only that process."
   (when (eq (claude-code-ide-handover--run-status run) 'running)
-    (let ((strays (claude-code-ide-handover--relevant-strays (plist-get result :strays))))
+    (let ((strays (mapcar #'claude-code-ide-handover--with-start
+                          (claude-code-ide-handover--relevant-strays (plist-get result :strays)))))
       (pcase (plist-get result :status)
         ((or 'stopped (and 'strays (guard (null strays))))
-         (claude-code-ide-handover--source-stopped run))
+         (claude-code-ide-handover--after-scan run))
         ('strays
          (claude-code-ide-handover--needs-user
           run 'strays "Processes still run in the worktree" strays))
@@ -830,6 +986,7 @@ Strays, a source that survived, and a failed scan need a person."
   "Stop RUN for a person: REASON, TEXT and STRAYS say why.
 A handover that a person started asks that person at once.  Else the
 coordinator sees the status `needs-user', and Emacs shows a message."
+  (claude-code-ide-handover--cancel-timers run)
   (setf (claude-code-ide-handover--run-status run) 'needs-user
         (claude-code-ide-handover--run-reason run) reason
         (claude-code-ide-handover--run-message run) text
@@ -850,6 +1007,12 @@ coordinator sees the status `needs-user', and Emacs shows a message."
     ('scan-failed
      '((?w wait "check again")
        (?g go "go on without the check")
+       (?c cancel "cancel the handover")))
+    ('no-delivery
+     '((?w wait "wait again for the delivery")
+       (?c cancel "cancel the handover and stop the target")))
+    ('target-exited
+     '((?r retry "start the target again")
        (?c cancel "cancel the handover")))
     (_
      '((?r retry "try the stage again")
@@ -883,18 +1046,16 @@ coordinator sees the status `needs-user', and Emacs shows a message."
                                         (nth 1 (assq (car answer) choices))))))
 
 (defun claude-code-ide-handover--stray-alive-p (stray)
-  "Return non-nil when the process of STRAY still runs the same command."
-  (when-let* ((pid (plist-get stray :pid))
-              (attributes (ignore-errors (process-attributes pid))))
-    (let ((command (plist-get stray :command))
-          (args (alist-get 'args attributes))
-          (comm (alist-get 'comm attributes)))
-      (or (null command)
-          (and (stringp args) (string-prefix-p (car (split-string command)) args))
-          (and (stringp comm) (string-match-p (regexp-quote comm) command))))))
+  "Return non-nil when the process of STRAY is still the process of the scan.
+Its process ID must run with the start time that the scan recorded.
+An unknown start time, at the scan or now, never matches."
+  (let ((recorded (plist-get stray :start))
+        (now (claude-code-ide-handover--process-start (plist-get stray :pid))))
+    (and (numberp recorded) (numberp now)
+         (< (abs (- recorded now)) 0.01))))
 
 (defun claude-code-ide-handover--end-strays (strays signal)
-  "Send SIGNAL to each of STRAYS that still runs the same command."
+  "Send SIGNAL to each of STRAYS that is still the process of the scan."
   (dolist (stray strays)
     (when (claude-code-ide-handover--stray-alive-p stray)
       (ignore-errors (signal-process (plist-get stray :pid) signal)))))
@@ -921,15 +1082,22 @@ THEN, when given, runs first, with the strays of RUN."
     (unless ids (user-error "No handover is unfinished"))
     (if (cdr ids) (completing-read prompt ids nil t) (car ids))))
 
+(defun claude-code-ide-handover--resume (run)
+  "Set RUN running again, without a reason, and save it."
+  (setf (claude-code-ide-handover--run-status run) 'running
+        (claude-code-ide-handover--run-reason run) nil
+        (claude-code-ide-handover--run-message run) nil)
+  (claude-code-ide-handover--save run))
+
 (defun claude-code-ide-handover-resolve (handover-id &optional action)
   "Answer the question of the handover HANDOVER-ID with ACTION.
 ACTION is one of the choices that the handover offers:
 - `end': end the stray processes (SIGTERM, then SIGKILL), then check again.
-- `wait': wait `claude-code-ide-handover-stray-wait' seconds, then check again.
+- `wait': check the strays again after `claude-code-ide-handover-stray-wait'
+  seconds, or wait again for the delivery of the document.
 - `go': go on although the process check failed.
-- `retry': run the stage again.
-- `cancel': cancel the handover.  When the source is stopped already,
-  it stays stopped; `claude-code-ide-reopen-session' starts it again.
+- `retry': run the stage again; for a target that ended, start it again.
+- `cancel': cancel the handover; see `claude-code-ide-handover-cancel'.
 Interactively, choose the handover and the action."
   (interactive (list (claude-code-ide-handover--read-unfinished "Handover: ") nil))
   (let ((run (or (gethash handover-id claude-code-ide-handover--runs)
@@ -946,7 +1114,12 @@ Interactively, choose the handover and the action."
         (user-error "Handover %s cannot %s now" handover-id action))
       (pcase action
         ('cancel (claude-code-ide-handover-cancel handover-id))
-        ('wait (claude-code-ide-handover--rescan run))
+        ('wait
+         (if (eq (claude-code-ide-handover--run-reason run) 'no-delivery)
+             (progn
+               (claude-code-ide-handover--resume run)
+               (claude-code-ide-handover--start-watch run))
+           (claude-code-ide-handover--rescan run)))
         ('end
          (let ((strays (claude-code-ide-handover--run-strays run)))
            (claude-code-ide-handover--end-strays strays 'SIGTERM)
@@ -954,34 +1127,68 @@ Interactively, choose the handover and the action."
             run (lambda (_) (claude-code-ide-handover--end-strays strays 'SIGKILL)))))
         ('go
          (setf (claude-code-ide-handover--run-status run) 'running)
-         (claude-code-ide-handover--source-stopped run))
+         (claude-code-ide-handover--after-scan run))
         ('retry
-         (setf (claude-code-ide-handover--run-status run) 'running
-               (claude-code-ide-handover--run-reason run) nil
-               (claude-code-ide-handover--run-message run) nil)
-         (claude-code-ide-handover--save run)
+         (when (eq (claude-code-ide-handover--run-reason run) 'target-exited)
+           ;; A new launch of the same target ID, with the same document
+           (setf (claude-code-ide-handover--run-stage run) 'target-started
+                 (claude-code-ide-handover--run-target-native-id run) nil))
+         (claude-code-ide-handover--resume run)
          (claude-code-ide-handover--schedule run 0)))
       (claude-code-ide-handover--result run))))
 
+(defun claude-code-ide-handover--live-target (run)
+  "Return the descriptor of the target of RUN when it runs, else nil."
+  (when-let* ((id (claude-code-ide-handover--run-target-id run))
+              (instance (claude-code-ide-instance-by-id id))
+              ((claude-code-ide-instance-live-p instance)))
+    instance))
+
+(defun claude-code-ide-handover--claim (run)
+  "Make this Emacs the owner of RUN in the registry.  Return non-nil on success.
+The claim fails when another Emacs that still runs owns RUN."
+  (and (claude-code-ide-session-registry-claim-handover
+        (claude-code-ide-handover--run-source-id run)
+        (claude-code-ide-handover--run-id run))
+       (setf (claude-code-ide-handover--run-owner run) 'self)))
+
+(defun claude-code-ide-handover--drop-target (run)
+  "Stop the target of RUN when it runs, and archive its registry entry.
+A cancelled handover leaves no target that a restore could start."
+  (when-let* ((instance (claude-code-ide-handover--live-target run)))
+    (if (fboundp 'claude-code-ide-process-stop)
+        (claude-code-ide-process-stop instance)
+      (claude-code-ide-provider-call (claude-code-ide-instance-provider instance) 'stop instance)))
+  (when-let* ((id (claude-code-ide-handover--run-target-id run))
+              ((claude-code-ide-session-registry-entry-of id)))
+    (claude-code-ide-session-registry--submit
+     "archived" (claude-code-ide-session-registry--change-archived id))))
+
 (defun claude-code-ide-handover-cancel (handover-id)
   "Cancel the unfinished handover HANDOVER-ID.
-A handover whose target started can no longer be cancelled; the target
-is the new conversation then.  A cancel after the stop leaves the
-source stopped."
+A handover whose target runs can be cancelled only when the target
+did not get the document in time, or when it ended: then the target
+is stopped and its registry entry archived.  A cancel before the stop
+keeps the source current; after the stop, the source stays stopped.
+A handover that another live Emacs runs is refused; a handover of an
+Emacs that ended is claimed first."
   (interactive (list (claude-code-ide-handover--read-unfinished "Cancel handover: ")))
   (let ((run (claude-code-ide-handover--find handover-id)))
     (cond
      ((null run) (user-error "No handover %s" handover-id))
      ((not (claude-code-ide-handover--unfinished-p run))
       (user-error "Handover %s is %s already" handover-id (claude-code-ide-handover--run-status run)))
-     ((and (not (claude-code-ide-handover--stage< (claude-code-ide-handover--run-stage run)
-                                                  'target-started))
-           (let ((target (claude-code-ide-handover--run-target-id run)))
-             (and target (claude-code-ide-instance-by-id target)
-                  (claude-code-ide-instance-live-p (claude-code-ide-instance-by-id target)))))
+     ((and (claude-code-ide-handover--live-target run)
+           (not (memq (claude-code-ide-handover--run-reason run) '(no-delivery target-exited))))
       (user-error "The target of handover %s runs already" handover-id))
+     ((and (not (gethash (claude-code-ide-handover--run-id run) claude-code-ide-handover--runs))
+           (not (claude-code-ide-handover--claim run)))
+      (user-error "Another Emacs runs handover %s" handover-id))
      (t
       (puthash (claude-code-ide-handover--run-id run) run claude-code-ide-handover--runs)
+      (unless (claude-code-ide-handover--stage< (claude-code-ide-handover--run-stage run)
+                                                'target-started)
+        (claude-code-ide-handover--drop-target run))
       (claude-code-ide-handover--finish
        run 'cancelled 'user-cancelled
        (if (claude-code-ide-handover--stage< (claude-code-ide-handover--run-stage run)
@@ -1073,6 +1280,21 @@ nil when WORKTREE is not in Git."
       (and (equal (secure-hash 'sha256 text) (claude-code-ide-handover--run-document-hash run))
            text))))
 
+(defun claude-code-ide-handover-start-prompt (run)
+  "Return the first prompt of the target of RUN: a pointer to its document.
+The document itself never goes on the command line, which has a size
+limit and which `ps' shows.  The first line is the marker of the
+handover, so that its `UserPromptSubmit' is the delivery, and the
+transcript reader treats the turn as the start of a leg.  Signal an
+error when the document file is missing or does not have its hash."
+  (unless (claude-code-ide-handover--document run)
+    (error "The handover document %s is missing or changed"
+           (claude-code-ide-handover--run-document run)))
+  (format "%s\nRead the handover document at %s fully, and follow its instructions.\n- State summary file: `%s`"
+          (format claude-code-ide-transcript--marker-format (claude-code-ide-handover--run-id run))
+          (claude-code-ide-handover--run-document run)
+          (claude-code-ide-handover--run-summary-file run)))
+
 ;;; The target
 
 (defun claude-code-ide-handover--target-leg (run &optional pending)
@@ -1103,8 +1325,8 @@ PENDING is as for `claude-code-ide-handover--target-leg'."
                     leg))
             (list (claude-code-ide-handover--target-leg run pending)))))
 
-(defun claude-code-ide-handover--start-spec (run text)
-  "Return the start spec of the target of RUN, with TEXT as its first prompt."
+(defun claude-code-ide-handover--start-spec (run prompt)
+  "Return the start spec of the target of RUN, with PROMPT as its first prompt."
   (let* ((id (claude-code-ide-handover--run-target-id run))
          (entry (claude-code-ide-session-registry-entry-of id))
          (last (max (or (claude-code-ide-instance-current-generation id) 0)
@@ -1112,7 +1334,7 @@ PENDING is as for `claude-code-ide-handover--target-leg'."
     (claude-code-ide-start-spec-create
      :directory (claude-code-ide-handover--run-directory run)
      :instance-name (claude-code-ide-handover--run-instance-name run)
-     :prompt text
+     :prompt prompt
      :provider (claude-code-ide-handover--run-target-provider run)
      :instance-id id
      ;; A start of an instance ID that has a record names its generation
@@ -1124,27 +1346,74 @@ PENDING is as for `claude-code-ide-handover--target-leg'."
      ;; whether to trust the Codex status hooks of the target
      :interactive (and (claude-code-ide-handover--run-interactive run) t))))
 
+(defun claude-code-ide-handover--save-pending-chain (run)
+  "Save the chain of the target of RUN, with its leg pending.
+While the registry is busy, try again every second, as long as the
+handover runs and is not committed.  The pending leg keeps the target
+from a plain restore."
+  (unless (claude-code-ide-session-registry-save-chain
+           (claude-code-ide-handover--run-target-id run)
+           (claude-code-ide-handover--target-chain run 'pending))
+    (run-at-time 1 nil
+                 (lambda ()
+                   (when (and (claude-code-ide-handover--unfinished-p run)
+                              (claude-code-ide-handover--stage<
+                               (claude-code-ide-handover--run-stage run) 'committed))
+                     (claude-code-ide-handover--save-pending-chain run))))))
+
 (defun claude-code-ide-handover--start-target (run)
-  "Start the target of RUN with the document as its first prompt.
-A target that a recovery finds identified is resumed instead."
+  "Start the target of RUN with the pointer to the document as its first prompt.
+The target ID is saved in the registry before the start; while the
+registry is busy, the start waits."
   (unless (claude-code-ide-handover--run-target-id run)
-    (setf (claude-code-ide-handover--run-target-id run) (claude-code-ide-instance-new-id))
-    ;; The target ID is in the registry before the start
-    (claude-code-ide-handover--save run))
-  (let ((text (or (claude-code-ide-handover--document run)
-                  (error "The handover document %s is missing or changed"
-                         (claude-code-ide-handover--run-document run))))
-        (claude-code-ide-handover--allowed (claude-code-ide-handover--run-id run)))
-    (condition-case err
-        (claude-code-ide--start-session nil nil (claude-code-ide-handover--start-spec run text))
-      ((error quit)
-       (claude-code-ide-handover--needs-user
-        run 'start-failed (format "The target did not start: %s" (error-message-string err)))))
-    (when (eq (claude-code-ide-handover--run-status run) 'running)
-      (claude-code-ide-session-registry-save-chain
-       (claude-code-ide-handover--run-target-id run)
-       (claude-code-ide-handover--target-chain run 'pending))
-      (claude-code-ide-handover--check-identified run))))
+    (setf (claude-code-ide-handover--run-target-id run) (claude-code-ide-instance-new-id)))
+  (if (not (claude-code-ide-handover--save run))
+      (claude-code-ide-handover--busy-registry run)
+    (let ((prompt (claude-code-ide-handover-start-prompt run))
+          (claude-code-ide-handover--allowed (claude-code-ide-handover--run-id run)))
+      (condition-case err
+          (claude-code-ide--start-session nil nil (claude-code-ide-handover--start-spec run prompt))
+        ((error quit)
+         (claude-code-ide-handover--needs-user
+          run 'start-failed (format "The target did not start: %s" (error-message-string err)))))
+      (when (eq (claude-code-ide-handover--run-status run) 'running)
+        (claude-code-ide-handover--save-pending-chain run)
+        (claude-code-ide-handover--start-watch run)
+        (claude-code-ide-handover--check-identified run)))))
+
+(defun claude-code-ide-handover--start-watch (run)
+  "Watch the target of RUN until it gets the document.
+After `claude-code-ide-handover-delivery-timeout' seconds without the
+delivery, or when the target ends before it, the handover needs a
+person."
+  (setf (claude-code-ide-handover--run-delivery-deadline run)
+        (+ (float-time) claude-code-ide-handover-delivery-timeout))
+  (claude-code-ide-handover--schedule-watch run))
+
+(defun claude-code-ide-handover--schedule-watch (run)
+  "Check the target of RUN again after `claude-code-ide-handover-watch-interval'."
+  (when (timerp (claude-code-ide-handover--run-watch run))
+    (cancel-timer (claude-code-ide-handover--run-watch run)))
+  (setf (claude-code-ide-handover--run-watch run)
+        (run-at-time claude-code-ide-handover-watch-interval nil
+                     #'claude-code-ide-handover--watch run)))
+
+(defun claude-code-ide-handover--watch (run)
+  "Check that the target of RUN runs and gets its document in time."
+  (setf (claude-code-ide-handover--run-watch run) nil)
+  (when (and (eq (claude-code-ide-handover--run-status run) 'running)
+             (claude-code-ide-handover--stage< (claude-code-ide-handover--run-stage run)
+                                               'delivered))
+    (cond
+     ((not (claude-code-ide-handover--live-target run))
+      (claude-code-ide-handover--needs-user
+       run 'target-exited "The target ended before it got the handover document"))
+     ((> (float-time) (or (claude-code-ide-handover--run-delivery-deadline run) 0))
+      (claude-code-ide-handover--needs-user
+       run 'no-delivery
+       (format "The target did not get the handover document in %s seconds"
+               claude-code-ide-handover-delivery-timeout)))
+     (t (claude-code-ide-handover--schedule-watch run)))))
 
 (defun claude-code-ide-handover--check-identified (run)
   "Mark the target of RUN identified when its native ID is known now."
@@ -1174,19 +1443,24 @@ A target that a recovery finds identified is resumed instead."
       (claude-code-ide-handover--commit run))))
 
 (defun claude-code-ide-handover--commit (run)
-  "Make the target of RUN the current instance of the chain."
+  "Make the target of RUN the current instance of the chain.
+The final chain of the target is saved first; the inbox of the source
+moves to the target before the commit is final, so that a crash in
+between moves it again at the recovery (the move is idempotent)."
   (when (claude-code-ide-handover--enter run 'committed)
     (let ((source (claude-code-ide-handover--run-source-id run))
           (target (claude-code-ide-handover--run-target-id run)))
-      (claude-code-ide-session-registry-save-chain target (claude-code-ide-handover--target-chain run))
-      (claude-code-ide-handover--finish run 'committed nil
-                                        (format "%s %s -> %s %s"
-                                                (claude-code-ide-handover--run-source-provider run)
-                                                source
-                                                (claude-code-ide-handover--run-target-provider run)
-                                                target))
-      ;; Queued prompts and review results go to the new instance
-      (claude-code-ide-control-move-inbox source target))))
+      (if (not (claude-code-ide-session-registry-save-chain
+                target (claude-code-ide-handover--target-chain run)))
+          (claude-code-ide-handover--busy-registry run)
+        ;; Queued prompts and review results go to the new instance
+        (claude-code-ide-control-move-inbox source target)
+        (claude-code-ide-handover--finish run 'committed nil
+                                          (format "%s %s -> %s %s"
+                                                  (claude-code-ide-handover--run-source-provider run)
+                                                  source
+                                                  (claude-code-ide-handover--run-target-provider run)
+                                                  target))))))
 
 (defun claude-code-ide-handover--run-of-target (instance-id)
   "Return the unfinished run of this Emacs whose target is INSTANCE-ID, or nil."
@@ -1198,7 +1472,7 @@ A target that a recovery finds identified is resumed instead."
 (defun claude-code-ide-handover--on-event (event)
   "Follow the target of a handover, and the requests of agents, with EVENT.
 A `session-start' of a target gives its native ID.  A `prompt-submit'
-of a target whose prompt is the document of its handover is the
+of a target whose prompt starts with the marker of its handover is the
 delivery.  A `turn-end' of an instance with a handover request asks
 the user."
   (let ((instance-id (plist-get event :instance-id))
@@ -1245,75 +1519,107 @@ the user."
              (claude-code-ide-transcript-read file))))
 
 (defun claude-code-ide-handover--resume-target (run)
-  "Resume the identified target of RUN, and deliver the document when it lacks it."
+  "Resume the identified target of RUN, and deliver the document when it lacks it.
+A target that lacks the document gets the pointer prompt as the first
+prompt of its resume.  A target that already runs gets it through the
+inbox."
   (let* ((id (claude-code-ide-handover--run-target-id run))
          (entry (claude-code-ide-session-registry-entry-of id))
-         (claude-code-ide-handover--allowed (claude-code-ide-handover--run-id run)))
-    (unless (and (claude-code-ide-instance-by-id id)
-                 (claude-code-ide-instance-live-p (claude-code-ide-instance-by-id id)))
+         (delivered (or (not (claude-code-ide-handover--stage<
+                              (claude-code-ide-handover--run-stage run) 'delivered))
+                        (claude-code-ide-handover--target-delivered-p run)))
+         (prompt (unless delivered (claude-code-ide-handover-start-prompt run)))
+         (claude-code-ide-handover--allowed (claude-code-ide-handover--run-id run))
+         (claude-code-ide-session-registry--handover-start id))
+    (if (claude-code-ide-handover--live-target run)
+        (when prompt
+          (claude-code-ide-control-submit
+           id prompt
+           :request-id (or (claude-code-ide-handover--run-request-id run)
+                           (concat "handover-" (claude-code-ide-handover--run-id run)))
+           :queue t))
       (unless entry (error "The registry has no entry of the target %s" id))
       (unless (claude-code-ide-session-registry-entry-session-id entry)
         (setf (claude-code-ide-session-registry-entry-session-id entry)
               (claude-code-ide-handover--run-target-native-id run)))
       (claude-code-ide-session-registry--start-entry
-       entry nil (claude-code-ide-handover--run-interactive run)))
+       entry prompt (claude-code-ide-handover--run-interactive run)))
     (cond
      ((not (claude-code-ide-handover--stage< (claude-code-ide-handover--run-stage run) 'delivered))
       (claude-code-ide-handover--commit run))
-     ((claude-code-ide-handover--target-delivered-p run)
-      (claude-code-ide-handover--delivered run))
-     (t
-      (claude-code-ide-control-submit
-       id (or (claude-code-ide-handover--document run)
-              (error "The handover document %s is missing or changed"
-                     (claude-code-ide-handover--run-document run)))
-       :request-id (or (claude-code-ide-handover--run-request-id run)
-                       (concat "handover-" (claude-code-ide-handover--run-id run)))
-       :queue t)))))
+     (delivered (claude-code-ide-handover--delivered run))
+     (t (claude-code-ide-handover--start-watch run)))))
+
+(defun claude-code-ide-handover--target-survivor (run)
+  "Return the target CLI of RUN as a stray when it outlived its Emacs, or nil.
+The registry entry of the target gives its process ID and start time."
+  (when-let* ((entry (claude-code-ide-session-registry-entry-of
+                      (claude-code-ide-handover--run-target-id run)))
+              ((claude-code-ide-session-registry--owner-live-p entry)))
+    (list :pid (claude-code-ide-session-registry-entry-pid entry)
+          :command "the target CLI, still running"
+          :cwd (claude-code-ide-handover--run-directory run)
+          :reason 'target
+          :start (claude-code-ide-session-registry-entry-process-start-time entry))))
+
+(defun claude-code-ide-handover--restart-target (run)
+  "Start the target of RUN again after a crash, when no writer is left.
+The worktree scan runs first, and a target CLI that outlived the crash
+counts as a stray."
+  (setf (claude-code-ide-handover--run-stage run) 'target-started)
+  (claude-code-ide-handover--save run)
+  (let ((result (claude-code-ide-handover--scan run))
+        (survivor (claude-code-ide-handover--target-survivor run)))
+    (when (and survivor (not (eq (plist-get result :status) 'error)))
+      (setq result (list :status 'strays
+                         :strays (cons survivor
+                                       (cl-remove (plist-get survivor :pid) (plist-get result :strays)
+                                                  :key (lambda (s) (plist-get s :pid)))))))
+    (claude-code-ide-handover--after-stop run result)))
 
 (defun claude-code-ide-handover--recover-run (run interactive)
   "Continue the interrupted RUN of an Emacs that ended.  Return its result.
-INTERACTIVE non-nil lets Emacs ask the person about stray processes."
-  (puthash (claude-code-ide-handover--run-id run) run claude-code-ide-handover--runs)
-  (setf (claude-code-ide-handover--run-status run) 'running
-        (claude-code-ide-handover--run-interactive run) interactive)
-  (let ((stage (claude-code-ide-handover--run-stage run)))
-    (condition-case err
-        (cond
-         ;; Before the stop: the source stays current
-         ((claude-code-ide-handover--stage< stage 'source-stopped)
-          (claude-code-ide-handover--finish
-           run 'cancelled 'recovered-before-stop "Emacs ended before the source stopped; it stays current"))
-         ;; The stop may not have ended: check the worktree first
-         ((eq stage 'source-stopped)
-          (claude-code-ide-handover--after-stop run (claude-code-ide-handover--scan run)))
-         ((eq stage 'document-written)
-          (claude-code-ide-handover--write-document run))
-         ((eq stage 'committed)
-          (claude-code-ide-handover--commit run))
-         ;; Never both: the source is not started again
-         ((or (claude-code-ide-handover--run-target-native-id run)
-              (when-let* ((entry (claude-code-ide-session-registry-entry-of
-                                  (claude-code-ide-handover--run-target-id run))))
-                (claude-code-ide-session-registry-entry-session-id entry)))
-          (claude-code-ide-handover--resume-target run))
-         (t
-          (setf (claude-code-ide-handover--run-stage run) 'target-started)
-          (claude-code-ide-handover--start-target run)))
-      (error
-       (claude-code-ide-handover--needs-user
-        run 'step-failed (format "Recovery at %s failed: %s" stage (error-message-string err)))))
-    (claude-code-ide-handover--result run)))
+This Emacs claims RUN first; when another live Emacs owns it, nothing
+happens and the result is nil.  INTERACTIVE non-nil lets Emacs ask the
+person about stray processes."
+  (when (claude-code-ide-handover--claim run)
+    (puthash (claude-code-ide-handover--run-id run) run claude-code-ide-handover--runs)
+    (setf (claude-code-ide-handover--run-status run) 'running
+          (claude-code-ide-handover--run-interactive run) interactive)
+    (let ((stage (claude-code-ide-handover--run-stage run)))
+      (condition-case err
+          (cond
+           ;; Before the stop: the source stays current
+           ((claude-code-ide-handover--stage< stage 'source-stopped)
+            (claude-code-ide-handover--finish
+             run 'cancelled 'recovered-before-stop "Emacs ended before the source stopped; it stays current"))
+           ;; The stop may not have ended: check the worktree first
+           ((eq stage 'source-stopped)
+            (claude-code-ide-handover--after-stop run (claude-code-ide-handover--scan run)))
+           ((eq stage 'document-written)
+            (claude-code-ide-handover--write-document run))
+           ((eq stage 'committed)
+            (claude-code-ide-handover--commit run))
+           ;; Never both: the source is not started again
+           ((or (claude-code-ide-handover--run-target-native-id run)
+                (when-let* ((entry (claude-code-ide-session-registry-entry-of
+                                    (claude-code-ide-handover--run-target-id run))))
+                  (claude-code-ide-session-registry-entry-session-id entry)))
+            (claude-code-ide-handover--resume-target run))
+           (t (claude-code-ide-handover--restart-target run)))
+        (error
+         (claude-code-ide-handover--needs-user
+          run 'step-failed (format "Recovery at %s failed: %s" stage (error-message-string err)))))
+      (claude-code-ide-handover--result run))))
 
 (defun claude-code-ide-handover--interrupted-runs ()
-  "Return the unfinished runs in the registry that no live Emacs runs."
+  "Return the unfinished runs in the registry that no live Emacs runs.
+The owner of a run is the Emacs in its own record (process ID and
+start time), not the owner of the source entry."
   (cl-remove-if
    (lambda (run)
      (or (gethash (claude-code-ide-handover--run-id run) claude-code-ide-handover--runs)
-         (when-let* ((entry (claude-code-ide-session-registry-entry-of
-                             (claude-code-ide-handover--run-source-id run))))
-           (or (not (equal (claude-code-ide-session-registry-entry-host entry) (system-name)))
-               (claude-code-ide-session-registry--other-emacs-p entry)))))
+         (eq (claude-code-ide-handover--run-owner run) 'other)))
    (cl-remove-if-not #'claude-code-ide-handover--unfinished-p
                      (claude-code-ide-handover--registry-runs))))
 
@@ -1323,9 +1629,10 @@ INTERACTIVE non-nil lets Emacs ask the person about stray processes."
 A handover before the stage source-stopped is cancelled: its source
 stays current.  A later one never starts its source again: its target
 is resumed when its native ID is known, else started again with the
-same document.  With EARLY-ONLY, only cancel the early ones.
-INTERACTIVE non-nil (always for the command) lets Emacs ask about
-stray processes.  Return the results."
+same document.  Each run is claimed in the registry first, so that two
+Emacs never recover the same handover.  With EARLY-ONLY, only cancel
+the early ones.  INTERACTIVE non-nil (always for the command) lets
+Emacs ask about stray processes.  Return the results."
   (interactive (list nil t))
   (let ((results nil) (late 0))
     (dolist (run (claude-code-ide-handover--interrupted-runs))
@@ -1333,7 +1640,8 @@ stray processes.  Return the results."
                (not (claude-code-ide-handover--stage< (claude-code-ide-handover--run-stage run)
                                                       'source-stopped)))
           (setq late (1+ late))
-        (push (claude-code-ide-handover--recover-run run interactive) results)))
+        (when-let* ((result (claude-code-ide-handover--recover-run run interactive)))
+          (push result results))))
     (when (> late 0)
       (message "%d interrupted handover%s: M-x claude-code-ide-handover-recover continues them"
                late (if (= late 1) "" "s")))

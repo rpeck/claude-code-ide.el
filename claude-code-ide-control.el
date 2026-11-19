@@ -455,10 +455,11 @@ Use the native parser when this Emacs has one, else json.el."
         (claude-code-ide-session-registry--file-string file)))
     (error nil)))
 
-(defun claude-code-ide-control--write-file (file record)
-  "Write RECORD to FILE atomically.
-The text goes to a temporary file in the same folder, which is then
-renamed over FILE.  The folder is private (mode 0700)."
+(defun claude-code-ide-control--write-json-file (file data)
+  "Write DATA, a value for `json-encode', to FILE atomically.
+The text goes to a temporary file (mode 0600) in the same folder, which
+is then renamed over FILE.  The folder is private (mode 0700).  Other
+files of the package, such as the review file, use it too."
   (let ((dir (file-name-directory file)))
     (with-file-modes #o700
       (make-directory dir t))
@@ -467,11 +468,15 @@ renamed over FILE.  The folder is private (mode 0700)."
       (unwind-protect
           (progn
             (let ((coding-system-for-write 'utf-8-unix))
-              (write-region (json-encode (claude-code-ide-control--record-to-alist record))
-                            nil tmp nil 'silent))
+              (write-region (json-encode data) nil tmp nil 'silent))
             (rename-file tmp file t))
         (when (file-exists-p tmp)
           (delete-file tmp))))))
+
+(defun claude-code-ide-control--write-file (file record)
+  "Write RECORD to FILE atomically; see `claude-code-ide-control--write-json-file'."
+  (claude-code-ide-control--write-json-file
+   file (claude-code-ide-control--record-to-alist record)))
 
 (defun claude-code-ide-control--pending-records (instance-id)
   "Return the pending records of INSTANCE-ID, oldest first.
@@ -499,17 +504,24 @@ left-over of an interrupted move, and is deleted."
                                           (claude-code-ide-control--record-seq b))))
                    claude-code-ide-control--index))))))
 
-(defun claude-code-ide-control--prune-done (instance-id)
-  "Delete the final records of INSTANCE-ID that are too old.
-See `claude-code-ide-control-done-days'."
-  (let ((dir (claude-code-ide-control--done-directory instance-id))
-        (limit (* claude-code-ide-control-done-days 86400)))
+(defun claude-code-ide-control--prune-folder (dir days &optional regexp)
+  "Delete the files in DIR whose names match REGEXP and that are older than DAYS.
+REGEXP defaults to the names of the inbox files (hex digits and
+\".json\").  Other files of the package, such as the review file, use
+it too."
+  (let ((limit (* days 86400)))
     (when (file-directory-p dir)
-      (dolist (file (directory-files dir t "\\`[0-9a-f]+\\.json\\'" t))
+      (dolist (file (directory-files dir t (or regexp "\\`[0-9a-f]+\\.json\\'") t))
         (when-let* ((attributes (file-attributes file)))
           (when (> (float-time (time-subtract nil (file-attribute-modification-time attributes)))
                    limit)
             (ignore-errors (delete-file file))))))))
+
+(defun claude-code-ide-control--prune-done (instance-id)
+  "Delete the final records of INSTANCE-ID that are too old.
+See `claude-code-ide-control-done-days'."
+  (claude-code-ide-control--prune-folder (claude-code-ide-control--done-directory instance-id)
+                                         claude-code-ide-control-done-days))
 
 (defun claude-code-ide-control--write-record (record)
   "Write RECORD to its inbox file and update the index.  Return RECORD.
@@ -658,6 +670,29 @@ not run, the session registry decides:
 
 ;;; Submit and delivery
 
+(defvar claude-code-ide-control--held nil
+  "Instance IDs whose inbox delivery is held.
+A handover holds the delivery to its source while it quiesces and
+stops it, so that no queued prompt is sent to the source then.")
+
+(defun claude-code-ide-control-hold (instance-id)
+  "Hold the inbox delivery to INSTANCE-ID: its prompts are only queued."
+  (unless (member instance-id claude-code-ide-control--held)
+    (push instance-id claude-code-ide-control--held))
+  instance-id)
+
+(defun claude-code-ide-control-release (instance-id)
+  "End the hold of the inbox delivery to INSTANCE-ID, and deliver its prompts."
+  (when (member instance-id claude-code-ide-control--held)
+    (setq claude-code-ide-control--held (delete instance-id claude-code-ide-control--held))
+    (when (claude-code-ide-control--pending-records instance-id)
+      (claude-code-ide-control--schedule-delivery instance-id)))
+  instance-id)
+
+(defun claude-code-ide-control-held-p (instance-id)
+  "Return non-nil when the inbox delivery to INSTANCE-ID is held."
+  (and (member instance-id claude-code-ide-control--held) t))
+
 (defun claude-code-ide-control--requester ()
   "Return the instance ID of the current MCP request, or nil."
   (and (fboundp 'claude-code-ide-mcp-request-instance-id)
@@ -762,6 +797,11 @@ and PENDING the pending records of INSTANCE-ID."
     (cond
      ((not (claude-code-ide-control--provider-can-submit-p instance))
       (setq action 'reject reason 'no-submit))
+     ;; A handover holds the delivery: queue (or reject without a queue)
+     ((and (eq action 'deliver) (claude-code-ide-control-held-p instance-id))
+      (if (eq queue 'never)
+          (setq action 'reject reason 'held)
+        (setq action 'queue reason 'held)))
      ;; Earlier prompts go first
      ((and (eq action 'deliver) pending)
       (if (eq queue 'never)
@@ -825,8 +865,9 @@ when sent."
 
 (defun claude-code-ide-control-deliver-pending (instance-id)
   "Send the oldest queued prompt of INSTANCE-ID when the instance can take it.
-It can take it when it runs, is idle, and has no sent prompt that
-still waits for its acknowledgement (see
+It can take it when it runs, is idle, is not held (see
+`claude-code-ide-control-hold'), and has no sent prompt that still
+waits for its acknowledgement (see
 `claude-code-ide-control-ack-timeout').  Send at most one prompt.
 When the provider of the instance has no submit-prompt, the queued
 prompts become final with the reason `no-submit'.  Return the request
@@ -838,6 +879,7 @@ ID of the prompt that was sent, or nil."
          (next (cl-find-if-not #'claude-code-ide-control--record-sent-at pending)))
     (cond
      ((or (null next) (null state)) nil)
+     ((claude-code-ide-control-held-p instance-id) nil)
      ((not (claude-code-ide-control--provider-can-submit-p instance))
       (dolist (record pending)
         (claude-code-ide-control--finish record 'rejected 'no-submit))

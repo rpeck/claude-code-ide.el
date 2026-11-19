@@ -578,8 +578,8 @@ cdr of its :cleanup key."
 
 (ert-deftest claude-code-ide-test-registry-v1-and-v2-files ()
   "Each version goes to its own file; the version 1 file is read once and never written.
-The registry writes version 3 (the decision D1 of the orchestrator);
-docs/session-schema.md describes the files."
+The registry writes version 4 (decision D3 of the orchestrator, for the
+handover fields); docs/session-schema.md describes the files."
   (claude-code-ide-tests--with-registry
     (let ((v1 (claude-code-ide-session-registry--v1-file))
           (v2 (expand-file-name "other-v2.json" registry-dir))
@@ -589,7 +589,7 @@ docs/session-schema.md describes the files."
       ;; The two file names, and the report directory of version 1
       (should (equal v1 (expand-file-name "state.json" registry-dir)))
       (should (equal (claude-code-ide-session-registry--state-file)
-                     (expand-file-name "state-v3.json" registry-dir)))
+                     (expand-file-name "state-v4.json" registry-dir)))
       (should (equal (claude-code-ide-session-registry--report-directory)
                      (file-name-as-directory (expand-file-name "state-reports" registry-dir))))
       ;; A version 2 record reads with all its fields
@@ -614,14 +614,14 @@ docs/session-schema.md describes the files."
         (should (= (claude-code-ide-session-registry-entry-generation old) 0))
         (should-not (claude-code-ide-session-registry-entry-role old))
         (should (eq (claude-code-ide-session-registry-entry-state old) 'open)))
-      ;; The first write makes the version 3 file and leaves version 1 alone
+      ;; The first write makes the version 4 file and leaves version 1 alone
       (claude-code-ide-session-registry--submit "noop" #'identity)
       (should (equal (claude-code-ide-session-registry--file-string v1) v1-text))
       (should-not (file-exists-p (concat v1 ".bak")))
       (let ((data (claude-code-ide-session-registry--json-decode
                    (claude-code-ide-session-registry--file-string
                     (claude-code-ide-session-registry--state-file)))))
-        (should (= (alist-get 'version data) 3))
+        (should (= (alist-get 'version data) 4))
         (let ((record (car (alist-get 'sessions data))))
           (should (equal (alist-get 'instance_id record) "cci-test-k1"))
           (should (equal (alist-get 'native_id record) "cci-test-n1"))
@@ -629,7 +629,7 @@ docs/session-schema.md describes the files."
           (should (= (alist-get 'generation record) 0))
           (should-not (assq 'key record))
           (should-not (assq 'session_id record))))
-      ;; An older Emacs that writes the version 1 file does not change version 3
+      ;; An older Emacs that writes the version 1 file does not change version 4
       (with-temp-file v1 (insert (replace-regexp-in-string "cci-test-k1" "cci-test-k9" v1-text)))
       (should (equal (claude-code-ide-tests--registry-file-keys) '("cci-test-k1")))
       (claude-code-ide-session-registry--submit "b" (claude-code-ide-tests--registry-add "b"))
@@ -637,7 +637,7 @@ docs/session-schema.md describes the files."
       (should (string-match-p "cci-test-k9" (claude-code-ide-session-registry--file-string v1)))
       (should (= 1 (length (directory-files registry-dir nil "\\`state\\.json"))))
       ;; An unknown version is refused
-      (with-temp-file v2 (insert "{\"version\": 4, \"sessions\": []}"))
+      (with-temp-file v2 (insert "{\"version\": 5, \"sessions\": []}"))
       (should-error (claude-code-ide-session-registry--read-file v2)
                     :type 'claude-code-ide-session-registry-error))))
 
