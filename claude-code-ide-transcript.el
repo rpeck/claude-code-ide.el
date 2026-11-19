@@ -51,12 +51,13 @@
   :group 'claude-code-ide
   :prefix "claude-code-ide-transcript-")
 
-(defcustom claude-code-ide-transcript-budget 40000
+(defcustom claude-code-ide-transcript-budget 100000
   "Size budget of a handover document, in characters.
 The budget cuts the user prompts of the chain, the state summary and
 the latest turns.  It never cuts the header, the workspace state, the
-coordinator context, the original first prompt, the \"not carried
-over\" list or the instructions."
+coordinator context, the references to the source sessions, the
+original first prompt, the \"not carried over\" list or the
+instructions."
   :type 'integer
   :group 'claude-code-ide-transcript)
 
@@ -103,12 +104,14 @@ A line that is not a JSON object gives nil."
   "Call FUNCTION with each JSON object of the JSONL FILE, in order.
 Only lines that match REGEXP are parsed, when REGEXP is non-nil.  A
 line that does not parse, and a record for which FUNCTION signals an
-error, are skipped."
+error, are skipped.  Return the number of lines of FILE."
   (with-temp-buffer
-    (let ((coding-system-for-read 'utf-8))
-      (insert-file-contents file))
-    (goto-char (point-min))
-    (while (not (eobp))
+    (let ((coding-system-for-read 'utf-8)
+          (lines 0))
+      (insert-file-contents file)
+      (goto-char (point-min))
+      (while (not (eobp))
+        (setq lines (1+ lines))
       (let ((end (line-end-position)))
         (when (and (< (point) end)
                    (or (null regexp)
@@ -119,7 +122,8 @@ error, are skipped."
             (condition-case nil
                 (funcall function record)
               (error nil)))))
-      (forward-line 1))))
+      (forward-line 1))
+      lines)))
 
 (defun claude-code-ide-transcript--add (turns role text tools time)
   "Add a turn to TURNS, which is newest first, and return TURNS.
@@ -329,8 +333,16 @@ Thinking blocks are left out.  Tool paths are relative to ROOT."
   "Return the turns of the Claude Code transcript FILE, oldest first.
 Tool paths inside ROOT are relative to ROOT.  See the commentary of
 this file for the form of a turn."
-  (let (turns)
-    (claude-code-ide-transcript--map-records
+  (plist-get (claude-code-ide-transcript--read-claude-full file root) :turns))
+
+(defun claude-code-ide-transcript--read-claude-full (file root)
+  "Return (:turns TURNS :records LINES) of the Claude Code transcript FILE.
+TURNS are those of `claude-code-ide-transcript-read-claude' with ROOT,
+and LINES is the number of lines of FILE."
+  (let (turns records)
+    (setq
+     records
+     (claude-code-ide-transcript--map-records
      file claude-code-ide-transcript--claude-line-regexp
      (lambda (record)
        (let ((time (alist-get 'timestamp record)))
@@ -341,8 +353,8 @@ this file for the form of a turn."
            ("assistant"
             (when-let* ((part (claude-code-ide-transcript--claude-assistant record root)))
               (setq turns (claude-code-ide-transcript--add
-                           turns 'assistant (car part) (cdr part) time))))))))
-    (nreverse turns)))
+                           turns 'assistant (car part) (cdr part) time)))))))))
+    (list :turns (nreverse turns) :records records)))
 
 ;;; Codex rollouts
 
@@ -497,11 +509,14 @@ the first item, else the length of ENTRIES."
           first-item))))
 
 (defun claude-code-ide-transcript--read-codex-full (file root)
-  "Return (:turns TURNS :meta META) of the Codex rollout FILE, in one read.
-See `claude-code-ide-transcript-read-codex' for TURNS and ROOT, and
-`claude-code-ide-transcript-codex-meta' for META."
-  (let (entries meta)
-    (claude-code-ide-transcript--map-records
+  "Return (:turns TURNS :meta META :records LINES) of the Codex rollout FILE.
+The file is read one time.  See `claude-code-ide-transcript-read-codex'
+for TURNS and ROOT, and `claude-code-ide-transcript-codex-meta' for
+META.  LINES is the number of lines of FILE."
+  (let (entries meta records)
+    (setq
+     records
+     (claude-code-ide-transcript--map-records
      file claude-code-ide-transcript--codex-line-regexp
      (lambda (record)
        (let ((payload (alist-get 'payload record))
@@ -518,7 +533,7 @@ See `claude-code-ide-transcript-read-codex' for TURNS and ROOT, and
             ((equal (alist-get 'type payload) "task_started")
              (push (list 'task time nil) entries))
             ((member (alist-get 'type payload) '("user_message" "agent_message"))
-             (push (list 'event time payload) entries)))))))
+             (push (list 'event time payload) entries))))))))
     (let* ((entries (nreverse entries))
            (history-end (claude-code-ide-transcript--codex-history-end entries))
            (first-item t)
@@ -545,7 +560,7 @@ See `claude-code-ide-transcript-read-codex' for TURNS and ROOT, and
                     (setq first-item nil))))
               ;; One bad record does not stop the read.
               (error nil))))
-      (list :turns (nreverse turns) :meta meta))))
+      (list :turns (nreverse turns) :meta meta :records records))))
 
 (defun claude-code-ide-transcript-read-codex (file &optional root)
   "Return the turns of the Codex rollout FILE, oldest first.
@@ -957,11 +972,12 @@ Return nil when not even the heading and the note fit."
    "- Then reply `ready` and wait for the next prompt."))
 
 (defun claude-code-ide-transcript--leg-read (leg root)
-  "Return (:format FORMAT :turns TURNS :meta META) of the transcript of LEG.
-The transcript is read one time.  The format is the provider of LEG
-when it has a reader, else it comes from the file.  META is the Codex
-session metadata, or nil.  Tool paths are relative to ROOT.  A leg
-without a readable transcript gives nil."
+  "Return (:format FORMAT :turns TURNS :meta META :records LINES) of LEG.
+The transcript of LEG is read one time.  The format is the provider of
+LEG when it has a reader, else it comes from the file.  META is the
+Codex session metadata, or nil.  LINES is the number of lines of the
+file, or nil for a reader of another package.  Tool paths are relative
+to ROOT.  A leg without a readable transcript gives nil."
   (let* ((file (plist-get leg :transcript))
          (file (and (stringp file) (file-readable-p file) file))
          (provider (plist-get leg :provider))
@@ -973,7 +989,9 @@ without a readable transcript gives nil."
      ((null reader) nil)
      ((eq reader #'claude-code-ide-transcript-read-codex)
       (cons :format (cons format (claude-code-ide-transcript--read-codex-full file root))))
-     (t (list :format format :turns (funcall reader file root) :meta nil)))))
+     ((eq reader #'claude-code-ide-transcript-read-claude)
+      (cons :format (cons format (claude-code-ide-transcript--read-claude-full file root))))
+     (t (list :format format :turns (funcall reader file root) :meta nil :records nil)))))
 
 (defun claude-code-ide-transcript--split-bootstrap (turns)
   "Return (KEPT . DOCUMENTS) for TURNS.
@@ -1040,8 +1058,261 @@ the heading and the cut note fit."
          (<= (+ (length heading) (length body)) budget)
          (concat heading body))))
 
+;;; References to the source sessions
+
+(defcustom claude-code-ide-handover-session-server "claude-sessions"
+  "Name of the MCP server that reads past sessions, or nil.
+When the target of a handover has an MCP server of this name, the
+handover document tells the target to read the source sessions with
+its tools.  nil turns these references off; the document then names
+only the transcript files."
+  :type '(choice (string :tag "Server name") (const :tag "Off" nil))
+  :group 'claude-code-ide-transcript)
+
+(defcustom claude-code-ide-handover-session-server-providers '(claude)
+  "Providers whose sessions the session server reads.
+The session server is `claude-code-ide-handover-session-server'.
+The server named \"claude-sessions\" reads Claude Code sessions only.
+For a leg of another provider, the document names the transcript file."
+  :type '(repeat symbol)
+  :group 'claude-code-ide-transcript)
+
+(defconst claude-code-ide-transcript--session-tools
+  '(get_session_outline get_messages)
+  "Tools of the session server that the handover document names.")
+
+(defun claude-code-ide-transcript--read-json-file (file)
+  "Return the JSON object in FILE as a hash table with string keys, or nil.
+A missing or broken file gives nil."
+  (when (and (stringp file) (file-readable-p file))
+    (condition-case nil
+        (with-temp-buffer
+          (let ((coding-system-for-read 'utf-8))
+            (insert-file-contents file))
+          (let ((value (json-parse-buffer :object-type 'hash-table :null-object nil
+                                          :false-object nil)))
+            (and (hash-table-p value) value)))
+      (error nil))))
+
+(defun claude-code-ide-transcript--json-get (object &rest keys)
+  "Return the value at the string KEYS in the nested hash tables of OBJECT."
+  (while (and keys (hash-table-p object))
+    (setq object (gethash (pop keys) object)))
+  (and (null keys) object))
+
+(defun claude-code-ide-transcript--has-server-p (servers name)
+  "Return non-nil when the hash table SERVERS has the server NAME."
+  (and (hash-table-p servers) (hash-table-p (gethash name servers)) t))
+
+(defun claude-code-ide-transcript--claude-config-file ()
+  "Return the global configuration file of Claude Code (.claude.json).
+It is in CLAUDE_CONFIG_DIR when that is set, else in HOME."
+  (expand-file-name ".claude.json" (or (getenv "CLAUDE_CONFIG_DIR") (getenv "HOME") "~")))
+
+(defun claude-code-ide-transcript--claude-project-entry (config worktree)
+  "Return the project entry of WORKTREE in the Claude Code CONFIG, or nil."
+  (let ((projects (claude-code-ide-transcript--json-get config "projects")))
+    (when (and worktree (hash-table-p projects))
+      (let ((dir (directory-file-name (expand-file-name worktree))))
+        (or (gethash dir projects)
+            (gethash (file-name-as-directory dir) projects)
+            (gethash (directory-file-name (file-truename dir)) projects))))))
+
+(defun claude-code-ide-transcript--claude-server-p (name worktree)
+  "Return non-nil when Claude Code in WORKTREE has the MCP server NAME.
+The server can be in the user scope (mcpServers of .claude.json), in
+the local scope (the project entry of WORKTREE in .claude.json), or in
+the project scope (WORKTREE/.mcp.json, unless the project entry
+disables it).  The files are only read."
+  (let* ((config (claude-code-ide-transcript--read-json-file
+                  (claude-code-ide-transcript--claude-config-file)))
+         (project (claude-code-ide-transcript--claude-project-entry config worktree))
+         (shared (and worktree
+                      (claude-code-ide-transcript--read-json-file
+                       (expand-file-name ".mcp.json" worktree)))))
+    (or (claude-code-ide-transcript--has-server-p
+         (claude-code-ide-transcript--json-get config "mcpServers") name)
+        (claude-code-ide-transcript--has-server-p
+         (claude-code-ide-transcript--json-get project "mcpServers") name)
+        (and (claude-code-ide-transcript--has-server-p
+              (claude-code-ide-transcript--json-get shared "mcpServers") name)
+             (not (member name (append (claude-code-ide-transcript--json-get
+                                        project "disabledMcpjsonServers")
+                                       nil)))))))
+
+(defun claude-code-ide-transcript--codex-config-file ()
+  "Return the configuration file of Codex.
+It is config.toml in CODEX_HOME when that is set, else in HOME/.codex."
+  (expand-file-name "config.toml"
+                    (or (getenv "CODEX_HOME")
+                        (expand-file-name ".codex" (or (getenv "HOME") "~")))))
+
+(defun claude-code-ide-transcript--codex-server-p (name)
+  "Return non-nil when the Codex configuration has the MCP server NAME.
+That is a table [mcp_servers.NAME] (the name can be quoted) without
+`enabled = false', or a key mcp_servers.NAME = ....  The file is only
+read, line by line, without a full TOML parser."
+  (let ((file (claude-code-ide-transcript--codex-config-file))
+        (key (concat "mcp_servers\\.\\(?:" (regexp-quote name)
+                     "\\|\"" (regexp-quote name) "\"\\|'" (regexp-quote name) "'\\)")))
+    (when (file-readable-p file)
+      (with-temp-buffer
+        (let ((coding-system-for-read 'utf-8)
+              (case-fold-search nil))
+          (insert-file-contents file)
+          (goto-char (point-min))
+          (cond
+           ((re-search-forward (concat "^[ \t]*\\[[ \t]*" key "[ \t]*\\][ \t]*\\(?:#.*\\)?$") nil t)
+            ;; The table ends at the next table header.
+            (let ((end (save-excursion
+                         (if (re-search-forward "^[ \t]*\\[" nil t) (match-beginning 0) (point-max)))))
+              (not (re-search-forward "^[ \t]*enabled[ \t]*=[ \t]*false\\b" end t))))
+           ((re-search-forward (concat "^[ \t]*" key "[ \t]*=") nil t) t)))))))
+
+(defun claude-code-ide-transcript-session-server-p (provider &optional worktree)
+  "Return non-nil when the PROVIDER configuration has the session server.
+The server is `claude-code-ide-handover-session-server'.  PROVIDER is
+`claude' or `codex'; WORKTREE is the folder where it runs.  Another
+provider, or a nil server name, gives nil.  The configuration files
+are only read, and a missing or broken file gives nil."
+  (let ((name claude-code-ide-handover-session-server))
+    (and (stringp name) (not (string-empty-p name))
+         (pcase provider
+           ('claude (claude-code-ide-transcript--claude-server-p name worktree))
+           ('codex (claude-code-ide-transcript--codex-server-p name))))))
+
+(defun claude-code-ide-transcript-session-tool (provider tool)
+  "Return the name that the target PROVIDER gives TOOL of the session server.
+Claude Code uses mcp__SERVER__TOOL.  Codex changes the hyphens of the
+server name to underscores.  Another provider gives nil."
+  (let ((server claude-code-ide-handover-session-server))
+    (pcase provider
+      ('claude (format "mcp__%s__%s" server tool))
+      ('codex (format "mcp__%s__%s" (string-replace "-" "_" server) tool)))))
+
+(defun claude-code-ide-transcript--leg-native-id (leg data)
+  "Return the native conversation ID of LEG with its leg DATA, or nil.
+It is the :native-id of LEG, else the ID in the Codex metadata, else
+the name of a CC transcript file."
+  (or (plist-get leg :native-id)
+      (plist-get (plist-get data :meta) :id)
+      (and (eq (plist-get data :format) 'claude)
+           (stringp (plist-get leg :transcript))
+           (file-name-base (plist-get leg :transcript)))))
+
+(defun claude-code-ide-transcript--leg-uses-server-p (leg server)
+  "Return non-nil when the target reads LEG with the session server.
+SERVER is non-nil when the target has the server."
+  (and server
+       (memq (plist-get leg :provider) claude-code-ide-handover-session-server-providers)))
+
+(defconst claude-code-ide-transcript--format-names
+  '((claude . "Claude Code JSONL: one JSON record on each line")
+    (codex . "Codex rollout JSONL: one JSON record on each line"))
+  "Names of the transcript formats for people.")
+
+(defun claude-code-ide-transcript--render-leg-reference (data source-p server)
+  "Return the reference entry of the leg DATA.
+SOURCE-P is non-nil for the source leg.  SERVER is non-nil when the
+target has the session server."
+  (let* ((leg (plist-get data :leg))
+         (all (plist-get data :all))
+         (native (claude-code-ide-transcript--leg-native-id leg data))
+         (file (plist-get leg :transcript))
+         (format (plist-get data :format))
+         (records (plist-get data :records)))
+    (string-join
+     (delq nil
+           (list
+            (format "### Leg %d: %s%s" (plist-get data :number)
+                    (or (plist-get leg :provider) 'unknown)
+                    (if source-p " (the source: this leg just ended)" ""))
+            ""
+            (format "- Conversation ID: %s" (or native 'unknown))
+            (format "- Transcript: %s" (if file (format "`%s`" (expand-file-name file)) "unknown"))
+            (and format (format "- Format: %s" (alist-get format claude-code-ide-transcript--format-names)))
+            (format "- Started: %s" (or (plist-get (car all) :time) 'unknown))
+            (format "- Ended: %s%s" (or (plist-get (car (last all)) :time) 'unknown)
+                    (if records
+                        (format ", at record %d (line %d of the file).  Later records are not part of this chain."
+                                records records)
+                      "."))
+            (format "- Read it with: %s"
+                    (if (and native (claude-code-ide-transcript--leg-uses-server-p leg server))
+                        (format "the %s tools (conversation_id %s), or the file"
+                                claude-code-ide-handover-session-server native)
+                      "the file"))))
+     "\n")))
+
+(defun claude-code-ide-transcript--render-server-instructions (target)
+  "Return the instructions to read the legs with the session server of TARGET."
+  (let ((outline (claude-code-ide-transcript-session-tool target 'get_session_outline))
+        (messages (claude-code-ide-transcript-session-tool target 'get_messages)))
+    (concat
+     (format "The user asks you to read the source sessions with the %s tools when you need a detail.  "
+             claude-code-ide-handover-session-server)
+     "This is the explicit request of the user for these tools.\n\n"
+     (format "1. Call `%s` with the conversation ID of the leg, in pages of 100: " outline)
+     "`limit` 100, then `start_position` set to `next_position` of the page before.\n"
+     (format "2. Call `%s` with the conversation ID and only the `positions` that you need.\n" messages)
+     "3. Do not fetch a whole session at once: always give `positions`.\n"
+     "4. Use the end time of the leg: messages after it are not part of this chain.")))
+
+(defun claude-code-ide-transcript--render-file-instructions (formats)
+  "Return the instructions to read the transcript files of FORMATS."
+  (concat
+   "Each transcript file can be very large (hundreds of megabytes).  "
+   "Never read a whole file.  Read only parts, with commands like these "
+   "(FILE is the transcript, N the end record of the leg):\n\n"
+   "- Find a word, with a short context: "
+   "`grep -n -o '.\\{0,100\\}WORD.\\{0,100\\}' FILE | head -n 20`\n"
+   "- The last records of a leg: `head -n N FILE | tail -n 40 | cut -c1-400`"
+   (if (memq 'claude formats)
+       (concat
+        "\n- Claude Code: prompts and replies are the records with `\"type\":\"user\"` and "
+        "`\"type\":\"assistant\"`, with the text in `message.content`.  With jq: "
+        "`head -n N FILE | tail -n 200 | jq -c 'select(.type==\"user\" or .type==\"assistant\") "
+        "| [.timestamp, .type, (.message.content | tostring | .[0:300])]'`")
+     "")
+   (if (memq 'codex formats)
+       (concat
+        "\n- Codex: the turns are the records with `\"type\":\"event_msg\"` and "
+        "`payload.type` `item_completed`; `payload.item.type` is `UserMessage`, `AgentMessage`, "
+        "`CommandExecution` or `FileChange`.  With jq: "
+        "`head -n N FILE | tail -n 400 | jq -c 'select(.payload.type==\"item_completed\") "
+        "| [.timestamp, .payload.item.type, (.payload.item | tostring | .[0:300])]'`")
+     "")))
+
+(defun claude-code-ide-transcript--render-references (leg-data server target)
+  "Return the \"Source sessions\" part for LEG-DATA, oldest first.
+SERVER is non-nil when the TARGET provider has the session server.
+The last leg is the source."
+  (let* ((source (car (last leg-data)))
+         (via-server (cl-some (lambda (data)
+                                (and (claude-code-ide-transcript--leg-uses-server-p
+                                      (plist-get data :leg) server)
+                                     (claude-code-ide-transcript--leg-native-id
+                                      (plist-get data :leg) data)))
+                              leg-data))
+         (formats (delete-dups (delq nil (mapcar (lambda (data) (plist-get data :format))
+                                                 leg-data)))))
+    (string-join
+     (append
+      (list "## Source sessions"
+            (concat "The history below is a short extract.  "
+                    "The source sessions have all details: read them when you need a detail."))
+      (and via-server (list (claude-code-ide-transcript--render-server-instructions target)))
+      (list (concat (if via-server "Without these tools, read the files.  " "")
+                    (claude-code-ide-transcript--render-file-instructions formats)))
+      (mapcar (lambda (data)
+                (claude-code-ide-transcript--render-leg-reference
+                 data (eq data source) server))
+              leg-data))
+     "\n\n")))
+
 (cl-defun claude-code-ide-transcript-handover-document
-    (&key source chain context budget handover-id target-provider summary-file time)
+    (&key source chain context budget handover-id target-provider summary-file time
+          (session-server 'auto))
   "Return the text of a handover document, as plan section 4.7 describes.
 SOURCE is the source: an instance descriptor, or a leg plist.  CHAIN
 is the list of the earlier legs of the chain, oldest first; each is a
@@ -1054,8 +1325,15 @@ for `claude-code-ide-transcript-budget'.
 These keys are optional: HANDOVER-ID (a new ID when nil),
 TARGET-PROVIDER (a provider name, or nil for unknown), SUMMARY-FILE
 \(the file for the state summary of the target; nil gives a file in
-the worktree after `claude-code-ide-transcript-summary-file-format')
-and TIME (a Lisp time, nil for now)."
+the worktree after `claude-code-ide-transcript-summary-file-format'),
+TIME (a Lisp time, nil for now) and SESSION-SERVER.  SESSION-SERVER
+says whether the target has the server
+`claude-code-ide-handover-session-server': t, nil, or `auto' (the
+default) to read the configuration of TARGET-PROVIDER with
+`claude-code-ide-transcript-session-server-p'.  With the server, the
+\"Source sessions\" part tells the target to read the legs of the
+providers in `claude-code-ide-handover-session-server-providers' with
+its tools.  The part always names the transcript files."
   (let* ((source-leg (claude-code-ide-transcript--leg source))
          (earlier (mapcar #'claude-code-ide-transcript--leg chain))
          (same (cl-find-if (lambda (leg) (claude-code-ide-transcript--same-leg-p leg source-leg))
@@ -1080,8 +1358,17 @@ and TIME (a Lisp time, nil for now)."
                                            (split (claude-code-ide-transcript--split-bootstrap all)))
                                       (list :leg leg :number number :all all
                                             :meta (plist-get read :meta)
+                                            :format (plist-get read :format)
+                                            :records (plist-get read :records)
                                             :turns (car split) :documents (cdr split)))))
          (source-data (car (last leg-data)))
+         ;; Whether the target can read sessions with the session server.
+         (server (and (stringp claude-code-ide-handover-session-server)
+                      (claude-code-ide-transcript-session-tool target-provider 'get_messages)
+                      (if (eq session-server 'auto)
+                          (claude-code-ide-transcript-session-server-p target-provider worktree)
+                        session-server)
+                      t))
          ;; The state summary of the previous target is that of the
          ;; source, when a handover started the source.
          (source-summary-file
@@ -1111,6 +1398,8 @@ and TIME (a Lisp time, nil for now)."
                       (claude-code-ide-transcript--render-workspace state)
                       (and context (not (string-empty-p (string-trim context)))
                            (concat "## Context from the coordinator\n\n" (string-trim context)))
+                      (claude-code-ide-transcript--render-references
+                       leg-data server target-provider)
                       "## History of the chain"
                       (concat "### Original task (the first user prompt of the chain; "
                               "it can be out of date)\n\n"
