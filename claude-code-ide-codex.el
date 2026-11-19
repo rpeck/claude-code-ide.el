@@ -109,7 +109,8 @@ A launch reads the shell environment policy of the user through
 (defcustom claude-code-ide-codex-coordinator-approved-tools
   '("claude-code-ide-control-list-instances"
     "claude-code-ide-control-inspect-instance"
-    "claude-code-ide-control-request-status")
+    "claude-code-ide-control-request-status"
+    "claude-code-ide-control-handover-status")
   "Coordinator tools that a Codex coordinator may call without approval.
 Only a Codex instance with the role \"coordinator\" gets coordinator
 tools, and these only read.  Every other coordinator tool, such as
