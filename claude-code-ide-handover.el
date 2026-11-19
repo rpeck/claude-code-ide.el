@@ -383,13 +383,14 @@ registry (for example of an Emacs that crashed) count."
                 (append (hash-table-values claude-code-ide-handover--runs)
                         (claude-code-ide-handover--registry-runs)))))
 
-(defun claude-code-ide-handover--guard-start (start &optional continue resume spec)
+(defun claude-code-ide-handover--guard-start (start &rest args)
   "Refuse a start in a working tree that a handover holds, then call START.
-START is `claude-code-ide--start-session', and CONTINUE, RESUME and
-SPEC its arguments.  Only the start of the handover's own target, in
-`claude-code-ide-handover--allowed', goes through: one writer for each
-working tree."
-  (let* ((directory (ignore-errors
+START is `claude-code-ide--start-session', and ARGS its arguments; the
+third one is the start spec, or nil.  Only the start of the handover's
+own target, in `claude-code-ide-handover--allowed', goes through: one
+writer for each working tree."
+  (let* ((spec (nth 2 args))
+         (directory (ignore-errors
                       (if spec
                           (claude-code-ide-start-spec-directory spec)
                         (claude-code-ide--get-working-directory))))
@@ -400,7 +401,7 @@ working tree."
                   (claude-code-ide-handover--run-id run)
                   (claude-code-ide-handover--directory-key directory)
                   (claude-code-ide-handover--run-stage run)))
-    (funcall start continue resume spec)))
+    (apply start args)))
 
 (advice-add 'claude-code-ide--start-session :around #'claude-code-ide-handover--guard-start)
 
@@ -1118,7 +1119,10 @@ PENDING is as for `claude-code-ide-handover--target-leg'."
      :last-generation (and (> last 0) last)
      :role (claude-code-ide-handover--run-role run)
      :resume-id (claude-code-ide-handover--run-fork-id run)
-     :fork (and (claude-code-ide-handover--run-fork-id run) t))))
+     :fork (and (claude-code-ide-handover--run-fork-id run) t)
+     ;; Only a handover that a person started may ask, for example
+     ;; whether to trust the Codex status hooks of the target
+     :interactive (and (claude-code-ide-handover--run-interactive run) t))))
 
 (defun claude-code-ide-handover--start-target (run)
   "Start the target of RUN with the document as its first prompt.
@@ -1251,7 +1255,8 @@ the user."
       (unless (claude-code-ide-session-registry-entry-session-id entry)
         (setf (claude-code-ide-session-registry-entry-session-id entry)
               (claude-code-ide-handover--run-target-native-id run)))
-      (claude-code-ide-session-registry--start-entry entry nil))
+      (claude-code-ide-session-registry--start-entry
+       entry nil (claude-code-ide-handover--run-interactive run)))
     (cond
      ((not (claude-code-ide-handover--stage< (claude-code-ide-handover--run-stage run) 'delivered))
       (claude-code-ide-handover--commit run))
