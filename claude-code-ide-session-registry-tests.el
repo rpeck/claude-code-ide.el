@@ -17,8 +17,6 @@
 (require 'claude-code-ide-session-registry)
 (require 'claude-code-ide-codex)
 
-(defvar claude-code-ide-session-prepare-functions)
-
 (declare-function claude-code-ide-tests--make-session "claude-code-ide-tests")
 (declare-function claude-code-ide-tests--clear-processes "claude-code-ide-tests")
 
@@ -873,9 +871,10 @@ is non-nil, and its MCP setup is mocked."
                        ((symbol-function 'claude-code-ide--read-instance-name)
                         (lambda (&rest _) (error "Must not prompt")))
                        ((symbol-function 'claude-code-ide-mcp-create-session)
-                        (lambda (dir session-id &optional instance-name)
+                        (lambda (dir session-id &optional instance-name no-ide-server)
                           (claude-code-ide-tests--make-session
-                           dir :session-id session-id :instance-name instance-name :port 12345)))
+                           dir :session-id session-id :instance-name instance-name
+                           :port (unless no-ide-server 12345))))
                        ((symbol-function 'claude-code-ide--create-terminal-session)
                         (lambda (&rest args)
                           (let ((command (funcall (nth 8 args)))
@@ -1544,14 +1543,13 @@ slot of the start spec, a fork has no native ID and no --session-id."
             (claude-code-ide-session-registry-mode -1)
             (should-not (memq #'claude-code-ide-session-registry--on-prepare
                               claude-code-ide-session-prepare-functions))
-            ;; The fork slot of the start spec, when it exists
-            (cl-letf (((symbol-function 'claude-code-ide-start-spec-fork) (lambda (_spec) t)))
-              (let ((fork (claude-code-ide-tests--registry-spec :resume-id "cci-test-source")))
-                (should-not (claude-code-ide-session-registry--launch-native-id session fork))
-                (should-not (member "--session-id"
-                                    (claude-code-ide-session-registry--cli-args
-                                     (claude-code-ide-tests--make-session "/tmp/cci-test-prepare/")
-                                     (claude-code-ide-tests--registry-spec)))))))
+            ;; The fork slot of the start spec
+            (let ((fork (claude-code-ide-tests--registry-spec :resume-id "cci-test-source" :fork t)))
+              (should-not (claude-code-ide-session-registry--launch-native-id session fork))
+              (should-not (member "--session-id"
+                                  (claude-code-ide-session-registry--cli-args
+                                   (claude-code-ide-tests--make-session "/tmp/cci-test-prepare/")
+                                   fork)))))
         (setq claude-code-ide-session-registry-mode nil)
         (claude-code-ide-tests--clear-processes)))))
 
@@ -1694,7 +1692,7 @@ also for a start that saved no provisional entry."
                           (claude-code-ide-instance-create
                            :id key :provider provider :generation 2 :session session)))
                (spec (claude-code-ide-tests--registry-spec
-                      :provider provider :resume-id "cci-test-parent"
+                      :provider provider :resume-id "cci-test-parent" :fork t
                       :extra-flags "--model opus")))
           ;; The entry held the parent conversation before
           (claude-code-ide-session-registry--submit
@@ -1702,7 +1700,7 @@ also for a start that saved no provisional entry."
                      (append entries (list (claude-code-ide-tests--registry-entry
                                             key :provider provider
                                             :session-id "cci-test-parent")))))
-          (cl-letf (((symbol-function 'claude-code-ide-start-spec-fork) (lambda (_spec) t)))
+          (progn
             (let ((args (claude-code-ide-session-registry--cli-args session spec)))
               (should-not (member "--session-id" args))
               (should-not (member "cci-test-parent" args)))
@@ -1719,6 +1717,59 @@ also for a start that saved no provisional entry."
           (should-not (equal (claude-code-ide-instance-native-id instance) "cci-test-parent"))
           (claude-code-ide-instance-unregister key)))
       (claude-code-ide-tests--clear-processes))))
+
+(ert-deftest claude-code-ide-test-registry-start-records-launch-flags-and-model ()
+  "The record gets the flags and the model that the launch uses.
+The provisional record of the prepare hook sees only the spec's flags,
+which a start without a spec does not have, and the model `unknown'.
+The Claude Code launch writes the flags of `claude-code-ide-cli-extra-flags'
+back into the launch spec, and the start record takes them and their
+model.  A Codex record takes the model of the descriptor."
+  (claude-code-ide-tests--with-registry
+    (let* ((config-dir (expand-file-name "claude" registry-dir))
+           (process-environment (cons (concat "CLAUDE_CONFIG_DIR=" config-dir) process-environment))
+           (dir (claude-code-ide-tests--registry-project registry-dir "cci-test-flags"))
+           (claude-code-ide-cli-extra-flags "--model cci-test-opus --permission-mode plan")
+           (provisional '()))
+      (claude-code-ide-tests--with-mocked-starts
+        (cl-letf* ((real (symbol-function 'claude-code-ide-session-registry--on-prepare))
+                   ((symbol-function 'claude-code-ide-session-registry--on-prepare)
+                    (lambda (session spec)
+                      (funcall real session spec)
+                      (push (claude-code-ide-tests--registry-get
+                             (gethash session claude-code-ide-session-registry--keys))
+                            provisional))))
+          ;; Inside the macro, which binds the Codex flags itself
+          (let ((claude-code-ide-codex-extra-flags "--model gpt-cci-test"))
+            (dolist (provider '(claude codex))
+              (claude-code-ide--start-session
+               nil nil (claude-code-ide-start-spec-create :directory dir :provider provider)))))
+        (should (= (length provisional) 2))
+        (let* ((cc-provisional (cadr provisional))
+               (key (claude-code-ide-session-registry-entry-key cc-provisional))
+               (cc (claude-code-ide-tests--registry-get key))
+               (native (cadr (member "--session-id"
+                                     (claude-code-ide-tests--launch-words
+                                      "*claude-code[cci-test-flags]*")))))
+          ;; Before the spawn: no flags and no model yet
+          (should (eq (claude-code-ide-session-registry-entry-state cc-provisional) 'pending))
+          (should-not (claude-code-ide-session-registry-entry-model cc-provisional))
+          (should (equal (claude-code-ide-session-registry-entry-extra-flags cc-provisional) ""))
+          ;; After the start: the flags and the model of the launch
+          (should (eq (claude-code-ide-session-registry-entry-state cc) 'open))
+          (should (equal (claude-code-ide-session-registry-entry-model cc) "cci-test-opus"))
+          (should (equal (claude-code-ide-session-registry-entry-extra-flags cc)
+                         "--permission-mode plan"))
+          (should (equal (claude-code-ide-session-registry-entry-permission-mode cc) "plan"))
+          (should native)
+          (should (equal (claude-code-ide-session-registry-entry-session-id cc) native)))
+        (let* ((key (claude-code-ide-session-registry-entry-key (car provisional)))
+               (codex (claude-code-ide-tests--registry-get key)))
+          (should-not (claude-code-ide-session-registry-entry-model (car provisional)))
+          (should (eq (claude-code-ide-session-registry-entry-provider codex) 'codex))
+          (should (equal (claude-code-ide-session-registry-entry-model codex) "gpt-cci-test"))
+          (should (equal (claude-code-ide-session-registry-entry-extra-flags codex) ""))
+          (should (eq (claude-code-ide-session-registry-entry-state codex) 'pending)))))))
 
 (provide 'claude-code-ide-session-registry-tests)
 

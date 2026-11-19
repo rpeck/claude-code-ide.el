@@ -317,7 +317,8 @@ The transitions:
 
 - The record holds the descriptor: the instance ID, the provider, the generation, the role, the project directory, the worktree, the instance name, the Emacs process ID, and the Emacs start time.
 - A Claude Code start saves it in `claude-code-ide-session-registry--cli-args`, which runs before the CLI starts. The record has the native ID that Emacs chooses (`--session-id`), or the ID that the start resumes.
-- Every provider: the function `claude-code-ide-session-registry--on-prepare` saves it, when the start runs `claude-code-ide-session-prepare-functions`. That hook is in `claude-code-ide.el`. Until the hook exists there, a Codex record is saved after the spawn, at the session start.
+- Every provider: `claude-code-ide--start-session` runs `claude-code-ide-session-prepare-functions` before the spawn, and `claude-code-ide-session-registry--on-prepare` saves the record there. A start that does not run the hook saves the record at the session start, after the spawn.
+- **Flags and model come later.** The provisional record sees only the flags of the start spec (none for a start without a spec) and no model. The Claude Code launch writes the flags that it uses (`claude-code-ide-cli-extra-flags`) back into the launch spec. The start record then takes those flags, their model, and their permission mode. A Codex record takes the model of the descriptor, which the Codex launch sets from `claude-code-ide-codex-extra-flags`.
 - A start saves the record one time. A second call does nothing.
 - **A new instance whose start fails** loses its record:
   - The end functions of a start that fails after the terminal exists remove it.
