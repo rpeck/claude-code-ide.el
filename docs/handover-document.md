@@ -118,6 +118,7 @@ A leg is a plist, or an instance descriptor that becomes a plist:
 | `:document-hash` | The SHA-256 of that document, or nil. |
 | `:summary-file` | The state summary file that the leg wrote in its first turn, or nil. |
 | `:start-commit` | HEAD when the leg started, or nil. |
+| `:end-record` | The line of the transcript where the leg ended, recorded at the handover, or nil. nil uses the line of the last record that gave a turn. |
 
 - `(claude-code-ide-transcript-instance-leg INSTANCE)` makes the leg of the current conversation of INSTANCE. Its transcript file comes from the `transcript` operation of the provider, with WHAT `file`.
 - The record of the source leg: when a leg of CHAIN has the same native ID or the same transcript file as the source, it is the source. Its values fill in the values that the source lacks, for example `:handover-id` and `:summary-file`. It does not show as a separate leg.
@@ -173,25 +174,37 @@ All transcript text (prompts, turns, and the state summary) is in Markdown block
 The document does not hold every detail. It refers to the source sessions, so that the target reads a detail when it needs it.
 
 - **One entry for each leg of the chain**, oldest first. The entry of the source has "(the source: this leg just ended)". Each entry has:
-  - The provider and the native conversation ID. The ID is the `:native-id` of the leg, else the ID in the Codex session metadata, else the file name of a CC transcript.
-  - The absolute transcript path and its format.
+  - The provider and the native conversation ID.
+    - The provider is the `:provider` of the leg, else the format of its transcript.
+    - The ID is the `:native-id` of the leg, else the session ID that the read found (the `sessionId` of the CC records, or the ID in the Codex session metadata), else the file name of a CC transcript.
+  - The absolute transcript path and its format. A leg without a transcript says "no transcript is known for this leg", also in "Read it with".
   - The start and end time of the leg: the times of its first and last turn.
-  - The end record: the number of lines of the file when the document was written. Later records are not part of the chain.
+  - The end record: the `:end-record` of the leg when the caller gives it, else the line of the last record that gave a turn. Records that the file gets later are not part of the chain.
   - How to read it: with the session server, or the file.
 - **The session server.** `claude-code-ide-handover-session-server` names an MCP server that reads past sessions. The default is `"claude-sessions"`. nil turns the server references off.
   - `(claude-code-ide-transcript-session-server-p PROVIDER &optional WORKTREE)` says whether the target provider has the server. It only reads the files, and a missing or broken file gives nil:
-    - `claude`: `mcpServers` of `.claude.json` (in `CLAUDE_CONFIG_DIR`, else HOME), the `mcpServers` of the project entry of WORKTREE in that file, and `WORKTREE/.mcp.json` (unless the project entry lists the server in `disabledMcpjsonServers`).
-    - `codex`: a table `[mcp_servers.NAME]` (the name can be quoted) without `enabled = false`, or a key `mcp_servers.NAME = ...`, in `config.toml` of `CODEX_HOME`, else `HOME/.codex`.
+    - `claude`: `.claude.json` is in `CLAUDE_CONFIG_DIR`, else in HOME. The server counts when it is in one of these, and the project entry of WORKTREE does not list it in `disabledMcpServers` (written by `/mcp`):
+      - `mcpServers` of `.claude.json` (user scope).
+      - `mcpServers` of the project entry of WORKTREE (local scope).
+      - `mcpServers` of `WORKTREE/.mcp.json` (project scope), only when Claude Code approved it: the project entry lists it in `enabledMcpjsonServers`, or has `enableAllProjectMcpServers` true, and does not list it in `disabledMcpjsonServers`.
+      - A list value that is not a JSON array counts as empty.
+    - `codex`: `config.toml` of `CODEX_HOME`, else `HOME/.codex`. A small TOML reader finds the keys under `mcp_servers.NAME`:
+      - The forms are a table header `[mcp_servers.NAME]` (also a sub-table), a table `[mcp_servers]` with `NAME = { ... }`, and dotted keys such as `mcp_servers.NAME.command = ...`. The name can be quoted.
+      - `enabled = false` (in any of these forms) turns the server off.
+      - Keys under other tables, such as `[profiles.x]`, do not count.
+      - The reader knows comments, strings (also multi-line), arrays over lines, inline tables, booleans, numbers, and arrays of tables. Any other form gives nil.
+    - A read error gives nil. The detection in the document is also wrapped, so that it can never fail the document.
+    - The document parses each JSON file at most one time (`claude-code-ide-transcript--json-cache`, keyed by the file, its time, and its size).
     - Another provider gives nil.
   - A caller can give the answer with `:session-server` (`t` or nil). The default `auto` uses this function for the target provider. An unknown target provider never uses the server.
   - `claude-code-ide-handover-session-server-providers` lists the providers whose sessions the server reads. The default is `(claude)`, because claude-sessions reads Claude Code sessions only. A leg of another provider gets the file reference.
 - **The server instructions**, when the target has the server and a leg can use it:
-  - They are phrased as the request of the user, because the tools of claude-sessions say "only call when the user explicitly asks".
+  - They are a plain instruction: "Read the source sessions with the claude-sessions tools when you need a detail:". The document is the first prompt of the user to the target, so it makes no other claim.
   - First `get_session_outline` with the conversation ID, in pages of 100 (`limit` 100, then `start_position` from `next_position`). Then `get_messages` with only the `positions` that the target needs. Never the whole session at once.
   - `(claude-code-ide-transcript-session-tool PROVIDER TOOL)` gives the tool name in the form of the target: `mcp__claude-sessions__get_messages` for Claude Code, and `mcp__claude_sessions__get_messages` for Codex, which changes hyphens to underscores.
 - **The file reference** is always present, as the fallback:
   - It says that a file can be very large and must never be read whole.
-  - It gives safe commands: `grep -n -o` with a short context, `head -n N | tail -n 40 | cut -c1-400`, and a short `jq` filter for each format in the chain (CC records of type `user` and `assistant`; Codex `item_completed` records).
+  - It gives safe commands: `grep -n -o` with a short context, `head -n N | tail -n 40 | cut -c1-400`, and a short `jq` filter for each format in the chain (CC records of type `user` and `assistant`; Codex `item_completed` records, and the `user_message` and `agent_message` records of an imported rollout).
 - The budget never cuts this part. The latest turns fill the rest of the budget after it.
 
 ### No nested documents
