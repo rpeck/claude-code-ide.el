@@ -792,6 +792,40 @@ CONTENT is a JSON value as text; FIELDS are extra \"key\":value texts."
                                            (shell-quote-argument script)))))
         (should (equal (buffer-string) ""))))))
 
+(defconst claude-code-ide-tests--script-writers 20
+  "Parallel writers that a hook script must serve without a lost event.")
+
+(defconst claude-code-ide-tests--script-hold 0.1
+  "Seconds that one writer holds the lock of a hook script at most.
+It runs echo, cat, two mv and rm; that takes a few milliseconds on an
+idle machine.")
+
+(defun claude-code-ide-tests--script-lock-budget (script)
+  "Check the lock loop of the hook SCRIPT text for parallel writers.
+The loop sleeps a fixed time between tries and gives up after a number
+of tries.  A dead holder's lock must break before the end, and the
+tries must last at least as long as all other writers hold the lock."
+  (let ((limit (and (string-match "\"\\$tries\" -gt \\([0-9]+\\)" script)
+                    (string-to-number (match-string 1 script))))
+        (break (and (string-match "\"\\$tries\" -eq \\([0-9]+\\)" script)
+                    (string-to-number (match-string 1 script))))
+        (pause (and (string-match "^ *sleep \\([0-9.]+\\)$" script)
+                    (string-to-number (match-string 1 script)))))
+    (should (natnump limit))
+    (should (natnump break))
+    (should (and (numberp pause) (> pause 0)))
+    (should (< break limit))
+    ;; Each try sleeps at least PAUSE, so the tries last at least this long
+    (should (>= (* limit pause)
+                (* (1- claude-code-ide-tests--script-writers)
+                   claude-code-ide-tests--script-hold)))))
+
+(ert-deftest claude-code-ide-test-status-hook-script-lock-budget ()
+  "The tries of the status hook script give 20 parallel writers enough time.
+The parallel test above makes the waits independent of the speed of
+the machine; this test checks the numbers of the real loop."
+  (claude-code-ide-tests--script-lock-budget claude-code-ide-session-status--script))
+
 (ert-deftest claude-code-ide-test-status-drain-applies-in-order ()
   "Events are applied in sequence order; unknown launches are deleted."
   (claude-code-ide-tests--with-status
