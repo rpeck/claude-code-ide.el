@@ -2024,7 +2024,17 @@ never gets the Claude Code flags --model and --name.")
       (funcall fn entry)
     ""))
 
-(defun claude-code-ide-session-registry--start-entry (entry prompt)
+(declare-function claude-code-ide-codex-prepare-trust "claude-code-ide-codex-events" (&optional directory))
+
+(defun claude-code-ide-session-registry--spec-with-interactive (spec interactive)
+  "Return SPEC, marked as a start that the user asked for when INTERACTIVE.
+The `interactive' slot of the start spec comes from the hook trust
+change of the Codex status; without the slot, SPEC stays as it is."
+  (when (and interactive (fboundp 'claude-code-ide-start-spec-interactive))
+    (setf (cl-struct-slot-value 'claude-code-ide-start-spec 'interactive spec) t))
+  spec)
+
+(defun claude-code-ide-session-registry--start-entry (entry prompt &optional interactive)
   "Start ENTRY's conversation again, with PROMPT as its first message.
 The instance starts with ENTRY's provider, in ENTRY's directory, with
 its instance ID, instance name and role, resumed by its native ID:
@@ -2036,7 +2046,9 @@ or the directory is missing), ENTRY becomes `failed' with the reason,
 and the error is signaled again.  A failure after the provisional
 entry is recorded once, by `claude-code-ide-session-registry--on-start-failed'.
 A start that still runs after `claude-code-ide-session-registry-restore-grace'
-seconds counts as good and clears the failures of ENTRY."
+seconds counts as good and clears the failures of ENTRY.  INTERACTIVE
+non-nil marks the start as one that the user asked for, in the
+`interactive' slot of the start spec when that slot exists."
   (let ((id (claude-code-ide-session-registry-entry-session-id entry))
         (dir (claude-code-ide-session-registry-entry-project-dir entry))
         (key (claude-code-ide-session-registry-entry-key entry))
@@ -2062,16 +2074,18 @@ seconds counts as good and clears the failures of ENTRY."
             (user-error "Directory %s does not exist" dir))
           (claude-code-ide--start-session
            nil nil
-           (claude-code-ide-start-spec-create
-            :directory dir
-            :instance-name (claude-code-ide-session-registry-entry-instance-name entry)
-            :resume-id id
-            :extra-flags (claude-code-ide-session-registry--restore-flags entry)
-            :prompt prompt
-            :provider provider
-            :instance-id key
-            :last-generation (claude-code-ide-session-registry-entry-generation entry)
-            :role (claude-code-ide-session-registry-entry-role entry)))
+           (claude-code-ide-session-registry--spec-with-interactive
+            (claude-code-ide-start-spec-create
+             :directory dir
+             :instance-name (claude-code-ide-session-registry-entry-instance-name entry)
+             :resume-id id
+             :extra-flags (claude-code-ide-session-registry--restore-flags entry)
+             :prompt prompt
+             :provider provider
+             :instance-id key
+             :last-generation (claude-code-ide-session-registry-entry-generation entry)
+             :role (claude-code-ide-session-registry-entry-role entry))
+            interactive))
           (when-let* ((instance (claude-code-ide-instance-by-id key))
                       (session (claude-code-ide-instance-session instance)))
             (puthash session (float-time) claude-code-ide-session-registry--restoring)
@@ -2166,7 +2180,7 @@ seconds counts as good and clears the failures of ENTRY."
               (format "; unknown, no conversation to resume: %s"
                       (string-join unknown "; "))))))
 
-(defun claude-code-ide-session-registry--start-entries (entries prompt &optional unknown)
+(defun claude-code-ide-session-registry--start-entries (entries prompt &optional unknown interactive)
   "Start ENTRIES again, each from its own timer, with PROMPT as first message.
 An error or a quit in one start does not stop the others, and Emacs
 stays usable between the starts.  A failed start marks only its own
@@ -2174,9 +2188,11 @@ entry `failed'.  When its timer fires, each start reads its entry
 again: an entry that changed since the plan (for example, the user
 closed or archived it), or that runs now, is skipped, and so is an
 instance that runs already.  The check uses a context of that entry
-alone.  UNKNOWN is the list of entries without a
-conversation, which start nothing and are only reported.  The last
-start reports the result."
+alone.  UNKNOWN is the list of entries without a conversation, which
+start nothing and are only reported.  INTERACTIVE non-nil marks each
+start as one that the user asked for; see
+`claude-code-ide-session-registry--start-entry'.  The last start
+reports the result."
   (let ((run (claude-code-ide-session-registry--restore-run-create
               :remaining (length entries)
               :unknown (mapcar #'claude-code-ide-session-registry--describe unknown)))
@@ -2194,7 +2210,9 @@ start reports the result."
                  (if (not (claude-code-ide-session-registry--still-restorable-p entry current))
                      (push (claude-code-ide-session-registry--describe entry)
                            (claude-code-ide-session-registry--restore-run-skipped run))
-                   (claude-code-ide-session-registry--start-entry current prompt)
+                   (if interactive
+                       (claude-code-ide-session-registry--start-entry current prompt interactive)
+                     (claude-code-ide-session-registry--start-entry current prompt))
                    (cl-incf (claude-code-ide-session-registry--restore-run-started run))))
              (claude-code-ide-session-registry-running
               (push (claude-code-ide-session-registry--describe entry)
@@ -2222,7 +2240,13 @@ a native conversation ID starts nothing and is shown as unknown.  The
 instances start one after the other, each from its own timer, so that
 one failure or quit does not stop the rest; a failure marks only its
 own entry `failed', with the reason.  With a prefix argument PICK,
-choose which ones."
+choose which ones.
+
+When you call it as a command and it restores a Codex entry, it
+settles the Codex hook trust one time first (it asks at most once; see
+`claude-code-ide-codex-prepare-trust'), and the Codex starts are
+interactive when the hooks are trusted.  A call from Lisp, such as an
+automatic restore at the start of Emacs, never asks."
   (interactive "P")
   (pcase-let ((`(,entries . ,unknown) (claude-code-ide-session-registry--restore-plan)))
     (if (and (null entries) (null unknown))
@@ -2235,7 +2259,16 @@ choose which ones."
       (when entries
         (message "Restoring %d session%s" (length entries) (if (cdr entries) "s" "")))
       (claude-code-ide-session-registry--start-entries
-       entries claude-code-ide-restore-note unknown))))
+       entries claude-code-ide-restore-note unknown
+       ;; A restore that you start settles the Codex hook trust once,
+       ;; asking at most one time; the starts then count as interactive
+       ;; only when the hooks are trusted
+       (and (called-interactively-p 'any)
+            (cl-some (lambda (entry)
+                       (eq (claude-code-ide-session-registry-entry-provider entry) 'codex))
+                     entries)
+            (fboundp 'claude-code-ide-codex-prepare-trust)
+            (claude-code-ide-codex-prepare-trust))))))
 
 ;;;###autoload
 (defun claude-code-ide-reopen-session (entry)

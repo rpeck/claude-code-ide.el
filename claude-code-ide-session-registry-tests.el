@@ -2125,6 +2125,84 @@ record that the start-failed hook still resolves."
                              "cci-test-getter-native")))
           (claude-code-ide-tests--clear-processes))))))
 
+(ert-deftest claude-code-ide-test-registry-restore-asks-trust-once ()
+  "A restore that you start settles the Codex hook trust one time.
+It calls `claude-code-ide-codex-prepare-trust' once for several Codex
+entries, after the plan, and passes the result to each start.  A
+restore from Lisp, and a restore without Codex entries, never call it."
+  (claude-code-ide-tests--with-registry
+    (let* ((config-dir (expand-file-name "claude" registry-dir))
+           (process-environment (cons (concat "CLAUDE_CONFIG_DIR=" config-dir) process-environment))
+           (trust-calls 0)
+           (starts '()))
+      (claude-code-ide-session-registry--submit
+       "setup"
+       (lambda (_)
+         (list (claude-code-ide-tests--registry-entry
+                "cci-test-trust-cx1" :provider 'codex :session-id "cci-test-trust-n1"
+                :emacs-pid 999999991)
+               (claude-code-ide-tests--registry-entry
+                "cci-test-trust-cx2" :provider 'codex :session-id "cci-test-trust-n2"
+                :emacs-pid 999999991 :started-at "2026-11-03T10:01:00Z")
+               (claude-code-ide-tests--registry-entry
+                "cci-test-trust-cc" :session-id "cci-test-trust-n3"
+                :emacs-pid 999999991 :started-at "2026-11-03T10:02:00Z"))))
+      (cl-flet ((restore (interactively)
+                  (let ((timers '()))
+                    (setq starts nil)
+                    (cl-letf (((symbol-function 'run-with-timer)
+                               (lambda (_secs _repeat fn &rest args) (push (cons fn args) timers)))
+                              ((symbol-function 'message) #'ignore)
+                              ((symbol-function 'claude-code-ide-codex-prepare-trust)
+                               (lambda (&optional _directory) (cl-incf trust-calls) t))
+                              ((symbol-function 'claude-code-ide-session-registry--start-entry)
+                               (lambda (entry _prompt &optional interactive)
+                                 (push (cons (claude-code-ide-session-registry-entry-key entry)
+                                             interactive)
+                                       starts))))
+                      (if interactively
+                          (call-interactively #'claude-code-ide-restore-sessions)
+                        (claude-code-ide-restore-sessions))
+                      (claude-code-ide-tests--run-restore-timers timers)))))
+        ;; The command: one question for the two Codex entries
+        (restore t)
+        (should (= trust-calls 1))
+        (should (= (length starts) 3))
+        (should (cl-every #'cdr starts))
+        ;; From Lisp, for example at the start of Emacs: never
+        (restore nil)
+        (should (= trust-calls 1))
+        (should (= (length starts) 3))
+        (should-not (cl-some #'cdr starts))
+        ;; The command without a Codex entry: never
+        (claude-code-ide-session-registry--submit
+         "no codex" (lambda (entries)
+                      (cl-remove-if (lambda (entry)
+                                      (eq (claude-code-ide-session-registry-entry-provider entry)
+                                          'codex))
+                                    entries)))
+        (restore t)
+        (should (= trust-calls 1))
+        (should (equal (mapcar #'car starts) '("cci-test-trust-cc")))
+        (should-not (cdar starts))))))
+
+(ert-deftest claude-code-ide-test-registry-restore-interactive-spec ()
+  "An interactive restore start reaches the start, and needs no spec slot."
+  (claude-code-ide-tests--with-registry
+    (let ((dir (claude-code-ide-tests--registry-project registry-dir "cci-test-ispec"))
+          (specs '()))
+      (claude-code-ide-session-registry--submit
+       "setup" (lambda (_) (list (claude-code-ide-tests--registry-entry
+                                  "cci-test-ispec" :provider 'codex :project-dir dir
+                                  :emacs-pid 999999991))))
+      (cl-letf (((symbol-function 'claude-code-ide--start-session)
+                 (lambda (_continue _resume spec) (push spec specs))))
+        (claude-code-ide-session-registry--start-entry
+         (claude-code-ide-tests--registry-get "cci-test-ispec") nil t))
+      (should (= (length specs) 1))
+      (when (fboundp 'claude-code-ide-start-spec-interactive)
+        (should (funcall 'claude-code-ide-start-spec-interactive (car specs)))))))
+
 (provide 'claude-code-ide-session-registry-tests)
 
 ;; Local Variables:
