@@ -7,6 +7,7 @@ This document describes the data that all providers share:
 - The common event.
 - The common states.
 - The session registry file, version 2, and the migration of version 1.
+- The states of a record, provisional records, Codex records, and the restore of both providers.
 
 Code: `claude-code-ide-instance.el` and `claude-code-ide-session-registry.el`.
 The provider interface is in [providers.md](providers.md).
@@ -87,7 +88,7 @@ A later branch can need a value that the frozen descriptor does not have, for ex
 1. `claude-code-ide--start-session` makes the descriptor after it makes the MCP session, and before the provider builds the command. So `claude-code-ide-cli-args-functions` can find the instance. A second start of an instance ID that runs fails at the registration, and leaves the running instance and its generation as they are.
 2. After the terminal starts, the start sets `buffer`, `pid`, and `process-start-time`.
 3. A rename updates `display-name`.
-4. The session registry sets `native-id` when it knows the CLI session id. That happens at the start, after a SessionStart report, and for an adopted session.
+4. The native ID is set when it is known. For Claude Code, the session registry sets it at the start, after a SessionStart report, and for an adopted session. For Codex, the provider sets it from the first `session-start` event of each conversation (`claude-code-ide-codex--note-session-start`).
 5. `claude-code-ide--cleanup-session` removes the descriptor at the end, after the end functions ran.
 
 The start spec (`claude-code-ide-start-spec`) has four new slots:
@@ -163,11 +164,11 @@ The status drain builds one common event for each event file. The `map-event` op
 | `waiting-for-user` | `approval`, `question`, `dialog` |
 | `waiting-for-task` | `subagent`, `background-task`, `other-instance` |
 | `disconnected` | `untracked`, `no-signal` |
+| `failed` | `quota-limit`, `exit-code`, `error` |
 
 - `working/starting`: the CLI starts and has not yet reported that it is ready.
 - `disconnected/untracked`: the process runs, but it has no status hooks (for example, it started before the status hooks existed).
 - `disconnected/no-signal`: the process runs and has hooks, but no event came.
-| `failed` | `quota-limit`, `exit-code`, `error` |
 
 ### The state accessor
 
@@ -201,21 +202,24 @@ The accessor decides the state in this order:
 | `waiting`, a dialog of AskUserQuestion (tool name from the PermissionRequest, else from the tool in flight) | NEEDS ANSWER | `waiting-for-user` | `question` | no |
 | `waiting`, an elicitation or another waiting notification | NEEDS ANSWER | `waiting-for-user` | `dialog` | no |
 | `asks` | ASKS YOU | `waiting-for-user` | `question` | yes |
-| `error` | FAILED | `failed` | `error` | no |
-| `unobserved` | NO SIGNAL | `disconnected` | none | no |
+| `error`, a `StopFailure` of another error, or `rate_limit` without a usage-limit text | FAILED | `failed` | `error` | no |
+| `error`, a `StopFailure` with `billing_error` | QUOTA LIMIT | `failed` | `quota-limit` | no |
+| `error`, a `StopFailure` with `rate_limit` whose `error_details` or `last_assistant_message` matches `claude-code-ide-session-status-quota-regexp` | QUOTA LIMIT | `failed` | `quota-limit` | no |
+| `unobserved` | NO SIGNAL | `disconnected` | `no-signal` | no |
 | `tasks-quiet` | TASKS QUIET | `waiting-for-task` | `subagent` | no |
 | `tasks` | WAITS ON TASKS | `waiting-for-task` | `subagent` | no |
 | `idle` | WAITS FOR YOU | `idle` | none | yes after the interrupt check |
-| `starting` | STARTING | `working` | none | no |
+| `starting` | STARTING | `working` | `starting` | no |
 | `working` | WORKING | `working` | none | no |
-| `untracked` | UNTRACKED | `disconnected` | none | no |
+| `untracked` | UNTRACKED | `disconnected` | `untracked` | no |
 
 Notes on the mapping:
 
-- **`starting` has no common state.** It maps to `working`, because the CLI does not take a prompt yet.
+- **`starting`** maps to `working/starting`, because the CLI does not take a prompt yet.
 - **`tasks-quiet`** loses its urgency in the common state. Only the status buffer shows it.
-- **`failed/quota-limit`** is not set yet. The fields of a Claude Code rate-limit `StopFailure` are not verified (test S6).
-- **Without the session registry**, Claude Code instances have no status hooks. Their state is `disconnected`.
+- **A short rate limit** ("Rate limit reached ... try again in 1.2s") stays `failed/error`, with the detail "Error: rate limit". Only a usage limit or a plan limit is `failed/quota-limit`. The regexp is one option for both providers; `docs/status-events.md` describes it.
+- **Without the session registry**, Claude Code instances have no status hooks. Their state is `disconnected/untracked`.
+- **Codex** has its own state function and event mapping. `docs/status-events.md` describes them.
 
 ## The registry file
 
@@ -237,10 +241,10 @@ The report directory stays `<version 1 name without extension>-reports`, so both
     {
       "instance_id": "5afe576e-88a4-4ecf-b317-1cd4b509ca6d",
       "provider": "claude",
-      "native_id": "5afe576e-88a4-4ecf-b317-1cd4b509ca6d",
+      "native_id": "0c9d2f61-3a3e-4b8e-9f7e-2b1d6f0e4a11",
       "generation": 1,
       "role": null,
-      "transcript_path": "/home/me/.claude/projects/-home-me-src-app/5afe576e-88a4-4ecf-b317-1cd4b509ca6d.jsonl",
+      "transcript_path": "/home/me/.claude/projects/-home-me-src-app/0c9d2f61-3a3e-4b8e-9f7e-2b1d6f0e4a11.jsonl",
       "project_dir": "/home/me/src/app/",
       "buffer_name": "*claude-code[app:refactor]*",
       "instance_name": "refactor",
@@ -253,7 +257,13 @@ The report directory stays `<version 1 name without extension>-reports`, so both
       "closed_at": null,
       "closed_by": null,
       "emacs_pid": 41022,
-      "host": "laptop"
+      "host": "laptop",
+      "worktree": "/home/me/src/app/",
+      "pid": 41388,
+      "process_start_time": 1794201164.0,
+      "emacs_start_time": 1794190002.0,
+      "failure": null,
+      "failed_at": null
     }
   ]
 }
@@ -264,18 +274,96 @@ These fields are new or have a new name in version 2:
 | Field | Struct slot | Value |
 |---|---|---|
 | `instance_id` | `key` | The instance ID. It was `key` in version 1. |
-| `provider` | `provider` | The provider name, a string. |
-| `native_id` | `session-id` | The native conversation ID. It was `session_id` in version 1. |
+| `provider` | `provider` | The provider name, a string: `"claude"` or `"codex"`. |
+| `native_id` | `session-id` | The native conversation ID. It was `session_id` in version 1. null means that the ID is not known yet. |
 | `generation` | `generation` | The launch generation of the last launch. |
 | `role` | `role` | The optional role, or null. |
+| `worktree` | `worktree` | The top directory of the Git working tree of the project, from the descriptor, or null. |
+| `pid` | `pid` | The process ID of the terminal process of the last launch, or null. |
+| `process_start_time` | `process-start-time` | The start time of that process, as seconds since the epoch (a float), or null. |
+| `emacs_start_time` | `emacs-start-time` | The start time of the Emacs process `emacs_pid`, or null. |
+| `failure` | `failure` | Why the last restore or reopen failed, or null. |
+| `failed_at` | `failed-at` | When it failed, or null. |
+
+The fields from `worktree` to `failed_at` came after the first version 2 release. A record without them reads as before, with null values. A value of a wrong type also reads as null. The version number stays 2, because an older version 2 reader ignores the new fields.
 
 The other fields keep their version 1 meaning:
 
-- **`model`** is the `--model` of the start flags. null means that the model is not known. The file does not use the string `"unknown"`, because a restore passes the value to `--model`.
-- **`state`** is `open`, `closed`, or `archived`.
+- **`model`** is the `--model` of the Claude Code start flags. For Codex, it is the model that the SessionStart report gives. null means that the model is not known. The file does not use the string `"unknown"`, because a Claude Code restore passes the value to `--model`.
+- **`extra_flags`** holds the Claude Code start flags without the model and the session flags. A Codex record stores `""`: the Codex flags come from `claude-code-ide-codex-extra-flags` at each launch.
 - **`closed_by`** is `exited`, `killed`, or `emacs-exit`.
 
-The struct slots `key` and `session-id` keep their names, so the code that uses them does not change. The accessors are `claude-code-ide-session-registry-entry-<slot>`.
+### States of a record
+
+| State | Meaning | Restore |
+|---|---|---|
+| `pending` | Emacs starts the instance, or the instance runs and its native ID is not known yet. | Yes, when the Emacs that owns it ended. Without a native ID, the restore starts nothing and shows it as unknown. |
+| `open` | The instance runs, or it ran when its Emacs crashed. | Yes, when the Emacs that owns it ended. |
+| `closed` | The instance ended, or Emacs exited normally. | Only the records that the last Emacs closed at its exit (`closed_by` = `emacs-exit`). |
+| `failed` | The last restore or reopen failed. `failure` says why. | Yes: the next restore tries it again. |
+| `archived` | The instance is done. | Never. |
+
+The transitions:
+
+1. **Before the spawn**, a start saves the provisional record with the state `pending`. A crash during the start therefore leaves a record.
+2. **After the spawn**, the record becomes `open` when the native ID is known. A Codex record of a new conversation stays `pending` (see below).
+3. **The SessionStart report** gives the native ID. A `pending` record becomes `open`.
+4. **The end** of the CLI makes the record `closed`. A normal exit of Emacs closes the records of its running instances with `emacs-exit`.
+5. **A failed start** removes the provisional record of a new instance. A restore or a reopen that fails makes its record `failed`, with the reason.
+
+### Provisional records
+
+- The record holds the descriptor: the instance ID, the provider, the generation, the role, the project directory, the worktree, the instance name, the Emacs process ID, and the Emacs start time.
+- A Claude Code start saves it in `claude-code-ide-session-registry--cli-args`, which runs before the CLI starts. The record has the native ID that Emacs chooses (`--session-id`), or the ID that the start resumes.
+- Every provider: the function `claude-code-ide-session-registry--on-prepare` saves it, when the start runs `claude-code-ide-session-prepare-functions`. That hook is in `claude-code-ide.el`. Until the hook exists there, a Codex record is saved after the spawn, at the session start.
+- A start saves the record one time. A second call does nothing.
+- **A new instance whose start fails** loses its record:
+  - The end functions of a start that fails after the terminal exists remove it.
+  - A start that fails before the terminal exists runs no end functions. A timer checks the provisional records every 5 seconds. It removes a record whose MCP session is gone and whose start was never recorded.
+- **A known record whose start fails** (a restore or a reopen) becomes `failed`. Its native ID and names stay.
+
+### Codex records
+
+- **The native ID comes late.** Codex sends `SessionStart` only at the first prompt, also for `codex resume`. So a new Codex conversation has no native ID at the start, and its record stays `pending`.
+- **The report.** The registry adds `claude-code-ide-session-registry--on-event` to `claude-code-ide-event-functions`. For a `session-start` event of an instance of another provider than `claude`, it sets:
+  - `native_id` from `session_id`.
+  - `transcript_path` from `transcript_path`. A new native ID without a transcript path clears the old one.
+  - `model` from `model`, when the event has one.
+  - The state `open`, when the record was `pending`.
+- **The report is idempotent.** It sets no time stamp, so the same report twice gives the same record and the same file.
+- **Reports that change nothing:** a `SessionStart` of a subagent (with `agent_id`), a report of an older launch generation than the record's, and every other event.
+- **A new conversation in the same terminal** (`/new`) gives a new `session_id`. The record follows it.
+- **No prompt, no conversation.** A Codex record that never got a prompt has no native ID. A restore starts nothing for it, and the restore message and the list show it as `unknown`. The record does not change. Archive or forget it by hand.
+- **Claude Code** gets its native ID from its own report file (written by the registry's SessionStart hook), not from the event.
+
+### Restore
+
+`claude-code-ide-restore-sessions` starts the restorable records again. A record is restorable when all of these are true:
+
+- It is `open`, `pending`, or `failed`, on this host, of an Emacs that no longer runs. Or the last Emacs closed it at its exit.
+- It does not run in this Emacs.
+- Its owner process does not run: no process has the ID `pid` and the start time `process_start_time`.
+- No running Claude Code CLI has its native ID (the files in `~/.claude/sessions`).
+
+Each record restores alone:
+
+- **The provider of the record**, never the default provider and never the menu toggle, starts it. A record of a provider that is not loaded fails with a reason.
+- **The native ID of the record** is resumed:
+  - Claude Code: `claude --resume ID`, with the stored flags, the model of the transcript (else `model`) as `--model`, and the title of the transcript as `--name`.
+  - Codex: `codex resume … -- ID PROMPT`. It gets no `--model` and no `--name`. The Codex options give the Codex flags and the model.
+- **The flags of each provider** come from `claude-code-ide-session-registry-restore-flags-functions`, an alist of a provider name and a function of the record. A provider without an entry gets no flags. The provider struct has no slot for restore flags, so the registry keeps this table.
+- **The start spec** has the record's `instance_id`, `provider`, `generation` as `last-generation`, `role`, `project_dir`, and `instance_name`. So the instance keeps its instance ID, its name, its buffer name, and its worktree, and gets the next generation.
+- **Each start runs from its own timer.** An error or a quit in one start does not stop the others.
+- **A failure marks only its own record `failed`**, with the reason:
+  - The provider CLI is missing (for example "Codex CLI not available").
+  - The directory is missing.
+  - The start signals an error.
+  - The CLI exits with an error within `claude-code-ide-session-registry-restore-grace` seconds (default 20) of its start, for example for a conversation ID that the CLI does not know. The reason gives the exit code.
+- **A failed record restores again** at the next restore. The Emacs that marks it owns it, so another running Emacs leaves it alone.
+- **Refusals are not failures.** A record without a native ID, or whose owner process still runs, is refused and does not change.
+- **The message** names the number of started sessions, each failure with its reason, and each unknown record.
+
+`claude-code-ide-reopen-session` starts one record in the same way, with the same failure handling.
 
 ### Migration of version 1
 
@@ -305,6 +393,6 @@ The cost of two files:
 
 - The entry key is the instance ID.
 - A new Claude Code conversation gets a new UUID as its `--session-id`. The record stores it as `native_id`. It is never the instance ID, so a new conversation of an existing instance never reuses a native ID.
-- A start records the provider, the generation, and the role of the descriptor.
-- A restore starts each record with a start spec that has its `instance_id`, its `provider`, its `generation` as `last-generation`, and its `role`. So the restored instance keeps its instance ID and gets the next generation.
-- A record of a provider that is not registered fails to restore with a `user-error`. The other records restore normally.
+- A fork gets no `--session-id`, and its record has no native ID until the report.
+- A start records the provider, the generation, the role, the worktree, and the process of the descriptor.
+- The list buffer (`M-x claude-code-ide-list-session-registry`) shows the provider of each record. The state is `live` for a record that runs in this Emacs, and `unknown` for a record without a native ID. For a `failed` record, the Title column shows the reason.
