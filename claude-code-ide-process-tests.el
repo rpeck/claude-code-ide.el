@@ -963,8 +963,9 @@ ID then belongs to an unrelated process."
       ;; The PID of the pipe's child belongs to an unrelated process now
       (list (claude-code-ide-process-tests--entry 300 1 300 7000.0)
             (claude-code-ide-process-tests--entry 310 300 310 7001.0))
+    ;; The launch recorded the native PID, but no start time
     (let ((instance (claude-code-ide-instance-create
-                     :id "cci-test-ghostel" :provider 'claude))
+                     :id "cci-test-ghostel" :provider 'claude :pid 300))
           (pipe (make-pipe-process :name "cci-test-ghostel-pipe" :noquery t)))
       (unwind-protect
           (progn
@@ -1059,6 +1060,102 @@ tree of the second, running instance."
                claude-code-ide-process--tracks)
       (claude-code-ide-process-stop first :scan nil)
       (should (member '(-410 SIGTERM) claude-code-ide-process-tests--signals)))))
+
+;;; Third review fixes: older processes, and foreign process objects
+
+(ert-deftest claude-code-ide-test-process-attached-older-process-is-not-recorded ()
+  "A process that started before the CLI, under a descendant, is never recorded.
+On macOS a debugger that attaches to a process becomes its parent, so
+ps shows the target, and its children, under the CLI's tree."
+  (claude-code-ide-process-tests--with-table
+      (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+            ;; shell -> lldb -> debugserver
+            (claude-code-ide-process-tests--entry 110 100 110 1001.0)
+            (claude-code-ide-process-tests--entry 120 110 110 1002.0)
+            (claude-code-ide-process-tests--entry 130 120 110 1003.0)
+            ;; The target: a server in Terminal, started long before the CLI
+            (claude-code-ide-process-tests--entry 900 130 900 500.0)
+            ;; Its child started after the CLI, but only through the target
+            (claude-code-ide-process-tests--entry 901 900 900 1200.0)
+            ;; A process with no readable start time
+            (list :pid 140 :ppid 110 :pgid 140 :uid (user-uid) :start nil))
+    (let ((instance (claude-code-ide-process-tests--instance)))
+      (claude-code-ide-process-track instance nil)
+      (should (equal (mapcar (lambda (g) (plist-get g :pgid))
+                             (claude-code-ide-process-groups instance))
+                     '(100 110)))
+      (let ((members (claude-code-ide-process--track-members
+                      (claude-code-ide-process--track-of instance))))
+        (dolist (pid '(900 901 140))
+          (should-not (gethash pid members))))
+      ;; The debugger detaches; the target gets its old parent again
+      (plist-put (claude-code-ide-process-tests--find 900) :ppid 1)
+      (add-hook 'claude-code-ide-process-tests--reactions
+                (claude-code-ide-process-tests--cli-exits-on 'SIGHUP))
+      (claude-code-ide-process-stop instance :scan nil)
+      (should-not (cl-find-if (lambda (s) (memq (car s) '(900 -900 901 140 -140)))
+                              claude-code-ide-process-tests--signals))
+      (should (claude-code-ide-process-tests--find 900))
+      (should (claude-code-ide-process-tests--find 901)))))
+
+(ert-deftest claude-code-ide-test-process-attached-emacs-children-not-recorded ()
+  "With Emacs attached under a descendant, none of Emacs's children are recorded."
+  (claude-code-ide-process-tests--with-table
+      (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+            (claude-code-ide-process-tests--entry 110 100 110 1001.0)
+            (claude-code-ide-process-tests--entry 130 110 110 1003.0)
+            ;; Other children of Emacs: an LSP server and another CLI
+            (claude-code-ide-process-tests--entry 600 (emacs-pid) 600 1500.0)
+            (claude-code-ide-process-tests--entry 700 (emacs-pid) 700 2000.0))
+    ;; Emacs started before the CLI, and a debugserver in the CLI's tree
+    ;; is now its parent
+    (plist-put (claude-code-ide-process-tests--find (emacs-pid)) :start 100.0)
+    (plist-put (claude-code-ide-process-tests--find (emacs-pid)) :ppid 130)
+    (let ((instance (claude-code-ide-process-tests--instance)))
+      (claude-code-ide-process-track instance nil)
+      ;; The CLI is now an ancestor of Emacs, so its own groups are
+      ;; protected too; no group of an Emacs child is recorded
+      (should-not (cl-intersection (mapcar (lambda (g) (plist-get g :pgid))
+                                           (claude-code-ide-process-groups instance))
+                                   (list 50 600 700)))
+      (let ((members (claude-code-ide-process--track-members
+                      (claude-code-ide-process--track-of instance))))
+        (dolist (pid (list (emacs-pid) 600 700))
+          (should-not (gethash pid members))))
+      (claude-code-ide-process-stop instance :scan nil :timeout 0.01 :kill-wait 0.01)
+      (should-not (cl-find-if (lambda (s) (memq (car s) (list 600 -600 700 -700 (emacs-pid))))
+                              claude-code-ide-process-tests--signals)))))
+
+(ert-deftest claude-code-ide-test-process-foreign-process-is-ignored ()
+  "A live child of Emacs that is not the instance's process never becomes the root."
+  (let ((foreign (make-process :name "cci-test-foreign" :command '("/bin/sleep" "30")
+                               :noquery t :connection-type 'pipe)))
+    (unwind-protect
+        (claude-code-ide-process-tests--with-table
+            (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+                  (claude-code-ide-process-tests--entry 200 100 200)
+                  ;; The foreign child, in the synthetic table
+                  (claude-code-ide-process-tests--entry (process-id foreign) (emacs-pid)
+                                                        (process-id foreign)))
+          (let ((instance (claude-code-ide-process-tests--instance))
+                (fpid (process-id foreign)))
+            (claude-code-ide-process-track instance nil)
+            ;; track with the foreign process uses the descriptor's PID
+            (should (eql (claude-code-ide-process-track
+                          (claude-code-ide-instance-create :id "cci-test-other" :pid 4242)
+                          foreign)
+                         4242))
+            (add-hook 'claude-code-ide-process-tests--reactions
+                      (claude-code-ide-process-tests--cli-exits-on 'SIGHUP))
+            (let ((result (claude-code-ide-process-stop instance :process foreign :scan nil)))
+              (should (eq (plist-get result :status) 'stopped))
+              (should (equal (plist-get result :ended) '(200))))
+            ;; The stop used the instance's own records, and never the foreign child
+            (should (equal (claude-code-ide-process-tests--signal-list)
+                           '((-100 SIGHUP) (-200 SIGTERM))))
+            (should-not (cl-find-if (lambda (s) (memq (car s) (list fpid (- fpid))))
+                                    claude-code-ide-process-tests--signals))))
+      (delete-process foreign))))
 
 ;;; Bounded runs of ps and lsof
 
