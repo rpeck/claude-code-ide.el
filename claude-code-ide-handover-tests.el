@@ -314,6 +314,8 @@ BODY can use `worktree', the folder of a Git repository."
         (should (equal (claude-code-ide-start-spec-instance-id spec) (cdr stage-at-start)))
         (should (equal (file-name-as-directory (claude-code-ide-start-spec-directory spec)) worktree))
         (should-not (claude-code-ide-start-spec-fork spec))
+        ;; A coordinator handover never asks the user at the target start
+        (should-not (claude-code-ide-start-spec-interactive spec))
         (should (equal (claude-code-ide-transcript-document-id prompt) id))
         (should (string-match-p "cci-test-context" prompt))
         ;; The document file and its hash
@@ -549,7 +551,9 @@ BODY can use `worktree', the folder of a Git repository."
           (should (equal (cdr (car questions)) '(?e ?w ?c)))
           (should (equal (reverse signals) '((4444 SIGTERM) (4444 SIGKILL))))
           (should (= claude-code-ide-handover-tests--scans 1))
-          (should (eq (plist-get (claude-code-ide-handover-status id) :stage) 'target-started)))
+          (should (eq (plist-get (claude-code-ide-handover-status id) :stage) 'target-started))
+          ;; The target start of a person's handover may ask, for the hook trust
+          (should (claude-code-ide-start-spec-interactive (car claude-code-ide-handover-tests--starts))))
         ;; Cancel: the handover ends, and nothing starts
         (setq answer ?c questions nil claude-code-ide-handover-tests--starts nil)
         (claude-code-ide-handover-tests--add "cci-test-src2" 'cci-test-a
