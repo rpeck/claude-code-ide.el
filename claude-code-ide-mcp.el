@@ -1020,27 +1020,58 @@ without an IDE connection, such as Codex, get their buffer this way."
 
 ;;; Public API
 
-(defun claude-code-ide-mcp-create-session (project-dir session-id &optional instance-name)
+(defun claude-code-ide-mcp-create-session (project-dir session-id &optional instance-name
+                                                       no-ide-server)
   "Create a new MCP session for PROJECT-DIR with SESSION-ID.
 INSTANCE-NAME is the user-visible instance name, or nil for the
 unnamed instance.  Always creates a fresh session with its own
 WebSocket server, port and lockfile; a project may own any number of
-concurrent sessions.  Returns the session object."
+concurrent sessions.  Returns the session object.
+
+With NO-IDE-SERVER non-nil, the session gets no WebSocket server, no
+port and no lock file in ~/.claude/ide/, so that no Claude Code CLI
+can connect to it.  That is the session of a CLI without the IDE
+protocol, which only the MCP tools server serves."
+  (if no-ide-server
+      (claude-code-ide-mcp--create-plain-session project-dir session-id instance-name)
+    (claude-code-ide-mcp--create-ide-session project-dir session-id instance-name)))
+
+(defun claude-code-ide-mcp--new-session (project-dir session-id instance-name)
+  "Return a new session struct for PROJECT-DIR, SESSION-ID and INSTANCE-NAME."
+  (make-claude-code-ide-mcp-session
+   :session-id session-id
+   :instance-name instance-name
+   :project-dir (expand-file-name project-dir)
+   :last-used (float-time)
+   :deferred (make-hash-table :test 'equal)
+   :active-diffs (make-hash-table :test 'equal)
+   :original-tab (when (fboundp 'tab-bar--current-tab)
+                   (tab-bar--current-tab))))
+
+(defun claude-code-ide-mcp--create-plain-session (project-dir session-id instance-name)
+  "Register a session without an IDE server.
+PROJECT-DIR, SESSION-ID and INSTANCE-NAME are as for
+`claude-code-ide-mcp-create-session'."
+  (let ((session (claude-code-ide-mcp--new-session project-dir session-id instance-name)))
+    (puthash session-id session claude-code-ide-mcp--sessions)
+    ;; The active buffer tracker also serves the MCP tools server
+    ;; sessions of instances without an IDE connection
+    (add-hook 'post-command-hook #'claude-code-ide-mcp--track-active-buffer)
+    (claude-code-ide-debug "Session %s has no IDE server" session-id)
+    session))
+
+(defun claude-code-ide-mcp--create-ide-session (project-dir session-id instance-name)
+  "Register a session with its WebSocket server, port and lock file.
+PROJECT-DIR, SESSION-ID and INSTANCE-NAME are as for
+`claude-code-ide-mcp-create-session'."
   (claude-code-ide-debug "=== Starting MCP server ===")
   (let* ((project-dir (expand-file-name project-dir))
-         (session (make-claude-code-ide-mcp-session
-                   :session-id session-id
-                   :instance-name instance-name
-                   :project-dir project-dir
-                   :last-used (float-time)
-                   :deferred (make-hash-table :test 'equal)
-                   :active-diffs (make-hash-table :test 'equal)
-                   :original-tab (when (fboundp 'tab-bar--current-tab)
-                                   (tab-bar--current-tab))
-                   ;; Generated before the server exists, so a failure
-                   ;; here leaves nothing listening
-                   :auth-token (when claude-code-ide-mcp-require-auth-token
-                                 (claude-code-ide-mcp--generate-auth-token))))
+         (session (claude-code-ide-mcp--new-session project-dir session-id instance-name))
+         (_ (when claude-code-ide-mcp-require-auth-token
+              ;; Generated before the server exists, so a failure
+              ;; here leaves nothing listening
+              (setf (claude-code-ide-mcp-session-auth-token session)
+                    (claude-code-ide-mcp--generate-auth-token))))
          (server-and-port (claude-code-ide-mcp--find-free-port session))
          (server (car server-and-port))
          (port (cdr server-and-port)))

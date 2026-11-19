@@ -901,7 +901,9 @@ Each function is called with SESSION and LAUNCH, the start spec of
 the launch, for every provider.  They run after the instance
 descriptor and the MCP tools server session are registered, so that
 the descriptor and its launch generation are known.  Errors are
-reported and do not stop the start.")
+reported and do not stop the start.
+The session registry adds its provisional record here; this file
+itself adds no function.")
 
 (defvar claude-code-ide-session-end-functions nil
   "Functions called when a Claude Code instance ends.
@@ -1234,10 +1236,21 @@ most recently used one — only displaying or hiding windows would."
   ;; A config file whose session is already gone from the table
   (claude-code-ide--delete-all-mcp-config-files))
 
-;; Ensure cleanup on Emacs exit.  Depth -50: run before ghostel's hook,
-;; which sends SIGKILL to its native children.
-(remove-hook 'kill-emacs-hook #'claude-code-ide--cleanup-all-sessions)
-(add-hook 'kill-emacs-hook #'claude-code-ide--cleanup-all-sessions -50)
+(defconst claude-code-ide--quit-hook-depth -40
+  "Depth of `claude-code-ide--cleanup-all-sessions' in `kill-emacs-hook'.
+It runs after the session registry's hook (depth -50), which must mark
+the exit first, and before ghostel's hook (depth 0), which sends
+SIGKILL to its native children.")
+
+(defun claude-code-ide--install-quit-hook ()
+  "Put `claude-code-ide--cleanup-all-sessions' on `kill-emacs-hook'.
+A second call, as at a reload, keeps the same depth."
+  (remove-hook 'kill-emacs-hook #'claude-code-ide--cleanup-all-sessions)
+  (add-hook 'kill-emacs-hook #'claude-code-ide--cleanup-all-sessions
+            claude-code-ide--quit-hook-depth))
+
+;; Ensure cleanup on Emacs exit
+(claude-code-ide--install-quit-hook)
 
 (defun claude-code-ide--hide-foreign-side-windows (project-dir)
   "Delete every Claude side window whose session is not in PROJECT-DIR.
@@ -1533,11 +1546,10 @@ hook signals wrong-type-argument that way)."
 
 (defun claude-code-ide--session-provider-name (session)
   "Return the display name of the provider of SESSION's instance."
-  (let ((provider (when-let* ((instance (claude-code-ide-instance-of-session session)))
-                    (claude-code-ide-get-provider (claude-code-ide-instance-provider instance)))))
-    (if provider
-        (claude-code-ide-provider-display-name provider)
-      "Claude Code")))
+  (claude-code-ide--provider-display-name
+   (if-let* ((instance (claude-code-ide-instance-of-session session)))
+       (claude-code-ide-instance-provider instance)
+     'claude)))
 
 ;;; CLI Detection
 
@@ -1600,7 +1612,15 @@ deletes each file when its instance ends and when Emacs quits."
   "Text that replaces a secret in the debug log.")
 
 (defvar claude-code-ide--mcp-config-files nil
-  "MCP config files that this Emacs wrote and did not delete yet.")
+  "MCP config files that this Emacs wrote and did not delete yet.
+An alist of (SESSION-ID . FILE).  A delete uses the file that was
+written, also when the folder option changed since.")
+
+(defvar claude-code-ide--mcp-config-fallback-directory nil
+  "Private folder that this Emacs made because the usual folder failed.")
+
+(defvar claude-code-ide--mcp-config-swept nil
+  "Folders whose stale config files this Emacs already deleted.")
 
 (defun claude-code-ide--mcp-config-directory ()
   "Return the folder of the MCP config files, as a directory name."
@@ -1609,6 +1629,42 @@ deletes each file when its instance ends and when Emacs quits."
     (or claude-code-ide-mcp-config-directory
         (expand-file-name (format "claude-code-ide-%d" (user-uid))
                           temporary-file-directory)))))
+
+(defun claude-code-ide--mcp-config-folder ()
+  "Return the private folder for a new MCP config file, made if needed.
+When `claude-code-ide--mcp-config-directory' cannot be used (it
+belongs to another user, it is a link, or it cannot be made), use a
+new folder from `make-temp-file' with mode 0700 instead, so that the
+start of Claude Code does not fail."
+  (condition-case err
+      (claude-code-ide--ensure-private-directory (claude-code-ide--mcp-config-directory))
+    (error
+     (unless (and claude-code-ide--mcp-config-fallback-directory
+                  (file-directory-p claude-code-ide--mcp-config-fallback-directory)
+                  (not (file-symlink-p (directory-file-name
+                                        claude-code-ide--mcp-config-fallback-directory))))
+       (let ((dir (with-file-modes #o700 (make-temp-file "claude-code-ide-" t))))
+         (set-file-modes dir #o700)
+         (setq claude-code-ide--mcp-config-fallback-directory (file-name-as-directory dir))
+         (message "%s; the MCP config files go to %s"
+                  (error-message-string err) dir)))
+     claude-code-ide--mcp-config-fallback-directory)))
+
+(defun claude-code-ide--emacs-pid-live-p (pid)
+  "Return non-nil when PID is this Emacs or another running Emacs."
+  (or (= pid (emacs-pid))
+      (let ((command (alist-get 'comm (process-attributes pid))))
+        (and command (string-match-p "emacs" (downcase command))))))
+
+(defun claude-code-ide--sweep-mcp-config-files (directory)
+  "Delete the config files in DIRECTORY of Emacs processes that no longer run.
+Each folder is swept once in this Emacs."
+  (unless (member directory claude-code-ide--mcp-config-swept)
+    (push directory claude-code-ide--mcp-config-swept)
+    (dolist (file (directory-files directory t "\\`mcp-[0-9]+-[0-9a-f]+\\.json\\'"))
+      (let ((pid (string-to-number (nth 1 (split-string (file-name-nondirectory file) "-")))))
+        (unless (claude-code-ide--emacs-pid-live-p pid)
+          (ignore-errors (delete-file file)))))))
 
 (defun claude-code-ide--ensure-private-directory (directory)
   "Make DIRECTORY with mode 0700 when it is missing, and return it.
@@ -1631,25 +1687,39 @@ open gets mode 0700."
         (set-file-modes dir #o700))))
     (file-name-as-directory dir)))
 
-(defun claude-code-ide--mcp-config-file (session-id)
-  "Return the MCP config file of the MCP session SESSION-ID.
+(defun claude-code-ide--mcp-config-file-name (session-id)
+  "Return the name, without folder, of the config file of SESSION-ID.
 The name is fixed for SESSION-ID and this Emacs, so that a second
 build of the same command gives the same file."
-  (expand-file-name
-   (format "mcp-%d-%s.json" (emacs-pid)
-           (substring (secure-hash 'sha256 (format "%s" session-id)) 0 16))
-   (claude-code-ide--mcp-config-directory)))
+  (format "mcp-%d-%s.json" (emacs-pid)
+          (substring (secure-hash 'sha256 (format "%s" session-id)) 0 16)))
+
+(defun claude-code-ide--mcp-config-file (session-id)
+  "Return the MCP config file of the MCP session SESSION-ID.
+That is the file that this Emacs wrote for it, else its name in
+`claude-code-ide--mcp-config-directory'."
+  (or (cdr (assoc (format "%s" session-id) claude-code-ide--mcp-config-files))
+      (expand-file-name (claude-code-ide--mcp-config-file-name session-id)
+                        (claude-code-ide--mcp-config-directory))))
 
 (defun claude-code-ide--write-mcp-config-file (session-id text)
   "Write TEXT, an MCP config, to the config file of SESSION-ID.
 The file has mode 0600 from the start, in a private 0700 folder, and
-the write is atomic.  Return the file name."
-  (let* ((dir (claude-code-ide--ensure-private-directory
-               (claude-code-ide--mcp-config-directory)))
-         (file (claude-code-ide--mcp-config-file session-id))
-         (temp (let ((coding-system-for-write 'utf-8-unix))
-                 (with-file-modes #o600
-                   (make-temp-file (expand-file-name ".mcp-" dir) nil ".tmp" text)))))
+the write is atomic.  A second write for SESSION-ID replaces the same
+file.  The first write into a folder deletes the files of Emacs
+processes that no longer run.  Return the file name."
+  (let* ((key (format "%s" session-id))
+         (known (cdr (assoc key claude-code-ide--mcp-config-files)))
+         (dir (if (and known (file-directory-p (file-name-directory known)))
+                  (file-name-directory known)
+                (claude-code-ide--mcp-config-folder)))
+         (file (or known
+                   (expand-file-name (claude-code-ide--mcp-config-file-name session-id) dir)))
+         (temp (progn
+                 (claude-code-ide--sweep-mcp-config-files dir)
+                 (let ((coding-system-for-write 'utf-8-unix))
+                   (with-file-modes #o600
+                     (make-temp-file (expand-file-name ".mcp-" dir) nil ".tmp" text))))))
     (condition-case err
         (progn
           (set-file-modes temp #o600)
@@ -1657,21 +1727,21 @@ the write is atomic.  Return the file name."
       (error
        (ignore-errors (delete-file temp))
        (signal (car err) (cdr err))))
-    (cl-pushnew file claude-code-ide--mcp-config-files :test #'equal)
+    (unless known
+      (push (cons key file) claude-code-ide--mcp-config-files))
     file))
 
 (defun claude-code-ide--delete-mcp-config-file (session-id)
-  "Delete the MCP config file of SESSION-ID, when this Emacs wrote it."
-  (let ((file (claude-code-ide--mcp-config-file session-id)))
-    (when (member file claude-code-ide--mcp-config-files)
-      (ignore-errors (delete-file file))
-      (setq claude-code-ide--mcp-config-files
-            (delete file claude-code-ide--mcp-config-files)))))
+  "Delete the MCP config file that this Emacs wrote for SESSION-ID."
+  (when-let* ((cell (assoc (format "%s" session-id) claude-code-ide--mcp-config-files)))
+    (ignore-errors (delete-file (cdr cell)))
+    (setq claude-code-ide--mcp-config-files
+          (delq cell claude-code-ide--mcp-config-files))))
 
 (defun claude-code-ide--delete-all-mcp-config-files ()
   "Delete every MCP config file that this Emacs wrote."
-  (dolist (file claude-code-ide--mcp-config-files)
-    (ignore-errors (delete-file file)))
+  (dolist (cell claude-code-ide--mcp-config-files)
+    (ignore-errors (delete-file (cdr cell))))
   (setq claude-code-ide--mcp-config-files nil))
 
 (defun claude-code-ide--config-secrets (config)
@@ -2138,9 +2208,21 @@ here, so that only Claude Code gets them (the session registry adds
 --session-id and --settings this way).  ARGS, the caller's own
 arguments, come after them.  The start continues (-c), opens the
 picker (-r) or resumes the conversation of SPEC's resume ID (--resume)
-when SPEC asks for it."
+when SPEC asks for it.
+
+The flags are SPEC's extra flags, else `claude-code-ide-cli-extra-flags'.
+SPEC records the flags that the launch uses, and the descriptor gets
+the model of their --model, so that the session registry stores both."
   (let* ((session (claude-code-ide-instance-session instance))
-         (resume-id (claude-code-ide-start-spec-resume-id spec)))
+         (resume-id (claude-code-ide-start-spec-resume-id spec))
+         (claude-code-ide-cli-extra-flags
+          (or (claude-code-ide-start-spec-extra-flags spec) claude-code-ide-cli-extra-flags)))
+    (setf (claude-code-ide-start-spec-extra-flags spec) claude-code-ide-cli-extra-flags
+          (claude-code-ide-instance-model instance)
+          (claude-code-ide-or-unknown
+           (claude-code-ide--flags-model claude-code-ide-cli-extra-flags)))
+    (claude-code-ide-instance-set-property
+     instance :launch-note (and claude-code-ide-cli-debug "debug mode enabled"))
     (list :command (claude-code-ide--build-claude-command
                     (claude-code-ide-start-spec-continue spec)
                     (claude-code-ide-start-spec-resume spec)
@@ -2281,28 +2363,6 @@ child whose PID ghostel keeps in the process property
        (or (process-get process 'ghostel--native-pid)
            (process-id process))))
 
-(defun claude-code-ide--create-plain-session (project-dir session-id &optional instance-name)
-  "Make the session record of an instance whose CLI has no IDE protocol.
-PROJECT-DIR, SESSION-ID and INSTANCE-NAME are as for
-`claude-code-ide-mcp-create-session', but the session gets no
-WebSocket server, no port and no lock file in ~/.claude/ide/, so that
-no Claude Code CLI can connect to it.  The MCP tools server serves
-the instance.  Return the session."
-  (let ((session (make-claude-code-ide-mcp-session
-                  :session-id session-id
-                  :instance-name instance-name
-                  :project-dir (expand-file-name project-dir)
-                  :last-used (float-time)
-                  :deferred (make-hash-table :test 'equal)
-                  :active-diffs (make-hash-table :test 'equal)
-                  :original-tab (when (fboundp 'tab-bar--current-tab)
-                                  (tab-bar--current-tab)))))
-    (puthash session-id session claude-code-ide-mcp--sessions)
-    ;; The active buffer tracker also serves the MCP tools server
-    ;; sessions of instances without an IDE connection
-    (add-hook 'post-command-hook #'claude-code-ide-mcp--track-active-buffer)
-    session))
-
 (defun claude-code-ide--start-session (&optional continue resume spec)
   "Start a new Claude Code instance for the current project.
 If CONTINUE is non-nil, start Claude with the -c (continue) flag.
@@ -2328,7 +2388,6 @@ SPEC's provider, else `claude-code-ide-default-provider', checks the
 CLI, builds the command and the environment, and words the exit
 messages."
   (let* ((provider (claude-code-ide--spec-provider spec))
-         (claude-p (eq (claude-code-ide-provider-name provider) 'claude))
          (display (claude-code-ide-provider-display-name provider))
          ;; Only a CLI that speaks the IDE protocol gets a WebSocket
          ;; server and a lock file in ~/.claude/ide/
@@ -2339,16 +2398,9 @@ messages."
          ;; terminal backend is available before starting MCP
          (_ready (progn (claude-code-ide--cleanup-dead-sessions)
                         (claude-code-ide--terminal-ensure-backend)))
-         ;; The Claude Code flags go only to Claude Code.  Another
-         ;; provider keeps the flags of its own options, and the start
-         ;; passes only the flags that SPEC itself gives.
-         (extra-flags (if claude-p
-                          (or (and spec (claude-code-ide-start-spec-extra-flags spec))
-                              claude-code-ide-cli-extra-flags)
-                        (and spec (claude-code-ide-start-spec-extra-flags spec))))
-         (claude-code-ide-cli-extra-flags (if claude-p
-                                              extra-flags
-                                            claude-code-ide-cli-extra-flags))
+         ;; Only the flags that SPEC itself gives.  Each provider's
+         ;; launch adds the flags of its own options, and the model.
+         (extra-flags (and spec (claude-code-ide-start-spec-extra-flags spec)))
          (fork (and spec (claude-code-ide-start-spec-fork spec)))
          (continue (if spec (claude-code-ide-start-spec-continue spec) continue))
          (resume (if spec (claude-code-ide-start-spec-resume spec) resume))
@@ -2403,7 +2455,8 @@ messages."
           ;; or only its session record for a CLI without the protocol
           (setq session (if ide-protocol
                             (claude-code-ide-mcp-create-session working-dir session-id instance-name)
-                          (claude-code-ide--create-plain-session working-dir session-id instance-name)))
+                          (claude-code-ide-mcp-create-session working-dir session-id instance-name
+                                                              'no-ide-server)))
           (setf (claude-code-ide-mcp-session-window-slot session)
                 (claude-code-ide--assign-window-slot working-dir))
           ;; The descriptor exists before the provider builds the command,
@@ -2422,12 +2475,8 @@ messages."
                     ;; Recorded only when the registration succeeds
                     :generation (claude-code-ide-instance-candidate-generation
                                  instance-id (claude-code-ide-start-spec-last-generation launch))
-                    ;; The model of the Claude Code flags; another
-                    ;; provider's launch sets the model of its own flags
-                    :model (if claude-p
-                               (claude-code-ide-or-unknown
-                                (claude-code-ide--flags-model extra-flags))
-                             'unknown)
+                    ;; The provider's launch sets the model of its flags
+                    :model 'unknown
                     :role (claude-code-ide-start-spec-role launch)
                     :session session))))
           ;; Register with the MCP tools server BEFORE spawning the CLI so
@@ -2541,8 +2590,12 @@ messages."
                                        (t ""))
                                  (claude-code-ide--session-display-name session)
                                  (if port (format " with MCP on port %d" port) "")
-                                 (if (and claude-p claude-code-ide-cli-debug)
-                                     " (debug mode enabled)" ""))
+                                 ;; A note of the provider's launch, such as
+                                 ;; the debug mode of Claude Code
+                                 (if-let* ((note (claude-code-ide-instance-property
+                                                  instance :launch-note)))
+                                     (format " (%s)" note)
+                                   ""))
             (claude-code-ide--run-session-hook 'claude-code-ide-session-start-functions
                                                session launch)
             ;; Delayed so the startup message above stays readable first
@@ -2560,6 +2613,9 @@ messages."
              (claude-code-ide-mcp-server-session-ended session-id))
            (when session
              (claude-code-ide-mcp--stop-session session))))
+       ;; The launch may have written the MCP config file before the
+       ;; terminal failed; the cleanup above runs only with a buffer
+       (claude-code-ide--delete-mcp-config-file session-id)
        (when instance
          (claude-code-ide-instance-unregister (claude-code-ide-instance-id instance)))
        ;; Re-signal the error with improved message
@@ -3155,8 +3211,6 @@ window layouts, so each tab hides and restores its own set."
 (autoload 'claude-code-ide-session-status-mode "claude-code-ide-session-status" nil t)
 (autoload 'claude-code-ide-show-session-status "claude-code-ide-session-status" nil t)
 (autoload 'claude-code-ide-visit-waiting-session "claude-code-ide-session-status" nil t)
-(autoload 'claude-code-ide-reload "claude-code-ide-reload" nil t)
-
 (provide 'claude-code-ide)
 
 ;; Load points.  Each optional file below adds a part of the package
