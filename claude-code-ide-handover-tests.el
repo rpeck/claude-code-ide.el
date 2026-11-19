@@ -190,6 +190,7 @@ BODY can use `worktree', the folder of a Git repository."
           (claude-code-ide-control--index (make-hash-table :test 'equal))
           (claude-code-ide-control--warned-providers nil)
           (claude-code-ide-control-delivered-functions nil)
+          (claude-code-ide-control--held nil)
           (claude-code-ide-instance--all nil)
           (claude-code-ide-instance--generations (make-hash-table :test 'equal))
           (claude-code-ide-instance-state-functions
@@ -692,10 +693,12 @@ BODY can use `worktree', the folder of a Git repository."
 
 (defun claude-code-ide-handover-tests--interrupted (stage &rest extra)
   "Run a handover of a new source up to STAGE, then forget it as a crash would.
-EXTRA is a plist of :target-native to set the target's native ID.
-Return the handover ID."
+EXTRA is a plist of :target-native to set the target's native ID, and
+:context for the context of the handover.  Return the handover ID."
   (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a (claude-code-ide-handover-tests--worktree) 'idle)
-  (let* ((id (plist-get (claude-code-ide-handover-session "cci-test-src" 'cci-test-b) :handover-id))
+  (let* ((id (plist-get (claude-code-ide-handover-session "cci-test-src" 'cci-test-b
+                                                          :context (plist-get extra :context))
+                        :handover-id))
          (run (gethash id claude-code-ide-handover--runs)))
     (cl-letf (((symbol-function 'claude-code-ide-handover--step) #'ignore))
       (claude-code-ide-handover-tests--run-timers))
@@ -885,7 +888,8 @@ Return the handover ID."
                                 (list :provider 'cci-test-b :instance-id "cci-test-e" :pending t))))
     (should (claude-code-ide-session-registry-save-handover
              "cci-test-e" '((id . "h1") (stage . "quiescing") (status . "running"))))
-    (should-not (claude-code-ide-session-registry-save-handover "cci-test-none" '((id . "h2"))))
+    (should (eq (claude-code-ide-session-registry-save-handover "cci-test-none" '((id . "h2")))
+                :missing))
     (let ((entry (claude-code-ide-session-registry-entry-of "cci-test-e")))
       (should (equal (claude-code-ide-session-registry-entry-legs entry)
                      '((:provider cci-test-a :native-id "n1" :end-record 20)
@@ -1208,10 +1212,10 @@ When that Emacs ends, the recovery claims the run in the registry first."
     (let ((status-at-move nil))
       (cl-letf* ((move (symbol-function 'claude-code-ide-control-move-inbox))
                  ((symbol-function 'claude-code-ide-control-move-inbox)
-                  (lambda (from to)
+                  (lambda (from to &rest args)
                     (setq status-at-move
                           (alist-get 'status (claude-code-ide-handover-tests--record "cci-test-src")))
-                    (funcall move from to))))
+                    (apply move from to args))))
         (let ((result (claude-code-ide-handover-session "cci-test-src" 'cci-test-b)))
           (claude-code-ide-handover-tests--run-timers 20)
           (claude-code-ide-handover-tests--deliver result)
@@ -1564,6 +1568,322 @@ Its result, which arrives after the commit, goes to the target through
             (should (string-match-p "cci-test-review-result"
                                     (claude-code-ide-control--record-text
                                      (car (claude-code-ide-control--pending-records target)))))))))))
+
+;;; Second review fixes
+
+(defun claude-code-ide-handover-tests--start-prompt-of (id)
+  "Return the start prompt of the handover ID: the prompt of its last start."
+  (claude-code-ide-handover-start-prompt (gethash id claude-code-ide-handover--runs)))
+
+(defun claude-code-ide-handover-tests--marker-transcript (file id)
+  "Write a CC transcript FILE whose user turn starts with the marker of ID."
+  (with-temp-file file
+    (insert (json-encode `((type . "user") (sessionId . "cci-test-tgt-native")
+                           (message . ((role . "user")
+                                       (content . ,(format "<!-- claude-code-ide-handover-document id=%s -->\nRead it." id)))))))
+    (insert "\n")))
+
+(ert-deftest claude-code-ide-test-handover-delivery-while-needs-user ()
+  "A delivery that comes while the run needs a person still commits it.
+The wait for the delivery looks at the transcript of the target first."
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (let* ((claude-code-ide-handover-delivery-timeout 0)
+           (id (plist-get (claude-code-ide-handover-session "cci-test-src" 'cci-test-b) :handover-id)))
+      (claude-code-ide-handover-tests--run-timers 20)
+      (should (eq (plist-get (claude-code-ide-handover-status id) :reason) 'no-delivery))
+      (claude-code-ide-handover-tests--event
+       (plist-get (claude-code-ide-handover-status id) :target-id) 'prompt-submit
+       (list (cons 'prompt (claude-code-ide-handover-tests--start-prompt-of id))))
+      (claude-code-ide-handover-tests--run-timers 3)
+      (should (eq (plist-get (claude-code-ide-handover-status id) :status) 'committed))))
+  ;; "wait": the transcript has the marker, so the handover commits
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (let* ((claude-code-ide-handover-delivery-timeout 0)
+           (id (plist-get (claude-code-ide-handover-session "cci-test-src" 'cci-test-b) :handover-id))
+           (file (expand-file-name "cci-test-target.jsonl" claude-code-ide-handover-tests--root)))
+      (claude-code-ide-handover-tests--run-timers 20)
+      (let ((target (plist-get (claude-code-ide-handover-status id) :target-id)))
+        (claude-code-ide-handover-tests--marker-transcript file id)
+        (claude-code-ide-session-registry--submit
+         "report" (claude-code-ide-session-registry--change-reported target "cci-test-tgt-native" file nil nil))
+        (claude-code-ide-handover-resolve id 'wait)
+        (claude-code-ide-handover-tests--run-timers 3)
+        (should (eq (plist-get (claude-code-ide-handover-status id) :status) 'committed))))))
+
+(ert-deftest claude-code-ide-test-handover-context-survives-recovery ()
+  "The coordinator context is kept in a private file, and a rewrite uses it."
+  (claude-code-ide-handover-tests--with
+    (let* ((id (claude-code-ide-handover-tests--interrupted 'document-written
+                                                            :context "cci-test-secret-context"))
+           (file (expand-file-name (concat ".handover/" id "-context.md") worktree)))
+      (should (file-exists-p file))
+      (should (= (file-modes file) #o600))
+      (should (equal (alist-get 'context_file (claude-code-ide-handover-tests--record "cci-test-src"))
+                     file))
+      ;; The recovery writes the document again, with the context
+      (claude-code-ide-handover-recover)
+      (let ((document (plist-get (claude-code-ide-handover-status id) :document)))
+        (should (string-match-p "cci-test-secret-context"
+                                (with-temp-buffer (insert-file-contents document) (buffer-string))))))))
+
+(ert-deftest claude-code-ide-test-handover-callback-errors-need-user ()
+  "An error in a step that a timer runs gives needs-user, never a lost run."
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (cl-letf (((symbol-function 'claude-code-ide-control-move-inbox)
+               (lambda (&rest _) (error "cci-test move failed"))))
+      (let ((result (claude-code-ide-handover-session "cci-test-src" 'cci-test-b)))
+        (claude-code-ide-handover-tests--run-timers 20)
+        (claude-code-ide-handover-tests--deliver result)
+        (let ((status (claude-code-ide-handover-status (plist-get result :handover-id))))
+          (should (eq (plist-get status :status) 'needs-user))
+          (should (eq (plist-get status :reason) 'step-failed))
+          (should (string-match-p "cci-test move failed" (plist-get status :message))))))))
+
+(ert-deftest claude-code-ide-test-handover-host-id ()
+  "The owner of a handover is checked by a host ID file, not by the host name.
+An old record with another host name and a dead owner can be
+recovered; a forced claim takes over a live owner after a yes."
+  (claude-code-ide-handover-tests--with
+    ;; An old record of another host name, with a dead owner: claimable
+    (let ((id (claude-code-ide-handover-tests--interrupted 'target-started)))
+      (let ((record (copy-alist (claude-code-ide-handover-tests--record "cci-test-src"))))
+        (setf (alist-get 'emacs_pid record) 999999999
+              (alist-get 'host record) "cci-test-elsewhere")
+        (setq record (assq-delete-all 'host_id record))
+        (should (claude-code-ide-session-registry-save-handover "cci-test-src" record)))
+      (should-not (claude-code-ide-session-registry--handover-owner
+                   (claude-code-ide-handover-tests--record "cci-test-src")))
+      (claude-code-ide-handover-recover)
+      (should (= (length claude-code-ide-handover-tests--starts) 1))
+      (should (eq (plist-get (claude-code-ide-handover-status id) :stage) 'target-started)))
+    ;; The host ID file
+    (let* ((host-id (claude-code-ide-session-registry-host-id))
+           (file (claude-code-ide-session-registry--host-id-file)))
+      (should (string-match-p "\\`[0-9a-f-]\\{36\\}\\'" host-id))
+      (should (= (file-modes file) #o600))
+      (should (equal (claude-code-ide-session-registry-host-id) host-id))
+      ;; Another host ID: another host
+      (should (eq (claude-code-ide-session-registry--handover-owner
+                   '((emacs_pid . 1) (host_id . "00000000-0000-4000-8000-000000000000")))
+                  'other))))
+  ;; A forced claim of a live owner, after a yes
+  (claude-code-ide-handover-tests--with
+    (let* ((id (claude-code-ide-handover-tests--interrupted 'target-started))
+           (other (start-process "cci-test-other-emacs" nil "sleep" "30"))
+           (pid (process-id other))
+           (answers nil))
+      (unwind-protect
+          (let ((record (copy-alist (claude-code-ide-handover-tests--record "cci-test-src"))))
+            (setf (alist-get 'emacs_pid record) pid
+                  (alist-get 'emacs_start_time record)
+                  (float-time (alist-get 'start (process-attributes pid))))
+            (should (claude-code-ide-session-registry-save-handover "cci-test-src" record))
+            (cl-letf (((symbol-function 'yes-or-no-p)
+                       (lambda (prompt) (push prompt answers) nil)))
+              (should-error (claude-code-ide-handover-resolve id) :type 'user-error))
+            (should (string-match-p (number-to-string pid) (car answers)))
+            (should-not claude-code-ide-handover-tests--starts)
+            (cl-letf (((symbol-function 'yes-or-no-p) (lambda (_) t)))
+              (claude-code-ide-handover-resolve id))
+            (should (eql (alist-get 'emacs_pid (claude-code-ide-handover-tests--record "cci-test-src"))
+                         (emacs-pid)))
+            (should (= (length claude-code-ide-handover-tests--starts) 1)))
+        (when (process-live-p other) (delete-process other))))))
+
+(ert-deftest claude-code-ide-test-handover-survivors-before-any-start ()
+  "A resume, a retry of a target that ended, and a cancel check for survivors first."
+  ;; Recovery of an identified target whose CLI still runs
+  (claude-code-ide-handover-tests--with
+    (let* ((id (claude-code-ide-handover-tests--interrupted 'target-identified
+                                                            :target-native "cci-test-tgt-native"))
+           (survivor (start-process "cci-test-target-cli" nil "sleep" "30"))
+           (pid (process-id survivor)))
+      (unwind-protect
+          (progn
+            (claude-code-ide-handover-tests--registry-add
+             "cci-test-tgt" 'cci-test-b worktree :generation 3 :session-id "cci-test-tgt-native"
+             :pid pid :process-start-time (float-time (alist-get 'start (process-attributes pid))))
+            (claude-code-ide-handover-recover)
+            (should (eq (plist-get (claude-code-ide-handover-status id) :reason) 'strays))
+            (should (memql pid (mapcar (lambda (s) (plist-get s :pid))
+                                       (plist-get (claude-code-ide-handover-status id) :strays))))
+            (should-not claude-code-ide-handover-tests--starts)
+            ;; A cancel leaves no start, and asks before it ends the process
+            (claude-code-ide-handover-cancel id)
+            (should (eq (plist-get (claude-code-ide-handover-status id) :status) 'needs-user))
+            (should (process-live-p survivor))
+            ;; "end": the process ends, then the cancel finishes
+            (claude-code-ide-handover-resolve id 'end)
+            (claude-code-ide-handover-tests--wait-for (lambda () (not (process-live-p survivor))))
+            (claude-code-ide-handover-tests--run-timers 3)
+            (should (eq (plist-get (claude-code-ide-handover-status id) :status) 'cancelled))
+            (should-not claude-code-ide-handover-tests--starts))
+        (when (process-live-p survivor) (delete-process survivor)))))
+  ;; A retry of a target that ended scans first
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (let ((id (plist-get (claude-code-ide-handover-session "cci-test-src" 'cci-test-b) :handover-id)))
+      (claude-code-ide-handover-tests--run-timers 20)
+      (let ((target (plist-get (claude-code-ide-handover-status id) :target-id)))
+        (kill-buffer (claude-code-ide-instance-buffer (claude-code-ide-instance-by-id target))))
+      (claude-code-ide-handover-tests--run-timers 3)
+      (should (eq (plist-get (claude-code-ide-handover-status id) :reason) 'target-exited))
+      (setq claude-code-ide-handover-tests--scan-strays
+            '((:pid 5151 :command "sleep 900" :cwd "/x" :reason worktree))
+            claude-code-ide-handover-tests--starts nil)
+      (claude-code-ide-handover-resolve id 'retry)
+      (should (eq (plist-get (claude-code-ide-handover-status id) :reason) 'strays))
+      (should-not claude-code-ide-handover-tests--starts)
+      ;; No writer left: the target starts again
+      (setq claude-code-ide-handover-tests--scan-strays nil)
+      (claude-code-ide-handover-resolve id 'wait)
+      (claude-code-ide-handover-tests--run-timers 3)
+      (should (= (length claude-code-ide-handover-tests--starts) 1)))))
+
+(ert-deftest claude-code-ide-test-handover-waits-for-acknowledgements ()
+  "The stop waits for the acknowledgement of a prompt that the source got.
+A prompt without it moves to the target, with a note."
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (let ((drains 0))
+      (cl-letf (((symbol-function 'claude-code-ide-session-status--drain)
+                 (lambda () (cl-incf drains))))
+        (should (claude-code-ide-control--record-sent-at
+                 (car (claude-code-ide-control--pending-records
+                       (progn (claude-code-ide-control-submit "cci-test-src" "cci-test-sent"
+                                                              :request-id "s1")
+                              "cci-test-src")))))
+        (let ((id (plist-get (claude-code-ide-handover-session "cci-test-src" 'cci-test-b)
+                             :handover-id)))
+          (claude-code-ide-handover-tests--run-timers 5)
+          (should (eq (plist-get (claude-code-ide-handover-status id) :stage) 'quiescing))
+          (should (> drains 0))
+          (should-not claude-code-ide-handover-tests--stops)
+          ;; The acknowledgement comes: the stop goes on
+          (claude-code-ide-handover-tests--event "cci-test-src" 'prompt-submit
+                                                 '((prompt . "cci-test-sent")))
+          (claude-code-ide-handover-tests--run-timers 5)
+          (should (equal claude-code-ide-handover-tests--stops '("cci-test-src")))))))
+  ;; No acknowledgement in time: the prompt moves, with a note
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (let ((claude-code-ide-handover-ack-wait 0))
+      (cl-letf (((symbol-function 'claude-code-ide-session-status--drain) #'ignore))
+        (claude-code-ide-control-submit "cci-test-src" "cci-test-sent" :request-id "s1")
+        (let ((result (claude-code-ide-handover-session "cci-test-src" 'cci-test-b)))
+          (claude-code-ide-handover-tests--run-timers 20)
+          (let* ((target (claude-code-ide-handover-tests--deliver result))
+                 (moved (car (claude-code-ide-control--pending-records target))))
+            (should (equal (claude-code-ide-control--record-request-id moved) "s1"))
+            (should (string-match-p "may have reached" (claude-code-ide-control--record-note moved)))
+            (should (eq (claude-code-ide-control--record-result moved) 'queued))))))))
+
+(ert-deftest claude-code-ide-test-handover-live-target-after-failure ()
+  "A failed start with a live target: retry takes it up again, cancel stops it."
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (let ((stopped nil))
+      (cl-letf* ((start (symbol-function 'claude-code-ide--start-session))
+                 ((symbol-function 'claude-code-ide--start-session)
+                  (lambda (&rest args)
+                    (apply start args)
+                    (error "cci-test start failed after the spawn")))
+                 ((symbol-function 'claude-code-ide-process-stop)
+                  (lambda (instance &rest _)
+                    (push (claude-code-ide-instance-id instance) stopped)
+                    (claude-code-ide-instance-unregister (claude-code-ide-instance-id instance))
+                    '(:status stopped))))
+        (let ((id (plist-get (claude-code-ide-handover-session "cci-test-src" 'cci-test-b) :handover-id)))
+          (claude-code-ide-handover-tests--run-timers 20)
+          (should (eq (plist-get (claude-code-ide-handover-status id) :reason) 'start-failed))
+          ;; Retry: no second start
+          (claude-code-ide-handover-resolve id 'retry)
+          (claude-code-ide-handover-tests--run-timers 3)
+          (should (= (length claude-code-ide-handover-tests--starts) 1))
+          (should (eq (plist-get (claude-code-ide-handover-status id) :status) 'running))
+          ;; The watch runs again for the target
+          (should (claude-code-ide-handover--run-delivery-deadline
+                   (gethash id claude-code-ide-handover--runs)))))
+      ;; A new failure with a live target: the cancel stops it
+      (claude-code-ide-handover-tests--add "cci-test-src2" 'cci-test-a
+                                           (claude-code-ide-handover-tests--other "proj2") 'idle)
+      (cl-letf* ((start (symbol-function 'claude-code-ide--start-session))
+                 ((symbol-function 'claude-code-ide--start-session)
+                  (lambda (&rest args)
+                    (apply start args)
+                    (error "cci-test start failed after the spawn")))
+                 ((symbol-function 'claude-code-ide-process-stop)
+                  (lambda (instance &rest _)
+                    (push (claude-code-ide-instance-id instance) stopped)
+                    (claude-code-ide-instance-unregister (claude-code-ide-instance-id instance))
+                    '(:status stopped))))
+        (let ((id (plist-get (claude-code-ide-handover-session "cci-test-src2" 'cci-test-b) :handover-id)))
+          (claude-code-ide-handover-tests--run-timers 20)
+          (let ((target (plist-get (claude-code-ide-handover-status id) :target-id)))
+            (should (eq (plist-get (claude-code-ide-handover-status id) :reason) 'start-failed))
+            (claude-code-ide-handover-cancel id)
+            (should (member target stopped))
+            (should (eq (plist-get (claude-code-ide-handover-status id) :status) 'cancelled))))))))
+
+(ert-deftest claude-code-ide-test-handover-stray-start-tolerance ()
+  "The start time of a stray matches within the one second of the registry."
+  (let ((signals nil))
+    (cl-letf (((symbol-function 'process-attributes)
+               (lambda (_pid) `((args . "sleep 600") (start . ,(seconds-to-time 1000.5)))))
+              ((symbol-function 'signal-process)
+               (lambda (pid signal) (push (list pid signal) signals) 0)))
+      (claude-code-ide-handover--end-strays '((:pid 5252 :start 1000.0)) 'SIGTERM)
+      (should (equal signals '((5252 SIGTERM))))
+      (setq signals nil)
+      (claude-code-ide-handover--end-strays '((:pid 5252 :start 1002.0)) 'SIGTERM)
+      (should-not signals))))
+
+(ert-deftest claude-code-ide-test-handover-inbox-collision-and-redirect ()
+  "A request ID that the target has already moves under a new ID; nothing is dropped.
+After the commit, a prompt for the source goes to the target."
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'working)
+    (claude-code-ide-control-submit "cci-test-src" "cci-test-for-source" :request-id "q1")
+    (let ((result (claude-code-ide-handover-session "cci-test-src" 'cci-test-b :force t)))
+      (claude-code-ide-handover-tests--set-state "cci-test-src" 'idle)
+      (claude-code-ide-handover-tests--run-timers 20)
+      (let* ((id (plist-get result :handover-id))
+             (target (plist-get (claude-code-ide-handover-status id) :target-id))
+             (renamed (format "handover:%s:q1" id)))
+        ;; The target has its own q1 before the commit
+        (claude-code-ide-control-submit target "cci-test-for-target" :request-id "q1")
+        (claude-code-ide-handover-tests--deliver result)
+        (should (eq (plist-get (claude-code-ide-handover-status id) :status) 'committed))
+        (let ((copy (claude-code-ide-control--find-record target renamed))
+              (old (claude-code-ide-control--find-record "cci-test-src" "q1")))
+          (should copy)
+          (should (equal (claude-code-ide-control--record-text copy) "cci-test-for-source"))
+          (should (equal (claude-code-ide-control--record-moved-from copy) "cci-test-src:q1"))
+          (should (equal (claude-code-ide-control--record-moved-to old) (concat target ":" renamed)))
+          (should (equal (claude-code-ide-control--record-text
+                          (claude-code-ide-control--find-record target "q1"))
+                         "cci-test-for-target")))
+        ;; A second move moves nothing again
+        (should-not (claude-code-ide-control-move-inbox "cci-test-src" target id))
+        ;; A prompt for the old instance goes to the current one
+        (let ((submit (claude-code-ide-control-submit "cci-test-src" "cci-test-late" :request-id "q2")))
+          (should (equal (plist-get submit :destination) target))
+          (should (claude-code-ide-control--find-record target "q2")))))))
+
+(ert-deftest claude-code-ide-test-handover-missing-entry-needs-user ()
+  "A missing registry entry gives needs-user, never an endless retry."
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (let ((id (plist-get (claude-code-ide-handover-session "cci-test-src" 'cci-test-b) :handover-id)))
+      (claude-code-ide-session-registry--submit
+       "forget" (claude-code-ide-session-registry--change-forgotten "cci-test-src"))
+      (should (< (claude-code-ide-handover-tests--run-timers 50) 50))
+      (let ((run (gethash id claude-code-ide-handover--runs)))
+        (should (eq (claude-code-ide-handover--run-status run) 'needs-user))
+        (should (eq (claude-code-ide-handover--run-reason run) 'registry-entry-missing))))))
 
 (provide 'claude-code-ide-handover-tests)
 

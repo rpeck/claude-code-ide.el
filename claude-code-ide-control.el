@@ -336,14 +336,18 @@ The prompts in its inbox stay there."
   (sent-generation nil :documentation "Launch generation that got the prompt, or nil.")
   (sent-guess nil :documentation "Non-nil when the idle state at the send was a guess.")
   (delivered-at nil)
-  (requested-by nil :documentation "Instance ID of the MCP request, or nil."))
+  (requested-by nil :documentation "Instance ID of the MCP request, or nil.")
+  (moved-from nil :documentation "INSTANCE:REQUEST-ID of the record that a handover moved here, or nil.")
+  (moved-to nil :documentation "INSTANCE:REQUEST-ID of the record that a handover moved this one to, or nil.")
+  (note nil :documentation "Text for people about the record, or nil."))
 
 (defconst claude-code-ide-control--record-fields
   '((request_id . request-id) (instance_id . instance-id) (seq . seq)
     (text_hash . text-hash) (text . text) (result . result) (reason . reason)
     (created_at . created-at) (updated_at . updated-at) (sent_at . sent-at)
     (sent_generation . sent-generation) (sent_guess . sent-guess)
-    (delivered_at . delivered-at) (requested_by . requested-by))
+    (delivered_at . delivered-at) (requested_by . requested-by)
+    (moved_from . moved-from) (moved_to . moved-to) (note . note))
   "JSON key and struct slot of each field of an inbox file.")
 
 (defconst claude-code-ide-control--symbol-slots '(result reason)
@@ -757,8 +761,12 @@ QUEUE says what happens when the instance cannot take TEXT now:
 without the key, the rules of each state apply (queue, but reject a
 failed or stopped instance); t always queues; nil rejects.
 
-Return a plist with :destination (INSTANCE-ID), :request-id, :result,
-:reason and :sent-at.  :result is one of these:
+After a committed handover of INSTANCE-ID, the prompt goes to the
+current instance of its chain; see
+`claude-code-ide-session-registry-chain-current'.
+
+Return a plist with :destination (the instance that gets TEXT),
+:request-id, :result, :reason and :sent-at.  :result is one of these:
 - `delivered': a `prompt-submit' event of the instance had the same text.
 - `queued': TEXT waits in the inbox, or it was sent and waits for its
   acknowledgement; then :sent-at is non-nil and :reason is
@@ -771,6 +779,8 @@ Return a plist with :destination (INSTANCE-ID), :request-id, :result,
                       ((memq queue '(auto always never)) queue)
                       (queue 'always)
                       (t 'never))))
+    (when (claude-code-ide-control--valid-id-p instance-id)
+      (setq instance-id (claude-code-ide-control--chain-current instance-id)))
     (if (not (claude-code-ide-control--valid-id-p instance-id))
         (claude-code-ide-control--rejected instance-id request-id 'invalid-instance-id)
       (let* ((pending (claude-code-ide-control--refresh instance-id))
@@ -785,6 +795,17 @@ Return a plist with :destination (INSTANCE-ID), :request-id, :result,
                 (claude-code-ide-control--rejected instance-id request-id 'unknown-instance)
               (claude-code-ide-control--submit-new
                instance-id text request-id queue state pending)))))))))
+
+(defun claude-code-ide-control--chain-current (instance-id)
+  "Return the current instance of the handover chain of INSTANCE-ID.
+After a committed handover, a prompt for the old instance goes to the
+new one.  Without a chain, or without the registry, it is INSTANCE-ID."
+  (or (and (bound-and-true-p claude-code-ide-session-registry-mode)
+           (fboundp 'claude-code-ide-session-registry-chain-current)
+           (let ((current (ignore-errors
+                            (funcall 'claude-code-ide-session-registry-chain-current instance-id))))
+             (and (claude-code-ide-control--valid-id-p current) current)))
+      instance-id))
 
 (defun claude-code-ide-control--submit-new (instance-id text request-id queue state pending)
   "Record and handle a new request REQUEST-ID with TEXT for INSTANCE-ID.
@@ -893,41 +914,73 @@ ID of the prompt that was sent, or nil."
 
 ;;; Moving an inbox
 
-(defun claude-code-ide-control-move-inbox (from to)
+(defun claude-code-ide-control--move-target-id (from to record pending handover-id)
+  "Return (ID . DONE) for the copy of RECORD of FROM in the inbox of TO.
+ID is the request ID of the copy: the same one, or
+\"handover:HANDOVER-ID:ID\" when TO has another record with that ID.
+DONE is non-nil when an earlier move made the copy already.  PENDING
+is the list of the pending records of TO."
+  (let* ((id (claude-code-ide-control--record-request-id record))
+         (from-ref (concat from ":" id))
+         (moved-before (lambda (found)
+                         (and found (equal (claude-code-ide-control--record-moved-from found)
+                                           from-ref))))
+         (existing (claude-code-ide-control--find-record to id pending)))
+    (cond
+     ((null existing) (cons id nil))
+     ((funcall moved-before existing) (cons id t))
+     (t
+      (let* ((renamed (format "handover:%s:%s" (or handover-id from) id))
+             (found (claude-code-ide-control--find-record to renamed pending)))
+        (cons renamed (and found t)))))))
+
+(defun claude-code-ide-control-move-inbox (from to &optional handover-id)
   "Move the queued prompts of the instance FROM into the inbox of TO.
-A handover calls this after its commit, so that the prompts and the
+A handover calls this at its commit, so that the prompts and the
 review results for the old instance go to the new one (plan section
-4.8).  Each prompt that FROM has not received yet gets a record in the
-inbox of TO with the same request ID, text and creation time, after
-the prompts that TO has already.  The record of FROM then becomes
-final: `rejected' with the reason `handed-over'.  A prompt that FROM
-received and that waits for its acknowledgement stays: FROM no longer
-runs, so it becomes `unacknowledged' in time.  A request ID that TO
-knows already is not moved again, so a second call moves nothing.
-Return the request IDs that moved, oldest first."
+4.8).  Each pending record of FROM gets a queued copy in the inbox of
+TO, with the same text and creation time, after the records that TO
+has already:
+- The copy keeps the request ID.  When TO has another record with that
+  ID, the copy gets the ID \"handover:HANDOVER-ID:ID\" instead (FROM
+  when HANDOVER-ID is nil); no record is dropped.
+- The copy records where it came from (`moved_from': FROM:ID), and the
+  record of FROM where it went (`moved_to': TO:NEW-ID).  The record of
+  FROM then becomes final: `rejected' with the reason `handed-over'.
+- A record that FROM received, and whose acknowledgement did not come,
+  moves too, with a note that it may have reached FROM.
+A second call moves nothing again.  Return the request IDs of the
+copies, oldest first."
   (when (and (claude-code-ide-control--valid-id-p from)
              (claude-code-ide-control--valid-id-p to)
              (not (equal from to)))
     (let ((moved nil))
       (dolist (record (claude-code-ide-control--pending-records from))
-        (unless (claude-code-ide-control--record-sent-at record)
-          (let* ((request-id (claude-code-ide-control--record-request-id record))
-                 (pending (claude-code-ide-control--pending-records to)))
-            (unless (claude-code-ide-control--find-record to request-id pending)
-              ;; The new record first, so that a crash loses no prompt
-              (claude-code-ide-control--write-record
-               (claude-code-ide-control--record-create
-                :request-id request-id
-                :instance-id to
-                :seq (1+ (apply #'max 0 (mapcar #'claude-code-ide-control--record-seq pending)))
-                :text-hash (claude-code-ide-control--record-text-hash record)
-                :text (claude-code-ide-control--record-text record)
-                :result 'queued
-                :reason 'handed-over
-                :created-at (claude-code-ide-control--record-created-at record)
-                :requested-by (claude-code-ide-control--record-requested-by record)))
-              (push request-id moved))
-            (claude-code-ide-control--finish record 'rejected 'handed-over))))
+        (let* ((request-id (claude-code-ide-control--record-request-id record))
+               (pending (claude-code-ide-control--pending-records to))
+               (target (claude-code-ide-control--move-target-id from to record pending handover-id))
+               (new-id (car target))
+               (sent (claude-code-ide-control--record-sent-at record)))
+          (unless (cdr target)
+            ;; The copy first, so that a crash loses no prompt
+            (claude-code-ide-control--write-record
+             (claude-code-ide-control--record-create
+              :request-id new-id
+              :instance-id to
+              :seq (1+ (apply #'max 0 (mapcar #'claude-code-ide-control--record-seq pending)))
+              :text-hash (claude-code-ide-control--record-text-hash record)
+              :text (claude-code-ide-control--record-text record)
+              :result 'queued
+              :reason 'handed-over
+              :created-at (claude-code-ide-control--record-created-at record)
+              :requested-by (claude-code-ide-control--record-requested-by record)
+              :moved-from (concat from ":" request-id)
+              :note (when sent
+                      (format "Sent to %s at %s without an acknowledgement; it may have reached that instance before the handover"
+                              from sent))))
+            (push new-id moved))
+          (setf (claude-code-ide-control--record-moved-to record) (concat to ":" new-id))
+          (claude-code-ide-control--finish record 'rejected 'handed-over)))
       (when moved
         (claude-code-ide-control--start-timer)
         (claude-code-ide-control--schedule-delivery to))
