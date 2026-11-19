@@ -1185,9 +1185,11 @@ CHAIN is a list of leg alists.  DONE is as for
   "Submit the change that CHANGE-FN makes, named LABEL, and report the result.
 CHANGE-FN takes a cons DONE and returns the change; the change sets the
 car of DONE when it finds its entry.  Return the car of DONE when the
-state file holds the change now, else nil.  A busy lock leaves the
-change queued, so that a later drain writes it, unless DROP is
-non-nil: then the change leaves the queue and is never written."
+state file holds the change now.  Return `:missing' when the change was
+written but did not find its entry: a retry cannot help then.  Return
+nil when the lock was busy: the change stays queued, so that a later
+drain writes it, unless DROP is non-nil: then the change leaves the
+queue and is never written."
   (let* ((done (list nil))
          (cell (cons label (funcall change-fn done))))
     (setq claude-code-ide-session-registry--queue
@@ -1199,77 +1201,131 @@ non-nil: then the change leaves the queue and is never written."
             (setq claude-code-ide-session-registry--queue
                   (delq cell claude-code-ide-session-registry--queue)))
           nil)
-      (car done))))
+      (or (car done) :missing))))
 
 (defun claude-code-ide-session-registry-save-handover (key handover &optional drop)
   "Save the HANDOVER alist as the handover of the entry KEY.
-Return non-nil when the state file holds it; nil when the entry does
-not exist or the write waits for the lock.  DROP non-nil removes a
+Return t when the state file holds it, `:missing' when the entry does
+not exist, and nil when the write waits for the lock.  DROP non-nil removes a
 change that waits for the lock, so that it is never written: the first
 save of a handover uses it, so that a refused handover leaves no
 record."
-  (claude-code-ide-session-registry--submit-checked
-   "handover" (lambda (done)
-                (claude-code-ide-session-registry--change-handover key handover done))
-   drop))
+  (let ((result (claude-code-ide-session-registry--submit-checked
+                 "handover" (lambda (done)
+                              (claude-code-ide-session-registry--change-handover key handover done))
+                 drop)))
+    (if (eq result :missing) :missing (and result t))))
+
+(defun claude-code-ide-session-registry--host-id-file ()
+  "Return the file that holds the host ID, in the report directory."
+  (expand-file-name "host-id" (claude-code-ide-session-registry--report-directory)))
+
+(defun claude-code-ide-session-registry--read-host-id (file)
+  "Return the host ID in FILE, or nil when FILE holds none."
+  (when (file-readable-p file)
+    (let ((id (string-trim (claude-code-ide-session-registry--file-string file))))
+      (and (string-match-p "\\`[0-9a-f-]\\{36\\}\\'" id) id))))
+
+(defun claude-code-ide-session-registry-host-id ()
+  "Return the ID of this host: a random UUID in a file of the report directory.
+The first call makes the file (mode 0600); the host name is not used,
+because it can change.  Two Emacs that make the file at the same time
+get the same ID: the rename does not replace a file that exists."
+  (let ((file (claude-code-ide-session-registry--host-id-file)))
+    (or (claude-code-ide-session-registry--read-host-id file)
+        (let ((dir (file-name-directory file))
+              (id (claude-code-ide-session-registry--uuid)))
+          (with-file-modes #o700 (make-directory dir t))
+          (let ((tmp (with-file-modes #o600
+                       (make-temp-file (expand-file-name ".host-id-" dir)))))
+            (unwind-protect
+                (progn
+                  (write-region (concat id "\n") nil tmp nil 'silent)
+                  (condition-case nil
+                      (rename-file tmp file nil)
+                    (file-already-exists nil)))
+              (when (file-exists-p tmp) (delete-file tmp))))
+          (or (claude-code-ide-session-registry--read-host-id file) id)))))
+
+(defun claude-code-ide-session-registry--owner-here (pid start)
+  "Return the owner of a handover on this host: `self', `other', or nil.
+PID and START are the process ID and the start time of the owning
+Emacs.  `other' is another Emacs that still runs with them."
+  (cond
+   ((and (eql pid (emacs-pid))
+         (or (not (numberp start))
+             (< (abs (- start (or (claude-code-ide-session-registry--emacs-start-time) 0))) 1)))
+    'self)
+   ((numberp start)
+    (and (claude-code-ide-session-registry--same-start-p pid start) 'other))
+   (t
+    (let ((command (alist-get 'comm (claude-code-ide-session-registry--process-attributes pid))))
+      (and command (string-match-p "emacs" (downcase command)) 'other)))))
 
 (defun claude-code-ide-session-registry--handover-owner (handover)
   "Return the owner of the HANDOVER alist: `self', `other', or nil.
 `self' is this Emacs (its process ID and start time).  `other' is
-another Emacs that still runs: on this host, a process with the
-recorded ID and start time; a handover of another host always counts
-as `other', because its Emacs cannot be checked.  nil is an owner that
-ended, or no owner."
+another Emacs that still runs.  nil is an owner that ended, or no
+owner.
+- A record with `host_id' of another host is `other': its Emacs cannot
+  be checked from here.
+- A record with this host ID, and an older record with only a host
+  name (also another name: the host is then unknown), is checked here:
+  the owner PID with its start time."
   (let ((pid (alist-get 'emacs_pid handover))
         (start (alist-get 'emacs_start_time handover))
-        (host (alist-get 'host handover)))
+        (host-id (alist-get 'host_id handover)))
     (cond
      ((not (integerp pid)) nil)
-     ((and (stringp host) (not (equal host (system-name)))) 'other)
-     ((and (eql pid (emacs-pid))
-           (or (not (numberp start))
-               (< (abs (- start (or (claude-code-ide-session-registry--emacs-start-time) 0))) 1)))
-      'self)
-     ((numberp start)
-      (and (claude-code-ide-session-registry--same-start-p pid start) 'other))
-     (t
-      (let ((command (alist-get 'comm (claude-code-ide-session-registry--process-attributes pid))))
-        (and command (string-match-p "emacs" (downcase command)) 'other))))))
+     ((and (stringp host-id) (not (equal host-id (claude-code-ide-session-registry-host-id))))
+      'other)
+     (t (claude-code-ide-session-registry--owner-here pid start)))))
 
-(defun claude-code-ide-session-registry-claim-handover (key handover-id)
+(defun claude-code-ide-session-registry-claim-handover (key handover-id &optional force)
   "Make this Emacs the owner of the handover HANDOVER-ID of the entry KEY.
 The check and the claim are one change under the lock of the state
 file.  The claim fails when the entry has another handover, or when
-another Emacs that still runs owns it.  Return the claimed handover
-alist when the state file holds the claim, else nil."
-  (claude-code-ide-session-registry--submit-checked
-   "claim handover"
-   (lambda (done)
-     (lambda (entries)
-       (claude-code-ide-session-registry--update
-        entries (list key)
-        (lambda (entry)
-          (let ((handover (claude-code-ide-session-registry-entry-handover entry)))
-            (when (and (equal (alist-get 'id handover) handover-id)
-                       (not (eq (claude-code-ide-session-registry--handover-owner handover)
-                                'other)))
-              (let ((claimed (copy-alist handover)))
-                (setf (alist-get 'emacs_pid claimed) (emacs-pid)
-                      (alist-get 'emacs_start_time claimed)
-                      (claude-code-ide-session-registry--emacs-start-time)
-                      (alist-get 'host claimed) (system-name))
-                (setf (claude-code-ide-session-registry-entry-handover entry) claimed)
-                (setcar done claimed))))))))
-   'drop))
+another Emacs that still runs owns it; FORCE non-nil claims it also
+then (a person decided).  Return the claimed handover alist when the
+state file holds the claim, `:missing' without the entry, else nil."
+  (pcase (claude-code-ide-session-registry--submit-checked
+          "claim handover"
+          (lambda (done)
+            (lambda (entries)
+              (claude-code-ide-session-registry--update
+               entries (list key)
+               (lambda (entry)
+                 (let ((handover (claude-code-ide-session-registry-entry-handover entry)))
+                   ;; Found, but not claimed (yet): not a missing entry
+                   (setcar done 'refused)
+                   (when (and (equal (alist-get 'id handover) handover-id)
+                              (or force
+                                  (not (eq (claude-code-ide-session-registry--handover-owner handover)
+                                           'other))))
+                     (let ((claimed (copy-alist handover)))
+                       (setf (alist-get 'emacs_pid claimed) (emacs-pid)
+                             (alist-get 'emacs_start_time claimed)
+                             (claude-code-ide-session-registry--emacs-start-time)
+                             (alist-get 'host_id claimed) (claude-code-ide-session-registry-host-id)
+                             (alist-get 'host claimed) (system-name))
+                       (setf (claude-code-ide-session-registry-entry-handover entry) claimed)
+                       (setcar done claimed))))))))
+          'drop)
+    ((and (pred consp) claimed) claimed)
+    (:missing :missing)
+    (_ nil)))
+
+
 
 (defun claude-code-ide-session-registry-save-chain (key legs)
   "Save LEGS, a list of leg plists oldest first, as the chain of the entry KEY.
-Return non-nil when the state file holds it, as for
+Return t, `:missing' or nil, as for
 `claude-code-ide-session-registry-save-handover'."
-  (let ((chain (mapcar #'claude-code-ide-session-registry-leg-to-alist legs)))
-    (claude-code-ide-session-registry--submit-checked
-     "chain" (lambda (done)
-               (claude-code-ide-session-registry--change-chain key chain done)))))
+  (let* ((chain (mapcar #'claude-code-ide-session-registry-leg-to-alist legs))
+         (result (claude-code-ide-session-registry--submit-checked
+                  "chain" (lambda (done)
+                            (claude-code-ide-session-registry--change-chain key chain done)))))
+    (if (eq result :missing) :missing (and result t))))
 
 (defun claude-code-ide-session-registry-entry-of (key)
   "Return the entry KEY of the state file, or nil."
