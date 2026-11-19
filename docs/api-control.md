@@ -30,7 +30,7 @@ This document describes the control operations of claude-code-ide.el, the prompt
 | `resume` | `(claude-code-ide-control-resume INSTANCE-ID &key PROMPT DIRECTORY NATIVE-ID PROVIDER)` | The same as `launch`. |
 | `submit-prompt` | `(claude-code-ide-control-submit INSTANCE-ID TEXT &key REQUEST-ID QUEUE)` | `(:destination :request-id :result :reason ...)`. |
 | `stop` | `(claude-code-ide-control-stop INSTANCE-ID)` | `(:status ok :instance-id ID :result stopped)`. |
-| `handover` | Phase 3 (`feat/handover`) | Unavailable until that file defines it. |
+| `handover` | `(claude-code-ide-handover-session INSTANCE-ID TARGET-PROVIDER &key METHOD CONTEXT INTERRUPT FORCE REQUEST-ID)` | Defined by `claude-code-ide-handover.el`; see [handover.md](handover.md). It returns at once. |
 | `track-review` | Phase 3 (`feat/review-tracking`) | Unavailable until that file defines it. |
 
 `claude-code-ide-control-request-status (INSTANCE-ID REQUEST-ID)` gives the current result of a submitted prompt. REQUEST-ID is a string or a number, as for `submit-prompt`.
@@ -133,6 +133,7 @@ This document describes the control operations of claude-code-ide.el, the prompt
 | `earlier-prompts-pending` | queued or rejected | The instance is idle, but older prompts wait. They go first. |
 | `send-failed` | queued | The provider did not send the prompt. It waits for the next try. |
 | `no-submit` | rejected | The provider has no `submit-prompt`. Queued prompts of such an instance also become final with this reason. |
+| `handed-over` | rejected, or queued | A handover moved the prompt to its target (`claude-code-ide-control-move-inbox`). The old record is `rejected` with this reason. The target has a `queued` copy with the same request ID and this reason. Follow the chain with `claude-code-ide-session-registry-chain-current`. |
 | `unknown-instance` | rejected | Neither this Emacs nor the registry knows the ID. |
 | `invalid-instance-id`, `empty-text` | rejected | The request is not valid. |
 
@@ -155,6 +156,8 @@ The state comes from `claude-code-ide-instance-state`.
 - **Only `idle` sends.** Every other state queues, because a provider does not yet report each of its dialogs reliably (plan §10).
 - **An instance that does not run** in this Emacs:
   - When the session registry marks it closed or archived, it is stopped.
+  - When the registry marks it `failed`, it is `failed`, with the reason `exit-code` (the CLI exited with an error code) or `error`. The state plist has the failure text as `:detail`.
+  - When the registry marks it `pending`, it is `working` with the reason `starting`.
   - When the registry has it open (as after a crash of Emacs), or this Emacs launched it before, it is `disconnected`.
   - Else it is unknown.
 - **A guessed idle state** (`:guess t`) also sends. The inbox file records it in `sent_guess`.
@@ -197,7 +200,8 @@ The state comes from `claude-code-ide-instance-state`.
 - **Index.** The pending records of each inbox folder are in memory. The first use of a folder reads its pending files. After that, events and submits read no files, and each write updates the index. A duplicate check of a final request reads one file in `done/`.
 - **Reload.** Loading the package reads no inbox file. The index fills from disk at the first use of each instance, so the inbox survives a reload of the package and a restart of Emacs.
 - **Old Emacs.** The files are read with the native JSON parser when Emacs has one, else with json.el.
-- `claude-code-ide-control-inbox-directory-of (INSTANCE-ID)` returns the folder. A handover can move it (plan §4.8).
+- `claude-code-ide-control-inbox-directory-of (INSTANCE-ID)` returns the folder.
+- `(claude-code-ide-control-move-inbox FROM TO)` moves the queued prompts of FROM to TO after a handover (plan §4.8). Each keeps its request ID; see the reason `handed-over`.
 
 ### The file
 
@@ -260,7 +264,7 @@ Each operation is also an MCP tool with `:scope coordinator`. Only a request wit
 
 ## Phase 3 operations
 
-- `claude-code-ide-control-operations` is an alist of each operation and its function. `handover` and `track-review` have nil.
+- `claude-code-ide-control-operations` is an alist of each operation and its function. `claude-code-ide-handover.el` fills `handover`, and the review file fills `track-review`.
 - `(claude-code-ide-control-define-operation OPERATION FUNCTION)` gives an operation its function.
 - `(claude-code-ide-control-call OPERATION &rest ARGS)` calls the operation, or returns the unavailable result.
 - `(claude-code-ide-control-define-tool &rest SPEC)` adds a coordinator tool. SPEC has the arguments of `claude-code-ide-make-tool`. The tool gets `:scope coordinator`.
