@@ -895,15 +895,17 @@ The Codex start commit comes from the same read."
       (should (claude-code-ide-transcript-session-server-p 'claude work))
       (should (claude-code-ide-transcript-session-server-p 'claude (file-name-as-directory work)))
       (should-not (claude-code-ide-transcript-session-server-p 'claude other))
-      ;; The project scope: .mcp.json of the worktree, unless it is disabled.
-      (claude-code-ide-transcript-tests--json config '((projects)))
+      ;; The project scope: .mcp.json of the worktree, when it is approved.
+      (claude-code-ide-transcript-tests--json
+       config `((projects (,(intern work) (enabledMcpjsonServers . ["claude-sessions"])))))
       (claude-code-ide-transcript-tests--json
        (expand-file-name ".mcp.json" work)
        `((mcpServers (claude-sessions . ,claude-code-ide-transcript-tests--server))))
       (should (claude-code-ide-transcript-session-server-p 'claude work))
       (should-not (claude-code-ide-transcript-session-server-p 'claude other))
       (claude-code-ide-transcript-tests--json
-       config `((projects (,(intern work) (disabledMcpjsonServers . ["claude-sessions"])))))
+       config `((projects (,(intern work) (enabledMcpjsonServers . ["claude-sessions"])
+                           (disabledMcpjsonServers . ["claude-sessions"])))))
       (should-not (claude-code-ide-transcript-session-server-p 'claude work))
       ;; Another server name, and no server name.
       (claude-code-ide-transcript-tests--json
@@ -974,7 +976,7 @@ The Codex start commit comes from the same read."
                                                           "## Source sessions" doc))
       (dolist (entry
                `(("### Leg 1: claude\n" "cci-test-0000-0000-0000-000000000001" "claude-leg1.jsonl"
-                  "- Started: 2026-11-17T10:01:00.000Z" "- Ended: 2026-11-17T10:15:00.000Z, at record 23 ")
+                  "- Started: 2026-11-17T10:01:00.000Z" "- Ended: 2026-11-17T10:15:00.000Z, at record 20 ")
                  ("### Leg 2: codex\n" "cci-test-codex-0002" "codex-leg2.jsonl"
                   "- Started: 2026-11-17T11:03:00.000Z" "- Ended: 2026-11-17T11:11:00.000Z, at record 18 ")
                  ("### Leg 3: claude (the source: this leg just ended)\n"
@@ -999,7 +1001,7 @@ The Codex start commit comes from the same read."
       (should (string-search "Never read a whole file." refs))
       (should (string-search "grep -n -o" refs))
       (should (string-search "jq -c 'select(.type==\"user\" or .type==\"assistant\")" refs))
-      (should (string-search "jq -c 'select(.payload.type==\"item_completed\")" refs))
+      (should (string-search "jq -c 'select(.payload.type==\"item_completed\" or" refs))
       (should (= (claude-code-ide-transcript-tests--count "- Read it with: the file" refs) 3)))
     ;; A nil server name turns the references to the tools off.
     (let ((claude-code-ide-handover-session-server nil))
@@ -1019,7 +1021,7 @@ A Codex leg uses its file, unless the server reads Codex sessions."
        (expand-file-name "codex-home/config.toml" dir) "[mcp_servers.claude-sessions]\n")
       (let ((refs (claude-code-ide-transcript-tests--references
                    (claude-code-ide-transcript-tests--chain-document dir))))
-        (should (string-search "The user asks you to read the source sessions with the claude-sessions tools" refs))
+        (should (string-search "Read the source sessions with the claude-sessions tools when you need a detail:" refs))
         (should (string-search "`mcp__claude_sessions__get_session_outline`" refs))
         (should (string-search "`mcp__claude_sessions__get_messages`" refs))
         (should (string-search "`limit` 100" refs))
@@ -1061,7 +1063,7 @@ A Codex leg uses its file, unless the server reads Codex sessions."
       (should (string-search "- Conversation ID: cci-test-codex-0002" refs))
       (should (string-search "- Read it with: the file" refs))
       (should-not (string-search "mcp__" refs))
-      (should (string-search "jq -c 'select(.payload.type==\"item_completed\")" refs)))))
+      (should (string-search "jq -c 'select(.payload.type==\"item_completed\" or" refs)))))
 
 (ert-deftest claude-code-ide-test-transcript-references-not-cut ()
   "The budget never cuts the \"Source sessions\" part."
@@ -1070,6 +1072,210 @@ A Codex leg uses its file, unless the server reads Codex sessions."
       (should (string-search "### Leg 3: claude (the source: this leg just ended)" doc))
       (should (string-search "Never read a whole file." doc))
       (should-not (string-search "### Latest turns" doc)))))
+
+;;; Review fixes of the references
+
+(ert-deftest claude-code-ide-test-transcript-claude-server-list-values ()
+  "A list value of the project entry that is not an array counts as empty."
+  (claude-code-ide-transcript-tests--with-dir home
+    (let ((work (expand-file-name "cci-test-work" home))
+          (claude-code-ide-handover-session-server "claude-sessions"))
+      (make-directory work t)
+      (claude-code-ide-transcript-tests--json
+       (expand-file-name ".mcp.json" work)
+       `((mcpServers (claude-sessions . ,claude-code-ide-transcript-tests--server))))
+      (dolist (value (list t 5 '((cci-test . 1)) "claude-sessions"))
+        (claude-code-ide-transcript-tests--json
+         (expand-file-name ".claude.json" home)
+         `((projects (,(intern work) (enableAllProjectMcpServers . t)
+                      (disabledMcpjsonServers . ,value)
+                      (disabledMcpServers . ,value)
+                      (enabledMcpjsonServers . ,value)))))
+        (should (claude-code-ide-transcript-session-server-p 'claude work))))))
+
+(ert-deftest claude-code-ide-test-transcript-claude-server-approval ()
+  "A server of .mcp.json counts only when Claude Code approved it.
+A server in disabledMcpServers of the project entry never counts."
+  (claude-code-ide-transcript-tests--with-dir home
+    (let ((work (expand-file-name "cci-test-work" home))
+          (config (expand-file-name ".claude.json" home))
+          (claude-code-ide-handover-session-server "claude-sessions"))
+      (make-directory work t)
+      (claude-code-ide-transcript-tests--json
+       (expand-file-name ".mcp.json" work)
+       `((mcpServers (claude-sessions . ,claude-code-ide-transcript-tests--server))))
+      (dolist (case
+               `((nil . nil)
+                 (((projects (,(intern work) (cci-test . 1)))) . nil)
+                 (((projects (,(intern work) (enabledMcpjsonServers . ["cci-test-other"])))) . nil)
+                 (((projects (,(intern work) (enabledMcpjsonServers . ["claude-sessions"])))) . t)
+                 (((projects (,(intern work) (enableAllProjectMcpServers . t)))) . t)
+                 (((projects (,(intern work) (enableAllProjectMcpServers . :json-false)))) . nil)
+                 (((projects (,(intern work) (enableAllProjectMcpServers . t)
+                              (disabledMcpjsonServers . ["claude-sessions"])))) . nil)
+                 (((projects (,(intern work) (enabledMcpjsonServers . ["claude-sessions"])
+                              (disabledMcpServers . ["claude-sessions"])))) . nil)))
+        (if (car case)
+            (claude-code-ide-transcript-tests--json config (car case))
+          (when (file-exists-p config) (delete-file config)))
+        (should (eq (claude-code-ide-transcript-session-server-p 'claude work) (cdr case))))
+      ;; disabledMcpServers also turns off the user and the local scope.
+      (delete-file (expand-file-name ".mcp.json" work))
+      (claude-code-ide-transcript-tests--json
+       config `((mcpServers (claude-sessions . ,claude-code-ide-transcript-tests--server))
+                (projects (,(intern work)
+                           (mcpServers (claude-sessions . ,claude-code-ide-transcript-tests--server))
+                           (disabledMcpServers . ["claude-sessions"])))))
+      (should-not (claude-code-ide-transcript-session-server-p 'claude work))
+      (should (claude-code-ide-transcript-session-server-p
+               'claude (expand-file-name "cci-test-elsewhere" home))))))
+
+(ert-deftest claude-code-ide-test-transcript-codex-server-read-errors ()
+  "A config.toml that cannot be read gives nil, not an error."
+  (claude-code-ide-transcript-tests--with-dir home
+    (let ((config (expand-file-name "codex-home/config.toml" home))
+          (claude-code-ide-handover-session-server "claude-sessions"))
+      ;; A directory.
+      (make-directory config t)
+      (should-not (claude-code-ide-transcript-session-server-p 'codex))
+      (delete-directory config)
+      ;; An error during the read.
+      (claude-code-ide-transcript-tests--write config "[mcp_servers.claude-sessions]\n")
+      (should (claude-code-ide-transcript-session-server-p 'codex))
+      (cl-letf (((symbol-function 'insert-file-contents)
+                 (lambda (&rest _) (error "cci-test read error"))))
+        (should-not (claude-code-ide-transcript-session-server-p 'codex))))))
+
+(ert-deftest claude-code-ide-test-transcript-codex-server-toml-forms ()
+  "The TOML reader finds the server in each form, and an unknown form gives nil."
+  (claude-code-ide-transcript-tests--with-dir home
+    (let ((config (expand-file-name "codex-home/config.toml" home))
+          (claude-code-ide-handover-session-server "claude-sessions"))
+      (dolist (case
+               '(;; [mcp_servers] with an inline table.
+                 ("[mcp_servers]\nclaude-sessions = { command = \"x\", args = [\"a\"] }\n" . t)
+                 ("[mcp_servers]\n\"claude-sessions\" = { command = 'x' }\n" . t)
+                 ;; Dotted keys.
+                 ("mcp_servers.claude-sessions.command = \"x\"\n" . t)
+                 ("[mcp_servers]\nclaude-sessions.command = \"x\"\n" . t)
+                 ;; enabled = false in an inline table, and as a dotted key.
+                 ("[mcp_servers]\nclaude-sessions = { command = \"x\", enabled = false }\n" . nil)
+                 ("mcp_servers.claude-sessions.command = \"x\"\nmcp_servers.claude-sessions.enabled = false\n" . nil)
+                 ("[mcp_servers]\nclaude-sessions = { command = \"x\", enabled = true }\n" . t)
+                 ;; A sub-table only.
+                 ("[mcp_servers.claude-sessions.env]\nCCI_TEST = \"1\"\n" . t)
+                 ;; Keys under other tables do not count.
+                 ("[profiles.cci-test]\nmcp_servers.claude-sessions = { command = \"x\" }\n" . nil)
+                 ("[profiles.cci-test.mcp_servers.claude-sessions]\ncommand = \"x\"\n" . nil)
+                 ;; Other values around the server.
+                 ("model = \"cci-test\" # comment\nnum = 5\nflag = true\nlist = [\n  \"a\", # c\n  \"b\",\n]\n\
+text = \"\"\"\n[mcp_servers.claude-sessions]\n\"\"\"\n[[cci_test]]\nname = 'x'\n" . nil)
+                 ("list = [\n  1,\n  2\n]\n[mcp_servers.claude-sessions]\ncommand = \"x\"  # c\n" . t)
+                 ;; Unknown forms give nil.
+                 ("[mcp_servers.claude-sessions]\ncommand = @cci-test\n" . nil)
+                 ("[mcp_servers.claude-sessions\ncommand = \"x\"\n" . nil)
+                 ("[mcp_servers.claude-sessions]\ncommand = \"x\" extra\n" . nil)
+                 ("[mcp_servers.claude-sessions]\ncommand = \"never closed\n" . nil)))
+        (claude-code-ide-transcript-tests--write config (car case))
+        (should (eq (and (claude-code-ide-transcript-session-server-p 'codex) t) (cdr case)))))))
+
+(ert-deftest claude-code-ide-test-transcript-detection-cannot-fail-document ()
+  "An error in the detection gives a document with file references only."
+  (claude-code-ide-transcript-tests--with-repo dir
+    (cl-letf (((symbol-function 'claude-code-ide-transcript-session-server-p)
+               (lambda (&rest _) (error "cci-test detection error"))))
+      (let ((doc (claude-code-ide-transcript-tests--chain-document dir)))
+        (should (string-search "## Source sessions" doc))
+        (should-not (string-search "mcp__" doc))))))
+
+(ert-deftest claude-code-ide-test-transcript-end-record-after-growth ()
+  "The end record is the line of the last turn that the read used.
+Records that the file got later, and that give no turn, do not move
+it.  An :end-record of the leg wins."
+  (claude-code-ide-transcript-tests--with-dir dir
+    (let ((file (expand-file-name "cci-test-grown.jsonl" dir)))
+      (copy-file (claude-code-ide-transcript-tests--fixture "claude-leg3.jsonl") file)
+      ;; After the handover, the file gets records without turns.
+      (with-temp-buffer
+        (dotimes (_ 5)
+          (insert "{\"type\":\"attachment\",\"sessionId\":\"cci-test\"}\n"))
+        (append-to-file (point-min) (point-max) file))
+      (let ((refs (claude-code-ide-transcript-tests--references
+                   (claude-code-ide-transcript-handover-document
+                    :source (list :provider 'claude :transcript file :worktree dir)))))
+        (should (string-search "at record 8 (line 8 of the file)" refs)))
+      (let ((refs (claude-code-ide-transcript-tests--references
+                   (claude-code-ide-transcript-handover-document
+                    :source (list :provider 'claude :transcript file :worktree dir
+                                  :end-record 6)))))
+        (should (string-search "at record 6 (line 6 of the file)" refs))))))
+
+(ert-deftest claude-code-ide-test-transcript-leg-without-provider ()
+  "A leg without :provider uses the format of its transcript, also for the server."
+  (claude-code-ide-transcript-tests--with-dir dir
+    (let* ((doc (claude-code-ide-transcript-handover-document
+                 :source (list :worktree dir
+                               :transcript (claude-code-ide-transcript-tests--fixture
+                                            "claude-leg1.jsonl"))
+                 :target-provider 'claude :session-server t))
+           (refs (claude-code-ide-transcript-tests--references doc)))
+      (should (string-search "### Leg 1: claude (the source" refs))
+      (should (string-search "- Source: claude, conversation" doc))
+      (should (string-search "(conversation_id cci-test-0000-0000-0000-000000000001)" refs)))))
+
+(ert-deftest claude-code-ide-test-transcript-server-wording ()
+  "The server instructions are a plain instruction, without a claim of consent."
+  (claude-code-ide-transcript-tests--with-repo dir
+    (let ((refs (claude-code-ide-transcript-tests--references
+                 (claude-code-ide-transcript-tests--chain-document dir :session-server t))))
+      (should (string-search "Read the source sessions with the claude-sessions tools when you need a detail:" refs))
+      (should-not (string-search "explicit" refs))
+      (should-not (string-search "The user asks" refs)))))
+
+(ert-deftest claude-code-ide-test-transcript-reference-details ()
+  "The Codex jq filter shows the legacy events, an unknown transcript says so,
+and the unused tool list is gone."
+  (claude-code-ide-transcript-tests--with-dir dir
+    (let ((refs (claude-code-ide-transcript-tests--references
+                 (claude-code-ide-transcript-handover-document
+                  :source (list :provider 'codex :worktree dir
+                                :transcript (claude-code-ide-transcript-tests--fixture
+                                             "codex-legacy.jsonl"))
+                  :chain (list (list :provider 'claude :native-id "cci-test-no-file"))))))
+      (should (string-search ".payload.type==\"user_message\" or .payload.type==\"agent_message\"" refs))
+      (should (string-search "(.payload.item // .payload.message)" refs))
+      ;; The leg without a transcript.
+      (should (string-search "- Transcript: unknown: no transcript is known for this leg" refs))
+      (should (string-search "- Read it with: nothing: no transcript is known for this leg" refs))
+      (should (= (claude-code-ide-transcript-tests--count "- Read it with: the file" refs) 1))))
+  (should-not (boundp 'claude-code-ide-transcript--session-tools)))
+
+(ert-deftest claude-code-ide-test-transcript-json-cache ()
+  "With the cache of a call, each JSON file is parsed one time."
+  (claude-code-ide-transcript-tests--with-dir home
+    (let ((work (expand-file-name "cci-test-work" home))
+          (parses 0)
+          (real (symbol-function 'json-parse-buffer))
+          (claude-code-ide-handover-session-server "claude-sessions"))
+      (make-directory work t)
+      (claude-code-ide-transcript-tests--json
+       (expand-file-name ".claude.json" home)
+       `((mcpServers (claude-sessions . ,claude-code-ide-transcript-tests--server))))
+      (cl-letf (((symbol-function 'json-parse-buffer)
+                 (lambda (&rest args) (setq parses (1+ parses)) (apply real args))))
+        (let ((claude-code-ide-transcript--json-cache (make-hash-table :test 'equal)))
+          (should (claude-code-ide-transcript-session-server-p 'claude work))
+          (should (claude-code-ide-transcript-session-server-p 'claude work))
+          (should (= parses 1)))
+        ;; A changed file is parsed again.
+        (let ((claude-code-ide-transcript--json-cache (make-hash-table :test 'equal)))
+          (claude-code-ide-transcript-session-server-p 'claude work)
+          (claude-code-ide-transcript-tests--json
+           (expand-file-name ".claude.json" home)
+           `((mcpServers (cci-test-other . ,claude-code-ide-transcript-tests--server))
+             (cci-test-padding . "changed size")))
+          (should-not (claude-code-ide-transcript-session-server-p 'claude work))
+          (should (= parses 3)))))))
 
 (provide 'claude-code-ide-transcript-tests)
 
