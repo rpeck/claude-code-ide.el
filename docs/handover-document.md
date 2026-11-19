@@ -118,6 +118,7 @@ A leg is a plist, or an instance descriptor that becomes a plist:
 | `:document-hash` | The SHA-256 of that document, or nil. |
 | `:summary-file` | The state summary file that the leg wrote in its first turn, or nil. |
 | `:start-commit` | HEAD when the leg started, or nil. |
+| `:end-record` | The line of the transcript where the leg ended, recorded at the handover, or nil. nil uses the line of the last record that gave a turn. |
 
 - `(claude-code-ide-transcript-instance-leg INSTANCE)` makes the leg of the current conversation of INSTANCE. Its transcript file comes from the `transcript` operation of the provider, with WHAT `file`.
 - The record of the source leg: when a leg of CHAIN has the same native ID or the same transcript file as the source, it is the source. Its values fill in the values that the source lacks, for example `:handover-id` and `:summary-file`. It does not show as a separate leg.
@@ -127,19 +128,21 @@ A leg is a plist, or an instance descriptor that becomes a plist:
 ```elisp
 (claude-code-ide-transcript-handover-document
  :source SOURCE :chain CHAIN :context CONTEXT :budget BUDGET
- :handover-id ID :target-provider PROVIDER :summary-file FILE :time TIME)
+ :handover-id ID :target-provider PROVIDER :summary-file FILE :time TIME
+ :session-server SERVER)
 ```
 
 - `:source`, `:chain`, `:context`, and `:budget` are the keys of PHASE2-CONTRACTS §6.
   - SOURCE is an instance descriptor. A leg plist also works.
   - CHAIN is the list of the earlier legs, oldest first.
   - CONTEXT is text from the coordinator, or nil.
-  - BUDGET is the size budget in characters. nil uses `claude-code-ide-transcript-budget` (40000).
+  - BUDGET is the size budget in characters. nil uses `claude-code-ide-transcript-budget` (100000).
 - These keys are optional:
   - `:handover-id`: the ID of the new handover. nil makes a new UUID.
   - `:target-provider`: the provider of the target. nil shows `unknown`.
   - `:summary-file`: the file for the state summary of the target. nil gives `.handover/<ID>-state.md` in the worktree (`claude-code-ide-transcript-summary-file-format`).
   - `:time`: a Lisp time for the header. nil is now.
+  - `:session-server`: whether the target has the session server (see "Source sessions"). `t`, nil, or `auto` (the default) to read the configuration of the target provider.
 - The result is the text. The caller records its hash, for example with `(secure-hash 'sha256 TEXT)`.
 
 ### Parts, in this order
@@ -148,14 +151,15 @@ A leg is a plist, or an instance descriptor that becomes a plist:
 2. **Workspace state.** The branch, HEAD, `git status --porcelain`, the diff stat since the start of the source, the untracked files, and `git log --oneline -n 20`.
    - The start of the source is its `:start-commit`. Else it is the commit in the Codex session metadata. Else it is the last commit before the first turn of the source.
 3. **Context from the coordinator**, when CONTEXT is given.
-4. **History of the chain:**
+4. **Source sessions:** how to read the full source sessions, and one entry for each leg (see "Source sessions" below).
+5. **History of the chain:** a short extract.
    - **Original task:** the first user prompt of the first leg, marked "it can be out of date". When a handover document started the first leg, the original task of that document is used.
      - When no original task is found, the part says "Not found in the transcripts.". The next document reads this as no original task, not as a prompt. The prompt list then starts at P1.
    - **State summary of the previous target:** the summary file of the source, verbatim. The file comes from `:summary-file`, or from the document that started the source. The part is left out when no handover started the source.
    - **User prompts of the chain:** every other user prompt, oldest first, with the numbers P2, P3, and so on. P1 is the original task. Each prompt is cut to `claude-code-ide-transcript-prompt-limit` characters.
    - **Latest turns:** the turns of all legs, oldest first. Each turn text is cut to `claude-code-ide-transcript-turn-limit` characters. A user turn whose prompt is already in the document shows only its number, for example "(P5 in the list of user prompts above.)".
-5. **Not carried over:** background tasks and subagents that still run, the permission mode, and the plan mode.
-6. **Instructions to the target:**
+6. **Not carried over:** background tasks and subagents that still run, the permission mode, and the plan mode.
+7. **Instructions to the target:**
    - The workspace state and the coordinator context have priority over older history.
    - A newer user prompt replaces an older one.
    - The instructions of earlier handover documents do not apply.
@@ -164,6 +168,44 @@ A leg is a plist, or an instance descriptor that becomes a plist:
    - Then reply `ready` and wait.
 
 All transcript text (prompts, turns, and the state summary) is in Markdown block quotes, so that it cannot add headings to the document.
+
+### Source sessions
+
+The document does not hold every detail. It refers to the source sessions, so that the target reads a detail when it needs it.
+
+- **One entry for each leg of the chain**, oldest first. The entry of the source has "(the source: this leg just ended)". Each entry has:
+  - The provider and the native conversation ID.
+    - The provider is the `:provider` of the leg, else the format of its transcript.
+    - The ID is the `:native-id` of the leg, else the session ID that the read found (the `sessionId` of the CC records, or the ID in the Codex session metadata), else the file name of a CC transcript.
+  - The absolute transcript path and its format. A leg without a transcript says "no transcript is known for this leg", also in "Read it with".
+  - The start and end time of the leg: the times of its first and last turn.
+  - The end record: the `:end-record` of the leg when the caller gives it, else the line of the last record that gave a turn. Records that the file gets later are not part of the chain.
+  - How to read it: with the session server, or the file.
+- **The session server.** `claude-code-ide-handover-session-server` names an MCP server that reads past sessions. The default is `"claude-sessions"`. nil turns the server references off.
+  - `(claude-code-ide-transcript-session-server-p PROVIDER &optional WORKTREE)` says whether the target provider has the server. It only reads the files, and a missing or broken file gives nil:
+    - `claude`: `.claude.json` is in `CLAUDE_CONFIG_DIR`, else in HOME. The server counts when it is in one of these, and the project entry of WORKTREE does not list it in `disabledMcpServers` (written by `/mcp`):
+      - `mcpServers` of `.claude.json` (user scope).
+      - `mcpServers` of the project entry of WORKTREE (local scope).
+      - `mcpServers` of `WORKTREE/.mcp.json` (project scope), only when Claude Code approved it: the project entry lists it in `enabledMcpjsonServers`, or has `enableAllProjectMcpServers` true, and does not list it in `disabledMcpjsonServers`.
+      - A list value that is not a JSON array counts as empty.
+    - `codex`: `config.toml` of `CODEX_HOME`, else `HOME/.codex`. A small TOML reader finds the keys under `mcp_servers.NAME`:
+      - The forms are a table header `[mcp_servers.NAME]` (also a sub-table), a table `[mcp_servers]` with `NAME = { ... }`, and dotted keys such as `mcp_servers.NAME.command = ...`. The name can be quoted.
+      - `enabled = false` (in any of these forms) turns the server off.
+      - Keys under other tables, such as `[profiles.x]`, do not count.
+      - The reader knows comments, strings (also multi-line), arrays over lines, inline tables, booleans, numbers, and arrays of tables. Any other form gives nil.
+    - A read error gives nil. The detection in the document is also wrapped, so that it can never fail the document.
+    - The document parses each JSON file at most one time (`claude-code-ide-transcript--json-cache`, keyed by the file, its time, and its size).
+    - Another provider gives nil.
+  - A caller can give the answer with `:session-server` (`t` or nil). The default `auto` uses this function for the target provider. An unknown target provider never uses the server.
+  - `claude-code-ide-handover-session-server-providers` lists the providers whose sessions the server reads. The default is `(claude)`, because claude-sessions reads Claude Code sessions only. A leg of another provider gets the file reference.
+- **The server instructions**, when the target has the server and a leg can use it:
+  - They are a plain instruction: "Read the source sessions with the claude-sessions tools when you need a detail:". The document is the first prompt of the user to the target, so it makes no other claim.
+  - First `get_session_outline` with the conversation ID, in pages of 100 (`limit` 100, then `start_position` from `next_position`). Then `get_messages` with only the `positions` that the target needs. Never the whole session at once.
+  - `(claude-code-ide-transcript-session-tool PROVIDER TOOL)` gives the tool name in the form of the target: `mcp__claude-sessions__get_messages` for Claude Code, and `mcp__claude_sessions__get_messages` for Codex, which changes hyphens to underscores.
+- **The file reference** is always present, as the fallback:
+  - It says that a file can be very large and must never be read whole.
+  - It gives safe commands: `grep -n -o` with a short context, `head -n N | tail -n 40 | cut -c1-400`, and a short `jq` filter for each format in the chain (CC records of type `user` and `assistant`; Codex `item_completed` records, and the `user_message` and `agent_message` records of an imported rollout).
+- The budget never cuts this part. The latest turns fill the rest of the budget after it.
 
 ### No nested documents
 
@@ -176,7 +218,7 @@ Test S7 showed that a document that copies the previous document doubles in size
 
 ### The size budget
 
-- The budget never cuts the header, the workspace state, the coordinator context, the original task, the "not carried over" list, or the instructions. When these parts are larger than the budget, the document is larger than the budget.
+- The budget never cuts the header, the workspace state, the coordinator context, the "Source sessions" part, the original task, the "not carried over" list, or the instructions. When these parts are larger than the budget, the document is larger than the budget.
 - The rest of the budget goes to the other parts, in this order:
   1. The state summary. It is cut at the end when it does not fit, and its last line is `> [... cut]`. The size counts the `> ` of each quoted line.
   2. The user prompts. They get half of the rest, or more when the latest turns need less. The oldest prompts are left out first.
