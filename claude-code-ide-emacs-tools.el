@@ -119,18 +119,81 @@ This function uses the session context to operate in the correct project."
 
 (defun claude-code-ide-mcp-project-info ()
   "Get information about the current session's project.
-Returns project directory, active buffer, and file count."
+Returns project directory, active buffer, and file count.  For an
+instance, also its worktree and instance ID, from its descriptor."
   (let ((context (claude-code-ide-mcp-server-get-session-context)))
     (if context
         (let ((project-dir (plist-get context :project-dir))
-              (buffer (plist-get context :buffer)))
-          (format "Project: %s\nBuffer: %s\nFiles: %d"
-                  project-dir
-                  (if (and buffer (buffer-live-p buffer))
-                      (buffer-name buffer)
-                    "No active buffer")
-                  (length (project-files (project-current nil project-dir)))))
+              (buffer (plist-get context :buffer))
+              (worktree (plist-get context :worktree))
+              (instance-id (plist-get context :instance-id)))
+          (concat
+           (format "Project: %s\nBuffer: %s\nFiles: %d"
+                   project-dir
+                   (if (and buffer (buffer-live-p buffer))
+                       (buffer-name buffer)
+                     "No active buffer")
+                   (length (project-files (project-current nil project-dir))))
+           (if worktree (format "\nWorktree: %s" worktree) "")
+           (if instance-id (format "\nInstance: %s" instance-id) "")))
       "No session context available")))
+
+(defun claude-code-ide-mcp--operation-name (name)
+  "Return the provider operation symbol of the string NAME, or nil.
+NAME may use underscores for hyphens, as in \"submit_prompt\"."
+  (when (stringp name)
+    ;; `intern-soft': a client string never makes a new symbol
+    (let ((symbol (intern-soft (replace-regexp-in-string "_" "-" name))))
+      (and symbol (memq symbol claude-code-ide-provider-operations) symbol))))
+
+(defun claude-code-ide-mcp-capabilities (instance-id &optional operation)
+  "Return the capabilities of the instance INSTANCE-ID as an alist for JSON.
+With OPERATION, a string, return {\"status\": \"available\" or
+\"unavailable\", \"capability\": OPERATION} for that operation only.
+Without it, return the instance ID, the provider, the generation, the
+list of operations that the provider has, and one unavailable result
+for each operation that it does not have."
+  (let* ((instance (and instance-id (claude-code-ide-instance-by-id instance-id)))
+         (provider (and instance
+                        (claude-code-ide-get-provider
+                         (claude-code-ide-instance-provider instance)))))
+    (cond
+     ((not instance)
+      '((status . "unavailable") (reason . "no-instance")))
+     ((not provider)
+      `((status . "unavailable") (reason . "unknown-provider")
+        (provider . ,(format "%s" (claude-code-ide-instance-provider instance)))))
+     (operation
+      (let ((symbol (claude-code-ide-mcp--operation-name operation)))
+        `((status . ,(if (and symbol (claude-code-ide-provider-supports-p provider symbol))
+                         "available"
+                       "unavailable"))
+          (capability . ,operation))))
+     (t
+      (let ((available nil)
+            (missing nil))
+        (dolist (op claude-code-ide-provider-operations)
+          (if (claude-code-ide-provider-supports-p provider op)
+              (push (symbol-name op) available)
+            (push `((status . "unavailable") (capability . ,(symbol-name op))) missing)))
+        `((instance_id . ,instance-id)
+          (provider . ,(symbol-name (claude-code-ide-provider-name provider)))
+          (generation . ,(claude-code-ide-instance-generation instance))
+          (capabilities . ,(vconcat (nreverse available)))
+          (unavailable . ,(vconcat (nreverse missing)))))))))
+
+(defun claude-code-ide-mcp-get-capabilities (&optional operation instance_id)
+  "Return the capabilities of the calling instance as a JSON string.
+With OPERATION, say whether the instance has that operation.  A
+coordinator request may name another instance with INSTANCE_ID; for
+a plain request, another instance gives the coordinator-only result."
+  (let ((caller (claude-code-ide-mcp-request-instance-id)))
+    (json-encode
+     (if (and instance_id
+              (not (equal instance_id caller))
+              (not (claude-code-ide-mcp-server-coordinator-request-p)))
+         '((status . "unavailable") (reason . "coordinator-only"))
+       (claude-code-ide-mcp-capabilities (or instance_id caller) operation)))))
 
 (defun claude-code-ide-mcp-imenu-list-symbols (file-path)
   "List all symbols in FILE-PATH using imenu.
@@ -478,6 +541,20 @@ replaced."
    :name "claude-code-ide-mcp-project-info"
    :description "Get quick overview of your current project context including directory, active file, and project size"
    :args nil)
+
+  ;; Register the capability discovery tool
+  (claude-code-ide-make-tool
+   :function #'claude-code-ide-mcp-get-capabilities
+   :name "get_capabilities"
+   :description "List the operations that this coding-agent instance supports (launch, resume, fork, submit-prompt, stop, and so on). An operation that the instance does not have shows as {\"status\": \"unavailable\", \"capability\": NAME}. With operation, check only that operation."
+   :args '((:name "operation"
+                  :type string
+                  :description "One operation name, for example \"fork\" or \"submit_prompt\""
+                  :optional t)
+           (:name "instance_id"
+                  :type string
+                  :description "Another instance; only for coordinator requests"
+                  :optional t)))
 
   ;; Register imenu tool
   (claude-code-ide-make-tool
