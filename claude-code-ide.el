@@ -1318,7 +1318,17 @@ windows while the hook runs would call the hook again."
 The window is displayed on the side specified by
 `claude-code-ide-window-side' with dimensions from
 `claude-code-ide-window-width' or `claude-code-ide-window-height'.
-If `claude-code-ide-focus-on-open' is non-nil, the window is selected."
+If `claude-code-ide-focus-on-open' is non-nil, the window is selected.
+A dedicated diff frame never gets the window: then it goes to another
+frame (see `claude-code-ide-mcp-call-outside-ediff-frame')."
+  (if (fboundp 'claude-code-ide-mcp-call-outside-ediff-frame)
+      (claude-code-ide-mcp-call-outside-ediff-frame
+       (lambda () (claude-code-ide--display-buffer-in-side-window-here buffer)))
+    (claude-code-ide--display-buffer-in-side-window-here buffer)))
+
+(defun claude-code-ide--display-buffer-in-side-window-here (buffer)
+  "Display BUFFER in a side window of the selected frame.
+See `claude-code-ide--display-buffer-in-side-window'."
   ;; In `project' scope only one project stays on screen.  Remove the other
   ;; projects' windows before this one is displayed.
   (when (and claude-code-ide-use-side-window

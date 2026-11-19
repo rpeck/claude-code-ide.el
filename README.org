@@ -284,6 +284,14 @@ When =claude-code-ide-use-ide-diff= is enabled (default), Claude's code suggesti
 
 This allows you to refine Claude's suggestions before they're applied, ensuring the final code meets your exact requirements.
 
+*** Dedicated diff frames stay with their review
+
+- A new terminal window (a launch, resume, restore, or handover target) never goes into a dedicated diff frame. It goes to another frame, and the diff frame keeps the focus.
+- A frame with an open ediff, also a suspended one, is never deleted by the end of another instance.
+- =claude-code-ide-ediff-files-in-frame= queues a diff while its frame has an open ediff. The diff opens when the ediff before it ends.
+- =openDiff= never takes a frame with an open ediff: it uses the frame "ediff LABEL <2>" and so on.
+- See [[file:docs/review.md][docs/review.md]].
+
 ** Configuration
 
 *** Configuration Variables
@@ -800,6 +808,15 @@ Once enabled, Claude can use these tools to navigate your codebase. For example:
 - The control operations list, inspect, launch, resume, prompt, and stop an instance by its instance ID. Each is an Elisp function (=claude-code-ide-control-...=) and an MCP coordinator tool. See [[file:docs/api-control.md][docs/api-control.md]].
 - A prompt goes through the instance's inbox in =<report directory>/inbox/=. It is sent only when the instance is idle, and it counts as delivered when the CLI reports the same prompt.
 - Options: =claude-code-ide-control-inbox-directory=, =claude-code-ide-control-ack-timeout=, =claude-code-ide-control-retry-interval=, =claude-code-ide-control-enable-mcp-tools=, =claude-code-ide-control-done-days= (default 7).
+
+** Reviews
+
+- A review is an external process whose result belongs to one instance. =claude-code-ide-review-track= (and the coordinator tool =claude-code-ide-control-track-review=) records it.
+- When the process ends, Emacs reads the result file and puts the result into the instance's inbox. The instance gets it one time, when it can take it. A missing or broken result file gives an explicit error result.
+- After a handover, the result goes to the current instance of the chain. A review that ends while Emacs does not run is delivered at the next start.
+- The output of a review command never goes into a prompt or a record.
+- Options: =claude-code-ide-review-directory=, =claude-code-ide-review-check-interval=, =claude-code-ide-review-retry-seconds=, =claude-code-ide-review-max-result-chars=, =claude-code-ide-review-done-days=, =claude-code-ide-review-format-function=.
+- See [[file:docs/review.md][docs/review.md]].
 
 ** Creating Custom MCP Tools
 
