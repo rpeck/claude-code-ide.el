@@ -83,7 +83,9 @@ and cycles do not change the order."
 
 (ert-deftest claude-code-ide-test-reload-in-batch-emacs ()
   "A reload in a new Emacs loads each loaded file, reports a broken one,
-and keeps a running instance and the state of the package."
+and keeps a running instance and the state of the package.  A package
+mode that is on is turned off and on again, so that it installs the
+hooks of the new version."
   (let* ((dir (make-temp-file "cci-test-reload-" t))
          (emacs (expand-file-name invocation-name invocation-directory))
          (package-dir (file-name-directory (locate-library "claude-code-ide-reload.el" t)))
@@ -106,6 +108,12 @@ and keeps a running instance and the state of the package."
                                    (claude-code-ide-instance-create
                                     :id "cci-test-reload-live" :provider 'claude))))
                    (setq claude-code-ide-cli-extra-flags "--cci-test-kept")
+                   ;; The registry mode is on, in a temporary folder.  The
+                   ;; old version had no event hook: the reload must add it.
+                   (setq claude-code-ide-state-file ,(expand-file-name "state.json" dir))
+                   (claude-code-ide-session-registry-mode 1)
+                   (remove-hook 'claude-code-ide-event-functions
+                                #'claude-code-ide-session-registry--on-event)
                    ;; The update: a new function, and a broken file
                    (with-temp-buffer
                      (insert "\n(defun claude-code-ide-cci-test-new () 'cci-test-new)\n")
@@ -123,6 +131,12 @@ and keeps a running instance and the state of the package."
                      (princ (format "new=%S\n" (and (fboundp 'claude-code-ide-cci-test-new)
                                                     (funcall 'claude-code-ide-cci-test-new))))
                      (princ (format "kept=%S\n" claude-code-ide-cli-extra-flags))
+                     (princ (format "hooked=%S\n"
+                                    (and (memq #'claude-code-ide-session-registry--on-event
+                                               claude-code-ide-event-functions)
+                                         claude-code-ide-session-registry-mode
+                                         t)))
+                     (princ (format "modes=%S\n" (plist-get result :modes)))
                      (princ (format "instance=%S\n" (eq (claude-code-ide-instance-by-id
                                                          "cci-test-reload-live")
                                                         instance)))
@@ -150,12 +164,14 @@ and keeps a running instance and the state of the package."
                 (should (string-match-p "failed=(\"claude-code-ide-transcript.el\")" output))
                 (should (string-match-p "new=cci-test-new" output))
                 (should (string-match-p "kept=\"--cci-test-kept\"" output))
+                (should (string-match-p "hooked=t" output))
+                (should (string-match-p "modes=(claude-code-ide-session-registry-mode)" output))
                 (should (string-match-p "instance=t" output))
                 (should (string-match-p "process=t" output))
                 (should (string-match-p "order=t" output))
                 (should (string-match-p "last=\"claude-code-ide-reload.el\"" output))
                 (should (string-match-p "tests=nil" output))
-                (should (string-match-p "Reloaded [0-9]+ claude-code-ide files; 1 failed: claude-code-ide-transcript.el"
+                (should (string-match-p "Reloaded [0-9]+ claude-code-ide files; 1 failed: claude-code-ide-transcript.el; restarted claude-code-ide-session-registry-mode"
                                         output))))))
       (delete-directory dir t))))
 

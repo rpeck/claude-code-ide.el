@@ -52,14 +52,15 @@ The command does these things:
 1. It finds the package folder: the folder of `claude-code-ide` on `load-path`.
 2. It sorts the package files so that each file comes after the package files that it requires at its top level. Optional requires (`(require 'x nil t)`) do not count, because the main file loads its optional files after its own `provide`.
 3. It loads each file whose feature is loaded now, in that order. It loads `claude-code-ide-reload.el` last.
-4. It reports the result: "Reloaded N claude-code-ide files", and the names of the files that failed.
+4. It turns each global mode of the package that was on off and on again, so that the mode installs the hooks of the new version.
+5. It reports the result: "Reloaded N claude-code-ide files", the names of the files that failed, and the restarted modes.
 
 Details:
 
 - **Test files** (`*-tests.el`) and generated files (`*-autoloads.el`, `*-pkg.el`) never load.
 - **A file that is not loaded** stays unloaded, for example `claude-code-ide-transient.el` when you never opened the menu. From Lisp, `(claude-code-ide-reload nil t)` loads all files.
 - **A new file** of the update loads when a reloaded file requires it. The main file loads its optional files (`claude-code-ide-codex`, `-control`, `-transcript`, `-handover`, `-review`) this way.
-- **From Lisp:** `(claude-code-ide-reload DIRECTORY ALL)` returns a plist with `:loaded` (the files, in order) and `:failed` (a list of `(FILE . ERROR-MESSAGE)`).
+- **From Lisp:** `(claude-code-ide-reload DIRECTORY ALL)` returns a plist with `:loaded` (the files, in order), `:failed` (a list of `(FILE . ERROR-MESSAGE)`), `:modes` (the restarted modes), and `:failed-modes`.
 
 ## Step 4: failures
 
@@ -74,14 +75,17 @@ The reload evaluates each file again. These values stay:
 
 - **Running instances.** The terminal buffers, the CLI processes, the MCP sessions, and the instance descriptors stay. Their CLIs do not restart.
 - **Variables.** `defvar` and `defcustom` do not change a variable that has a value. Your settings and the state of the package (the session registry queue, the status of each instance, the inboxes) stay.
-- **Modes.** `claude-code-ide-session-registry-mode` and `claude-code-ide-session-status-mode` stay on. Their hooks point to function names, so they run the new code.
+- **Modes.** A reload does not run the body of a `define-minor-mode`, so a mode that is on keeps the hooks of the old version, and a hook that the new version adds is missing. So after the files, the reload turns each global mode of the package that is on off and on again. `claude-code-ide-session-registry-mode` turns on first, `claude-code-ide-session-status-mode` after it. The modes stay on.
+  - The status buffer closes and opens again.
+  - The registry mode shows its startup messages again ("N sessions can be restored").
+  - A mode that fails to turn off or on gets a warning. The message names the restarted modes.
 - **Constants change.** `defconst` takes its new value. A provider registers itself again with its new operations. That is the wanted result.
 
 These things do not change until a restart, or until you do them by hand:
 
 - **Closures that already exist.** A timer or a hook that holds a `lambda` keeps the old code until it is made again. For example, the process sentinel of a running instance keeps the old code. A new instance gets the new code.
 - **Struct changes.** When an update adds a slot to a `cl-defstruct` whose objects live in memory (for example `claude-code-ide-mcp-session` or `claude-code-ide-instance`), the objects of the running instances have the old layout. Restart Emacs after such an update. The registry entries are read from the file each time, so their struct can change without a restart.
-- **A changed hook or advice name.** When an update removes or renames a function that is in a hook, the hook keeps the old name. Turn the mode off and on again.
+- **A removed hook function.** When an update removes or renames a function that a mode put in a hook, turning the mode off removes only the names of the new version. The old name stays in the hook. Remove it with `remove-hook`, or restart Emacs.
 - **Running CLIs.** A change of the CLI command line, the MCP config, or the status hooks reaches only new launches. To give a running instance the new command line, end it and resume it (`M-x claude-code-ide-reopen-session`).
 - **Byte-compiled callers.** A macro change reaches only the files that load after the macro's file. The dependency order makes sure of this for package files.
 
