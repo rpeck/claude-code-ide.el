@@ -26,6 +26,10 @@
 
 (declare-function claude-code-ide-tests--make-session "claude-code-ide-tests")
 (declare-function claude-code-ide-tests--clear-processes "claude-code-ide-tests")
+(declare-function claude-code-ide-tests--wait-until "claude-code-ide-tests")
+(declare-function claude-code-ide-tests--call-with-clock "claude-code-ide-tests")
+(declare-function claude-code-ide-tests--advance-clock "claude-code-ide-tests")
+(defvar claude-code-ide-tests--wait-limit)
 
 ;;; Fixtures
 
@@ -319,19 +323,38 @@ source is listed too, and must not count."
 (defun claude-code-ide-codex-events-tests--run-script (dir env &optional input)
   "Run the hook script for Stop with the environment ENV and INPUT.
 ENV is a list of \"NAME=VALUE\" or \"NAME\" (removed) entries.  Return
-the seconds that it ran and the event files in DIR."
-  (let ((process-environment (append env
-                                     '("CCI_INSTANCE_ID" "CCI_GENERATION" "CCI_EVENTS_DIR"
-                                       "CODEX_THREAD_ID")
-                                     process-environment))
-        (start (float-time)))
-    (with-temp-buffer
-      (insert (or input "{\"session_id\":\"cci-test-s\",\"hook_event_name\":\"Stop\"}"))
-      (should (zerop (call-process-region (point-min) (point-max) "sh" nil nil nil
-                                          (claude-code-ide-codex-events--script-file)
-                                          "Stop"))))
-    (list (- (float-time) start)
-          (directory-files dir nil claude-code-ide-codex-events--file-regexp))))
+\(WENT-ON FILES): WENT-ON is non-nil when the script went on after its
+checks, to the temporary file of the record, and FILES are the event
+files in DIR.  A `mktemp' first in PATH notes its calls; so the result
+does not depend on the speed of the machine, as a time would."
+  (let* ((bin (make-temp-file "cci-test-bin-" t))
+         (mark (expand-file-name "mktemp-called" bin))
+         (process-environment (append env
+                                      (list (concat "PATH=" bin ":" (getenv "PATH")))
+                                      '("CCI_INSTANCE_ID" "CCI_GENERATION" "CCI_EVENTS_DIR"
+                                        "CODEX_THREAD_ID")
+                                      process-environment)))
+    (unwind-protect
+        (progn
+          (with-temp-file (expand-file-name "mktemp" bin)
+            (insert "#!/bin/sh\n"
+                    "echo x >> " (shell-quote-argument mark) "\n"
+                    "exec " (shell-quote-argument (executable-find "mktemp")) " \"$@\"\n"))
+          (set-file-modes (expand-file-name "mktemp" bin) #o700)
+          (with-temp-buffer
+            (insert (or input "{\"session_id\":\"cci-test-s\",\"hook_event_name\":\"Stop\"}"))
+            (should (zerop (call-process-region (point-min) (point-max) "sh" nil nil nil
+                                                (claude-code-ide-codex-events--script-file)
+                                                "Stop"))))
+          (list (file-exists-p mark)
+                (directory-files dir nil claude-code-ide-codex-events--file-regexp)))
+      (delete-directory bin t))))
+
+(declare-function claude-code-ide-tests--script-lock-budget "claude-code-ide-session-status-tests")
+
+(ert-deftest claude-code-ide-codex-events-test-script-lock-budget ()
+  "The tries of the Codex hook script give 20 parallel writers enough time."
+  (claude-code-ide-tests--script-lock-budget claude-code-ide-codex-events--script))
 
 (ert-deftest claude-code-ide-codex-events-test-script-exits-without-identity ()
   "The script records nothing without CCI_INSTANCE_ID or with CODEX_THREAD_ID."
@@ -341,17 +364,17 @@ the seconds that it ran and the event files in DIR."
                  (claude-code-ide-codex-events--events-directory)))
            (events-dir (concat "CCI_EVENTS_DIR=" dir)))
       ;; No instance ID: it exits at once and writes nothing
-      (pcase-let ((`(,seconds ,files)
+      (pcase-let ((`(,went-on ,files)
                    (claude-code-ide-codex-events-tests--run-script
                     dir (list events-dir "CCI_GENERATION=1"))))
-        (should (< seconds 2))
+        (should-not went-on)
         (should-not files))
       ;; A nested Codex session: the same
-      (pcase-let ((`(,seconds ,files)
+      (pcase-let ((`(,went-on ,files)
                    (claude-code-ide-codex-events-tests--run-script
                     dir (list events-dir "CCI_INSTANCE_ID=cci-test-a" "CCI_GENERATION=1"
                               "CODEX_THREAD_ID=cci-test-parent"))))
-        (should (< seconds 2))
+        (should-not went-on)
         (should-not files))
       ;; Values that do not fit a file name
       (should-not (cadr (claude-code-ide-codex-events-tests--run-script
@@ -360,9 +383,10 @@ the seconds that it ran and the event files in DIR."
                          dir (list events-dir "CCI_INSTANCE_ID=cci-test-a" "CCI_GENERATION=1x"))))
       (should-not (directory-files dir nil "\\`[^.]"))
       ;; With the identity it writes one record, which Emacs reads
-      (pcase-let ((`(,_seconds ,files)
+      (pcase-let ((`(,went-on ,files)
                    (claude-code-ide-codex-events-tests--run-script
                     dir (list events-dir "CCI_INSTANCE_ID=cci-test-a" "CCI_GENERATION=12"))))
+        (should went-on)
         (should (equal files '("cci-test-a.12.00000001.Stop.json")))
         (let ((record (claude-code-ide-codex-events--read-file (expand-file-name (car files) dir))))
           (should (equal (alist-get 'event record) "Stop"))
@@ -800,7 +824,9 @@ trusted after a write."
                       (if (equal ,trust "trusted") (claude-code-ide-codex-events-tests--trust-toml) "")))
              (let ((claude-code-ide-codex-events-program
                     (claude-code-ide-codex-events-tests--fake-server ,dir hooks-file ,refuse))
-                   (claude-code-ide-codex-events-trust-timeout 5))
+                   ;; A loaded machine can answer slowly; tests of the
+                   ;; limit bind it themselves
+                   (claude-code-ide-codex-events-trust-timeout claude-code-ide-tests--wait-limit))
                ,@body))
          (delete-directory ,dir t)))))
 
@@ -842,12 +868,10 @@ real ~/.codex: the fake writes to DIR only."
            claude-code-ide-codex-events--checks)
   (clrhash claude-code-ide-codex-events--checks))
 
-(defun claude-code-ide-codex-events-tests--wait-checks (&optional seconds)
-  "Wait at most SECONDS (default 3) until no trust check runs."
-  (let ((deadline (+ (float-time) (or seconds 3))))
-    (while (and (> (hash-table-count claude-code-ide-codex-events--checks) 0)
-                (< (float-time) deadline))
-      (accept-process-output nil 0.05))))
+(defun claude-code-ide-codex-events-tests--wait-checks ()
+  "Wait until no trust check runs, at most `claude-code-ide-tests--wait-limit' s."
+  (claude-code-ide-tests--wait-until
+   (lambda () (zerop (hash-table-count claude-code-ide-codex-events--checks)))))
 
 (defun claude-code-ide-codex-events-tests--writes (dir)
   "Return the number of trust writes that the fake app-server in DIR got."
@@ -915,13 +939,17 @@ Then a trusted result of the background check gives the next one its hooks."
     (clrhash claude-code-ide-codex-events--trust-cache)
     (let* ((dir (make-temp-file "cci-test-codex-" t))
            (claude-code-ide-codex-events-program (claude-code-ide-codex-events-tests--silent-server dir))
-           (claude-code-ide-codex-events-trust-timeout 5)
-           (start (float-time)))
+           (claude-code-ide-codex-events-trust-timeout claude-code-ide-tests--wait-limit))
       (cl-letf (((symbol-function 'claude-code-ide-codex-events--start-trust-check)
                  claude-code-ide-codex-events-tests--real-trust-check))
         (unwind-protect
-            (pcase-let ((`(,args ,_env ,launch) (claude-code-ide-codex-events-tests--start "cci-test-nowait")))
-              (should (< (- (float-time) start) 1))
+            (pcase-let ((`(,args ,_env ,launch)
+                         ;; On the virtual clock, only a wait takes time
+                         (claude-code-ide-tests--call-with-clock
+                          (lambda ()
+                            (let ((start (float-time)))
+                              (prog1 (claude-code-ide-codex-events-tests--start "cci-test-nowait")
+                                (should (< (- (float-time) start) 1))))))))
               (should-not args)
               (should-not (claude-code-ide-codex-events--launch-hooks launch))
               ;; The check of that start answers trusted later
@@ -1153,19 +1181,37 @@ and nothing asks the user."
       (unwind-protect
           (let ((claude-code-ide-codex-events-program (claude-code-ide-codex-events-tests--silent-server dir))
                 (claude-code-ide-codex-events-trust-timeout 0.3)
-                (claude-code-ide-codex-events--background-limit 0.6)
-                (start (float-time)))
+                ;; The limit of the check runs on a real timer: no pause
+                ;; of a loaded machine reaches it during the wait
+                (claude-code-ide-codex-events--background-limit claude-code-ide-tests--wait-limit))
             (cl-letf (((symbol-function 'claude-code-ide-codex-events--start-trust-check)
                        claude-code-ide-codex-events-tests--real-trust-check)
                       ((symbol-function 'yes-or-no-p) (lambda (_prompt) (cl-incf asked) t)))
               (pcase-let ((`(,args ,_env ,launch)
-                           (claude-code-ide-codex-events-tests--start "cci-test-slow" t)))
-                (should (< (- (float-time) start) 2))
+                           ;; On the virtual clock, only the wait for the
+                           ;; answer takes time, however slow the machine is
+                           (claude-code-ide-tests--call-with-clock
+                            (lambda ()
+                              (let ((start (float-time)))
+                                (prog1 (claude-code-ide-codex-events-tests--start "cci-test-slow" t)
+                                  (should (< (- (float-time) start) 2))))))))
                 (should-not args)
                 (should (= asked 0))
                 (should (string-match-p "Hook trust unknown: no answer"
                                         (claude-code-ide-codex-events--launch-trust-detail launch)))
-                ;; The background check ends by itself
+                ;; The background check ends by itself at its limit; the
+                ;; test moves the timer of the limit to now
+                (let ((timer (claude-code-ide-codex-events--check-timer
+                              (gethash (claude-code-ide-codex-events--trust-key)
+                                       claude-code-ide-codex-events--checks))))
+                  (should (timerp timer))
+                  ;; The package activated it
+                  (should (memq timer timer-list))
+                  (should (< 0 (- (timer-until timer nil))
+                             (1+ claude-code-ide-codex-events--background-limit)))
+                  (cancel-timer timer)
+                  (timer-set-time timer (current-time))
+                  (timer-activate timer))
                 (claude-code-ide-codex-events-tests--wait-checks)
                 (should (zerop (hash-table-count claude-code-ide-codex-events--checks)))
                 (should (string-match-p "Hook trust unknown"
@@ -1314,21 +1360,24 @@ A model that is not known shows unknown (acceptance check 9)."
   (claude-code-ide-codex-events-tests--with-codex
     (claude-code-ide-tests--clear-processes)
     (unwind-protect
-        (let* ((instance (claude-code-ide-codex-events-tests--instance "cci-test-row" 1))
+        (let* ((now nil)
+               (instance (claude-code-ide-codex-events-tests--instance "cci-test-row" 1))
                (cc-buffer (generate-new-buffer "*cci-test-cc-row*"))
                (cc-session (claude-code-ide-tests--make-session "/tmp/cci-test-cc-row/" :buffer cc-buffer)))
           (claude-code-ide-instance-register
            (claude-code-ide-instance-create :id "cci-test-cc-row" :provider 'claude
                                             :session cc-session :buffer cc-buffer))
           (claude-code-ide-codex-events--track instance)
+          ;; One time for the events and the rows: a slow machine
+          ;; does not age the events
+          (setq now (float-time))
           (claude-code-ide-codex-events-tests--feed
            "cci-test-row" 1
            '(("UserPromptSubmit" "{}")
              ("PreToolUse" "{\"tool_name\":\"Bash\",\"tool_use_id\":\"t1\",\"tool_input\":{\"command\":\"make\"}}")
              ("PermissionRequest" "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"make\"}}"))
-           (- (float-time) 3))
-          (let* ((now (float-time))
-                 (rows (claude-code-ide-session-status--rows now))
+           (- now 3))
+          (let* ((rows (claude-code-ide-session-status--rows now))
                  (entries (claude-code-ide-session-status--entries rows now))
                  (codex-row (assq instance rows))
                  (codex-entry (cadr (assq instance entries)))
@@ -1908,19 +1957,24 @@ nothing."
   "After the question, the write and the re-check each get the full time limit.
 A slow check that used up the limit before the question does not cut them."
   (claude-code-ide-codex-events-tests--with-lazy-trust (dir "untrusted")
-    (let ((claude-code-ide-codex-events-trust-timeout 1.5)
+    (let ((limit claude-code-ide-codex-events-trust-timeout)
           (timeouts nil)
           (call (symbol-function 'claude-code-ide-codex-events--server-call))
           (wait (symbol-function 'claude-code-ide-codex-events--wait-check)))
+      ;; The check uses up the whole limit on the virtual clock
       (cl-letf (((symbol-function 'claude-code-ide-codex-events--wait-check)
-                 (lambda (&rest args) (prog1 (apply wait args) (sleep-for 1.4))))
+                 (lambda (&rest args)
+                   (prog1 (apply wait args) (claude-code-ide-tests--advance-clock limit))))
                 ((symbol-function 'claude-code-ide-codex-events--server-call)
                  (lambda (server method params &optional timeout)
                    (push (cons method timeout) timeouts)
                    (funcall call server method params timeout))))
-        (should (car (claude-code-ide-codex-events-tests--start "cci-test-slow-yes" t))))
+        (should (car (claude-code-ide-tests--call-with-clock
+                      (lambda ()
+                        (claude-code-ide-codex-events-tests--start "cci-test-slow-yes" t))))))
       (should (= asked 1))
-      (should (equal (reverse timeouts) '(("config/batchWrite" . 1.5) ("hooks/list" . 1.5)))))))
+      (should (equal (reverse timeouts)
+                     (list (cons "config/batchWrite" limit) (cons "hooks/list" limit)))))))
 
 (ert-deftest claude-code-ide-codex-events-test-prepare-trust-after-no ()
   "After a no in this Emacs, `claude-code-ide-codex-prepare-trust' starts nothing."

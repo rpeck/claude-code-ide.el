@@ -869,8 +869,13 @@ registry defaults when the registry options are not bound."
           (claude-code-ide-session-registry-report-directory (nth 1 settings)))
       (should (equal (claude-code-ide-mcp-server--report-directory)
                      (claude-code-ide-session-registry--report-directory)))))
-  ;; The registry not loaded: its options are unbound
-  (let ((loaded (claude-code-ide-mcp-server--report-directory))
+  ;; The registry not loaded: its options are unbound.  Their defaults
+  ;; give the folder of the loaded registry with its default options;
+  ;; the test run binds other values.
+  (let ((loaded (let ((claude-code-ide-state-file
+                       (eval (car (get 'claude-code-ide-state-file 'standard-value)) t))
+                      (claude-code-ide-session-registry-report-directory nil))
+                  (claude-code-ide-mcp-server--report-directory)))
         (state claude-code-ide-state-file)
         (reports claude-code-ide-session-registry-report-directory))
     (unwind-protect
@@ -880,9 +885,7 @@ registry defaults when the registry options are not bound."
           (should (equal (claude-code-ide-mcp-server--report-directory)
                          (file-name-as-directory
                           (expand-file-name "~/.emacs-claude-code-ide-state-reports"))))
-          (when (and (equal state (eval (car (get 'claude-code-ide-state-file 'standard-value)) t))
-                     (null reports))
-            (should (equal (claude-code-ide-mcp-server--report-directory) loaded))))
+          (should (equal (claude-code-ide-mcp-server--report-directory) loaded)))
       (set-default 'claude-code-ide-state-file state)
       (set-default 'claude-code-ide-session-registry-report-directory reports)))
   ;; The default of the server equals the default of the registry

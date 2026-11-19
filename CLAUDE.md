@@ -118,5 +118,10 @@ Tests use mocks for external dependencies (vterm, websocket) to run in batch mod
 - MCP handlers (file operations, diagnostics)
 - Edge cases (side windows, multiple sessions)
 
+Tests must not depend on the machine load or on other test runs:
+- Wait for a condition with `claude-code-ide-tests--wait-until` (60 s limit), never for a fixed time.
+- A test of a time limit of the package runs on `claude-code-ide-tests--call-with-clock`: a virtual clock that moves only by the waits. The test also fails after 20 s of real time.
+- While ERT runs, `claude-code-ide-tests--isolate-run` (an advice on `ert-run-tests`) binds the state file, the lock file folder, the MCP config folder, the provider file, `CLAUDE_CONFIG_DIR` and `CODEX_HOME` to a new folder of the run (`claude-code-ide-tests--run-directory`), and removes it after the run. Never write to a fixed shared path in a test, and never read or write the user's live folders (`~/.claude`, `~/.codex`, the live state files).
+
 ## Committing code
 Never commit changes unless the user explicitly asks you to.

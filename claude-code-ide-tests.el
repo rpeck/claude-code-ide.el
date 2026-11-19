@@ -214,6 +214,183 @@ routing tests depend on the carried text, not a placeholder."
 (define-error 'mcp-error "MCP Error" 'error)
 (require 'claude-code-ide-mcp-handlers)
 (require 'claude-code-ide)
+(require 'claude-code-ide-mcp)
+
+;;; A private folder for each test run
+
+;; Two test runs can run at the same time, for example in two
+;; worktrees.  So no test of a run uses a fixed shared path: the lock
+;; files of the MCP servers, the state file and its report folder, the
+;; inbox, the review records, the MCP config files, the provider file,
+;; and the configuration folders of Claude Code and Codex all go to a
+;; new folder of the run.  Tests that need their own folders still
+;; bind them.
+;;
+;; The isolation holds only while ERT runs tests, in batch mode and
+;; with M-x ert alike.  Loading this file changes none of these
+;; settings, so a running Emacs keeps its own after the tests.
+
+(defvar claude-code-ide-tests--run-directory nil
+  "Temporary folder of the current test run, or nil outside a run.")
+
+(defun claude-code-ide-tests--run-lockfile-directory ()
+  "Return the folder for the MCP lock files of the current test run.
+It replaces ~/.claude/ide/, which the CLIs that run on this machine
+read."
+  (expand-file-name "ide/" claude-code-ide-tests--run-directory))
+
+(defun claude-code-ide-tests--isolate-run (run &rest args)
+  "Call RUN with ARGS in a new temporary folder for all shared paths.
+RUN is `ert-run-tests'.  The folder is made before the run and removed
+after it; each setting is as before after the run.  A function that
+the run put on `kill-emacs-hook', such as the removal of a status
+snapshot, is taken off again: at the quit it would act on the paths
+of this Emacs, not on those of the run."
+  (let* ((quit-hooks (default-value 'kill-emacs-hook))
+         (dir (file-name-as-directory (make-temp-file "cci-test-run-" t)))
+         (claude-code-ide-tests--run-directory dir)
+         (claude-code-ide-state-file (expand-file-name "state.json" dir))
+         (claude-code-ide-session-registry-report-directory nil)
+         (claude-code-ide-control-inbox-directory nil)
+         (claude-code-ide-review-directory nil)
+         (claude-code-ide-mcp-server-coordinator-credential-file nil)
+         (claude-code-ide-mcp-config-directory (expand-file-name "mcp-config" dir))
+         (claude-code-ide-provider-file (expand-file-name "current-provider" dir))
+         (process-environment
+          (append (list (concat "CLAUDE_CONFIG_DIR=" (expand-file-name "claude-config" dir))
+                        (concat "CODEX_HOME=" (expand-file-name "codex-home" dir)))
+                  process-environment)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'claude-code-ide-mcp--lockfile-directory)
+                   #'claude-code-ide-tests--run-lockfile-directory))
+          (apply run args))
+      (dolist (function (default-value 'kill-emacs-hook))
+        (unless (memq function quit-hooks)
+          (remove-hook 'kill-emacs-hook function)))
+      (ignore-errors (delete-directory dir t)))))
+
+(advice-add 'ert-run-tests :around #'claude-code-ide-tests--isolate-run)
+
+;;; Waits and time
+
+;; A loaded machine can make each step of a test many times slower.
+;; So a test waits for a condition, with a generous limit, and not for
+;; a fixed time.  A test of a time limit of the package runs on a
+;; virtual clock, so that only the waits count, not the speed of the
+;; machine.
+
+(defconst claude-code-ide-tests--wait-limit 60
+  "Seconds that a test waits at most for a condition.")
+
+(defconst claude-code-ide-tests--real-float-time (symbol-function 'float-time)
+  "The real `float-time', also while a test replaces it.")
+
+(defun claude-code-ide-tests--wait-until (predicate &optional seconds)
+  "Wait until PREDICATE returns non-nil, and return its value.
+Process output, sentinels and timers run during the wait.  The wait
+ends with nil after SECONDS (default `claude-code-ide-tests--wait-limit')
+of real time, also on a virtual clock."
+  (let ((deadline (+ (funcall claude-code-ide-tests--real-float-time)
+                     (or seconds claude-code-ide-tests--wait-limit)))
+        (value (funcall predicate)))
+    (while (and (not value)
+                (< (funcall claude-code-ide-tests--real-float-time) deadline))
+      (accept-process-output nil 0.05)
+      (setq value (funcall predicate)))
+    value))
+
+(defvar claude-code-ide-tests--clock nil
+  "Time of the virtual clock of `claude-code-ide-tests--call-with-clock', or nil.")
+
+(defconst claude-code-ide-tests--clock-real-limit 20
+  "Seconds of real time that a test on the virtual clock may take at most.")
+
+(defun claude-code-ide-tests--advance-clock (seconds)
+  "Move the virtual clock SECONDS forward.
+The clock never goes back: a negative or missing step counts as 0, and
+signals an error, because a wait without a limit or with a negative
+one is a fault in a test of a time limit."
+  (unless (and (numberp seconds) (>= seconds 0))
+    (error "Virtual clock: a step of %S seconds" seconds))
+  (setq claude-code-ide-tests--clock (+ claude-code-ide-tests--clock seconds)))
+
+(defun claude-code-ide-tests--call-with-clock (function)
+  "Call FUNCTION with a virtual clock, and return its value.
+Only for tests of a time limit.  The clock starts at the real time, and
+`float-time' without an argument returns it.  It moves only by the
+time limit of each wait: `accept-process-output' and `sleep-for' still
+wait as usual, and then add their limit to the clock.
+`claude-code-ide-tests--advance-clock' moves it too.  So the work
+between two waits takes no time on the clock, however slow the machine
+is.  A wait without a limit signals an error.  The test also fails
+when FUNCTION takes more than `claude-code-ide-tests--clock-real-limit'
+seconds of real time, so a real block does not hide behind the clock."
+  (let* ((real-time claude-code-ide-tests--real-float-time)
+         (real-accept (symbol-function 'accept-process-output))
+         (real-sleep (symbol-function 'sleep-for))
+         (real-start (funcall real-time))
+         (claude-code-ide-tests--clock real-start))
+    (prog1
+        (cl-letf (((symbol-function 'float-time)
+                   (lambda (&optional time)
+                     (if time (funcall real-time time) claude-code-ide-tests--clock)))
+                  ((symbol-function 'accept-process-output)
+                   (lambda (&optional process seconds millisec just-this-one)
+                     (unless (numberp seconds)
+                       (error "Virtual clock: accept-process-output without a time limit"))
+                     (prog1 (funcall real-accept process seconds millisec just-this-one)
+                       (claude-code-ide-tests--advance-clock
+                        (+ seconds (if (numberp millisec) (/ millisec 1000.0) 0))))))
+                  ((symbol-function 'sleep-for)
+                   (lambda (seconds &optional millisec)
+                     (prog1 (funcall real-sleep seconds millisec)
+                       (claude-code-ide-tests--advance-clock
+                        (+ seconds (if (numberp millisec) (/ millisec 1000.0) 0)))))))
+          (funcall function))
+      (should (< (- (funcall real-time) real-start)
+                 claude-code-ide-tests--clock-real-limit)))))
+
+(ert-deftest claude-code-ide-test-helpers-virtual-clock ()
+  "The virtual clock moves by the waits only, never back, and not without a limit.
+A real block longer than its limit fails the test."
+  (claude-code-ide-tests--call-with-clock
+   (lambda ()
+     (let ((start (float-time)))
+       (accept-process-output nil 0.05)
+       (sleep-for 0.05)
+       (claude-code-ide-tests--advance-clock 10)
+       (should (< (abs (- (float-time) start 10.1)) 1e-6))
+       (should-error (accept-process-output nil nil))
+       (should-error (claude-code-ide-tests--advance-clock -1))
+       (should (< (abs (- (float-time) start 10.1)) 1e-6)))))
+  (let ((claude-code-ide-tests--clock-real-limit 0.1))
+    (should-error (claude-code-ide-tests--call-with-clock
+                   (lambda ()
+                     (let ((end (+ (funcall claude-code-ide-tests--real-float-time) 0.3)))
+                       (while (< (funcall claude-code-ide-tests--real-float-time) end)))))
+                  :type 'ert-test-failed)))
+
+(ert-deftest claude-code-ide-test-helpers-wait-until ()
+  "The wait returns the value of the condition at once, or nil at its limit."
+  (should (eq (claude-code-ide-tests--wait-until (lambda () 'cci-test)) 'cci-test))
+  (let ((start (funcall claude-code-ide-tests--real-float-time)))
+    (should-not (claude-code-ide-tests--wait-until #'ignore 0.2))
+    (should (>= (- (funcall claude-code-ide-tests--real-float-time) start) 0.2))))
+
+(ert-deftest claude-code-ide-test-helpers-run-isolation ()
+  "A test run has its own folder for the shared paths, inside the run only."
+  (should claude-code-ide-tests--run-directory)
+  (should (file-directory-p claude-code-ide-tests--run-directory))
+  (dolist (path (list claude-code-ide-state-file
+                      (claude-code-ide-mcp--lockfile-directory)
+                      claude-code-ide-mcp-config-directory
+                      claude-code-ide-provider-file
+                      (getenv "CLAUDE_CONFIG_DIR")
+                      (getenv "CODEX_HOME")))
+    (should (string-prefix-p claude-code-ide-tests--run-directory path)))
+  (should-not claude-code-ide-session-registry-report-directory)
+  (should-not claude-code-ide-control-inbox-directory)
+  (should-not claude-code-ide-review-directory))
 
 ;; Load every claude-code-ide-*-tests.el file of this folder, in name
 ;; order, so that a branch adds its tests without an edit here.  The
@@ -305,18 +482,6 @@ Used by tests that create real per-instance WebSocket servers."
   (dolist (session (claude-code-ide-mcp--active-sessions))
     (ignore-errors (claude-code-ide-mcp--stop-session session))))
 
-(defun claude-code-ide-tests--wait-for-process (buffer)
-  "Wait for the process in BUFFER to finish.
-This prevents race conditions in tests by ensuring mock processes
-have completed before cleanup.  Waits up to 5 seconds."
-  (with-current-buffer buffer
-    (let ((max-wait 50)) ; 5 seconds max (50 * 0.1s)
-      (while (and vterm--process
-                  (process-live-p vterm--process)
-                  (> max-wait 0))
-        (sleep-for 0.1)
-        (setq max-wait (1- max-wait))))))
-
 ;;; Tests for Helper Functions
 
 (ert-deftest claude-code-ide-test-default-buffer-name ()
@@ -398,7 +563,7 @@ have completed before cleanup.  Waits up to 5 seconds."
   "Test that only sessions with a dead terminal process are cleaned up."
   (claude-code-ide-tests--clear-processes)
   (let ((live-process (make-process :name "test-live"
-                                    :command '("sleep" "10")
+                                    :command '("sleep" "300")
                                     :buffer nil))
         (dead-process (make-process :name "test-dead"
                                     :command '("true")
@@ -3951,12 +4116,16 @@ LSP-ON is the buffer's initial `lsp-mode' value; PROJECT is what
   (claude-code-ide-tests--with-lsp-mocks nil '(transient . "/tmp/")
                                          (cl-letf (((symbol-function 'lsp)
                                                     (lambda (&rest _) (setq started (1+ started)))))
-                                           (let ((cci-ensure-lsp-timeout 0.3)
-                                                 (t0 (float-time)))
-                                             (cci-ensure-lsp "some_symbol" file)
-                                             (should (= started 1))
-                                             (should (= primed 0))
-                                             (should (< (- (float-time) t0) 2))))))
+                                           ;; On the virtual clock, only the
+                                           ;; wait for lsp-mode takes time
+                                           (claude-code-ide-tests--call-with-clock
+                                            (lambda ()
+                                              (let ((cci-ensure-lsp-timeout 0.3)
+                                                    (t0 (float-time)))
+                                                (cci-ensure-lsp "some_symbol" file)
+                                                (should (= started 1))
+                                                (should (= primed 0))
+                                                (should (< (- (float-time) t0) 2))))))))
 
 (ert-deftest claude-code-ide-test-cci-ensure-lsp-advises-xref-tools ()
   "References resolve their arguments first; apropos ensures lsp-mode first."

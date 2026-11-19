@@ -34,19 +34,8 @@
 (defvar claude-code-ide-process-quit-timeout)
 (defvar claude-code-ide-debug-buffer)
 
-;;; Temporary folders for the whole test run
-
-(defvar claude-code-ide-wiring-tests--root (make-temp-file "cci-test-wiring-" t)
-  "Temporary folder of this test run.")
-
-(setq claude-code-ide-mcp-config-directory
-      (expand-file-name "mcp-config" claude-code-ide-wiring-tests--root)
-      claude-code-ide-provider-file
-      (expand-file-name "current-provider" claude-code-ide-wiring-tests--root))
-
-(add-hook 'kill-emacs-hook
-          (lambda ()
-            (ignore-errors (delete-directory claude-code-ide-wiring-tests--root t))))
+;; The MCP config folder and the provider file of a test run are in
+;; the folder of the run; see `claude-code-ide-tests--isolate-run'.
 
 ;;; Helpers
 
