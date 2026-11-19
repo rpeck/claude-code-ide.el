@@ -57,6 +57,7 @@
 (require 'claude-code-ide-instance)
 (require 'claude-code-ide-session-registry)
 (require 'claude-code-ide-session-status)
+(require 'claude-code-ide-transcript)
 
 ;;; Customization
 
@@ -229,10 +230,11 @@ Only the current launch of an instance has a record.")
 (defvar claude-code-ide-codex-events--trust-cache (make-hash-table :test 'equal)
   "Trust results by key; see `claude-code-ide-codex-events--trust-key'.
 Each value is a plist with :status (`trusted', `untrusted' or
-`disabled'), :message, :hooks (the hooks that Codex does not run) and
-:config-stamp, the modification time and size of the Codex config file
-at the check.  A result is valid only while the config file keeps that
-stamp.")
+`disabled'), :message, :hooks (the hooks that Codex does not run),
+:trust (for `trusted': the (STATE-KEY . HASH) of each of our hooks
+that `hooks/list' called trusted) and :config-stamp, the modification
+time and size of the Codex config file at the check.  See
+`claude-code-ide-codex-events--cached-trust' for when it is valid.")
 
 (defvar claude-code-ide-codex-events--checks (make-hash-table :test 'equal)
   "The running trust check of each key, a `claude-code-ide-codex-events--check'.
@@ -1063,7 +1065,12 @@ hooks of this package that Codex does not run; :message explains it."
        ((< (length hooks) expected)
         (list :status 'error
               :message (format "Codex lists %d of %d status hooks" (length hooks) expected)))
-       (t (list :status 'trusted :message nil))))))
+       (t (list :status 'trusted :message nil
+                :trust (mapcar (lambda (hook)
+                                 (cons (alist-get 'key hook) (alist-get 'currentHash hook)))
+                               (cl-remove-if-not
+                                (lambda (hook) (equal (alist-get 'trustStatus hook) "trusted"))
+                                hooks))))))))
 
 (defun claude-code-ide-codex-events--config-file ()
   "Return the Codex config file, where Codex keeps the hook trust.
@@ -1093,13 +1100,43 @@ A result that is not `trusted', `untrusted' or `disabled' is not kept."
                          result)
              claude-code-ide-codex-events--trust-cache)))
 
+(defun claude-code-ide-codex-events--config-trusts-p (trust)
+  "Return non-nil when the Codex config file still trusts TRUST.
+TRUST is a list of (STATE-KEY . HASH).  Each STATE-KEY must have
+`trusted_hash' equal to HASH in the table `hooks.state', and must not
+have `enabled = false'.  The file is only read, with the tolerant TOML
+reader of claude-code-ide-transcript.el.  A missing or unreadable file,
+and a form that the reader does not know, give nil."
+  (condition-case nil
+      (let ((file (claude-code-ide-codex-events--config-file)))
+        (when (and (file-regular-p file) (file-readable-p file))
+          (with-temp-buffer
+            (let ((coding-system-for-read 'utf-8))
+              (insert-file-contents file))
+            (let ((entries (claude-code-ide-transcript--toml-entries)))
+              (cl-every (lambda (pair)
+                          (and (equal (cdr (assoc (list "hooks" "state" (car pair) "trusted_hash")
+                                                  entries))
+                                      (cdr pair))
+                               (not (eq (cdr (assoc (list "hooks" "state" (car pair) "enabled")
+                                                    entries))
+                                        :false))))
+                        trust)))))
+    (error nil)))
+
 (defun claude-code-ide-codex-events--cached-trust (key)
   "Return the cached trust result of KEY, or nil.
-A result is valid only while the Codex config file has the time and
-the size of the check: /hooks, a trust or another program can change
-the trust in it."
+A `trusted' result is valid while the Codex config file still has the
+trust records that `hooks/list' reported (see
+`claude-code-ide-codex-events--config-trusts-p'), whatever else in the
+file changed: Codex writes the file at each terminal start.  An
+`untrusted' or `disabled' result is valid while the file keeps the
+time and the size of the check, because /hooks in a terminal can trust
+or enable the hooks.  An invalid result leaves the cache."
   (when-let* ((cached (gethash key claude-code-ide-codex-events--trust-cache)))
-    (if (equal (plist-get cached :config-stamp) (claude-code-ide-codex-events--config-stamp))
+    (if (if (eq (plist-get cached :status) 'trusted)
+            (claude-code-ide-codex-events--config-trusts-p (plist-get cached :trust))
+          (equal (plist-get cached :config-stamp) (claude-code-ide-codex-events--config-stamp)))
         cached
       (remhash key claude-code-ide-codex-events--trust-cache)
       nil)))
