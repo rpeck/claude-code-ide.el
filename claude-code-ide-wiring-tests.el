@@ -1044,7 +1044,7 @@ The order holds also after the files are evaluated again."
       (claude-code-ide-set-current-provider 'codex)
       (let ((started nil))
         (cl-letf (((symbol-function 'claude-code-ide--start-session)
-                   (lambda (&optional continue resume spec)
+                   (lambda (&optional continue resume spec _interactive)
                      (push (list claude-code-ide-default-provider continue resume spec) started))))
           (let ((current-prefix-arg nil))
             (call-interactively #'claude-code-ide)

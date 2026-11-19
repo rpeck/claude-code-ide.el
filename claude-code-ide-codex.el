@@ -512,13 +512,14 @@ variables.  When the user's list cannot be read, the values go in
   (let ((generation (claude-code-ide-instance-generation instance)))
     (and (integerp generation) (> generation 0))))
 
-(defun claude-code-ide-codex--hook-args (instance)
+(defun claude-code-ide-codex--hook-args (instance &optional interactive)
   "Return the status hook arguments of INSTANCE, or nil.
 The `codex-status' part gives them, when it is loaded and INSTANCE has
-its launch generation."
+its launch generation.  INTERACTIVE, the `interactive' slot of the
+start spec, lets it ask the user to trust the hooks."
   (when (and (fboundp 'claude-code-ide-codex-status-hook-args)
              (claude-code-ide-codex--launched-p instance))
-    (funcall 'claude-code-ide-codex-status-hook-args instance)))
+    (funcall 'claude-code-ide-codex-status-hook-args instance interactive)))
 
 (defun claude-code-ide-codex--hook-env (instance)
   "Return the status hook environment entries of INSTANCE, or nil."
@@ -551,7 +552,7 @@ MCP-ENVIRONMENT holds the variables of the MCP headers."
            (claude-code-ide-codex--toml-string
             (claude-code-ide-codex--developer-instructions)))))
 
-(defun claude-code-ide-codex--command (instance args subcommand positional)
+(defun claude-code-ide-codex--command (instance args subcommand positional &optional interactive)
   "Return (:command :environment) for INSTANCE.
 SUBCOMMAND is a list of words after the program, such as (\"resume\").
 Then come the common arguments, the hook arguments,
@@ -560,12 +561,13 @@ arguments, which come last so that they win over an earlier -c of the
 same key.  POSITIONAL, a list of words such as a native ID and a
 prompt, comes after \"--\", so that no option takes it as a value and
 no word of it is a subcommand.  The model of INSTANCE becomes the one
-of the extra flags."
+of the extra flags.  INTERACTIVE is the `interactive' slot of the start
+spec, for the hook trust."
   (let* ((mcp (claude-code-ide-codex--mcp-setup instance))
          (flags (string-trim (or claude-code-ide-codex-extra-flags "")))
          (words (append subcommand
                         (claude-code-ide-codex--common-args)
-                        (claude-code-ide-codex--hook-args instance))))
+                        (claude-code-ide-codex--hook-args instance interactive))))
     (setf (claude-code-ide-instance-model instance)
           (claude-code-ide-or-unknown (claude-code-ide-codex--flags-model)))
     (list :command (concat
@@ -587,7 +589,8 @@ INSTANCE is the descriptor, SPEC the start spec, and ARGS the caller's
 extra arguments.  SPEC's prompt is the first prompt.  SPEC's extra
 flags are not used: they hold Claude Code flags."
   (let ((prompt (claude-code-ide-start-spec-prompt spec)))
-    (claude-code-ide-codex--command instance args nil (and prompt (list prompt)))))
+    (claude-code-ide-codex--command instance args nil (and prompt (list prompt))
+                                    (claude-code-ide-start-spec-interactive spec))))
 
 (defun claude-code-ide-codex--resume (instance spec args)
   "Return the command that resumes a Codex conversation of INSTANCE.
@@ -596,17 +599,19 @@ resume --last', and its resume flag the picker of `codex resume'.
 Only a resume of an ID can take SPEC's prompt: with --last or the
 picker, Codex would read the prompt as a session ID."
   (let ((resume-id (claude-code-ide-start-spec-resume-id spec))
-        (prompt (claude-code-ide-start-spec-prompt spec)))
+        (prompt (claude-code-ide-start-spec-prompt spec))
+        (interactive (claude-code-ide-start-spec-interactive spec)))
     (cond
      (resume-id
       (claude-code-ide-codex--command instance args '("resume")
-                                      (cons resume-id (and prompt (list prompt)))))
+                                      (cons resume-id (and prompt (list prompt)))
+                                      interactive))
      (prompt
       (user-error "Codex cannot take a first prompt with `codex resume --last' or the picker, because it reads the prompt as a session ID.  Resume a session ID, or type the prompt after the start"))
      ((claude-code-ide-start-spec-continue spec)
-      (claude-code-ide-codex--command instance args '("resume" "--last") nil))
+      (claude-code-ide-codex--command instance args '("resume" "--last") nil interactive))
      (t
-      (claude-code-ide-codex--command instance args '("resume") nil)))))
+      (claude-code-ide-codex--command instance args '("resume") nil interactive)))))
 
 (defun claude-code-ide-codex--fork (instance spec args)
   "Return the command that starts INSTANCE in a fork of SPEC's resume ID.
@@ -619,7 +624,8 @@ no prompt goes to the conversation that was forked."
       (error "A fork needs the native ID of the conversation to fork"))
     (setf (claude-code-ide-instance-native-id instance) 'unknown)
     (claude-code-ide-codex--command instance args '("fork")
-                                    (cons resume-id (and prompt (list prompt))))))
+                                    (cons resume-id (and prompt (list prompt)))
+                                    (claude-code-ide-start-spec-interactive spec))))
 
 ;;; Detection and exit
 
@@ -810,13 +816,14 @@ text of the screen.  It never sends keys."
 
 ;;; Commands
 
-(defun claude-code-ide-codex--start (&optional continue resume)
+(defun claude-code-ide-codex--start (&optional continue resume interactive)
   "Start a Codex instance for the current project.
-CONTINUE and RESUME are as for `claude-code-ide--start-session'.
-Codex becomes the current provider, as the menu toggle makes it."
+CONTINUE, RESUME and INTERACTIVE are as for
+`claude-code-ide--start-session'.  Codex becomes the current provider,
+as the menu toggle makes it."
   (claude-code-ide-set-current-provider 'codex)
   (let ((claude-code-ide-default-provider 'codex))
-    (claude-code-ide--start-session continue resume)))
+    (claude-code-ide--start-session continue resume nil interactive)))
 
 ;;;###autoload
 (defun claude-code-ide-codex ()
@@ -826,22 +833,19 @@ With a prefix argument, or when the project has instances, ask for an
 instance name.  When the Codex status hooks are not trusted yet, the
 start offers to trust them."
   (interactive)
-  (let ((claude-code-ide-interactive-start (called-interactively-p 'any)))
-    (claude-code-ide-codex--start)))
+  (claude-code-ide-codex--start nil nil (called-interactively-p 'any)))
 
 ;;;###autoload
 (defun claude-code-ide-codex-continue ()
   "Start a Codex instance that continues the most recent conversation."
   (interactive)
-  (let ((claude-code-ide-interactive-start (called-interactively-p 'any)))
-    (claude-code-ide-codex--start t)))
+  (claude-code-ide-codex--start t nil (called-interactively-p 'any)))
 
 ;;;###autoload
 (defun claude-code-ide-codex-resume ()
   "Start a Codex instance with the picker of earlier conversations."
   (interactive)
-  (let ((claude-code-ide-interactive-start (called-interactively-p 'any)))
-    (claude-code-ide-codex--start nil t)))
+  (claude-code-ide-codex--start nil t (called-interactively-p 'any)))
 
 ;;; The provider
 
