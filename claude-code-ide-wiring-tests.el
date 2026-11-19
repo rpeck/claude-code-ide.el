@@ -78,15 +78,36 @@
            (progn ,@body)
          (claude-code-ide-wiring-tests--cleanup)))))
 
+(defmacro claude-code-ide-wiring-tests--with-provider-file (&rest body)
+  "Run BODY with an empty provider file in a new folder, not yet read."
+  (declare (indent 0))
+  `(let* ((provider-root (make-temp-file "cci-test-provider-" t))
+          (claude-code-ide-provider-file (expand-file-name "sub/current-provider" provider-root))
+          (claude-code-ide--current-provider nil)
+          (claude-code-ide--current-provider-read nil)
+          (claude-code-ide-default-provider 'claude))
+     (unwind-protect
+         (progn ,@body)
+       (delete-directory provider-root t))))
+
+(defmacro claude-code-ide-wiring-tests--quiet (&rest body)
+  "Run BODY with `message' silenced."
+  (declare (indent 0))
+  `(cl-letf (((symbol-function 'message) #'ignore))
+     ,@body))
+
 (defvar claude-code-ide-wiring-tests--steps nil
   "Steps of the current mocked start, newest first.
 A function on a hook can push its own step here.")
 
-(cl-defun claude-code-ide-wiring-tests--start (spec &key process call)
+(cl-defun claude-code-ide-wiring-tests--start (spec &key process call run-launch terminal-error)
   "Start an instance as SPEC says, with the terminal mocked.
 PROCESS is the process of the terminal; the default is a new `sleep'.
 CALL, when non-nil, is a function without arguments that runs in place
 of the start, for example a command.
+RUN-LAUNCH non-nil makes the mocked terminal call the launch function,
+as the real terminal does.  TERMINAL-ERROR non-nil makes it then
+signal an error, as a terminal backend that fails.
 Return a plist: :session, :launch (the start spec of the launch),
 :launch-fn (the function that gives the command), :buffer, :process,
 :logs (the `claude-code-ide-log' texts, oldest first) and :order (the
@@ -105,14 +126,21 @@ steps of the start, oldest first)."
                (lambda (&optional _) '(:available t :program "codex" :version unknown)))
               ((symbol-function 'claude-code-ide--terminal-ensure-backend) #'ignore)
               ((symbol-function 'claude-code-ide-mcp-create-session)
-               (lambda (dir session-id &optional instance-name)
-                 (push 'ide-server claude-code-ide-wiring-tests--steps)
-                 (claude-code-ide-tests--make-session
-                  dir :session-id session-id :instance-name instance-name :port 12345)))
+               (lambda (dir session-id &optional instance-name no-ide-server)
+                 (if no-ide-server
+                     ;; The real session without an IDE server
+                     (claude-code-ide-mcp--create-plain-session dir session-id instance-name)
+                   (push 'ide-server claude-code-ide-wiring-tests--steps)
+                   (claude-code-ide-tests--make-session
+                    dir :session-id session-id :instance-name instance-name :port 12345))))
               ((symbol-function 'claude-code-ide--create-terminal-session)
                (lambda (&rest args)
                  (push 'spawn claude-code-ide-wiring-tests--steps)
                  (setq launch-fn (nth 8 args))
+                 (when (or run-launch terminal-error)
+                   (funcall launch-fn))
+                 (when terminal-error
+                   (error "cci-test terminal failed"))
                  (cons buffer process)))
               ((symbol-function 'claude-code-ide-mcp-server-session-started)
                (lambda (&rest _) (push 'tools-server claude-code-ide-wiring-tests--steps)))
@@ -230,8 +258,10 @@ With PATH-SECRET, the URL path also carries a secret."
           (cl-letf (((symbol-function 'claude-code-ide-mcp--lockfile-directory)
                      (lambda () (file-name-as-directory lock-dir))))
             ;; Without the IDE protocol: no server, and the stop works
-            (let ((plain (claude-code-ide--create-plain-session "/tmp/cci-test-wiring/proj/"
-                                                                "cci-test-plain")))
+            (let ((plain (claude-code-ide-mcp-create-session "/tmp/cci-test-wiring/proj/"
+                                                             "cci-test-plain" nil 'no-ide-server)))
+              (should-not (claude-code-ide-mcp-session-port plain))
+              (should-not (claude-code-ide-mcp-session-server plain))
               (should (eq (claude-code-ide-mcp--get-session-by-id "cci-test-plain") plain))
               (claude-code-ide-mcp--stop-session plain)
               (should-not (claude-code-ide-mcp--get-session-by-id "cci-test-plain"))
@@ -315,12 +345,31 @@ With PATH-SECRET, the URL path also carries a secret."
                                                         :extra-flags "-m cci-test-gpt"))))
         (should (equal (claude-code-ide-start-spec-extra-flags (plist-get codex :launch))
                        "-m cci-test-gpt")))
-      (let* ((cc (claude-code-ide-wiring-tests--start
-                  (claude-code-ide-wiring-tests--spec :instance-name "cc")))
-             (instance (claude-code-ide-instance-of-session (plist-get cc :session))))
-        (should (equal (claude-code-ide-start-spec-extra-flags (plist-get cc :launch))
-                       "--model cci-test-opus --cc-only"))
-        (should (equal (claude-code-ide-instance-model instance) "cci-test-opus"))))))
+      ;; The claude launch reads its own flags and model; the start
+      ;; passes only the flags of the spec
+      (cl-letf (((symbol-function 'claude-code-ide-mcp-server-ensure-server) #'ignore))
+        (let* ((cc (claude-code-ide-wiring-tests--start
+                    (claude-code-ide-wiring-tests--spec :instance-name "cc") :run-launch t))
+               (instance (claude-code-ide-instance-of-session (plist-get cc :session)))
+               (command (plist-get (funcall (plist-get cc :launch-fn)) :command)))
+          (should (equal (claude-code-ide-start-spec-extra-flags (plist-get cc :launch))
+                         "--model cci-test-opus --cc-only"))
+          (should (equal (claude-code-ide-instance-model instance) "cci-test-opus"))
+          (should (string-search " --model cci-test-opus --cc-only" command))
+          (should-not (cl-some (lambda (text) (string-search "debug mode" text))
+                               (plist-get cc :logs))))
+        ;; A spec's own flags win; the debug mode shows in the start text
+        (let* ((claude-code-ide-cli-debug t)
+               (cc (claude-code-ide-wiring-tests--start
+                    (claude-code-ide-wiring-tests--spec :instance-name "own-cc"
+                                                        :extra-flags "--model cci-test-sonnet")
+                    :run-launch t))
+               (instance (claude-code-ide-instance-of-session (plist-get cc :session))))
+          (should (equal (claude-code-ide-instance-model instance) "cci-test-sonnet"))
+          (should (cl-some (lambda (text)
+                             (string-match-p "\\`Claude Code started in proj:own-cc.* (debug mode enabled)\\'"
+                                             text))
+                           (plist-get cc :logs))))))))
 
 ;;; 4. Fork
 
@@ -359,6 +408,11 @@ With PATH-SECRET, the URL path also carries a secret."
         (should (claude-code-ide-start-spec-fork (plist-get started :launch)))
         (funcall (plist-get started :launch-fn))
         (should (equal (car calls) '(fork unknown "cci-test-native-1")))
+        ;; Without the session registry (no start function of it runs
+        ;; here), nothing sets the resume ID as the native ID later
+        (should-not (memq #'claude-code-ide-session-registry--on-start
+                          claude-code-ide-session-start-functions))
+        (should (eq (claude-code-ide-instance-native-id instance) 'unknown))
         (should (cl-some (lambda (text) (string-match-p "\\`Stub forked and started" text))
                          (plist-get started :logs))))
       ;; A fork without the ID to fork
@@ -523,10 +577,135 @@ With PATH-SECRET, the URL path also carries a secret."
           (should (= (file-modes open) #o700))
           (make-symbolic-link open link)
           (should-error (claude-code-ide--ensure-private-directory link))
-          (let ((claude-code-ide-mcp-config-directory link))
-            (should-error (claude-code-ide--write-mcp-config-file "cci-test-link" "{}")))
+          ;; A link as the folder: the file goes to a new private folder
+          (let* ((claude-code-ide-mcp-config-directory link)
+                 (claude-code-ide--mcp-config-fallback-directory nil)
+                 (claude-code-ide--mcp-config-files nil)
+                 (file (claude-code-ide-wiring-tests--quiet
+                         (claude-code-ide--write-mcp-config-file "cci-test-link" "{}")))
+                 (dir (file-name-directory file)))
+            (unwind-protect
+                (progn
+                  (should-not (string-prefix-p (file-name-as-directory link) file))
+                  (should (= (file-modes (directory-file-name dir)) #o700))
+                  (should (= (file-modes file) #o600)))
+              (claude-code-ide--delete-all-mcp-config-files)
+              (delete-directory dir t)))
           (should-not (directory-files open nil "\\.json\\'")))
       (delete-directory root t))))
+
+(ert-deftest claude-code-ide-test-wiring-mcp-config-other-user ()
+  "A config folder of another user does not stop the start: a new folder is used."
+  (let* ((root (make-temp-file "cci-test-other-" t))
+         (claude-code-ide-mcp-config-directory root)
+         (claude-code-ide--mcp-config-fallback-directory nil)
+         (claude-code-ide--mcp-config-files nil)
+         (real-uid (user-uid))
+         (messages nil))
+    (unwind-protect
+        (let ((file (cl-letf (((symbol-function 'file-attributes)
+                               (let ((original (symbol-function 'file-attributes)))
+                                 (lambda (name &rest args)
+                                   (let ((attributes (apply original name args)))
+                                     ;; The usual folder belongs to another user
+                                     (if (equal (directory-file-name (expand-file-name name))
+                                                (directory-file-name root))
+                                         (append (list (nth 0 attributes) (nth 1 attributes)
+                                                       (1+ real-uid))
+                                                 (nthcdr 3 attributes))
+                                       attributes)))))
+                              ((symbol-function 'message)
+                               (lambda (format-string &rest args)
+                                 (push (apply #'format format-string args) messages))))
+                      (claude-code-ide--write-mcp-config-file "cci-test-other" "{\"a\":1}"))))
+          (should (file-exists-p file))
+          (should-not (string-prefix-p (file-name-as-directory root) file))
+          (should (equal (file-name-directory file) claude-code-ide--mcp-config-fallback-directory))
+          (should (= (file-modes (directory-file-name (file-name-directory file))) #o700))
+          (should (= (file-modes file) #o600))
+          (should (cl-some (lambda (text) (string-search "belongs to another user" text)) messages))
+          ;; The delete finds the file in the new folder
+          (claude-code-ide--delete-mcp-config-file "cci-test-other")
+          (should-not (file-exists-p file)))
+      (when claude-code-ide--mcp-config-fallback-directory
+        (delete-directory claude-code-ide--mcp-config-fallback-directory t))
+      (delete-directory root t))))
+
+(ert-deftest claude-code-ide-test-wiring-mcp-config-delete-written-path ()
+  "The delete uses the file that was written, also after the folder option changed."
+  (let* ((root (make-temp-file "cci-test-moved-" t))
+         (first (expand-file-name "first" root))
+         (second (expand-file-name "second" root))
+         (claude-code-ide--mcp-config-files nil)
+         (file (let ((claude-code-ide-mcp-config-directory first))
+                 (claude-code-ide--write-mcp-config-file "cci-test-moved" "{}"))))
+    (unwind-protect
+        (let ((claude-code-ide-mcp-config-directory second))
+          (should (string-prefix-p (file-name-as-directory first) file))
+          ;; A second write of the same session keeps its file
+          (should (equal (claude-code-ide--write-mcp-config-file "cci-test-moved" "{\"b\":2}") file))
+          (should (equal (claude-code-ide--mcp-config-file "cci-test-moved") file))
+          (claude-code-ide--delete-mcp-config-file "cci-test-moved")
+          (should-not (file-exists-p file))
+          (should-not claude-code-ide--mcp-config-files)
+          (should-not (file-exists-p second)))
+      (delete-directory root t))))
+
+(defun claude-code-ide-wiring-tests--dead-pid ()
+  "Return a process ID that no process has now."
+  (let ((pid 99990))
+    (while (process-attributes pid)
+      (cl-decf pid))
+    pid))
+
+(ert-deftest claude-code-ide-test-wiring-mcp-config-sweep ()
+  "The first write deletes the files of Emacs processes that no longer run."
+  (let* ((root (make-temp-file "cci-test-sweep-" t))
+         (claude-code-ide-mcp-config-directory root)
+         (claude-code-ide--mcp-config-files nil)
+         (claude-code-ide--mcp-config-swept nil)
+         (other (start-process "cci-test-not-emacs" nil "sleep" "30"))
+         (dead (expand-file-name (format "mcp-%d-0123456789abcdef.json"
+                                         (claude-code-ide-wiring-tests--dead-pid))
+                                 root))
+         (not-emacs (expand-file-name (format "mcp-%d-0123456789abcdef.json" (process-id other))
+                                      root))
+         (own (expand-file-name (format "mcp-%d-fedcba9876543210.json" (emacs-pid)) root))
+         (unrelated (expand-file-name "notes.json" root)))
+    (unwind-protect
+        (progn
+          (dolist (file (list dead not-emacs own unrelated))
+            (with-temp-file file (insert "{}")))
+          (claude-code-ide--write-mcp-config-file "cci-test-sweep" "{}")
+          (should-not (file-exists-p dead))
+          (should-not (file-exists-p not-emacs))
+          (should (file-exists-p own))
+          (should (file-exists-p unrelated))
+          ;; The folder is swept once in this Emacs
+          (with-temp-file dead (insert "{}"))
+          (claude-code-ide--write-mcp-config-file "cci-test-sweep-2" "{}")
+          (should (file-exists-p dead)))
+      (when (process-live-p other) (delete-process other))
+      (claude-code-ide--delete-all-mcp-config-files)
+      (delete-directory root t))))
+
+(ert-deftest claude-code-ide-test-wiring-mcp-config-failed-start ()
+  "A start whose terminal fails deletes the MCP config file that its launch wrote."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((claude-code-ide-cli-extra-flags "")
+          (claude-code-ide--mcp-config-files nil))
+      (claude-code-ide-wiring-tests--with-config (claude-code-ide-wiring-tests--config)
+        (let ((written nil))
+          (cl-letf* ((original (symbol-function 'claude-code-ide--write-mcp-config-file))
+                     ((symbol-function 'claude-code-ide--write-mcp-config-file)
+                      (lambda (&rest args)
+                        (setq written (apply original args)))))
+            (should-error (claude-code-ide-wiring-tests--start
+                           (claude-code-ide-wiring-tests--spec) :terminal-error t)))
+          (should written)
+          (should-not (file-exists-p written))
+          (should-not claude-code-ide--mcp-config-files)
+          (should (= 0 (hash-table-count claude-code-ide-mcp--sessions))))))))
 
 ;;; 7. Process-tree calls
 
@@ -668,13 +847,32 @@ With PATH-SECRET, the URL path also carries a secret."
                            '(:budget 1.5 :timeout 1 :kill-wait 0.25 :scan nil)))
             ;; Then each cleanup
             (should (= 2 (cl-count 'stop (mapcar #'car (cdr order)))))))))
-    ;; The hook runs at depth -50, before ghostel's
-    (should (memq #'claude-code-ide--cleanup-all-sessions kill-emacs-hook))
-    (should (string-search
-             "(add-hook 'kill-emacs-hook #'claude-code-ide--cleanup-all-sessions -50)"
-             (with-temp-buffer
-               (insert-file-contents (locate-library "claude-code-ide.el" t))
-               (buffer-string))))))
+    (should (memq #'claude-code-ide--cleanup-all-sessions kill-emacs-hook))))
+
+(defun claude-code-ide-wiring-tests--ghostel-like ()
+  "Stand-in for ghostel's quit hook, at depth 0."
+  nil)
+
+(ert-deftest claude-code-ide-test-wiring-quit-hook-order ()
+  "At quit, the registry hook runs first, then the cleanup, then ghostel's.
+The order holds also after the files are evaluated again."
+  (let ((kill-emacs-hook nil)
+        (position (lambda (fn) (cl-position fn kill-emacs-hook))))
+    (should (< -50 claude-code-ide--quit-hook-depth 0))
+    ;; In the order of a normal start: the main file, then the registry
+    ;; mode, then ghostel
+    (claude-code-ide--install-quit-hook)
+    (add-hook 'kill-emacs-hook #'claude-code-ide-session-registry--on-kill-emacs -50)
+    (add-hook 'kill-emacs-hook #'claude-code-ide-wiring-tests--ghostel-like)
+    (dotimes (_ 2)
+      (should (< (funcall position #'claude-code-ide-session-registry--on-kill-emacs)
+                 (funcall position #'claude-code-ide--cleanup-all-sessions)
+                 (funcall position #'claude-code-ide-wiring-tests--ghostel-like)))
+      ;; A reload evaluates both files again
+      (claude-code-ide--install-quit-hook)
+      (remove-hook 'kill-emacs-hook #'claude-code-ide-session-registry--on-kill-emacs)
+      (add-hook 'kill-emacs-hook #'claude-code-ide-session-registry--on-kill-emacs -50))
+    (should (= 1 (cl-count #'claude-code-ide--cleanup-all-sessions kill-emacs-hook)))))
 
 ;;; The prepare hook (contract addition for the session registry)
 
@@ -715,19 +913,70 @@ With PATH-SECRET, the URL path also carries a secret."
                            :session)))
       (should (cl-some (lambda (text) (string-match-p "cci-test prepare failed" text)) messages)))))
 
-;;; 8. Provider choice
+;;; Codex approvals of coordinator tools
 
-(defmacro claude-code-ide-wiring-tests--with-provider-file (&rest body)
-  "Run BODY with an empty provider file in a new folder, not yet read."
-  (declare (indent 0))
-  `(let* ((provider-root (make-temp-file "cci-test-provider-" t))
-          (claude-code-ide-provider-file (expand-file-name "sub/current-provider" provider-root))
-          (claude-code-ide--current-provider nil)
-          (claude-code-ide--current-provider-read nil)
-          (claude-code-ide-default-provider 'claude))
-     (unwind-protect
-         (progn ,@body)
-       (delete-directory provider-root t))))
+(ert-deftest claude-code-ide-test-wiring-codex-coordinator-approvals ()
+  "A Codex coordinator gets list and inspect approved; the others always ask."
+  (let ((claude-code-ide-mcp-server-tools
+         (list (list :function #'ignore :name "claude-code-ide-mcp-project-info"
+                     :description "cci-test")
+               (list :function #'ignore :name "claude-code-ide-control-list-instances"
+                     :description "cci-test" :scope 'coordinator)
+               (list :function #'ignore :name "claude-code-ide-control-inspect-instance"
+                     :description "cci-test" :scope 'coordinator)
+               (list :function #'ignore :name "claude-code-ide-control-launch"
+                     :description "cci-test" :scope 'coordinator)
+               (list :function #'ignore :name "claude-code-ide-control-stop"
+                     :description "cci-test" :scope 'coordinator)
+               (list :function #'ignore :name "claude-code-ide-control-submit-prompt"
+                     :description "cci-test" :scope 'coordinator)))
+        (claude-code-ide-mcp-allowed-tools 'auto)
+        (approved (lambda (role)
+                    (let ((args (claude-code-ide-codex--approval-args
+                                 "mcp_servers.emacs_tools"
+                                 (claude-code-ide-instance-create :id "cci-test-coord" :role role))))
+                      (delq nil
+                            (mapcar (lambda (arg)
+                                      (when (string-match
+                                             "\\`mcp_servers\\.emacs_tools\\.tools\\.\\(.+\\)\\.approval_mode=\"approve\"\\'"
+                                             arg)
+                                        (match-string 1 arg)))
+                                    args))))))
+    (cl-letf (((symbol-function 'claude-code-ide-mcp-server-get-tool-names)
+               (lambda (&optional prefix)
+                 (mapcar (lambda (tool) (concat (or prefix "") (plist-get tool :name)))
+                         claude-code-ide-mcp-server-tools))))
+      (should (equal (funcall approved "coordinator")
+                     '("claude-code-ide-mcp-project-info"
+                       "claude-code-ide-control-list-instances"
+                       "claude-code-ide-control-inspect-instance")))
+      ;; Another role, no role, and no instance: no coordinator tool
+      (dolist (role '("worker" nil))
+        (should (equal (funcall approved role) '("claude-code-ide-mcp-project-info"))))
+      (should (equal (claude-code-ide-codex--approved-tool-names)
+                     '("claude-code-ide-mcp-project-info")))
+      ;; The default is "prompt", so the other coordinator tools ask
+      (should (member "mcp_servers.emacs_tools.default_tools_approval_mode=\"prompt\""
+                      (claude-code-ide-codex--approval-args
+                       "mcp_servers.emacs_tools"
+                       (claude-code-ide-instance-create :id "cci-test-c2" :role "coordinator"))))
+      ;; With approvals off, nothing is approved, also for a coordinator
+      (let ((claude-code-ide-mcp-allowed-tools nil))
+        (should-not (funcall approved "coordinator"))))))
+
+(ert-deftest claude-code-ide-test-wiring-codex-command-sets-provider ()
+  "M-x claude-code-ide-codex makes Codex the current provider."
+  (claude-code-ide-wiring-tests--with-provider-file
+    (cl-letf (((symbol-function 'claude-code-ide--start-session) #'ignore))
+      (should (eq (claude-code-ide-current-provider) 'claude))
+      (call-interactively #'claude-code-ide-codex)
+      (should (eq (claude-code-ide-current-provider) 'codex))
+      (should (equal (with-temp-buffer
+                       (insert-file-contents claude-code-ide-provider-file)
+                       (buffer-string))
+                     "codex\n")))))
+
+;;; 8. Provider choice
 
 (ert-deftest claude-code-ide-test-wiring-provider-toggle-cycles ()
   "The toggle cycles through the registered providers, in order."
