@@ -236,7 +236,7 @@ A provider is a coding-agent CLI. The package has two: =claude= (Claude Code) an
 *** Codex
 
 - =M-x claude-code-ide-codex= starts a Codex instance in the current project, and makes Codex the current provider. =claude-code-ide-codex-continue= and =claude-code-ide-codex-resume= continue the last conversation or open the picker.
-- A Codex instance with the role =coordinator= may call the coordinator tools that only read (=claude-code-ide-codex-coordinator-approved-tools=: list and inspect) without approval. Launch, resume, stop, submit-prompt and handover ask for approval. Another instance gets no approval for any coordinator tool.
+- A Codex instance with the role =coordinator= may call the coordinator tools that only read (=claude-code-ide-codex-coordinator-approved-tools=: list, inspect, request-status and handover-status) without approval. Launch, resume, stop, submit-prompt and handover ask for approval. Another instance gets no approval for any coordinator tool.
 - Emacs passes its instructions, the MCP tools server, and the approvals with =-c= options. Prompts go through =codex queue=. See [[file:docs/codex.md][docs/codex.md]].
 - A Codex instance gets no IDE server and no lock file in =~/.claude/ide/=, because Codex does not speak that protocol. It uses only the MCP tools server.
 - Codex never gets =claude-code-ide-cli-extra-flags= or the Claude Code model. Its flags and its model come from =claude-code-ide-codex-extra-flags=.
@@ -678,7 +678,7 @@ The state file holds only what Emacs knows. The conversation, its title and its 
 
 #+begin_src json
 {
-  "version": 3,
+  "version": 4,
   "sessions": [
     {
       "instance_id": "5afe576e-88a4-4ecf-b317-1cd4b509ca6d",
@@ -707,13 +707,16 @@ The state file holds only what Emacs knows. The conversation, its title and its 
       "failure": null,
       "failure_count": 0,
       "failed_at": null,
-      "native_id_generation": null
+      "native_id_generation": null,
+      "chain": null,
+      "handover": null
     }
   ]
 }
 #+end_src
 
-- The state file is now =~/.emacs-claude-code-ide-state-v3.json= (=-v3= before the extension of =claude-code-ide-state-file=), with version 3. While it does not exist, the version 2 file (=-v2=), else the version 1 file, is read and migrated one time. Emacs never writes or moves the version 1 or version 2 file, so an older version of the package keeps working with its own file. docs/session-schema.md describes all versions.
+- The state file is now =~/.emacs-claude-code-ide-state-v4.json= (=-v4= before the extension of =claude-code-ide-state-file=), with version 4. While it does not exist, the version 3 file (=-v3=), else the version 2 file (=-v2=), else the version 1 file, is read and migrated one time. Emacs never writes or moves the version 1, 2 or 3 file, so an older version of the package keeps working with its own file. docs/session-schema.md describes all versions.
+- =chain= and =handover= (new in version 4) hold the handover chain of the instance and the last handover with it as its source; see [[*Handover][Handover]].
 - =pid= and =process_start_time= identify the process of the last launch; a restore never starts an instance whose process still runs. =failure= and =failure_count= say why the last restore failed and how many restores failed in a row.
 - =instance_id= is the instance ID, which never changes.
 - =native_id= is the current CLI session id. Emacs starts a new conversation with =--session-id <new UUID>=. A SessionStart hook, passed with =--settings=, reports a new id after =/clear=, =/resume=, or a start with =-c= or =-r=. The reports go to a directory next to the state file (=claude-code-ide-session-registry-report-directory=).
@@ -822,6 +825,19 @@ Once enabled, Claude can use these tools to navigate your codebase. For example:
 - The control operations list, inspect, launch, resume, prompt, and stop an instance by its instance ID. Each is an Elisp function (=claude-code-ide-control-...=) and an MCP coordinator tool. See [[file:docs/api-control.md][docs/api-control.md]].
 - A prompt goes through the instance's inbox in =<report directory>/inbox/=. It is sent only when the instance is idle, and it counts as delivered when the CLI reports the same prompt.
 - Options: =claude-code-ide-control-inbox-directory=, =claude-code-ide-control-ack-timeout=, =claude-code-ide-control-retry-interval=, =claude-code-ide-control-enable-mcp-tools=, =claude-code-ide-control-done-days= (default 7).
+
+** Handover
+
+- =M-x claude-code-ide-handover= hands the work of an instance to a new conversation of the same or the other provider (Claude Code or Codex). The source stops; the target gets a short first prompt that points to the handover document in =.handover/= of the worktree, and writes a state summary there. The source never needs one more turn, so a handover works at a quota limit.
+- In the status buffer, =H= offers a handover of the session on the line, or of the first session at a quota limit. Emacs never starts a handover by itself.
+- Before the source stops, Emacs checks that the target CLI is found, that no other instance runs in the worktree, and, for a Codex target, that its status hooks are trusted (it asks you for the trust).
+- Processes that still run in the worktree after the stop are shown with their process ID, command and folder: end them, wait, or cancel. While a handover runs, no other instance starts in its worktree.
+- Each stage is saved in the session registry before it runs. After a crash, the handover continues when the registry mode starts (=claude-code-ide-handover-recover-at-start=, default t): before the stop it is cancelled, after it only the target is resumed or started again, never the source. =M-x claude-code-ide-handover-recover= runs the same recovery.
+- After the commit, the queued prompts and review results of the source go to the target.
+- =M-x claude-code-ide-handover-resolve= answers a handover that needs you, and =M-x claude-code-ide-handover-cancel= cancels one.
+- Coordinators use the MCP tools =claude-code-ide-control-handover= and =claude-code-ide-control-handover-status=. Agents can ask with =request_handover=; Emacs then asks you after their turn.
+- Options: =claude-code-ide-handover-quiesce-timeout=, =claude-code-ide-handover-delivery-timeout= (600 s for the target to get the document), =claude-code-ide-handover-watch-interval= (5 s), =claude-code-ide-handover-stray-wait=, =claude-code-ide-handover-directory=, =claude-code-ide-handover-session-server-detection=, =claude-code-ide-handover-budget=, =claude-code-ide-handover-recover-at-start=, =claude-code-ide-handover-enable-request-tool=.
+- See [[file:docs/handover.md][docs/handover.md]].
 
 ** Reviews
 
