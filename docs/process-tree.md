@@ -28,7 +28,8 @@ This document describes how claude-code-ide.el records that work, ends it at a s
 - A timer runs `ps` without a wait, every `claude-code-ide-process-track-interval` seconds (default 2).
   - One `ps -A -o pid=,ppid=,pgid=,uid=,lstart=` serves all instances. It takes about 60 ms for 2,500 processes.
   - Emacs `process-attributes` for all processes takes about 0.7 s, so the code does not use it for the table.
-- Each record follows the parent chain from the CLI. It keeps:
+- Each record follows the parent chain from the CLI. A process that started before the CLI, or whose start time is unknown, is not a descendant, and the walk does not go through it. A real descendant never starts before the CLI. On macOS a debugger that attaches to a process (`lldb -p X`) becomes its parent, so without this rule the walk would reach X and its children, which can be any process, also Emacs itself.
+- Each record keeps:
   - each process group of a descendant, with the start time of its leader and the leader's command;
   - each descendant process ID with its start time.
 - A common event `prompt-submit`, `tool-start`, `tool-end`, `turn-end`, `subagent-start`, or `subagent-end` of the instance also starts a record, at most one per second. The file adds itself to `claude-code-ide-event-functions` for this.
@@ -72,7 +73,7 @@ The keys of ARGS:
 | `:escalate` | nil skips SIGTERM and SIGKILL of the CLI. Default t. |
 | `:scan` | nil skips step 5. Default t. |
 | `:worktree` | The folder for step 5. Default: the descriptor's worktree, else its project root. |
-| `:process` | The terminal process. Default: the process of the descriptor's buffer, else the descriptor's `pid`. |
+| `:process` | The terminal process. Default: the process of the descriptor's buffer, else the descriptor's `pid`. A process that is neither the process of the instance's buffer nor has the descriptor's PID is ignored, with a debug message. The same rule holds for `claude-code-ide-process-track`. |
 | `:exclude` | Process IDs that step 5 leaves out. |
 
 The result is a plist:
