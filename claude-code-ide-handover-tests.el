@@ -497,6 +497,29 @@ BODY can use `worktree', the folder of a Git repository."
       (should (eq (plist-get (claude-code-ide-handover-status id) :stage) 'target-started))
       (should (eq (plist-get (claude-code-ide-handover-status id) :status) 'running)))))
 
+(ert-deftest claude-code-ide-test-handover-review-processes-stay ()
+  "The processes of a review are no strays, and the stop and the scan leave them out."
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (let ((stop-args nil) (scan-args nil))
+      (cl-letf* ((stop (symbol-function 'claude-code-ide-process-stop-later))
+                 ((symbol-function 'claude-code-ide-process-stop-later)
+                  (lambda (instance &rest args) (setq stop-args args) (apply stop instance args)))
+                 ((symbol-function 'claude-code-ide-process-worktree-strays)
+                  (lambda (&rest args) (setq scan-args args) nil))
+                 ((symbol-function 'claude-code-ide-review-process-ids) (lambda () '(4747))))
+        (setq claude-code-ide-handover-tests--stop-result
+              '(:status strays :strays ((:pid 4747 :command "cci-test-review" :cwd "/x"
+                                              :reason worktree))))
+        (let ((id (plist-get (claude-code-ide-handover-session "cci-test-src" 'cci-test-b)
+                             :handover-id)))
+          (claude-code-ide-handover-tests--run-timers)
+          (should (equal (plist-get stop-args :exclude) '(4747)))
+          (should (eq (plist-get (claude-code-ide-handover-status id) :stage) 'target-started))
+          ;; The scan of a recovery leaves them out too
+          (claude-code-ide-handover--scan (gethash id claude-code-ide-handover--runs))
+          (should (equal (cadr scan-args) '(4747))))))))
+
 (ert-deftest claude-code-ide-test-handover-strays-interactive ()
   "An interactive handover asks about strays: end them, wait, or cancel."
   (claude-code-ide-handover-tests--with

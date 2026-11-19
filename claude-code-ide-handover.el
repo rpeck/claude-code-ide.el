@@ -748,11 +748,27 @@ and the source stays current."
 
 ;;; The stop
 
+(declare-function claude-code-ide-review-process-ids "claude-code-ide-review" ())
+
+(defun claude-code-ide-handover--review-pids ()
+  "Return the process IDs of the review processes that run.
+A review command runs in the worktree of its owner, and its result
+goes to the target after the handover, so the stop leaves it alone."
+  (when (fboundp 'claude-code-ide-review-process-ids)
+    (cl-remove-if-not #'integerp
+                      (ignore-errors (funcall 'claude-code-ide-review-process-ids)))))
+
 (defun claude-code-ide-handover--relevant-strays (strays)
   "Return the STRAYS that can still write in the worktree.
 A process that this Emacs runs itself (`:emacs-process', for example a
-language server or a shell buffer) is not a writer of the source."
-  (cl-remove-if (lambda (stray) (plist-get stray :emacs-process)) strays))
+language server or a shell buffer) is not a writer of the source.  A
+review process (see `claude-code-ide-handover--review-pids') is left
+alone too."
+  (let ((reviews (claude-code-ide-handover--review-pids)))
+    (cl-remove-if (lambda (stray)
+                    (or (plist-get stray :emacs-process)
+                        (memql (plist-get stray :pid) reviews)))
+                  strays)))
 
 (defun claude-code-ide-handover--stop (run)
   "End the source of RUN with its process tree, then check the worktree."
@@ -763,6 +779,7 @@ language server or a shell buffer) is not a writer of the source."
          ;; nil: the soft end of the provider
          :soft-end nil
          :worktree (claude-code-ide-handover--run-worktree run)
+         :exclude (claude-code-ide-handover--review-pids)
          :callback (lambda (result) (claude-code-ide-handover--after-stop run result)))
       (claude-code-ide-handover--after-stop run (claude-code-ide-handover--scan run)))))
 
@@ -771,7 +788,8 @@ language server or a shell buffer) is not a writer of the source."
 Return a result plist like that of `claude-code-ide-process-stop'."
   (condition-case err
       (let ((strays (claude-code-ide-process-worktree-strays
-                     (claude-code-ide-handover--run-worktree run))))
+                     (claude-code-ide-handover--run-worktree run)
+                     (claude-code-ide-handover--review-pids))))
         (list :status (if strays 'strays 'stopped) :strays strays))
     (error (list :status 'error :reason (error-message-string err)))))
 
