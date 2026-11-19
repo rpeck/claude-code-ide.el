@@ -263,23 +263,34 @@ The Codex launch defines `(claude-code-ide-codex-screen-dialog BUFFER)`. It retu
 
 ## Claude Code sessions without status hooks
 
-A Claude Code CLI reads its hooks only at its start. A session that started before the status tracking was on has no hooks, and a restart would stop its work. Its state comes from the file that each CLI process keeps about itself: `~/.claude/sessions/<pid>.json` (in `CLAUDE_CONFIG_DIR` when that is set).
+A Claude Code CLI reads its hooks only at its start. A session that started before the status tracking was on has no hooks, and a restart would stop its work. Its state comes from the file that each CLI process keeps about itself: `<config>/sessions/<pid>.json`. `<config>` is `CLAUDE_CONFIG_DIR` when that is an absolute folder; an empty, relative, or missing value counts as unset, and then it is `~/.claude`.
 
-- **Which sessions.** Only a Claude Code session without a status record uses the file. A session with hooks always uses its hooks.
-- **Which file.** The file of the session's CLI PID (`claude-code-ide-mcp-session-cli-pid`, from `ide_connected`, else the PID of its terminal process). The file must name that PID, and its `procStart` (UTC, for example "Tue Nov 17 22:25:15 2026") must be within 2 seconds of the start time of that process. So a file of an older process with a reused PID never gives its state.
+- **Which sessions.** Only a Claude Code session without a status record uses the file, and only while its terminal process runs. A session with hooks always uses its hooks.
+- **Which file.** The file of the session's CLI PID: `claude-code-ide-mcp-session-cli-pid`, which `ide_connected` sets (only an integer counts), else the PID of the terminal process.
+- **Which process.** When Emacs first sees the PID of a session, it records the start time of that process. The file counts only when:
+  - it names that PID;
+  - its start time is within 1 second of the recorded start (`procStart`, a UTC text such as "Tue Nov 17 22:25:15 2026"; when that does not parse, `startedAt` in milliseconds);
+  - the process that holds the PID now has the recorded start too.
+
+  So a reused PID never gives the state of another process. The registry reads the file (`claude-code-ide-session-registry--read-cli-session`) and compares the starts (`--same-start-p`, one tolerance of 1 second).
 - **The states:**
 
-| `status` in the file | Common state | Status buffer |
-|---|---|---|
-| `busy` | `working` | WORKING |
-| `idle` | `idle` | WAITS FOR YOU |
-| `shell` (a background shell runs) | `waiting-for-task/background-task` | WAITS ON TASKS |
-| another value, none, no file, or a file of another process | `disconnected/no-signal` | NO SIGNAL |
+| The file | Common state | Status buffer | Detail |
+|---|---|---|---|
+| `status` `busy` | `working` | WORKING | "From CLI status: busy" |
+| `status` `idle` | `idle` | WAITS FOR YOU | "From CLI status: idle" |
+| `status` `shell` | `idle` | WAITS FOR YOU | "From CLI status: idle, a background shell runs" |
+| another status, or none | `disconnected/untracked` | UNTRACKED | "CLI status X is not known" |
+| no file | `disconnected/untracked` | UNTRACKED | "no CLI status file" |
+| a file that cannot be read, or with no start time | `disconnected/untracked` | UNTRACKED | "CLI status file not readable" |
+| a file of another process | `disconnected/untracked` | UNTRACKED | "the CLI status file is of another process" |
 
-- The CLI reports these states itself, so `:guess` is nil. The state plist has the extra key `:source` with the value `cli-file`, and the detail starts with "From CLI status".
+- A background shell is `idle`, as with the hooks: the agent waits for you while the shell runs. So `w` visits such a session, and a handover needs no force.
+- UNTRACKED is not urgent. NO SIGNAL is only for a session with hooks that sent no event.
+- The CLI reports `busy` and `idle` itself, so `:guess` is nil. The state plist has the extra key `:source` with the value `cli-file`.
 - The state starts at `statusUpdatedAt` (milliseconds), else at `updatedAt`. So the status buffer shows its age.
 - `claude-code-ide-instance-state`, the status snapshot, and the control operations use the same state.
-- **Cheap polling.** The file is read when the status buffer, the snapshot, or a state call needs it, on the existing status timer, and only when its modification time changed. The start time of the process is checked at each use. Emacs never writes the file.
+- **Cheap polling.** The state of a session is computed once for each refresh (one NOW), and the start of each process is asked once for each refresh. The file is read only when its modification time changed. The cache is keyed by session and weak, so it goes with the session. Emacs never writes the file.
 - `T` in the status buffer still restarts such a session with hooks.
 
 ## Tracking
