@@ -60,6 +60,10 @@
 (declare-function claude-code-ide-mcp-session-cli-pid "claude-code-ide-mcp" (session))
 (declare-function claude-code-ide-mcp-session-last-buffer "claude-code-ide-mcp" (session))
 (declare-function claude-code-ide--get-working-directory "claude-code-ide" ())
+(declare-function claude-code-ide-current-provider "claude-code-ide" ())
+(declare-function claude-code-ide-toggle-provider "claude-code-ide" ())
+(declare-function claude-code-ide--provider-display-name "claude-code-ide" (name))
+(declare-function claude-code-ide-provider-names "claude-code-ide-provider" ())
 
 ;; Declare variables
 (defvar claude-code-ide-cli-path)
@@ -85,12 +89,42 @@
   (length (claude-code-ide-mcp--sessions-for-project
            (claude-code-ide--get-working-directory))))
 
+(defun claude-code-ide--current-provider-display ()
+  "Return the display name of the current provider."
+  (claude-code-ide--provider-display-name (claude-code-ide-current-provider)))
+
 (defun claude-code-ide--start-description ()
   "Dynamic description for the start command."
-  (let ((count (claude-code-ide--project-session-count)))
+  (let ((count (claude-code-ide--project-session-count))
+        (provider (claude-code-ide--current-provider-display)))
     (if (> count 0)
-        (format "Start new Claude Code instance (%d running)" count)
-      "Start new Claude Code instance")))
+        (format "Start new %s instance (%d running)" provider count)
+      (format "Start new %s instance" provider))))
+
+(defun claude-code-ide--continue-description ()
+  "Dynamic description for the continue command."
+  (format "Continue in new %s instance" (claude-code-ide--current-provider-display)))
+
+(defun claude-code-ide--resume-description ()
+  "Dynamic description for the resume command."
+  (format "Resume in new %s instance" (claude-code-ide--current-provider-display)))
+
+(defun claude-code-ide--provider-description ()
+  "Dynamic description for the provider toggle."
+  (let ((names (claude-code-ide-provider-names))
+        (current (claude-code-ide-current-provider)))
+    (format "Provider: %s"
+            (mapconcat (lambda (name)
+                         (let ((text (claude-code-ide--provider-display-name name)))
+                           (if (eq name current)
+                               (propertize text 'face 'transient-value)
+                             (propertize text 'face 'transient-inactive-value))))
+                       names " | "))))
+
+(defun claude-code-ide--provider-header ()
+  "Return the header line that names the current provider."
+  (concat "Provider for new instances: "
+          (propertize (claude-code-ide--current-provider-display) 'face 'success)))
 
 (defun claude-code-ide--session-status ()
   "Return a string describing the current project's instances."
@@ -112,7 +146,7 @@
                      (lambda (session)
                        (let ((line (format "  %-20s port %-6s %s%s"
                                            (claude-code-ide--session-display-name session)
-                                           (or (claude-code-ide-mcp-session-port session) "?")
+                                           (or (claude-code-ide-mcp-session-port session) "-")
                                            (if (claude-code-ide-mcp-session-client session)
                                                "connected" "disconnected")
                                            (if (claude-code-ide--session-visible-p session)
@@ -126,12 +160,16 @@
                               (list (propertize
                                      (format "  …and %d more" (- (length sessions) (length shown)))
                                      'face 'transient-inactive-value)))))
-        (mapconcat #'identity (cons header lines) "\n")))
+        (mapconcat #'identity
+                   (cons (claude-code-ide--provider-header) (cons header lines))
+                   "\n")))
      ((> all-count 0)
-      (propertize (format "No session in this project (%d running elsewhere)" all-count)
-                  'face 'transient-inactive-value))
+      (concat (claude-code-ide--provider-header) "\n"
+              (propertize (format "No session in this project (%d running elsewhere)" all-count)
+                          'face 'transient-inactive-value)))
      (t
-      (propertize "No active sessions" 'face 'transient-inactive-value)))))
+      (concat (claude-code-ide--provider-header) "\n"
+              (propertize "No active sessions" 'face 'transient-inactive-value))))))
 
 (defun claude-code-ide-show-version-info ()
   "Show detailed version information for Claude Code CLI."
@@ -165,7 +203,8 @@
                              (if (and buffer (buffer-live-p buffer))
                                  (buffer-name buffer)
                                "None"))))
-            (princ (format "  Port: %d\n" (claude-code-ide-mcp-session-port session)))
+            (princ (format "  Port: %s\n" (or (claude-code-ide-mcp-session-port session)
+                                              "none (no IDE protocol)")))
             (princ (format "  Connected: %s\n"
                            (if (claude-code-ide-mcp-session-client session)
                                (if-let* ((pid (claude-code-ide-mcp-session-cli-pid session)))
@@ -187,7 +226,7 @@
         (with-output-to-temp-buffer "*Claude Code Active Ports*"
           (princ "Active MCP Server Ports\n")
           (princ "======================\n\n")
-          (dolist (session sessions)
+          (dolist (session (cl-remove-if-not #'claude-code-ide-mcp-session-port sessions))
             (princ (format "Port %d: %-20s %s (%s)\n"
                            (claude-code-ide-mcp-session-port session)
                            (claude-code-ide--session-display-name session)
@@ -333,8 +372,10 @@
   ["Claude Code IDE"
    ["Session Management"
     ("s" claude-code-ide :description claude-code-ide--start-description)
-    ("c" "Continue in new instance" claude-code-ide-continue)
-    ("r" "Resume in new instance" claude-code-ide-resume)
+    ("c" claude-code-ide-continue :description claude-code-ide--continue-description)
+    ("r" claude-code-ide-resume :description claude-code-ide--resume-description)
+    ("P" claude-code-ide-toggle-provider :description claude-code-ide--provider-description
+     :transient t)
     ("q" "Stop instance" claude-code-ide-stop)
     ("Q" "Stop all instances" claude-code-ide-stop-all)
     ("R" "Rename instance" claude-code-ide-rename-session)
