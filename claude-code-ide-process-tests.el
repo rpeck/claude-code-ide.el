@@ -670,8 +670,10 @@ PID now, as a real one does."
       (unwind-protect
           (progn
             (claude-code-ide-process-track instance nil)
-            ;; The old CLI is gone; its background group runs on
+            ;; The old CLI is gone; its background group runs on.  The
+            ;; new launch records its PID and start time in the descriptor.
             (claude-code-ide-process-tests--remove 100)
+            (setf (claude-code-ide-instance-pid instance) 300)
             (process-put pipe 'ghostel--native-pid 300)
             (add-hook 'claude-code-ide-process-tests--reactions
                       (lambda (target signal)
@@ -904,6 +906,160 @@ PID now, as a real one does."
       (ignore-errors (delete-file link))
       (delete-directory worktree t))))
 
+;;; Second review fixes: signal safety
+
+(ert-deftest claude-code-ide-test-process-sigkill-rechecks-reused-group ()
+  "After SIGTERM, a group ID that an unrelated group took gets no SIGKILL.
+A recorded member left the group with setsid and still runs; the group
+ID then belongs to an unrelated process."
+  (claude-code-ide-process-tests--with-table
+      (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+            (claude-code-ide-process-tests--entry 200 100 200)
+            (claude-code-ide-process-tests--entry 203 200 200))
+    (let ((instance (claude-code-ide-process-tests--instance)))
+      (claude-code-ide-process-track instance nil)
+      (add-hook 'claude-code-ide-process-tests--reactions
+                (claude-code-ide-process-tests--cli-exits-on 'SIGHUP))
+      (add-hook 'claude-code-ide-process-tests--reactions
+                (lambda (target signal)
+                  (when (and (eql target -200) (eq signal 'SIGTERM))
+                    ;; 203 left the group; the group ends; the ID comes back
+                    (plist-put (claude-code-ide-process-tests--find 203) :pgid 203)
+                    (claude-code-ide-process-tests--remove 200)
+                    (push (claude-code-ide-process-tests--entry 200 1 200 5000.0)
+                          claude-code-ide-process-tests--table)
+                    (push '(200 SIGTERM) claude-code-ide-process-tests--ignore))))
+      (claude-code-ide-process-stop instance :scan nil)
+      (should (member '(-200 SIGTERM) claude-code-ide-process-tests--signals))
+      (should-not (member '(-200 SIGKILL) claude-code-ide-process-tests--signals))
+      (should (claude-code-ide-process-tests--find 200))
+      (should (claude-code-ide-process-tests--find 203)))))
+
+(ert-deftest claude-code-ide-test-process-sigkill-needs-start-time ()
+  "A process without a start time never makes a group a SIGKILL target."
+  (claude-code-ide-process-tests--with-table
+      (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+            (claude-code-ide-process-tests--entry 200 100 200))
+    (let ((instance (claude-code-ide-process-tests--instance)))
+      (claude-code-ide-process-track instance nil)
+      (add-hook 'claude-code-ide-process-tests--reactions
+                (claude-code-ide-process-tests--cli-exits-on 'SIGHUP))
+      (add-hook 'claude-code-ide-process-tests--reactions
+                (lambda (target signal)
+                  (when (and (eql target -200) (eq signal 'SIGTERM))
+                    ;; The group ends; an unrelated process with that ID
+                    ;; and no readable start time comes
+                    (claude-code-ide-process-tests--remove 200)
+                    (push (list :pid 200 :ppid 1 :pgid 200 :uid (user-uid) :start nil)
+                          claude-code-ide-process-tests--table)
+                    (push '(200 SIGTERM) claude-code-ide-process-tests--ignore))))
+      (claude-code-ide-process-stop instance :scan nil)
+      (should-not (member '(-200 SIGKILL) claude-code-ide-process-tests--signals))
+      (should (claude-code-ide-process-tests--find 200)))))
+
+(ert-deftest claude-code-ide-test-process-ghostel-pipe-gives-no-start ()
+  "A ghostel pipe is not the real child: its PID gives no start time."
+  (claude-code-ide-process-tests--with-table
+      ;; The PID of the pipe's child belongs to an unrelated process now
+      (list (claude-code-ide-process-tests--entry 300 1 300 7000.0)
+            (claude-code-ide-process-tests--entry 310 300 310 7001.0))
+    (let ((instance (claude-code-ide-instance-create
+                     :id "cci-test-ghostel" :provider 'claude))
+          (pipe (make-pipe-process :name "cci-test-ghostel-pipe" :noquery t)))
+      (unwind-protect
+          (progn
+            (process-put pipe 'ghostel--native-pid 300)
+            (claude-code-ide-process-track instance pipe)
+            (should-not (claude-code-ide-process-groups instance))
+            (let ((result (claude-code-ide-process-stop instance :process pipe :scan nil)))
+              (should (eq (plist-get result :status) 'strays))
+              (should (equal (mapcar (lambda (s) (plist-get s :reason))
+                                     (plist-get result :strays))
+                             '(unverified))))
+            (should-not claude-code-ide-process-tests--signals))
+        (delete-process pipe)))))
+
+(ert-deftest claude-code-ide-test-process-cli-group-with-other-uid ()
+  "When a member of the CLI's group has another user ID, only the CLI gets a signal."
+  (claude-code-ide-process-tests--with-table
+      (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+            ;; A child that runs sudo: effective user ID 0
+            (claude-code-ide-process-tests--entry 110 100 100 nil 0))
+    (setq claude-code-ide-process-tests--ignore '((100 SIGHUP SIGTERM)))
+    (let ((result (claude-code-ide-process-stop
+                   (claude-code-ide-process-tests--instance) :scan nil)))
+      (should (equal (cl-subseq (claude-code-ide-process-tests--signal-list) 0 3)
+                     '((100 SIGHUP) (100 SIGTERM) (100 SIGKILL))))
+      (should-not (cl-find -100 claude-code-ide-process-tests--signals :key #'car))
+      (should (claude-code-ide-process-tests--find 110))
+      ;; 110 is in a recorded group with a process of another user: no signal
+      (should (eq (plist-get result :status) 'strays)))))
+
+(ert-deftest claude-code-ide-test-process-ledger-does-not-grow ()
+  "A process that joined a group after the records never proves the group.
+Round one ends the recorded leader; the unrecorded member is left, and
+gets no SIGKILL, because nothing that a record saw proves its group."
+  (claude-code-ide-process-tests--with-table
+      (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+            (claude-code-ide-process-tests--entry 200 100 200))
+    (let ((instance (claude-code-ide-process-tests--instance)))
+      (claude-code-ide-process-track instance nil)
+      (add-hook 'claude-code-ide-process-tests--reactions
+                (lambda (target signal)
+                  (when (and (eql target -100) (eq signal 'SIGHUP))
+                    (claude-code-ide-process-tests--remove 100)
+                    ;; A member that no record saw
+                    (push (claude-code-ide-process-tests--entry 202 200 200 1500.0)
+                          claude-code-ide-process-tests--table)
+                    (push '(202 SIGTERM) claude-code-ide-process-tests--ignore))))
+      (let ((result (claude-code-ide-process-stop instance :scan nil)))
+        (should (member '(-200 SIGTERM) claude-code-ide-process-tests--signals))
+        (should-not (member '(-200 SIGKILL) claude-code-ide-process-tests--signals))
+        (should (claude-code-ide-process-tests--find 202))
+        (should (eq (plist-get result :status) 'strays))
+        (should (equal (mapcar (lambda (s) (list (plist-get s :pid) (plist-get s :reason)))
+                               (plist-get result :strays))
+                       '((202 unverified))))))))
+
+(ert-deftest claude-code-ide-test-process-reap-spares-other-instance-tree ()
+  "With two tracked instances, a stop never reaps a group of the other's tree.
+The records of the first instance hold a group that is now in the
+tree of the second, running instance."
+  (claude-code-ide-process-tests--with-table
+      (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+            (claude-code-ide-process-tests--entry 400 (emacs-pid) 400)
+            (claude-code-ide-process-tests--entry 410 400 410))
+    (let ((first (claude-code-ide-process-tests--instance))
+          (second (claude-code-ide-instance-create
+                   :id "cci-test-process-2" :provider 'codex :pid 400
+                   :process-start-time claude-code-ide-process-tests--start)))
+      (claude-code-ide-process-track first nil)
+      (claude-code-ide-process-track second nil)
+      (should (equal (mapcar (lambda (g) (plist-get g :pgid))
+                             (claude-code-ide-process-groups second))
+                     '(400 410)))
+      ;; The first instance's records also name group 410 and process 410
+      (let ((track (claude-code-ide-process--track-of first)))
+        (puthash 410 (list :pgid 410 :leader-start claude-code-ide-process-tests--start)
+                 (claude-code-ide-process--track-groups track))
+        (puthash 410 claude-code-ide-process-tests--start
+                 (claude-code-ide-process--track-members track)))
+      (add-hook 'claude-code-ide-process-tests--reactions
+                (claude-code-ide-process-tests--cli-exits-on 'SIGHUP))
+      (claude-code-ide-process-stop first :scan nil)
+      (should (equal (claude-code-ide-process-tests--signal-list) '((-100 SIGHUP))))
+      (should (claude-code-ide-process-tests--find 410))
+      ;; Without the guard, the same records would end the group
+      (claude-code-ide-process-untrack second)
+      (puthash "cci-test-process"
+               (let ((track (claude-code-ide-process--new-track first nil)))
+                 (puthash 410 (list :pgid 410 :leader-start claude-code-ide-process-tests--start)
+                          (claude-code-ide-process--track-groups track))
+                 track)
+               claude-code-ide-process--tracks)
+      (claude-code-ide-process-stop first :scan nil)
+      (should (member '(-410 SIGTERM) claude-code-ide-process-tests--signals)))))
+
 ;;; Bounded runs of ps and lsof
 
 (ert-deftest claude-code-ide-test-process-run-timeout ()
@@ -985,6 +1141,8 @@ The check makes sure that the test signals only its own processes."
          (claude-code-ide-process--tracks (make-hash-table :test 'equal))
          (claude-code-ide-process--timer nil)
          (claude-code-ide-process--refresh-running nil)
+         ;; A full lsof scan can take 30 s on a busy Mac
+         (claude-code-ide-process-lsof-timeout 120)
          (claude-code-ide-process-track-interval 0.3)
          bg-pid)
     (unwind-protect
@@ -1031,6 +1189,8 @@ The check makes sure that the test signals only its own processes."
          (claude-code-ide-process--tracks (make-hash-table :test 'equal))
          (claude-code-ide-process--timer nil)
          (claude-code-ide-process--refresh-running nil)
+         ;; A full lsof scan can take 30 s on a busy Mac
+         (claude-code-ide-process-lsof-timeout 120)
          escaped)
     (unwind-protect
         (progn
