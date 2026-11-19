@@ -2243,10 +2243,11 @@ own entry `failed', with the reason.  With a prefix argument PICK,
 choose which ones.
 
 When you call it as a command and it restores a Codex entry, it
-settles the Codex hook trust one time first (it asks at most once; see
-`claude-code-ide-codex-prepare-trust'), and the Codex starts are
-interactive when the hooks are trusted.  A call from Lisp, such as an
-automatic restore at the start of Emacs, never asks."
+settles the Codex hook trust one time first, before it schedules the
+starts (it asks at most once; see `claude-code-ide-codex-prepare-trust').
+The starts are never interactive: after a yes they find the trusted
+result in the cache.  A call from Lisp, such as an automatic restore
+at the start of Emacs, never asks."
   (interactive "P")
   (pcase-let ((`(,entries . ,unknown) (claude-code-ide-session-registry--restore-plan)))
     (if (and (null entries) (null unknown))
@@ -2258,17 +2259,18 @@ automatic restore at the start of Emacs, never asks."
                                                           candidates nil t)))))
       (when entries
         (message "Restoring %d session%s" (length entries) (if (cdr entries) "s" "")))
+      ;; A restore that you start settles the Codex hook trust once,
+      ;; asking at most one time, before it schedules the starts.  After a
+      ;; yes the trusted cache holds the result, so the starts get their
+      ;; hooks; the starts run from timers and never ask or wait.
+      (when (and (called-interactively-p 'any)
+                 (cl-some (lambda (entry)
+                            (eq (claude-code-ide-session-registry-entry-provider entry) 'codex))
+                          entries)
+                 (fboundp 'claude-code-ide-codex-prepare-trust))
+        (claude-code-ide-codex-prepare-trust))
       (claude-code-ide-session-registry--start-entries
-       entries claude-code-ide-restore-note unknown
-       ;; A restore that you start settles the Codex hook trust once,
-       ;; asking at most one time; the starts then count as interactive
-       ;; only when the hooks are trusted
-       (and (called-interactively-p 'any)
-            (cl-some (lambda (entry)
-                       (eq (claude-code-ide-session-registry-entry-provider entry) 'codex))
-                     entries)
-            (fboundp 'claude-code-ide-codex-prepare-trust)
-            (claude-code-ide-codex-prepare-trust))))))
+       entries claude-code-ide-restore-note unknown))))
 
 ;;;###autoload
 (defun claude-code-ide-reopen-session (entry)

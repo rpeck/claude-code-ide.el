@@ -75,11 +75,19 @@ Emacs settles the trust before a Codex instance spawns, so that the user never n
    - `claude-code-ide`, `claude-code-ide-continue`, `claude-code-ide-resume` (also from the menu), `claude-code-ide-codex`, `claude-code-ide-codex-continue`, and `claude-code-ide-codex-resume` pass `called-interactively-p` as the 4th argument INTERACTIVE of `claude-code-ide--start-session`. The start puts it in the slot of the launch spec. A spec whose slot is set wins over the argument.
    - The Codex launch, resume, and fork operations pass the slot to `claude-code-ide-codex-status-hook-args`, as its optional 2nd argument.
    - Other starts (a restore at Emacs start, a coordinator launch, a timer, a call from Lisp) have nil.
-2. **The cache.** The key holds a SHA-256 hash of the hook definitions (the hook arguments, which contain the script path) and the path of the Codex config file (in `CODEX_HOME`, else `~/.codex`).
+2. **The cache.** The key holds three parts:
+   - A SHA-256 hash of the hook definitions (the hook arguments, which contain the script path).
+   - The path of the Codex config file: `claude-code-ide-transcript--codex-config-file`, which gives `config.toml` in `CODEX_HOME`, else in `$HOME/.codex`.
+   - The Codex program: the true path of `claude-code-ide-codex-events-program`, with the modification time and the size of that file. An update of Codex changes them. No process runs for it.
+
+   A cached result is valid as follows:
    - A `trusted` result stores the exact `hooks.state` key and the `currentHash` that `hooks/list` reported for each of our hooks. A start reads `config.toml` (read only, with the tolerant TOML reader of `claude-code-ide-transcript.el`), and the entry is valid while each key has `trusted_hash` equal to its stored hash and no `enabled = false`. Other writes do not matter: a Codex terminal writes the file at each start (`[tui]` keys).
+   - The file is read with `claude-code-ide-transcript--codex-config-entries`, the one reader of the Codex config entries.
+   - Each record needs a non-empty key and a non-empty hash. An empty list of records never makes an entry valid. A trusted result with a trusted hook that has no key or no hash is not cached.
+   - Managed hooks have no record in `config.toml`. A trusted result with managed hooks is valid for 60 seconds after its check, so `hooks/list` checks it again at most once a minute.
    - The entry is invalid when a key is missing, a hash differs, a hook is disabled, or the file is missing, unreadable, or has a TOML form that the reader does not know. No error comes from it. Then an interactive start checks again (and asks if needed), and another start gets no hooks and starts the background check.
    - An `untrusted` or `disabled` result holds only while `config.toml` keeps the modification time and the size of the check, because `/hooks` in a terminal can trust or enable the hooks.
-   - Other hook definitions (a new package version) or another `CODEX_HOME` give another key. They miss the cache, and the next interactive start asks again.
+   - Other hook definitions (a new package version), another `CODEX_HOME`, or another Codex give another key. They miss the cache, and the next interactive start asks again.
 3. **The check.** On a cache miss, Emacs starts `codex app-server` with the hook arguments, over stdio, in the project folder, and sends `initialize`, `initialized`, and `hooks/list` with the project folder in `cwds`.
    - Starts of the same key share one running check and one app-server.
    - The status hooks of the package are the hooks with `source` `sessionFlags` whose command runs the script.
@@ -87,7 +95,8 @@ Emacs settles the trust before a Codex instance spawns, so that the user never n
    - Results: `trusted`; `untrusted` (some hooks are enabled and not trusted); `disabled` (the hooks that Codex does not run are all disabled with `/hooks`); `error`.
    - The check ends with its answer, or after 30 seconds. Its result goes to the cache and to the launches without hooks.
 4. **The wait.**
-   - An interactive start waits for the check at most `claude-code-ide-codex-events-trust-timeout` seconds (5). The limit holds for all the app-server calls of the start, also the trust write. The time of the question does not count.
+   - An interactive start waits for the check at most `claude-code-ide-codex-events-trust-timeout` seconds (5). A C-g in the wait or in the question still frees the check, so its app-server ends.
+   - After a yes, the trust write and the second `hooks/list` each get the full limit again.
    - Another start never waits. On a cache miss it starts without hooks at once, and the check fills the cache for the next start.
 5. **The decision.** A launch gets hooks only when the trust is confirmed:
 
@@ -109,12 +118,12 @@ Emacs settles the trust before a Codex instance spawns, so that the user never n
 
 `M-x claude-code-ide-restore-sessions` asks at most one time for the whole restore. The automatic restore at Emacs start never asks.
 
-- Before its starts, when it starts at least one Codex instance, the restore command calls `(claude-code-ide-codex-prepare-trust DIRECTORY)` one time.
+- When it starts at least one Codex instance, the restore command calls `(claude-code-ide-codex-prepare-trust DIRECTORY)` one time, before it schedules the starts.
   - It returns non-nil when the hooks are trusted: from the cache, or after one question and a yes.
-  - It asks nothing when the user declined in this Emacs.
-- The restore puts the value in the `interactive` slot of each start spec.
-  - After a yes, the starts are interactive. They check again when the cache is not valid, and get trusted hooks; they do not ask again, because the hooks are trusted.
-  - After a no, the starts are not interactive. They never ask, and get no hooks.
+  - It returns nil at once, with no app-server, when the user declined in this Emacs.
+- The starts run from timers, and they are never interactive. So no start asks and no start waits.
+  - After a yes, the trusted result is in the cache, and each start gets its hooks on the cache hit.
+  - After a no, the starts get no hooks.
 
 ### The trust command
 
