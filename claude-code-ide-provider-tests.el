@@ -497,7 +497,7 @@ cdr of its :cleanup key."
             (progn
               ;; No status hooks: no event comes
               (should (equal (claude-code-ide-instance-state "cci-test-st" 50.0)
-                             '(:state disconnected :reason nil :since nil :guess nil :age nil)))
+                             '(:state disconnected :reason untracked :since nil :guess nil :age nil)))
               (claude-code-ide-session-status--hooks session "key-st")
               (let ((status (gethash session claude-code-ide-session-status--by-session)))
                 (setf (claude-code-ide-session-status-registered status) 0.0
@@ -759,12 +759,12 @@ cdr of its :cleanup key."
               (should (equal (claude-code-ide-session-status--provider-label session) "claude"))
               (should (equal (claude-code-ide-session-status--provider-label bare) "unknown"))
               (dolist (entry entries)
-                (should (= (length (cadr entry)) 5)))
+                (should (= (length (cadr entry)) 7)))
               (should (equal (aref (cadr (assq session entries)) 2) "claude"))
               (with-temp-buffer
                 (claude-code-ide-session-status-list-mode)
                 (should (equal (mapcar #'car (append tabulated-list-format nil))
-                               '("Status" "Session" "Provider" "For" "Detail")))))
+                               '("Status" "Session" "Provider" "Model" "State" "For" "Detail")))))
           (dolist (b (list buffer (claude-code-ide-mcp-session-buffer bare)))
             (let ((kill-buffer-hook nil))
               (kill-buffer b)))

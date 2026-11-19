@@ -42,7 +42,15 @@
 ;; *Coding Agents Sessions*, which updates itself, the ones that wait for
 ;; the user first.  RET in that buffer, or
 ;; `claude-code-ide-visit-waiting-session' from anywhere, goes to the
-;; session.
+;; session.  Instances of other providers, such as Codex, are in the same
+;; buffer: their state comes from `claude-code-ide-instance-state' and
+;; their detail from `claude-code-ide-session-status-detail-functions'.
+;; Each row shows the provider, the model (or "unknown") and the common
+;; state with its reason.
+;;
+;; The status snapshot, <report directory>/status/<emacs-pid>.json,
+;; gives the same states to programs outside Emacs; docs/status-schema.md
+;; describes it.
 
 ;;; Code:
 
@@ -177,6 +185,8 @@ time, which is true: the agent no longer waits on it."
   (generation 0 :type integer :documentation "Launch generation of the launch.")
   (phase 'starting :type symbol
          :documentation "`starting', `working', `idle' or `error'.")
+  (failure nil :type symbol
+           :documentation "Reason of the `error' phase: `error' or `quota-limit'.")
   (detail "" :type string)
   (since 0.0 :type float :documentation "Time the phase started.")
   (registered 0.0 :type float)
@@ -291,6 +301,70 @@ exit 0
   (expand-file-name "claude-code-ide-status-hook.sh"
                     (claude-code-ide-session-registry--report-directory)))
 
+(defun claude-code-ide-session-status--write-file-atomically (file text &optional file-mode dir-mode)
+  "Write TEXT to FILE through a temporary file in its folder and a rename.
+A reader sees the old file or the new one, never a part.  FILE-MODE is
+the mode of the new file, or nil for the default.  A folder that this
+call creates gets DIR-MODE, or the default mode when DIR-MODE is nil.
+The temporary file has a name that starts with a dot."
+  (let ((dir (file-name-directory file)))
+    (unless (file-directory-p dir)
+      (make-directory dir t)
+      (when dir-mode
+        (set-file-modes dir dir-mode)))
+    (let ((tmp (make-temp-file (expand-file-name (concat "." (file-name-nondirectory file) "-") dir))))
+      (unwind-protect
+          (progn
+            (let ((coding-system-for-write 'utf-8-unix))
+              (write-region text nil tmp nil 'silent))
+            (when file-mode
+              (set-file-modes tmp file-mode))
+            (rename-file tmp file t))
+        (when (file-exists-p tmp)
+          (delete-file tmp))))))
+
+(defun claude-code-ide-session-status--delete-matching-files (dir regexp)
+  "Delete the files and folders in DIR whose name matches REGEXP."
+  (when (file-directory-p dir)
+    (dolist (file (directory-files dir t regexp t))
+      (ignore-errors
+        (if (file-directory-p file)
+            (delete-directory file t)
+          (delete-file file))))))
+
+(defun claude-code-ide-session-status--remove-old-locks (dir regexp &optional age)
+  "Delete the lock folders in DIR whose name matches REGEXP, older than AGE.
+AGE is in seconds and defaults to 3.  A hook holds its lock for
+milliseconds; an older lock was left by a hook that the CLI killed,
+and would stop the numbering of its launch."
+  (when (file-directory-p dir)
+    (dolist (lock (directory-files dir t regexp t))
+      (when-let* ((attributes (file-attributes lock)))
+        (when (> (float-time (time-subtract nil (file-attribute-modification-time attributes)))
+                 (or age 3))
+          (ignore-errors (delete-directory lock t)))))))
+
+(defun claude-code-ide-session-status--parse-json (text &optional false-object)
+  "Parse the JSON TEXT into alists with symbol keys and lists.
+null is nil, and false is FALSE-OBJECT (default nil).  Emacs without
+native JSON uses json.el.  An invalid TEXT signals an error."
+  (if (and (fboundp 'json-available-p) (json-available-p))
+      (json-parse-string text :object-type 'alist :array-type 'list
+                         :null-object nil :false-object false-object)
+    (let ((json-object-type 'alist)
+          (json-array-type 'list)
+          (json-key-type 'symbol)
+          (json-false false-object)
+          (json-null nil))
+      (json-read-from-string text))))
+
+(defun claude-code-ide-session-status--read-json-file (file)
+  "Return the JSON in FILE as an alist, or nil when it cannot be read."
+  (condition-case nil
+      (claude-code-ide-session-status--parse-json
+       (claude-code-ide-session-registry--file-string file))
+    (error nil)))
+
 (defun claude-code-ide-session-status--install-script ()
   "Write the hook script when it is missing or differs.
 Several Emacs processes can share it, so it is written to a temporary
@@ -299,15 +373,8 @@ file and renamed."
     (unless (and (file-exists-p file)
                  (equal (claude-code-ide-session-registry--file-string file)
                         claude-code-ide-session-status--script))
-      (make-directory (file-name-directory file) t)
-      (let ((tmp (make-temp-file (concat file "-"))))
-        (unwind-protect
-            (progn
-              (let ((coding-system-for-write 'utf-8-unix))
-                (write-region claude-code-ide-session-status--script nil tmp nil 'silent))
-              (rename-file tmp file t))
-          (when (file-exists-p tmp)
-            (delete-file tmp)))))))
+      (claude-code-ide-session-status--write-file-atomically
+       file claude-code-ide-session-status--script))))
 
 (defun claude-code-ide-session-status--command (nonce event)
   "Return the hook command that records EVENT for the launch NONCE."
@@ -318,13 +385,9 @@ file and renamed."
 
 (defun claude-code-ide-session-status--remove-launch-files (nonce)
   "Delete the event, counter and lock files of the launch NONCE."
-  (let ((dir (claude-code-ide-session-status--events-directory)))
-    (when (file-directory-p dir)
-      (dolist (file (directory-files dir t (concat "\\`\\.?" (regexp-quote nonce) "[-.]")))
-        (ignore-errors
-          (if (file-directory-p file)
-              (delete-directory file t)
-            (delete-file file)))))))
+  (claude-code-ide-session-status--delete-matching-files
+   (claude-code-ide-session-status--events-directory)
+   (concat "\\`\\.?" (regexp-quote nonce) "[-.]")))
 
 (defun claude-code-ide-session-status--sweep-dead-directories ()
   "Delete the events directories of Emacs processes that no longer run."
@@ -339,25 +402,13 @@ file and renamed."
 
 (defun claude-code-ide-session-status--read-event (file)
   "Return the hook input in FILE as an alist, or nil when it cannot be read."
-  (condition-case nil
-      (let ((text (claude-code-ide-session-registry--file-string file)))
-        (if (and (fboundp 'json-available-p) (json-available-p))
-            (json-parse-string text :object-type 'alist :array-type 'list
-                               :null-object nil :false-object nil)
-          (claude-code-ide-session-registry--json-decode text)))
-    (error nil)))
+  (claude-code-ide-session-status--read-json-file file))
 
 (defun claude-code-ide-session-status--remove-stale-locks ()
   "Delete counter locks older than three seconds.
-A hook holds its lock for milliseconds; an older lock was left by a hook
-that the CLI killed, and would stop the numbering of its launch."
-  (let ((dir (claude-code-ide-session-status--events-directory)))
-    (when (file-directory-p dir)
-      (dolist (lock (directory-files dir t "\\`\\.[0-9a-f]+\\.lock\\'" t))
-        (when-let* ((attributes (file-attributes lock)))
-          (when (> (float-time (time-subtract nil (file-attribute-modification-time attributes)))
-                   3)
-            (ignore-errors (delete-directory lock t))))))))
+See `claude-code-ide-session-status--remove-old-locks'."
+  (claude-code-ide-session-status--remove-old-locks
+   (claude-code-ide-session-status--events-directory) "\\`\\.[0-9a-f]+\\.lock\\'"))
 
 ;;; State machine
 
@@ -509,6 +560,45 @@ main agent waits on the subagent that started them."
                      new)))))
     (setf (claude-code-ide-session-status-tasks status) new)))
 
+(defcustom claude-code-ide-session-status-quota-regexp
+  (concat "usage[_ ]?limit\\|plan[_ ]limit\\|quota"
+          "\\|credits?[_ ]\\(?:depleted\\|exhausted\\)\\|out of credits\\|insufficient[_ ]credits"
+          "\\|hit your limit\\|\\(?:5-hour\\|five-hour\\|weekly\\|daily\\|monthly\\) limit")
+  "Regexp for an error text that reports the usage limit of the account.
+It is matched without case.  It must not match a short rate limit,
+such as \"Rate limit reached ... tokens per min\", which ends in
+seconds.  A Claude Code rate limit or a failed Codex model request
+whose text matches it is `failed/quota-limit'."
+  :type 'regexp
+  :group 'claude-code-ide)
+
+(defun claude-code-ide-session-status--quota-text-p (text)
+  "Return non-nil when TEXT reports the usage limit of the account."
+  (and (stringp text)
+       (let ((case-fold-search t))
+         (string-match-p claude-code-ide-session-status-quota-regexp text))))
+
+(defun claude-code-ide-session-status--quota-failure-p (data)
+  "Return non-nil when the StopFailure input DATA reports a quota limit.
+`billing_error' means that the account has no credits.  `rate_limit'
+covers also short limits of a few seconds, so it counts only when
+`error_details' or the last message says that a usage or plan limit
+was reached; see `claude-code-ide-session-status-quota-regexp'."
+  (pcase (alist-get 'error data)
+    ("billing_error" t)
+    ("rate_limit"
+     (or (claude-code-ide-session-status--quota-text-p (alist-get 'error_details data))
+         (claude-code-ide-session-status--quota-text-p (alist-get 'last_assistant_message data))))))
+
+(defun claude-code-ide-session-status--failure-text (data)
+  "Return the text that explains the StopFailure input DATA."
+  (let ((value (lambda (field) (let ((v (alist-get field data)))
+                                 (and (stringp v) (not (string-blank-p v)) v)))))
+    (or (funcall value 'error_details)
+        (funcall value 'last_assistant_message)
+        (funcall value 'error)
+        "API error")))
+
 (defun claude-code-ide-session-status--apply (status event data &optional now)
   "Change STATUS for the hook EVENT with the input DATA, at time NOW.
 A session waits for the user while it has blockers: a permission
@@ -623,11 +713,23 @@ UserPromptSubmit, so the tool event is its first sign."
          (claude-code-ide-session-status--apply-snapshot
           status (alist-get 'background_tasks data) now))
        (claude-code-ide-session-status--end-main-turn status)
-       (claude-code-ide-session-status--set-phase
-        status 'error
-        (claude-code-ide-session-status--one-line
-         (format "Error: %s" (or (alist-get 'error data) (alist-get 'message data) "API error")))
-        now))
+       (let ((quota (claude-code-ide-session-status--quota-failure-p data)))
+         (claude-code-ide-session-status--set-phase
+          status 'error
+          (claude-code-ide-session-status--one-line
+           (cond
+            (quota
+             (format "Quota limit: %s" (claude-code-ide-session-status--failure-text data)))
+            ((equal (alist-get 'error data) "rate_limit")
+             (let ((details (alist-get 'error_details data)))
+               (if (and (stringp details) (not (string-blank-p details)))
+                   (format "Error: rate limit: %s" details)
+                 "Error: rate limit")))
+            (t
+             (format "Error: %s" (or (alist-get 'error data) (alist-get 'message data) "API error")))))
+          now)
+         (setf (claude-code-ide-session-status-failure status)
+               (if quota 'quota-limit 'error))))
       ("SubagentStop"
        ;; The end of the subagent's turn ends its tools and its dialogs
        (when subagent-event
@@ -882,7 +984,8 @@ The reading also covers systems without file notification."
       (claude-code-ide-session-status--refresh))))
 
 (defun claude-code-ide-session-status--ensure-timers ()
-  "Start the tick timer and the file watch."
+  "Start the tick timer, the file watch and the snapshot timer."
+  (claude-code-ide-session-status--ensure-snapshot-timer)
   (unless (timerp claude-code-ide-session-status--tick-timer)
     (setq claude-code-ide-session-status--tick-timer
           (run-with-timer 2 2 #'claude-code-ide-session-status--tick)))
@@ -1000,11 +1103,11 @@ seconds after its start."
 (defun claude-code-ide-session-status--state (status now)
   "Return the state of STATUS at NOW.
 `waiting' while it has blockers, `unobserved' when it sent no event
-since it started.  When the main turn ended: `asks' when its reply
-asks the user questions, `tasks' while subagents run, `tasks-quiet'
-when they are quiet too long, else `idle', also while background
-shells run.  Else the phase.  A nil STATUS is
-`untracked'."
+since it started, `quota' when the turn failed on a quota limit.
+When the main turn ended: `asks' when its reply asks the user
+questions, `tasks' while subagents run, `tasks-quiet' when they are
+quiet too long, else `idle', also while background shells run.  Else
+the phase.  A nil STATUS is `untracked'."
   (cond
    ((null status) 'untracked)
    ((claude-code-ide-session-status-blockers status) 'waiting)
@@ -1012,6 +1115,9 @@ shells run.  Else the phase.  A nil STATUS is
          (> (- now (claude-code-ide-session-status-registered status))
             claude-code-ide-session-status-start-timeout))
     'unobserved)
+   ((and (eq (claude-code-ide-session-status-phase status) 'error)
+         (eq (claude-code-ide-session-status-failure status) 'quota-limit))
+    'quota)
    ((eq (claude-code-ide-session-status-phase status) 'idle)
     (let ((running (claude-code-ide-session-status--running-tasks status)))
       (cond
@@ -1124,8 +1230,9 @@ approval.  An elicitation and the other notifications are dialogs."
 (defun claude-code-ide-session-status--common-state (status now)
   "Return the common state of STATUS at NOW.
 See `claude-code-ide-instance-state' for the result.
-A nil STATUS, a session without status hooks, is `disconnected': no
-event comes from it."
+A nil STATUS, a session without status hooks, is
+`disconnected/untracked'; hooks without an event since the start give
+`disconnected/no-signal', and a start `working/starting'."
   (let* ((state (claude-code-ide-session-status--state status now))
          (since (claude-code-ide-session-status--state-since status state)))
     (pcase state
@@ -1138,14 +1245,18 @@ event comes from it."
       ;; The reply ends with a question: a guess of the ask regexps
       ('asks (claude-code-ide-instance-make-state 'waiting-for-user 'question since t))
       ('error (claude-code-ide-instance-make-state 'failed 'error since))
+      ('quota (claude-code-ide-instance-make-state 'failed 'quota-limit since))
       ((or 'tasks 'tasks-quiet)
        (claude-code-ide-instance-make-state 'waiting-for-task 'subagent since))
       ('idle (claude-code-ide-instance-make-state
               'idle nil since (claude-code-ide-session-status-guessed status)))
       ;; The CLI starts and takes no prompt yet
-      ((or 'starting 'working) (claude-code-ide-instance-make-state 'working nil since))
-      ;; `unobserved' and `untracked': no event comes
-      (_ (claude-code-ide-instance-make-state 'disconnected nil since)))))
+      ('starting (claude-code-ide-instance-make-state 'working 'starting since))
+      ('working (claude-code-ide-instance-make-state 'working nil since))
+      ;; Hooks, but no event since the start
+      ('unobserved (claude-code-ide-instance-make-state 'disconnected 'no-signal since))
+      ;; No status hooks
+      (_ (claude-code-ide-instance-make-state 'disconnected 'untracked since)))))
 
 (defun claude-code-ide-session-status--instance-state (instance now)
   "Return the common state of the Claude Code INSTANCE at NOW, or nil.
@@ -1159,16 +1270,89 @@ This is a function of `claude-code-ide-instance-state-functions'."
 (add-hook 'claude-code-ide-instance-state-functions
           #'claude-code-ide-session-status--instance-state)
 
+;;; Instances of other providers
+
+(defvar claude-code-ide-session-status-detail-functions nil
+  "Functions that give the detail text of an instance of another provider.
+Each function is called with INSTANCE and NOW (a float time) and
+returns a string, or nil when it does not know INSTANCE.  The first
+non-nil result is used.  Claude Code instances get their detail from
+this file.")
+
+(defun claude-code-ide-session-status--other-provider-p (instance)
+  "Return non-nil when INSTANCE runs a provider other than Claude Code."
+  (and instance
+       (claude-code-ide-instance-provider instance)
+       (not (eq (claude-code-ide-instance-provider instance) 'claude))))
+
+(defun claude-code-ide-session-status--item-instance (item)
+  "Return the descriptor of the row ITEM, a session or a descriptor, or nil."
+  (if (claude-code-ide-instance-p item)
+      item
+    (claude-code-ide-instance-of-session item)))
+
+(defun claude-code-ide-session-status--item-buffer (item)
+  "Return the terminal buffer of the row ITEM, a session or a descriptor."
+  (if (claude-code-ide-instance-p item)
+      (or (claude-code-ide-instance-buffer item)
+          (let ((session (claude-code-ide-instance-session item)))
+            (and session (claude-code-ide-mcp-session-buffer session))))
+    (claude-code-ide-mcp-session-buffer item)))
+
+(defun claude-code-ide-session-status--item-project-dir (item)
+  "Return the project directory of the row ITEM, a session or a descriptor."
+  (file-name-as-directory
+   (expand-file-name
+    (if (claude-code-ide-instance-p item)
+        (or (claude-code-ide-known-or-nil (claude-code-ide-instance-project-root item))
+            (let ((session (claude-code-ide-instance-session item)))
+              (and session (claude-code-ide-mcp-session-project-dir session)))
+            default-directory)
+      (claude-code-ide-mcp-session-project-dir item)))))
+
+(defun claude-code-ide-session-status--common-label-key (state)
+  "Return the status buffer state for the common STATE plist.
+Rows of other providers use it; their state comes from
+`claude-code-ide-instance-state'."
+  (let ((reason (plist-get state :reason)))
+    (pcase (plist-get state :state)
+      ('waiting-for-user (if (and (eq reason 'question) (plist-get state :guess)) 'asks 'waiting))
+      ('failed (if (eq reason 'quota-limit) 'quota 'error))
+      ('waiting-for-task 'tasks)
+      ('idle 'idle)
+      ('working (if (eq reason 'starting) 'starting 'working))
+      (_ (pcase reason
+           ('untracked 'untracked)
+           ('no-signal 'unobserved)
+           (_ 'disconnected))))))
+
+(defun claude-code-ide-session-status--other-detail (instance now)
+  "Return the detail text of INSTANCE of another provider at NOW."
+  (or (run-hook-with-args-until-success 'claude-code-ide-session-status-detail-functions
+                                        instance now)
+      ""))
+
+(defun claude-code-ide-session-status--format-state (state)
+  "Return the common STATE plist as text, such as \"waiting-for-user/approval\".
+A state that Emacs guesses ends with a question mark."
+  (if (null state)
+      "unknown"
+    (concat (symbol-name (plist-get state :state))
+            (if (plist-get state :reason) (format "/%s" (plist-get state :reason)) "")
+            (if (plist-get state :guess) "?" ""))))
+
 (defconst claude-code-ide-session-status--rank
-  '((waiting . 0) (asks . 1) (error . 2) (unobserved . 3) (tasks-quiet . 4) (idle . 5)
-    (tasks . 6) (starting . 7) (working . 8) (untracked . 9))
+  '((waiting . 0) (asks . 1) (quota . 2) (error . 3) (unobserved . 4) (disconnected . 5)
+    (tasks-quiet . 6) (idle . 7) (tasks . 8) (starting . 9) (working . 10) (untracked . 11))
   "Order of the states in the status buffer: what needs the user first.")
 
 (defconst claude-code-ide-session-status--labels
   '((waiting "NEEDS ANSWER" claude-code-ide-session-status-waiting)
     (asks "ASKS YOU" claude-code-ide-session-status-waiting)
+    (quota "QUOTA LIMIT" claude-code-ide-session-status-waiting)
     (error "FAILED" claude-code-ide-session-status-waiting)
     (unobserved "NO SIGNAL" claude-code-ide-session-status-waiting)
+    (disconnected "DISCONNECTED" claude-code-ide-session-status-waiting)
     (tasks-quiet "TASKS QUIET" claude-code-ide-session-status-idle)
     (idle "WAITS FOR YOU" claude-code-ide-session-status-idle)
     (tasks "WAITS ON TASKS" claude-code-ide-session-status-working)
@@ -1186,25 +1370,57 @@ or next message, or the agent for its own background tasks.")
 
 (defun claude-code-ide-session-status--urgent-p (state)
   "Return non-nil when STATE asks the user to act or look at once."
-  (memq state '(waiting asks error unobserved tasks-quiet)))
+  (memq state '(waiting asks quota error unobserved disconnected tasks-quiet)))
+
+(defun claude-code-ide-session-status--claude-row (session now)
+  "Return the row of the Claude Code SESSION at NOW."
+  (let* ((status (gethash session claude-code-ide-session-status--by-session))
+         (state (claude-code-ide-session-status--state status now)))
+    (list session state
+          (claude-code-ide-session-status--state-since status state)
+          (claude-code-ide-session-status--detail status state now)
+          (claude-code-ide-session-status--common-state status now))))
+
+(defun claude-code-ide-session-status--other-row (item instance now)
+  "Return the row of ITEM, whose descriptor INSTANCE runs another provider, at NOW."
+  (let ((common (claude-code-ide-instance-state instance now)))
+    (list item (claude-code-ide-session-status--common-label-key common)
+          (plist-get common :since)
+          (claude-code-ide-session-status--other-detail instance now)
+          common)))
 
 (defun claude-code-ide-session-status--rows (&optional now)
-  "Return (SESSION STATE SINCE DETAIL) for each live session at NOW.
+  "Return (ITEM STATE SINCE DETAIL COMMON) for each live instance at NOW.
+ITEM is the MCP session of the instance, or its descriptor when it has
+no session.  STATE is a state of the status buffer, and COMMON is the
+common state plist.  Claude Code sessions get their state from their
+hooks; instances of other providers from `claude-code-ide-instance-state'.
 The rows are in the order of `claude-code-ide-session-status--rank',
 oldest first within a state."
   (let* ((now (or now (float-time)))
-         (rows (delq nil
-                     (mapcar
-                      (lambda (session)
-                        (let ((buffer (claude-code-ide-mcp-session-buffer session)))
-                          (when (and buffer (buffer-live-p buffer))
-                            (let* ((status (gethash session
-                                                    claude-code-ide-session-status--by-session))
-                                   (state (claude-code-ide-session-status--state status now)))
-                              (list session state
-                                    (claude-code-ide-session-status--state-since status state)
-                                    (claude-code-ide-session-status--detail status state now))))))
-                      (claude-code-ide-mcp--active-sessions)))))
+         (sessions (claude-code-ide-mcp--active-sessions))
+         (rows
+          (append
+           (delq nil
+                 (mapcar
+                  (lambda (session)
+                    (let ((buffer (claude-code-ide-mcp-session-buffer session))
+                          (instance (claude-code-ide-instance-of-session session)))
+                      (when (and buffer (buffer-live-p buffer))
+                        (if (claude-code-ide-session-status--other-provider-p instance)
+                            (claude-code-ide-session-status--other-row session instance now)
+                          (claude-code-ide-session-status--claude-row session now)))))
+                  sessions))
+           ;; Instances of other providers that have no MCP session
+           (delq nil
+                 (mapcar
+                  (lambda (instance)
+                    (let ((buffer (claude-code-ide-session-status--item-buffer instance)))
+                      (when (and (claude-code-ide-session-status--other-provider-p instance)
+                                 (not (memq (claude-code-ide-instance-session instance) sessions))
+                                 buffer (buffer-live-p buffer))
+                        (claude-code-ide-session-status--other-row instance instance now))))
+                  (claude-code-ide-instances))))))
     (sort rows
           (lambda (a b)
             (let ((rank-a (alist-get (nth 1 a) claude-code-ide-session-status--rank))
@@ -1212,6 +1428,170 @@ oldest first within a state."
               (if (/= rank-a rank-b)
                   (< rank-a rank-b)
                 (< (or (nth 2 a) now) (or (nth 2 b) now))))))))
+
+;;; Status snapshot
+
+(defcustom claude-code-ide-session-status-snapshot t
+  "When non-nil, write a status snapshot file for external coordinators.
+The file is <report directory>/status/<emacs-pid>.json, with the
+schema `claude-code-ide-status/v1' of docs/status-schema.md.  Emacs
+writes it at each change and at least every
+`claude-code-ide-session-status-snapshot-interval' seconds, while an
+instance runs or a status mode is on."
+  :type 'boolean
+  :group 'claude-code-ide)
+
+(defcustom claude-code-ide-session-status-snapshot-interval 10
+  "Seconds after which the status snapshot is written again without a change.
+A reader treats a snapshot older than 30 seconds as stale, so keep
+this value well below 30."
+  :type 'number
+  :group 'claude-code-ide)
+
+(defconst claude-code-ide-session-status-snapshot-schema "claude-code-ide-status/v1"
+  "Schema name of the status snapshot file.")
+
+(defconst claude-code-ide-session-status-snapshot-stale-after 30
+  "Seconds after which a reader treats a status snapshot as stale.")
+
+(defvar claude-code-ide-session-status--snapshot-timer nil
+  "Timer that writes the status snapshot at least every interval.")
+
+(defvar claude-code-ide-session-status--snapshot-last nil
+  "(TIME . KEY) of the last snapshot write: its time and its content without ages.")
+
+(defun claude-code-ide-session-status--snapshot-file (&optional pid)
+  "Return the status snapshot file of the Emacs process PID (default: this one)."
+  (expand-file-name (format "status/%d.json" (or pid (emacs-pid)))
+                    (claude-code-ide-session-registry--report-directory)))
+
+(defun claude-code-ide-session-status--iso-time (time)
+  "Return the float TIME as an ISO 8601 UTC string, or nil for a nil TIME."
+  (and time (format-time-string "%FT%T.%3NZ" time t)))
+
+(defun claude-code-ide-session-status--json-value (value)
+  "Return VALUE for the snapshot: `unknown' as \"unknown\", a symbol as its name."
+  (cond
+   ((null value) nil)
+   ((stringp value) value)
+   ((numberp value) value)
+   ((symbolp value) (symbol-name value))
+   (t (format "%s" value))))
+
+(defun claude-code-ide-session-status--instance-detail (instance now)
+  "Return the detail text of INSTANCE at NOW, of any provider."
+  (if (claude-code-ide-session-status--other-provider-p instance)
+      (claude-code-ide-session-status--other-detail instance now)
+    (let* ((status (gethash (claude-code-ide-instance-session instance)
+                            claude-code-ide-session-status--by-session))
+           (state (claude-code-ide-session-status--state status now)))
+      (or (claude-code-ide-session-status--detail status state now) ""))))
+
+(defun claude-code-ide-session-status--snapshot-instance (instance now)
+  "Return the snapshot record of INSTANCE at NOW, as an alist."
+  (let* ((state (claude-code-ide-instance-state instance now))
+         (buffer (claude-code-ide-session-status--item-buffer instance))
+         (value #'claude-code-ide-session-status--json-value))
+    `((instance_id . ,(claude-code-ide-instance-id instance))
+      (provider . ,(funcall value (claude-code-ide-or-unknown (claude-code-ide-instance-provider instance))))
+      (native_id . ,(funcall value (claude-code-ide-instance-native-id instance)))
+      (display_name . ,(funcall value (claude-code-ide-instance-display-name instance)))
+      (project_root . ,(funcall value (claude-code-ide-instance-project-root instance)))
+      (worktree . ,(funcall value (claude-code-ide-instance-worktree instance)))
+      (model . ,(funcall value (claude-code-ide-or-unknown (claude-code-ide-instance-model instance))))
+      (role . ,(funcall value (claude-code-ide-instance-role instance)))
+      (generation . ,(claude-code-ide-instance-generation instance))
+      (pid . ,(funcall value (claude-code-ide-instance-pid instance)))
+      (buffer . ,(if (buffer-live-p buffer) (buffer-name buffer) "unknown"))
+      (state . ,(funcall value (plist-get state :state)))
+      (reason . ,(funcall value (plist-get state :reason)))
+      (guess . ,(if (plist-get state :guess) t :json-false))
+      (since . ,(claude-code-ide-session-status--iso-time (plist-get state :since)))
+      (age_seconds . ,(let ((age (plist-get state :age))) (and age (round age))))
+      (detail . ,(claude-code-ide-session-status--instance-detail instance now)))))
+
+(defun claude-code-ide-session-status--snapshot-data (now)
+  "Return the status snapshot at NOW as an alist for `json-encode'."
+  `((schema . ,claude-code-ide-session-status-snapshot-schema)
+    (generated_at . ,(claude-code-ide-session-status--iso-time now))
+    (producer_pid . ,(emacs-pid))
+    (host . ,(system-name))
+    (interval_seconds . ,claude-code-ide-session-status-snapshot-interval)
+    (stale_after_seconds . ,claude-code-ide-session-status-snapshot-stale-after)
+    (instances . ,(vconcat (mapcar (lambda (instance)
+                                     (claude-code-ide-session-status--snapshot-instance instance now))
+                                   (claude-code-ide-instances))))))
+
+(defun claude-code-ide-session-status--snapshot-key (data)
+  "Return the instances of the snapshot DATA without their ages.
+Two snapshots with the same key differ only in values that change with
+time alone."
+  (mapcar (lambda (instance)
+            (cl-remove 'age_seconds instance :key #'car))
+          (append (alist-get 'instances data) nil)))
+
+(defun claude-code-ide-session-status--write-snapshot (&optional force now)
+  "Write the status snapshot when it changed, or when FORCE is non-nil.
+NOW is the float time of the snapshot.  A snapshot without a change is
+also written when the last write is
+`claude-code-ide-session-status-snapshot-interval' seconds old.
+Return non-nil when the file was written.  An error gives a message
+and does not stop the caller."
+  (when claude-code-ide-session-status-snapshot
+    (condition-case err
+        (let* ((now (or now (float-time)))
+               (data (claude-code-ide-session-status--snapshot-data now))
+               (key (claude-code-ide-session-status--snapshot-key data))
+               (last claude-code-ide-session-status--snapshot-last))
+          (when (or force
+                    (null last)
+                    (not (equal (cdr last) key))
+                    (>= (- now (car last)) claude-code-ide-session-status-snapshot-interval))
+            (claude-code-ide-session-status--write-file-atomically
+             (claude-code-ide-session-status--snapshot-file)
+             (concat (json-encode data) "\n") nil #o700)
+            (setq claude-code-ide-session-status--snapshot-last (cons now key))
+            (add-hook 'kill-emacs-hook #'claude-code-ide-session-status--remove-snapshot)
+            t))
+      (error
+       (message "Session status: the snapshot could not be written: %s"
+                (error-message-string err))
+       nil))))
+
+(defun claude-code-ide-session-status--remove-snapshot ()
+  "Delete the status snapshot of this Emacs."
+  (setq claude-code-ide-session-status--snapshot-last nil)
+  (ignore-errors (delete-file (claude-code-ide-session-status--snapshot-file))))
+
+(defun claude-code-ide-session-status--snapshot-wanted-p ()
+  "Return non-nil while the status snapshot has something to report.
+That is while an instance runs, a launch is tracked, or a status mode
+is on."
+  (and claude-code-ide-session-status-snapshot
+       (or (claude-code-ide-instances)
+           (> (hash-table-count claude-code-ide-session-status--by-nonce) 0)
+           claude-code-ide-session-status-mode
+           (bound-and-true-p claude-code-ide-session-registry-mode))))
+
+(defun claude-code-ide-session-status--snapshot-tick ()
+  "Write the status snapshot, or stop when there is nothing to report.
+When the timer stops, the snapshot file is deleted: a missing file
+means that this Emacs reports no instances."
+  (if (claude-code-ide-session-status--snapshot-wanted-p)
+      (claude-code-ide-session-status--write-snapshot t)
+    (when (timerp claude-code-ide-session-status--snapshot-timer)
+      (cancel-timer claude-code-ide-session-status--snapshot-timer))
+    (setq claude-code-ide-session-status--snapshot-timer nil)
+    (claude-code-ide-session-status--remove-snapshot)))
+
+(defun claude-code-ide-session-status--ensure-snapshot-timer ()
+  "Start the timer that writes the status snapshot, when it is wanted."
+  (when (and claude-code-ide-session-status-snapshot
+             (not (timerp claude-code-ide-session-status--snapshot-timer)))
+    (setq claude-code-ide-session-status--snapshot-timer
+          (run-with-timer claude-code-ide-session-status-snapshot-interval
+                          claude-code-ide-session-status-snapshot-interval
+                          #'claude-code-ide-session-status--snapshot-tick))))
 
 ;;; Status buffer
 
@@ -1238,12 +1618,28 @@ oldest first within a state."
 (defconst claude-code-ide-session-status--provider-width 8
   "Width of the Provider column.")
 
-(defun claude-code-ide-session-status--provider-label (session)
-  "Return the provider name of SESSION for its row, or \"unknown\"."
+(defconst claude-code-ide-session-status--model-width 16
+  "Width of the Model column; longer names are cut.")
+
+(defconst claude-code-ide-session-status--state-width 26
+  "Width of the State column, the common state and its reason.")
+
+(defun claude-code-ide-session-status--provider-label (item)
+  "Return the provider name of ITEM for its row, or \"unknown\".
+ITEM is a session or a descriptor."
   (claude-code-ide-format-value
    (claude-code-ide-or-unknown
-    (when-let* ((instance (claude-code-ide-instance-of-session session)))
+    (when-let* ((instance (claude-code-ide-session-status--item-instance item)))
       (claude-code-ide-instance-provider instance)))))
+
+(defun claude-code-ide-session-status--model-label (item)
+  "Return the model of ITEM for its row, or \"unknown\".
+ITEM is a session or a descriptor.  A model that Emacs does not know,
+also of a session without a descriptor, shows \"unknown\"."
+  (let* ((instance (claude-code-ide-session-status--item-instance item))
+         (model (and instance (claude-code-ide-instance-model instance))))
+    (claude-code-ide-format-value
+     (if (and (stringp model) (not (string-empty-p model))) model 'unknown))))
 
 (cl-defstruct (claude-code-ide-session-status--group
                (:constructor claude-code-ide-session-status--group-create)
@@ -1258,8 +1654,7 @@ The groups keep the order of their first row, so the project with the
 session that needs the user most comes first; rows keep their order."
   (let ((groups '()))
     (dolist (row rows)
-      (let* ((directory (file-name-as-directory
-                         (expand-file-name (claude-code-ide-mcp-session-project-dir (car row)))))
+      (let* ((directory (claude-code-ide-session-status--item-project-dir (car row)))
              (group (cl-find directory groups
                              :key #'claude-code-ide-session-status--group-directory
                              :test #'equal)))
@@ -1290,14 +1685,21 @@ It comes from the file that the CLI process keeps in ~/.claude/sessions."
           (puthash pid (cons time title) claude-code-ide-session-status--title-cache)
           title)))))
 
-(defun claude-code-ide-session-status--session-label (session)
-  "Return the name of SESSION in its row, under its project line.
-That is its instance name, else the title that the user gave it, else
-the project name."
-  (or (claude-code-ide-mcp-session-instance-name session)
-      (claude-code-ide-session-status--user-title session)
-      (file-name-nondirectory
-       (directory-file-name (claude-code-ide-mcp-session-project-dir session)))))
+(defun claude-code-ide-session-status--session-label (item)
+  "Return the name of ITEM in its row, under its project line.
+For a session: its instance name, else the title that the user gave
+it, else the project name.  For a descriptor without a session: its
+display name, else the project name."
+  (if (claude-code-ide-instance-p item)
+      (let ((name (claude-code-ide-known-or-nil (claude-code-ide-instance-display-name item))))
+        (if (and (stringp name) (not (string-empty-p name)))
+            name
+          (file-name-nondirectory
+           (directory-file-name (claude-code-ide-session-status--item-project-dir item)))))
+    (or (claude-code-ide-mcp-session-instance-name item)
+        (claude-code-ide-session-status--user-title item)
+        (file-name-nondirectory
+         (directory-file-name (claude-code-ide-mcp-session-project-dir item))))))
 
 (defun claude-code-ide-session-status--group-header (group)
   "Return the header line text of GROUP."
@@ -1314,11 +1716,12 @@ Each group starts with a header entry whose id is the group."
   (apply #'append
          (mapcar
           (lambda (group)
-            (cons (list group (vector (claude-code-ide-session-status--group-header group) "" "" "" ""))
+            (cons (list group (vector (claude-code-ide-session-status--group-header group)
+                                      "" "" "" "" "" ""))
                   (mapcar (lambda (row)
-                            (pcase-let* ((`(,session ,state ,since ,detail) row)
+                            (pcase-let* ((`(,item ,state ,since ,detail ,common) row)
                                          (`(,label ,face) (alist-get state claude-code-ide-session-status--labels)))
-                              (list session
+                              (list item
                                     (vector (propertize label
                                                         'face face
                                                         'mouse-face 'highlight
@@ -1326,9 +1729,13 @@ Each group starts with a header entry whose id is the group."
                                                         'follow-link t
                                                         'keymap claude-code-ide-session-status--label-map)
                                             (truncate-string-to-width
-                                             (concat "  " (claude-code-ide-session-status--session-label session))
+                                             (concat "  " (claude-code-ide-session-status--session-label item))
                                              claude-code-ide-session-status--session-width nil nil "…")
-                                            (claude-code-ide-session-status--provider-label session)
+                                            (claude-code-ide-session-status--provider-label item)
+                                            (truncate-string-to-width
+                                             (claude-code-ide-session-status--model-label item)
+                                             claude-code-ide-session-status--model-width nil nil "…")
+                                            (claude-code-ide-session-status--format-state common)
                                             (claude-code-ide-session-status--age since now)
                                             (or detail "")))))
                           (claude-code-ide-session-status--group-rows group))))
@@ -1362,6 +1769,8 @@ line goes to its first session.
         (vector (list "Status" (claude-code-ide-session-status--label-width) nil)
                 (list "Session" claude-code-ide-session-status--session-width nil)
                 (list "Provider" claude-code-ide-session-status--provider-width nil)
+                (list "Model" claude-code-ide-session-status--model-width nil)
+                (list "State" claude-code-ide-session-status--state-width nil)
                 '("For" 5 nil :right-align t)
                 '("Detail" 0 nil)))
   (setq tabulated-list-sort-key nil)
@@ -1386,14 +1795,22 @@ line goes to its first session.
           (fit-window-to-buffer window claude-code-ide-session-status-max-height))))
     (unless (= count claude-code-ide-session-status--urgent-count)
       (setq claude-code-ide-session-status--urgent-count count)
-      (force-mode-line-update t))))
+      (force-mode-line-update t))
+    ;; Only while the snapshot timer runs, which owns the file
+    (when (timerp claude-code-ide-session-status--snapshot-timer)
+      (claude-code-ide-session-status--write-snapshot nil now))))
 
-(defun claude-code-ide-session-status--visit-session (session)
-  "Show SESSION's terminal buffer and select its window."
-  (let ((buffer (claude-code-ide-mcp-session-buffer session)))
+(defun claude-code-ide-session-status--visit-session (item)
+  "Show the terminal buffer of ITEM and select its window.
+ITEM is a session or a descriptor."
+  (let ((buffer (claude-code-ide-session-status--item-buffer item))
+        (session (if (claude-code-ide-instance-p item)
+                     (claude-code-ide-instance-session item)
+                   item)))
     (unless (and buffer (buffer-live-p buffer))
-      (user-error "That Claude Code session has ended"))
-    (claude-code-ide--touch-session session)
+      (user-error "That session has ended"))
+    (when session
+      (claude-code-ide--touch-session session))
     (if-let* ((window (get-buffer-window buffer t)))
         (progn
           (select-frame-set-input-focus (window-frame window))
@@ -1414,6 +1831,8 @@ With a prefix argument FORCE, restart it also while it is busy."
   (let ((session (tabulated-list-get-id)))
     (unless (and session (not (claude-code-ide-session-status--group-p session)))
       (user-error "No session on this line"))
+    (when (claude-code-ide-instance-p session)
+      (user-error "Only Claude Code sessions are restarted with status hooks"))
     (unless (memq session (claude-code-ide-session-registry--untracked-sessions))
       (user-error "%s has status hooks already" (claude-code-ide--session-display-name session)))
     (when (yes-or-no-p (format "Restart %s to add status tracking?  Its background tasks end.  "
@@ -1438,7 +1857,8 @@ then those with quiet background tasks, then those that wait for your
 next message; the longest wait first within each state."
   (interactive)
   (let ((row (cl-find-if (lambda (row)
-                           (memq (nth 1 row) '(waiting asks error unobserved tasks-quiet idle)))
+                           (memq (nth 1 row) '(waiting asks quota error unobserved disconnected
+                                                       tasks-quiet idle)))
                          (claude-code-ide-session-status--rows))))
     (if row
         (claude-code-ide-session-status--visit-session (car row))
