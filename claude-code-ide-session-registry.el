@@ -72,8 +72,6 @@
 (require 'tabulated-list)
 (require 'claude-code-ide)
 
-(defvar claude-code-ide-session-prepare-functions)
-
 (declare-function claude-code-ide-session-status--set-tracking "claude-code-ide-session-status" (on))
 (declare-function claude-code-ide-session-status--forget "claude-code-ide-session-status" (session))
 
@@ -1030,9 +1028,6 @@ or names a session itself gets its id from the CLI."
   (when-let* ((instance (claude-code-ide-instance-of-session session)))
     (claude-code-ide-instance-id instance)))
 
-;; The `fork' slot of the start spec is newer than this file's callers
-(declare-function claude-code-ide-start-spec-fork "claude-code-ide" (spec))
-
 (defun claude-code-ide-session-registry--spec-provider (spec)
   "Return the provider name of SPEC: its own, else `claude'."
   (or (claude-code-ide-start-spec-provider spec) 'claude))
@@ -1042,8 +1037,7 @@ or names a session itself gets its id from the CLI."
 The start spec's `fork' slot says it.  The provider passes the fork
 flag of its CLI (Claude Code: --fork-session) in the launch arguments,
 not in SPEC's extra flags, so the flags cannot tell it."
-  (and (fboundp 'claude-code-ide-start-spec-fork)
-       (claude-code-ide-start-spec-fork spec)))
+  (claude-code-ide-start-spec-fork spec))
 
 (defun claude-code-ide-session-registry--new-native-id (session)
   "Return the id that Emacs chose for the new conversation of SESSION.
