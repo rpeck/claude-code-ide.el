@@ -107,6 +107,17 @@ process groups of those terminals."
   :type 'string
   :group 'claude-code-ide-process)
 
+(defcustom claude-code-ide-process-lsof-timeout 30
+  "Seconds that the scan of working folders may take.
+lsof takes about 0.6 seconds on an idle Mac, and 20 to 30 seconds
+under heavy load.  After this time the scan stops, and the stop
+reports the status `error'."
+  :type 'number
+  :group 'claude-code-ide-process)
+
+(defconst claude-code-ide-process--ps-timeout 10
+  "Seconds that one ps run may take.")
+
 ;;; Process data
 ;;
 ;; An entry is a plist (:pid :ppid :pgid :uid :start), where :start is
@@ -132,7 +143,8 @@ It may call it later; it returns at once.")
 (defvar claude-code-ide-process-cwd-function #'claude-code-ide-process--lsof-cwds
   "Function that returns the working folders of processes.
 It takes an optional list of process IDs (nil means all processes of
-this user) and returns a list of plists (:pid :cwd :command).")
+this user) and returns a list of plists (:pid :cwd :command), or the
+symbol `failed' when it cannot tell.")
 
 (defvar claude-code-ide-process-signal-function #'signal-process
   "Function that sends a signal: (TARGET SIGNAL), as `signal-process'.
@@ -170,44 +182,87 @@ the same."
   "Return the arguments of ps for the table of all processes."
   (list "-A" "-o" "pid=,ppid=,pgid=,uid=,lstart="))
 
+(defun claude-code-ide-process--run (program args timeout &optional any-exit)
+  "Run PROGRAM with ARGS in the folder /, and return its output, or nil.
+Wait up to TIMEOUT seconds; after that, end PROGRAM (a child of this
+Emacs) and return nil.  A non-zero exit gives nil, unless ANY-EXIT.
+Process output and sentinels run during the wait."
+  (let* ((default-directory "/")
+         (process-environment (cons "LC_ALL=C" process-environment))
+         (output (generate-new-buffer " *claude-code-ide-run*"))
+         (errors (generate-new-buffer " *claude-code-ide-run-errors*"))
+         (finished nil)
+         (process (ignore-errors
+                    (make-process :name "claude-code-ide-run"
+                                  :buffer output
+                                  :command (cons program args)
+                                  :connection-type 'pipe
+                                  :noquery t
+                                  :stderr errors
+                                  ;; The sentinel runs after the last output
+                                  :sentinel (lambda (_process _event)
+                                              (setq finished t))))))
+    (unwind-protect
+        (when process
+          (when-let* ((pipe (get-buffer-process errors)))
+            (set-process-query-on-exit-flag pipe nil))
+          (claude-code-ide-process--wait (lambda () finished) timeout)
+          (if (process-live-p process)
+              (progn (delete-process process) nil)
+            (when (and (eq (process-status process) 'exit)
+                       (or any-exit (eql 0 (process-exit-status process))))
+              (with-current-buffer output (buffer-string)))))
+      (dolist (buffer (list output errors))
+        (when (buffer-live-p buffer)
+          (let ((kill-buffer-query-functions nil))
+            (kill-buffer buffer)))))))
+
 (defun claude-code-ide-process--ps-list ()
   "Return the entries of all processes from ps, or nil when ps fails."
-  (with-temp-buffer
-    (let ((default-directory "/")
-          (process-environment (cons "LC_ALL=C" process-environment)))
-      (when (eql 0 (ignore-errors
-                     (apply #'call-process claude-code-ide-process-ps-program nil
-                            '(t nil) nil (claude-code-ide-process--ps-args))))
-        (claude-code-ide-process--parse-ps (buffer-string))))))
+  (when-let* ((text (claude-code-ide-process--run
+                     claude-code-ide-process-ps-program (claude-code-ide-process--ps-args)
+                     claude-code-ide-process--ps-timeout)))
+    (claude-code-ide-process--parse-ps text)))
 
 (defun claude-code-ide-process--ps-list-async (callback)
   "Run ps without a wait, and call CALLBACK with the entries.
-CALLBACK gets nil when ps fails."
+CALLBACK gets nil when ps fails.  The output and the error output go
+to hidden buffers that the sentinel kills."
   (let* ((default-directory "/")
          (process-environment (cons "LC_ALL=C" process-environment))
-         (buffer (generate-new-buffer " *claude-code-ide-ps*")))
+         (buffer (generate-new-buffer " *claude-code-ide-ps*"))
+         (errors (generate-new-buffer " *claude-code-ide-ps-errors*"))
+         (cleanup (lambda ()
+                    (dolist (b (list buffer errors))
+                      (when (buffer-live-p b)
+                        (let ((kill-buffer-query-functions nil))
+                          (kill-buffer b)))))))
     (condition-case nil
-        (make-process
-         :name "claude-code-ide-ps"
-         :buffer buffer
-         :command (cons claude-code-ide-process-ps-program
-                        (claude-code-ide-process--ps-args))
-         :connection-type 'pipe
-         :noquery t
-         :stderr null-device
-         :sentinel
-         (lambda (process _event)
-           (unless (process-live-p process)
-             (let ((entries (and (eq (process-status process) 'exit)
-                                 (eql 0 (process-exit-status process))
-                                 (buffer-live-p buffer)
-                                 (with-current-buffer buffer
-                                   (claude-code-ide-process--parse-ps (buffer-string))))))
-               (when (buffer-live-p buffer)
-                 (kill-buffer buffer))
-               (funcall callback entries)))))
+        (progn
+          (make-process
+           :name "claude-code-ide-ps"
+           :buffer buffer
+           :command (cons claude-code-ide-process-ps-program
+                          (claude-code-ide-process--ps-args))
+           :connection-type 'pipe
+           :noquery t
+           :stderr errors
+           :sentinel
+           (lambda (process _event)
+             (unless (process-live-p process)
+               (let ((entries (and (eq (process-status process) 'exit)
+                                   (eql 0 (process-exit-status process))
+                                   (buffer-live-p buffer)
+                                   (with-current-buffer buffer
+                                     (claude-code-ide-process--parse-ps (buffer-string))))))
+                 (funcall cleanup)
+                 (funcall callback entries)))))
+          ;; The error output has its own pipe process; it must not ask
+          ;; at the kill of its buffer
+          (when-let* ((pipe (get-buffer-process errors)))
+            (set-process-query-on-exit-flag pipe nil)))
       (error
-       (kill-buffer buffer)
+       (funcall cleanup)
        (funcall callback nil)))))
 
 (defun claude-code-ide-process--attributes-entry (pid)
@@ -247,73 +302,94 @@ A zombie counts as gone."
 (defun claude-code-ide-process--lsof-cwds (&optional pids)
   "Return the plists (:pid :cwd :command) of the processes of this user.
 With PIDS, only of those processes.  lsof runs in the folder /, so
-that it is never in a worktree itself."
-  (with-temp-buffer
-    (let ((default-directory "/")
-          (process-environment (cons "LC_ALL=C" process-environment)))
-      (ignore-errors
-        (apply #'call-process claude-code-ide-process-lsof-program nil '(t nil) nil
-               (append (list "-w" "-a" "-d" "cwd" "-Fpcn")
+that it is never in a worktree itself.  Return the symbol `failed'
+when lsof cannot run, or takes more than
+`claude-code-ide-process-lsof-timeout' seconds.  lsof exits with 1
+when a process of PIDS is gone, so its exit status does not count."
+  (let ((text (claude-code-ide-process--run
+               claude-code-ide-process-lsof-program
+               (append (list "-n" "-P" "-w" "-a" "-d" "cwd" "-Fpcn")
                        (if pids
                            (list "-p" (mapconcat #'number-to-string pids ","))
-                         (list "-u" (number-to-string (user-uid)))))))
-      (claude-code-ide-process--parse-lsof (buffer-string)))))
+                         (list "-u" (number-to-string (user-uid)))))
+               claude-code-ide-process-lsof-timeout t)))
+    (if text
+        (claude-code-ide-process--parse-lsof text)
+      'failed)))
 
 (defun claude-code-ide-process--entry-alive-p (pid start)
   "Return the entry of PID when it runs and its start time is START.
-START nil accepts any start time."
-  (when-let* ((entry (and (integerp pid)
+START nil means that the process cannot be verified: the result is
+then nil, so that it never gets a signal."
+  (when-let* ((entry (and (integerp pid) (numberp start)
                           (funcall claude-code-ide-process-entry-function pid))))
-    (when (or (null start)
-              (claude-code-ide-process--same-start-p start (plist-get entry :start)))
+    (when (claude-code-ide-process--same-start-p start (plist-get entry :start))
       entry)))
 
-;;; Tables
+(defun claude-code-ide-process--still-there-p (pid start)
+  "Return non-nil when PID may still be the process that started at START.
+Only for waits: a nil start time on either side counts as the same,
+so that a wait never ends too early.  It never allows a signal."
+  (when-let* ((entry (and (integerp pid)
+                          (funcall claude-code-ide-process-entry-function pid))))
+    (or (null start) (null (plist-get entry :start))
+        (claude-code-ide-process--same-start-p start (plist-get entry :start)))))
 
-(defun claude-code-ide-process--index (table)
-  "Return a hash table from process ID to entry, for TABLE."
-  (let ((index (make-hash-table)))
-    (dolist (entry table)
-      (puthash (plist-get entry :pid) entry index))
-    index))
+;;; Snapshots
+;;
+;; A snapshot is the table of one ps run with the indexes that the
+;; records and the stop need, built once: a plist (:table :index
+;; :children :protected).  :protected is (PIDS . PGIDS) that never get
+;; a signal: 0, 1, Emacs and all its ancestors, and their groups.
 
-(defun claude-code-ide-process--descendants (table root)
-  "Return the entries of ROOT and of all its descendants in TABLE.
-ROOT is a process ID.  The result is empty when ROOT is not in TABLE."
-  (let ((children (make-hash-table))
-        (index (claude-code-ide-process--index table))
-        result queue)
+(defun claude-code-ide-process--emacs-protected (index)
+  "Return (PIDS . PGIDS) of 0, 1, Emacs, its ancestors, and their groups.
+INDEX maps a process ID to its entry.  A process that INDEX does not
+hold is asked for with `claude-code-ide-process-entry-function'."
+  (let ((pids (list 0 1))
+        (pgids (list 0 1))
+        (pid (emacs-pid))
+        (guard 0))
+    (while (and (integerp pid) (> pid 1) (< guard 200))
+      (setq guard (1+ guard))
+      (push pid pids)
+      (let ((entry (or (and index (gethash pid index))
+                       (funcall claude-code-ide-process-entry-function pid))))
+        (when-let* ((pgid (plist-get entry :pgid)))
+          (push pgid pgids))
+        (setq pid (plist-get entry :ppid))))
+    (cons (delete-dups pids) (delete-dups pgids))))
+
+(defun claude-code-ide-process--snapshot (table)
+  "Return the snapshot of TABLE, a list of entries."
+  (let ((index (make-hash-table))
+        (children (make-hash-table)))
     (dolist (entry table)
+      (puthash (plist-get entry :pid) entry index)
       (push entry (gethash (plist-get entry :ppid) children)))
-    (when-let* ((root-entry (gethash root index)))
+    (list :table table :index index :children children
+          :protected (claude-code-ide-process--emacs-protected index))))
+
+(defun claude-code-ide-process--entry-of (snapshot pid)
+  "Return the entry of PID in SNAPSHOT, or nil."
+  (gethash pid (plist-get snapshot :index)))
+
+(defun claude-code-ide-process--descendants (snapshot root)
+  "Return the entries of ROOT and of all its descendants in SNAPSHOT.
+ROOT is a process ID.  The result is empty when ROOT is not in SNAPSHOT."
+  (let ((children (plist-get snapshot :children))
+        (seen (make-hash-table))
+        result queue)
+    (when-let* ((root-entry (claude-code-ide-process--entry-of snapshot root)))
       (setq queue (list root-entry))
       (while queue
         (let ((entry (pop queue)))
-          (push entry result)
-          (dolist (child (gethash (plist-get entry :pid) children))
-            ;; A ppid loop cannot happen, but a broken table must not hang
-            (unless (memq child result)
-              (setq queue (append queue (list child))))))))
+          ;; A ppid loop cannot happen, but a broken table must not hang
+          (unless (gethash (plist-get entry :pid) seen)
+            (puthash (plist-get entry :pid) t seen)
+            (push entry result)
+            (setq queue (append queue (gethash (plist-get entry :pid) children)))))))
     (nreverse result)))
-
-(defun claude-code-ide-process--emacs-protected (table)
-  "Return (PIDS . PGIDS) that a stop must never signal, from TABLE.
-These are 0, 1, Emacs and its ancestors, and their process groups."
-  (let* ((index (claude-code-ide-process--index table))
-         (pids (list 0 1))
-         (pgids (list 0 1))
-         (pid (emacs-pid))
-         (guard 0))
-    (when-let* ((own (funcall claude-code-ide-process-entry-function pid)))
-      (push (plist-get own :pgid) pgids))
-    (while (and pid (> pid 1) (< guard 100))
-      (setq guard (1+ guard))
-      (push pid pids)
-      (let ((entry (gethash pid index)))
-        (when entry
-          (push (plist-get entry :pgid) pgids))
-        (setq pid (and entry (plist-get entry :ppid)))))
-    (cons (delete-dups pids) (delete-dups pgids))))
 
 ;;; Records
 
@@ -324,7 +400,7 @@ These are 0, 1, Emacs and its ancestors, and their process groups."
   (instance nil :documentation "The descriptor.")
   (process nil :documentation "The process object of the terminal, or nil.")
   (pid nil :documentation "Process ID of the CLI (the root of the tree).")
-  (start nil :documentation "Start time of the root as a float, or nil.")
+  (start nil :documentation "Start time of the root as a float, or nil when it cannot be verified.")
   (groups (make-hash-table) :documentation "PGID -> plist (:pgid :leader-start :first-seen :command).")
   (members (make-hash-table) :documentation "PID -> start time of each recorded descendant.")
   (last-refresh nil :documentation "Time of the last record, or nil."))
@@ -344,6 +420,10 @@ These are 0, 1, Emacs and its ancestors, and their process groups."
       (claude-code-ide-instance-id instance)
     instance))
 
+(defun claude-code-ide-process--track-id (track)
+  "Return the instance ID of TRACK."
+  (claude-code-ide-instance-id (claude-code-ide-process--track-instance track)))
+
 (defun claude-code-ide-process--track-of (instance)
   "Return the records of INSTANCE, a descriptor or an ID, or nil."
   (gethash (claude-code-ide-process--instance-id instance)
@@ -357,13 +437,26 @@ pipe holds the process ID of the child."
     (or (process-get process 'ghostel--native-pid)
         (process-id process))))
 
-(defun claude-code-ide-process--record (track table now)
-  "Add the descendants of the root of TRACK in TABLE to its records.
-Drop the records of processes that are gone.  NOW is the time."
-  (let* ((index (claude-code-ide-process--index table))
+(defun claude-code-ide-process--root-alive-p (track &optional snapshot)
+  "Return non-nil when the root of TRACK still runs with its start time.
+With SNAPSHOT, look there; else ask for the one process.  A root
+without a known start time cannot be verified and counts as gone."
+  (let ((pid (claude-code-ide-process--track-pid track))
+        (start (claude-code-ide-process--track-start track)))
+    (and (numberp start)
+         (if snapshot
+             (when-let* ((entry (claude-code-ide-process--entry-of snapshot pid)))
+               (claude-code-ide-process--same-start-p start (plist-get entry :start)))
+           (claude-code-ide-process--entry-alive-p pid start)))))
+
+(defun claude-code-ide-process--record (track snapshot now)
+  "Add the descendants of the root of TRACK in SNAPSHOT to its records.
+Drop the records of processes that are gone.  NOW is the time.  The
+caller checks that the root runs with its recorded start time."
+  (let* ((index (plist-get snapshot :index))
          (members (claude-code-ide-process--track-members track))
          (groups (claude-code-ide-process--track-groups track))
-         (protected (cdr (claude-code-ide-process--emacs-protected table))))
+         (protected (cdr (plist-get snapshot :protected))))
     ;; Forget processes and groups that are gone.  A process group
     ;; cannot get new members after its last member is gone.
     (maphash (lambda (pid start)
@@ -374,23 +467,27 @@ Drop the records of processes that are gone.  NOW is the time."
                    (remhash pid members))))
              members)
     (let ((live-pgids (make-hash-table)))
-      (dolist (entry table)
+      (dolist (entry (plist-get snapshot :table))
         (puthash (plist-get entry :pgid) t live-pgids))
       (maphash (lambda (pgid _group)
                  (unless (gethash pgid live-pgids)
                    (remhash pgid groups)))
                groups))
     (dolist (entry (claude-code-ide-process--descendants
-                    table (claude-code-ide-process--track-pid track)))
+                    snapshot (claude-code-ide-process--track-pid track)))
       (let ((pid (plist-get entry :pid))
-            (pgid (plist-get entry :pgid)))
-        (puthash pid (plist-get entry :start) members)
+            (pgid (plist-get entry :pgid))
+            (start (plist-get entry :start)))
+        ;; A process without a start time cannot be verified later
+        (when (numberp start)
+          (puthash pid start members))
         (unless (memq pgid protected)
           (let ((group (or (gethash pgid groups)
                            (list :pgid pgid :leader-start nil :first-seen now
                                  :command nil))))
-            (when (and (eql pid pgid) (null (plist-get group :leader-start)))
-              (setq group (plist-put group :leader-start (plist-get entry :start)))
+            (when (and (eql pid pgid) (numberp start)
+                       (null (plist-get group :leader-start)))
+              (setq group (plist-put group :leader-start start))
               (setq group (plist-put group :command
                                      (funcall claude-code-ide-process-command-function
                                               pid))))
@@ -398,28 +495,30 @@ Drop the records of processes that are gone.  NOW is the time."
     (setf (claude-code-ide-process--track-last-refresh track) now)
     track))
 
-(defun claude-code-ide-process--root-alive-p (track &optional table)
-  "Return non-nil when the root of TRACK still runs.
-With TABLE, look there; else ask for the one process."
-  (let ((pid (claude-code-ide-process--track-pid track))
-        (start (claude-code-ide-process--track-start track)))
-    (if table
-        (when-let* ((entry (cl-find pid table :key (lambda (e) (plist-get e :pid)))))
-          (or (null start)
-              (claude-code-ide-process--same-start-p start (plist-get entry :start))))
-      (claude-code-ide-process--entry-alive-p pid start))))
+(defun claude-code-ide-process--record-if-alive (track snapshot now)
+  "Record SNAPSHOT in TRACK when its root runs there.  Return non-nil then."
+  (when (claude-code-ide-process--root-alive-p track snapshot)
+    (claude-code-ide-process--record track snapshot now)
+    t))
 
 (defun claude-code-ide-process--record-all (table)
   "Record TABLE in each track whose root still runs.
-Stop the timer when no root runs."
-  (let ((now (float-time))
+Stop the timer only when no root of the current tracks runs now: a
+track that was added after this ps run started is not in TABLE."
+  (let ((snapshot (claude-code-ide-process--snapshot table))
+        (now (float-time))
         (running nil))
     (maphash (lambda (_id track)
-               (when (claude-code-ide-process--root-alive-p track table)
-                 (setq running t)
-                 (claude-code-ide-process--record track table now)))
+               (when (claude-code-ide-process--record-if-alive track snapshot now)
+                 (setq running t)))
              claude-code-ide-process--tracks)
-    (unless running
+    (unless (or running
+                (let (live)
+                  (maphash (lambda (_id track)
+                             (when (claude-code-ide-process--root-alive-p track)
+                               (setq live t)))
+                           claude-code-ide-process--tracks)
+                  live))
       (claude-code-ide-process--cancel-timer))))
 
 (defun claude-code-ide-process--tick ()
@@ -455,22 +554,30 @@ Stop the timer when no root runs."
 
 (defun claude-code-ide-process--new-track (instance process)
   "Return new records for INSTANCE, whose terminal process is PROCESS.
-PROCESS nil means the process of the descriptor's buffer, else its PID."
+PROCESS nil means the process of the descriptor's buffer, else its PID.
+
+The start time of the root comes from the descriptor when it holds the
+same PID.  A live entry gives it only for a live process object of
+this Emacs with that PID: Emacs has not reaped it, so the PID cannot
+belong to another process.  Else the start time stays nil, and the
+root never gets a signal."
   (let* ((process (or process
                       (let ((buffer (claude-code-ide-instance-buffer instance)))
                         (and (buffer-live-p buffer) (get-buffer-process buffer)))))
-         (pid (or (claude-code-ide-process--process-pid process)
-                  (claude-code-ide-known-or-nil (claude-code-ide-instance-pid instance))))
-         (entry (and pid (funcall claude-code-ide-process-entry-function pid)))
+         (process-pid (claude-code-ide-process--process-pid process))
+         (known-pid (claude-code-ide-known-or-nil (claude-code-ide-instance-pid instance)))
+         (pid (or process-pid known-pid))
          (known-start (claude-code-ide-known-or-nil
                        (claude-code-ide-instance-process-start-time instance))))
-    (when pid
+    (when (integerp pid)
       (claude-code-ide-process--track-create
        :instance instance
        :process process
        :pid pid
-       :start (or (plist-get entry :start)
-                  (and (numberp known-start) known-start))))))
+       :start (cond
+               ((and (numberp known-start) (eql known-pid pid)) known-start)
+               ((and process-pid (process-live-p process))
+                (plist-get (funcall claude-code-ide-process-entry-function pid) :start)))))))
 
 ;;;###autoload
 (defun claude-code-ide-process-track (instance process)
@@ -498,8 +605,8 @@ record.  Return non-nil when the CLI has a process ID."
 Return the list of recorded groups, as `claude-code-ide-process-groups'."
   (when-let* ((track (claude-code-ide-process--track-of instance))
               (table (funcall claude-code-ide-process-list-function)))
-    (when (claude-code-ide-process--root-alive-p track table)
-      (claude-code-ide-process--record track table (float-time)))
+    (claude-code-ide-process--record-if-alive
+     track (claude-code-ide-process--snapshot table) (float-time))
     (claude-code-ide-process-groups instance)))
 
 (defun claude-code-ide-process-groups (instance)
@@ -526,17 +633,7 @@ At most one record per second; the record runs without a wait."
 
 (add-hook 'claude-code-ide-event-functions #'claude-code-ide-process--note-event)
 
-;;; Stop
-
-(defun claude-code-ide-process--wait (predicate seconds)
-  "Wait up to SECONDS until PREDICATE returns non-nil; return its value.
-Process output and sentinels run during the wait."
-  (let ((deadline (+ (float-time) (max 0 seconds)))
-        (value (funcall predicate)))
-    (while (and (not value) (< (float-time) deadline))
-      (accept-process-output nil (min 0.05 (max 0.001 (- deadline (float-time)))))
-      (setq value (funcall predicate)))
-    value))
+;;; Signals
 
 (defun claude-code-ide-process--send (target signal)
   "Send SIGNAL to TARGET, a process ID or a negative group ID.
@@ -550,23 +647,24 @@ Return non-nil on success."
                  claude-code-ide-process-soft-end)
       'SIGHUP))
 
-(defun claude-code-ide-process--signal-root (track signal)
+(defun claude-code-ide-process--signal-root (track signal protected)
   "Send SIGNAL to the process group of the root of TRACK.
-When the root is not the leader of its own group, send SIGNAL to the
-root only.  The root must still run with its recorded start time."
+The root must run with its recorded start time.  PROTECTED is the
+(PIDS . PGIDS) of a snapshot.  A protected root gets nothing.  A root
+in a protected group, or that is not the leader of its group, gets
+SIGNAL alone, never its group."
   (when-let* ((pid (claude-code-ide-process--track-pid track))
               (entry (claude-code-ide-process--entry-alive-p
                       pid (claude-code-ide-process--track-start track))))
-    (let ((protected (claude-code-ide-process--emacs-protected
-                      (list entry))))
-      (unless (memq pid (car protected))
-        (if (and (eql (plist-get entry :pgid) pid)
-                 (not (memq pid (cdr protected))))
-            (claude-code-ide-process--send (- pid) signal)
-          (claude-code-ide-process--send pid signal))))))
+    (unless (memq pid (car protected))
+      (if (and (eql (plist-get entry :pgid) pid)
+               (not (memq pid (cdr protected))))
+          (claude-code-ide-process--send (- pid) signal)
+        (claude-code-ide-process--send pid signal)))))
 
-(defun claude-code-ide-process--soft-end (track end)
-  "Run the soft end END for TRACK: a signal, a function, or `none'."
+(defun claude-code-ide-process--soft-end (track end protected)
+  "Run the soft end END for TRACK: a signal, a function, or `none'.
+PROTECTED is as for `claude-code-ide-process--signal-root'."
   (cond
    ((eq end 'none) nil)
    ((functionp end)
@@ -576,7 +674,7 @@ root only.  The root must still run with its recorded start time."
       (error (message "claude-code-ide-process: soft end failed: %s"
                       (error-message-string err)))))
    ((symbolp end)
-    (claude-code-ide-process--signal-root track end))))
+    (claude-code-ide-process--signal-root track end protected))))
 
 (defun claude-code-ide-process--ledger (tracks)
   "Return (GROUPS . MEMBERS), the union of the records of TRACKS.
@@ -599,7 +697,7 @@ signal.  A group is verified when its live leader has the recorded
 start time, or a live member is a recorded process with the same
 start time.  UNVERIFIED lists the entries of the other live members of
 recorded groups.  PROTECTED is (PIDS . PGIDS); a group with one of
-them never gets a signal."
+them never gets a signal, and protected processes are not listed."
   (let ((by-group (make-hash-table))
         (groups (car ledger))
         (members (cdr ledger))
@@ -628,7 +726,6 @@ them never gets a signal."
                 entries)))
          (if (and safe proven)
              (push (cons pgid entries) verified)
-           ;; Report them, but never Emacs or its ancestors
            (setq unverified
                  (append (cl-remove-if (lambda (e) (memq (plist-get e :pid) (car protected)))
                                        entries)
@@ -636,60 +733,25 @@ them never gets a signal."
      by-group)
     (cons verified unverified)))
 
-(defun claude-code-ide-process--group-gone-p (entries)
-  "Return non-nil when no process of ENTRIES runs any more."
-  (cl-notany (lambda (e)
-               (claude-code-ide-process--entry-alive-p (plist-get e :pid)
-                                                       (plist-get e :start)))
-             entries))
+(defun claude-code-ide-process--groups-left (groups)
+  "Return the entries of GROUPS, an alist (PGID . ENTRIES), that may still run."
+  (cl-remove-if-not (lambda (group)
+                      (cl-some (lambda (e)
+                                 (claude-code-ide-process--still-there-p
+                                  (plist-get e :pid) (plist-get e :start)))
+                               (cdr group)))
+                    groups))
 
-(defun claude-code-ide-process--reap (ledger protected kill-wait)
-  "End the live groups of LEDGER: SIGTERM, then SIGKILL after KILL-WAIT.
-Up to three rounds catch members that start during a round.
-PROTECTED is as for `claude-code-ide-process--classify'.  Return a
-plist (:ended PGIDS :survivors ENTRIES :unverified ENTRIES)."
-  (let ((round 0) ended survivors unverified done)
-    (while (and (not done) (< round 3))
-      (setq round (1+ round))
-      (let* ((table (funcall claude-code-ide-process-list-function))
-             (classes (claude-code-ide-process--classify ledger table protected))
-             (live (car classes)))
-        (setq unverified (cdr classes))
-        (if (null live)
-            (setq done t survivors nil)
-          ;; Live members of a verified group belong to it; remember
-          ;; them, so the next round still verifies the group after its
-          ;; recorded members are gone
-          (dolist (group live)
-            (dolist (entry (cdr group))
-              (puthash (plist-get entry :pid) (plist-get entry :start) (cdr ledger))))
-          (dolist (group live)
-            (when (claude-code-ide-process--send (- (car group)) 'SIGTERM)
-              (cl-pushnew (car group) ended)))
-          (let ((left (lambda ()
-                        (cl-remove-if (lambda (group)
-                                        (claude-code-ide-process--group-gone-p (cdr group)))
-                                      live))))
-            (unless (claude-code-ide-process--wait
-                     (lambda () (null (funcall left))) kill-wait)
-              (dolist (group (funcall left))
-                (claude-code-ide-process--send (- (car group)) 'SIGKILL))
-              (claude-code-ide-process--wait
-               (lambda () (null (funcall left))) (min kill-wait 1)))
-            (setq survivors (cl-mapcan (lambda (group) (copy-sequence (cdr group)))
-                                       (funcall left)))))))
-    (when (and (not done) (= round 3))
-      ;; The last round's survivors, as the table shows them now
-      (let* ((table (funcall claude-code-ide-process-list-function))
-             (classes (claude-code-ide-process--classify ledger table protected)))
-        (setq survivors (cl-mapcan (lambda (group) (copy-sequence (cdr group)))
-                                   (car classes))
-              unverified (cdr classes))))
-    (list :ended (nreverse ended) :survivors survivors :unverified unverified)))
+;;; Worktree scan
 
 (defun claude-code-ide-process--normal-dir (dir)
   "Return DIR as an absolute folder name, with the links resolved."
   (file-name-as-directory (file-truename (expand-file-name dir))))
+
+(defun claude-code-ide-process--dirs-of (worktree)
+  "Return the folder names that match WORKTREE, with a final slash."
+  (delete-dups (list (claude-code-ide-process--normal-dir worktree)
+                     (file-name-as-directory (expand-file-name worktree)))))
 
 (defun claude-code-ide-process--in-dir-p (file dirs)
   "Return non-nil when FILE is one of DIRS or inside one of them.
@@ -697,34 +759,42 @@ DIRS are folder names with a final slash."
   (let ((name (file-name-as-directory file)))
     (cl-some (lambda (dir) (string-prefix-p dir name)) dirs)))
 
-(defun claude-code-ide-process--owner-tags (pid trees)
+(defun claude-code-ide-process--owner-tags (pid trees emacs-pids)
   "Return the plist part that names the owner of PID.
-TREES maps a process ID to the instance ID whose CLI tree holds it."
+TREES maps a process ID to the instance ID whose CLI tree holds it.
+EMACS-PIDS maps a process ID to the name of an Emacs process object."
   (let ((instance-id (gethash pid trees))
-        (emacs-process (cl-find pid (process-list)
-                                :key #'claude-code-ide-process--process-pid)))
+        (emacs-process (gethash pid emacs-pids)))
     (append (when instance-id (list :instance-id instance-id))
-            (when emacs-process (list :emacs-process (process-name emacs-process))))))
+            (when emacs-process (list :emacs-process emacs-process)))))
 
-(defun claude-code-ide-process--instance-trees (table &optional except)
+(defun claude-code-ide-process--emacs-pids ()
+  "Return a hash table from process ID to name, for the processes of Emacs."
+  (let ((table (make-hash-table)))
+    (dolist (process (process-list))
+      (when-let* ((pid (claude-code-ide-process--process-pid process)))
+        (puthash pid (process-name process) table)))
+    table))
+
+(defun claude-code-ide-process--instance-trees (snapshot &optional except)
   "Return a hash table from process ID to instance ID, for the live CLIs.
-It holds the tree in TABLE of each tracked instance whose CLI runs,
+It holds the tree in SNAPSHOT of each tracked instance whose CLI runs,
 except the instance IDs in EXCEPT."
   (let ((trees (make-hash-table)))
     (maphash (lambda (id track)
                (unless (member id except)
-                 (when (claude-code-ide-process--root-alive-p track table)
+                 (when (claude-code-ide-process--root-alive-p track snapshot)
                    (dolist (entry (claude-code-ide-process--descendants
-                                   table (claude-code-ide-process--track-pid track)))
+                                   snapshot (claude-code-ide-process--track-pid track)))
                      (puthash (plist-get entry :pid) id trees)))))
              claude-code-ide-process--tracks)
     trees))
 
-(defun claude-code-ide-process--strays-in (dirs cwds table trees exclude)
+(defun claude-code-ide-process--strays-in (dirs cwds snapshot trees exclude)
   "Return the stray plists of the processes of CWDS inside DIRS.
-TABLE gives the group IDs, TREES the owner instances, and EXCLUDE
+SNAPSHOT gives the group IDs, TREES the owner instances, and EXCLUDE
 the process IDs to leave out.  Emacs itself is always left out."
-  (let ((index (claude-code-ide-process--index table))
+  (let ((emacs-pids (claude-code-ide-process--emacs-pids))
         strays)
     (dolist (item cwds)
       (let ((pid (plist-get item :pid)))
@@ -732,7 +802,7 @@ the process IDs to leave out.  Emacs itself is always left out."
                    (not (memq pid exclude))
                    (stringp (plist-get item :cwd))
                    (claude-code-ide-process--in-dir-p (plist-get item :cwd) dirs))
-          (let ((entry (gethash pid index)))
+          (let ((entry (claude-code-ide-process--entry-of snapshot pid)))
             (push (append (list :pid pid
                                 :command (or (funcall claude-code-ide-process-command-function pid)
                                              (plist-get item :command))
@@ -740,7 +810,7 @@ the process IDs to leave out.  Emacs itself is always left out."
                                 :pgid (plist-get entry :pgid)
                                 :ppid (plist-get entry :ppid)
                                 :reason 'worktree)
-                          (claude-code-ide-process--owner-tags pid trees))
+                          (claude-code-ide-process--owner-tags pid trees emacs-pids))
                   strays)))))
     (sort strays (lambda (a b) (< (plist-get a :pid) (plist-get b :pid))))))
 
@@ -751,15 +821,20 @@ Each one is a plist (:pid :command :cwd :pgid :ppid :reason worktree).
 A process of a running instance has :instance-id too, and a process
 that Emacs runs has :emacs-process.  Emacs itself, and the process IDs
 in EXCLUDE, are left out.  The function only reports; it never ends
-a process."
+a process.
+
+Signal an error when the scan fails (lsof cannot run or takes too
+long): an empty list would claim that nothing runs there."
   (when (and (stringp worktree) (file-directory-p worktree))
-    (let* ((dirs (delete-dups
-                  (list (claude-code-ide-process--normal-dir worktree)
-                        (file-name-as-directory (expand-file-name worktree)))))
-           (table (funcall claude-code-ide-process-list-function)))
+    (let ((snapshot (claude-code-ide-process--snapshot
+                     (funcall claude-code-ide-process-list-function)))
+          (cwds (funcall claude-code-ide-process-cwd-function)))
+      (when (eq cwds 'failed)
+        (error "The scan of working folders failed (lsof)"))
       (claude-code-ide-process--strays-in
-       dirs (funcall claude-code-ide-process-cwd-function) table
-       (claude-code-ide-process--instance-trees table) exclude))))
+       (claude-code-ide-process--dirs-of worktree)
+       cwds snapshot
+       (claude-code-ide-process--instance-trees snapshot) exclude))))
 
 (defun claude-code-ide-process--worktree-of (instance option)
   "Return the folder that a stop of INSTANCE scans, or nil.
@@ -773,151 +848,348 @@ descriptor, else its project root."
                    (claude-code-ide-instance-project-root instance))))
         (and (stringp root) root))))
 
-(defun claude-code-ide-process--resolve (instance process)
-  "Return the records of INSTANCE for a stop, with PROCESS when given.
-INSTANCE is a descriptor or an instance ID.  Without records, make
-new ones that only this stop uses.  Return nil when nothing is known."
-  (let* ((track (claude-code-ide-process--track-of instance))
-         (descriptor (cond ((claude-code-ide-instance-p instance) instance)
-                           (track (claude-code-ide-process--track-instance track))
-                           (t (claude-code-ide-instance-by-id instance)))))
-    (cond
-     ((and track process
-           (not (eql (claude-code-ide-process--process-pid process)
-                     (claude-code-ide-process--track-pid track))))
-      ;; A new process of the same instance: start new records
-      (claude-code-ide-process--new-track descriptor process))
-     (track track)
-     (descriptor (claude-code-ide-process--new-track descriptor process)))))
+;;; Stop
+;;
+;; A stop is a job: a chain of steps.  Each step returns either
+;; (:wait PREDICATE SECONDS NEXT), to wait until PREDICATE is non-nil
+;; or SECONDS pass and then run the step NEXT, or (:done RESULTS).
+;; `claude-code-ide-process-stop' runs the chain with waits;
+;; `claude-code-ide-process-stop-later' runs it from timers, so the
+;; command loop runs between the steps.
 
-(defun claude-code-ide-process--stop-tracks (items options)
-  "Stop the instances of ITEMS with OPTIONS, and return the results.
-ITEMS is a list of (TRACK . WORKTREE).  OPTIONS is the plist of
-`claude-code-ide-process-stop'.  Return a list of (TRACK . RESULT)."
-  (let* ((timeout (or (plist-get options :timeout) claude-code-ide-process-stop-timeout))
-         (kill-wait (or (plist-get options :kill-wait) claude-code-ide-process-kill-wait))
-         (escalate (if (plist-member options :escalate) (plist-get options :escalate) t))
-         (scan (if (plist-member options :scan) (plist-get options :scan) t))
-         (exclude (plist-get options :exclude))
-         (tracks (mapcar #'car items))
-         (ids (mapcar (lambda (track)
-                        (claude-code-ide-instance-id
-                         (claude-code-ide-process--track-instance track)))
-                      tracks))
-         (table (funcall claude-code-ide-process-list-function))
-         (now (float-time)))
-    ;; 1. The last record, while the CLIs still run
-    (dolist (track tracks)
-      (when (claude-code-ide-process--root-alive-p track table)
-        (claude-code-ide-process--record track table now)))
-    ;; 2. The soft end of each provider
-    (dolist (track tracks)
-      (when (claude-code-ide-process--root-alive-p track)
-        (claude-code-ide-process--soft-end
-         track (claude-code-ide-process--soft-end-of
-                (claude-code-ide-process--track-instance track)
-                (plist-get options :soft-end)))))
-    ;; 3. Wait for the CLIs to exit
-    (let* ((running (lambda ()
-                      (cl-remove-if-not #'claude-code-ide-process--root-alive-p tracks)))
-           (escalated (make-hash-table :test 'eq)))
-      (claude-code-ide-process--wait (lambda () (null (funcall running))) timeout)
-      (when (and escalate (funcall running))
-        (dolist (track (funcall running))
-          (claude-code-ide-process--signal-root track 'SIGTERM)
-          (puthash track 'SIGTERM escalated))
-        (unless (claude-code-ide-process--wait (lambda () (null (funcall running)))
-                                               kill-wait)
-          (dolist (track (funcall running))
-            (claude-code-ide-process--signal-root track 'SIGKILL)
-            (puthash track 'SIGKILL escalated))
-          (claude-code-ide-process--wait (lambda () (null (funcall running)))
-                                         (min kill-wait 1))))
-      (let* ((alive (funcall running))
-             (done (cl-remove-if (lambda (track) (memq track alive)) tracks))
-             ;; 4. End the recorded groups of the CLIs that are gone.  A
-             ;; CLI that still runs keeps its groups: they are its work.
-             (table (funcall claude-code-ide-process-list-function))
-             (other-trees (claude-code-ide-process--instance-trees table ids))
-             (protected (let ((p (claude-code-ide-process--emacs-protected table)))
-                          ;; Never signal the tree of another running instance
-                          (maphash (lambda (pid _id)
-                                     (push pid (car p))
-                                     (when-let* ((e (cl-find pid table :key (lambda (e) (plist-get e :pid)))))
-                                       (push (plist-get e :pgid) (cdr p))))
-                                   other-trees)
-                          p))
-             (reaped (claude-code-ide-process--reap
-                      (claude-code-ide-process--ledger done) protected kill-wait))
-             ;; 5. Scan the worktrees
-             (cwds (when (and scan items) (funcall claude-code-ide-process-cwd-function)))
-             (final (funcall claude-code-ide-process-list-function))
-             (trees (claude-code-ide-process--instance-trees final ids))
-             (leftover (append (plist-get reaped :survivors) (plist-get reaped :unverified))))
-        (mapcar
-         (lambda (item)
-           (let* ((track (car item))
-                  (worktree (cdr item))
-                  (own-members (claude-code-ide-process--track-members track))
-                  (own-groups (claude-code-ide-process--track-groups track))
-                  (mine (lambda (entry)
-                          (or (gethash (plist-get entry :pgid) own-groups)
-                              (gethash (plist-get entry :pid) own-members))))
-                  (root-alive (memq track alive))
-                  (survivors (cl-remove-if-not mine (plist-get reaped :survivors)))
-                  (unverified (cl-remove-if-not mine (plist-get reaped :unverified)))
-                  (listed (append survivors unverified))
-                  (strays
-                   (append
-                    (when root-alive
-                      (list (list :pid (claude-code-ide-process--track-pid track)
-                                  :command (funcall claude-code-ide-process-command-function
-                                                    (claude-code-ide-process--track-pid track))
-                                  :cwd nil :reason 'cli)))
-                    (mapcar (lambda (e)
-                              (list :pid (plist-get e :pid)
-                                    :command (funcall claude-code-ide-process-command-function
-                                                      (plist-get e :pid))
-                                    :cwd nil
-                                    :pgid (plist-get e :pgid)
-                                    :ppid (plist-get e :ppid)
-                                    :reason (if (memq e survivors) 'survivor 'unverified)))
-                            listed)
-                    (when (and scan worktree (file-directory-p worktree))
-                      (claude-code-ide-process--strays-in
-                       (delete-dups
-                        (list (claude-code-ide-process--normal-dir worktree)
-                              (file-name-as-directory (expand-file-name worktree))))
-                       cwds final trees
-                       (append exclude
-                               (mapcar (lambda (e) (plist-get e :pid)) leftover)
-                               (list (claude-code-ide-process--track-pid track)))))))
-                  (status (cond ((or root-alive survivors) 'timeout)
-                                (strays 'strays)
-                                (t 'stopped))))
-             ;; Fill in the working folders of the processes found by the records
-             (let ((missing (cl-remove-if (lambda (s) (plist-get s :cwd)) strays)))
-               (when missing
-                 (let ((found (funcall claude-code-ide-process-cwd-function
-                                       (mapcar (lambda (s) (plist-get s :pid)) missing))))
-                   (dolist (stray missing)
-                     (when-let* ((item (cl-find (plist-get stray :pid) found
-                                                :key (lambda (i) (plist-get i :pid)))))
-                       (plist-put stray :cwd (plist-get item :cwd)))))))
-             (cons track
-                   (list :status status
-                         :strays strays
-                         :ended (cl-remove-if-not
-                                 (lambda (pgid) (gethash pgid own-groups))
-                                 (plist-get reaped :ended))
-                         :escalated (gethash track escalated)))))
-         items)))))
+(cl-defstruct (claude-code-ide-process--job
+               (:constructor claude-code-ide-process--job-create)
+               (:copier nil))
+  "The state of one stop of one or more instances."
+  items options timeout kill-wait escalate scan exclude deadline
+  snapshot escalated alive done ledger protected round ended
+  live survivors unverified)
+
+(defun claude-code-ide-process--job-tracks (job)
+  "Return the tracks of JOB."
+  (mapcar #'car (claude-code-ide-process--job-items job)))
+
+(defun claude-code-ide-process--cap (job seconds)
+  "Return SECONDS, cut to the time that is left before the deadline of JOB."
+  (let ((deadline (claude-code-ide-process--job-deadline job)))
+    (max 0 (if deadline (min seconds (- deadline (float-time))) seconds))))
+
+(defun claude-code-ide-process--time-left-p (job)
+  "Return non-nil when JOB has no deadline or has time left before it."
+  (let ((deadline (claude-code-ide-process--job-deadline job)))
+    (or (null deadline) (< (float-time) deadline))))
+
+(defun claude-code-ide-process--running (job)
+  "Return the tracks of JOB whose CLI still runs."
+  (cl-remove-if-not #'claude-code-ide-process--root-alive-p
+                    (claude-code-ide-process--job-tracks job)))
+
+(defun claude-code-ide-process--error-done (job reason)
+  "Return the step that ends JOB with the status `error' and REASON.
+The records stay, so that a later stop can use them."
+  (list :done
+        (mapcar (lambda (item)
+                  (cons (car item)
+                        (list :status 'error :reason reason :strays nil
+                              :ended (cl-remove-if-not
+                                      (lambda (pgid)
+                                        (gethash pgid (claude-code-ide-process--track-groups
+                                                       (car item))))
+                                      (claude-code-ide-process--job-ended job))
+                              :escalated (and (claude-code-ide-process--job-escalated job)
+                                              (gethash (car item)
+                                                       (claude-code-ide-process--job-escalated job))))))
+                (claude-code-ide-process--job-items job))))
+
+(defun claude-code-ide-process--step-start (job)
+  "Step 1 and 2 of JOB: the last record, and the soft end of each CLI."
+  (let ((table (funcall claude-code-ide-process-list-function))
+        (now (float-time)))
+    (if (null table)
+        (claude-code-ide-process--error-done job "ps failed: no process table")
+      (let ((snapshot (claude-code-ide-process--snapshot table)))
+        (setf (claude-code-ide-process--job-snapshot job) snapshot
+              (claude-code-ide-process--job-escalated job) (make-hash-table :test 'eq))
+        (dolist (track (claude-code-ide-process--job-tracks job))
+          (when (claude-code-ide-process--record-if-alive track snapshot now)
+            (claude-code-ide-process--soft-end
+             track (claude-code-ide-process--soft-end-of
+                    (claude-code-ide-process--track-instance track)
+                    (plist-get (claude-code-ide-process--job-options job) :soft-end))
+             (plist-get snapshot :protected))))
+        (list :wait (lambda () (null (claude-code-ide-process--running job)))
+              (claude-code-ide-process--job-timeout job)
+              #'claude-code-ide-process--step-term)))))
+
+(defun claude-code-ide-process--escalate (job signal)
+  "Send SIGNAL to each CLI of JOB that still runs; return those CLIs."
+  (let ((running (claude-code-ide-process--running job))
+        (protected (plist-get (claude-code-ide-process--job-snapshot job) :protected)))
+    (dolist (track running)
+      (claude-code-ide-process--signal-root track signal protected)
+      (puthash track signal (claude-code-ide-process--job-escalated job)))
+    running))
+
+(defun claude-code-ide-process--step-term (job)
+  "Step 3a of JOB: SIGTERM to the CLIs that still run."
+  (if (and (claude-code-ide-process--job-escalate job)
+           (claude-code-ide-process--escalate job 'SIGTERM))
+      (list :wait (lambda () (null (claude-code-ide-process--running job)))
+            (claude-code-ide-process--job-kill-wait job)
+            #'claude-code-ide-process--step-kill)
+    (claude-code-ide-process--step-reap-start job)))
+
+(defun claude-code-ide-process--step-kill (job)
+  "Step 3b of JOB: SIGKILL to the CLIs that still run."
+  (if (claude-code-ide-process--escalate job 'SIGKILL)
+      (list :wait (lambda () (null (claude-code-ide-process--running job)))
+            (min (claude-code-ide-process--job-kill-wait job) 1)
+            #'claude-code-ide-process--step-reap-start)
+    (claude-code-ide-process--step-reap-start job)))
+
+(defun claude-code-ide-process--step-reap-start (job)
+  "Step 4 of JOB: get ready to end the groups of the CLIs that are gone.
+A CLI that still runs keeps its groups: they are its work."
+  (let* ((alive (claude-code-ide-process--running job))
+         (done (cl-remove-if (lambda (track) (memq track alive))
+                             (claude-code-ide-process--job-tracks job)))
+         (table (funcall claude-code-ide-process-list-function)))
+    (if (null table)
+        (claude-code-ide-process--error-done job "ps failed: no process table")
+      (let* ((snapshot (claude-code-ide-process--snapshot table))
+             (ids (mapcar #'claude-code-ide-process--track-id
+                          (claude-code-ide-process--job-tracks job)))
+             (protected (copy-tree (plist-get snapshot :protected))))
+        ;; Never signal the tree of another running instance
+        (maphash (lambda (pid _id)
+                   (push pid (car protected))
+                   (when-let* ((entry (claude-code-ide-process--entry-of snapshot pid)))
+                     (push (plist-get entry :pgid) (cdr protected))))
+                 (claude-code-ide-process--instance-trees snapshot ids))
+        (setf (claude-code-ide-process--job-alive job) alive
+              (claude-code-ide-process--job-done job) done
+              (claude-code-ide-process--job-ledger job) (claude-code-ide-process--ledger done)
+              (claude-code-ide-process--job-protected job) protected
+              (claude-code-ide-process--job-round job) 0)
+        (claude-code-ide-process--step-reap-round job)))))
+
+(defun claude-code-ide-process--step-reap-round (job)
+  "Step 4, one round of JOB: SIGTERM to each live recorded group."
+  (cl-incf (claude-code-ide-process--job-round job))
+  (let ((table (funcall claude-code-ide-process-list-function))
+        (ledger (claude-code-ide-process--job-ledger job)))
+    (if (null table)
+        (claude-code-ide-process--error-done job "ps failed: no process table")
+      (let* ((classes (claude-code-ide-process--classify
+                       ledger table (claude-code-ide-process--job-protected job)))
+             (live (car classes)))
+        (setf (claude-code-ide-process--job-unverified job) (cdr classes)
+              (claude-code-ide-process--job-live job) live)
+        (if (null live)
+            (progn (setf (claude-code-ide-process--job-survivors job) nil)
+                   (claude-code-ide-process--step-finish job))
+          ;; Live members of a verified group belong to it; remember
+          ;; them, so the next round still verifies the group after its
+          ;; recorded members are gone
+          (dolist (group live)
+            (dolist (entry (cdr group))
+              (when (numberp (plist-get entry :start))
+                (puthash (plist-get entry :pid) (plist-get entry :start) (cdr ledger)))))
+          (dolist (group live)
+            (when (claude-code-ide-process--send (- (car group)) 'SIGTERM)
+              (cl-pushnew (car group) (claude-code-ide-process--job-ended job))))
+          (list :wait (lambda () (null (claude-code-ide-process--groups-left live)))
+                (claude-code-ide-process--job-kill-wait job)
+                #'claude-code-ide-process--step-reap-kill))))))
+
+(defun claude-code-ide-process--step-reap-kill (job)
+  "Step 4, the end of a round of JOB: SIGKILL to the groups that still run."
+  (let ((left (claude-code-ide-process--groups-left (claude-code-ide-process--job-live job))))
+    (if (null left)
+        (claude-code-ide-process--step-reap-next job)
+      (dolist (group left)
+        (claude-code-ide-process--send (- (car group)) 'SIGKILL))
+      (list :wait (lambda () (null (claude-code-ide-process--groups-left left)))
+            (min (claude-code-ide-process--job-kill-wait job) 1)
+            #'claude-code-ide-process--step-reap-next))))
+
+(defun claude-code-ide-process--step-reap-next (job)
+  "Step 4 of JOB: run another round, up to three, while time is left."
+  (if (and (< (claude-code-ide-process--job-round job) 3)
+           (claude-code-ide-process--time-left-p job))
+      (claude-code-ide-process--step-reap-round job)
+    ;; The survivors and the unproven members, as the table shows them now
+    (let ((table (funcall claude-code-ide-process-list-function)))
+      (if (null table)
+          (claude-code-ide-process--error-done job "ps failed: no process table")
+        (let ((classes (claude-code-ide-process--classify
+                        (claude-code-ide-process--job-ledger job) table
+                        (claude-code-ide-process--job-protected job))))
+          (setf (claude-code-ide-process--job-survivors job)
+                (cl-mapcan (lambda (group) (copy-sequence (cdr group))) (car classes))
+                (claude-code-ide-process--job-unverified job) (cdr classes))
+          (claude-code-ide-process--step-finish job))))))
+
+(defun claude-code-ide-process--stray (entry reason)
+  "Return the stray plist of ENTRY with REASON; its folder comes later."
+  (list :pid (plist-get entry :pid)
+        :command (funcall claude-code-ide-process-command-function (plist-get entry :pid))
+        :cwd nil
+        :pgid (plist-get entry :pgid)
+        :ppid (plist-get entry :ppid)
+        :reason reason))
+
+(defun claude-code-ide-process--step-finish (job)
+  "Step 5 of JOB: scan the worktrees, and build the result of each instance."
+  (let* ((items (claude-code-ide-process--job-items job))
+         (ids (mapcar (lambda (item) (claude-code-ide-process--track-id (car item))) items))
+         (scan (claude-code-ide-process--job-scan job))
+         (scanned (cl-remove-if-not (lambda (item)
+                                      (and scan (stringp (cdr item))
+                                           (file-directory-p (cdr item))))
+                                    items))
+         ;; The full lsof scan only when some worktree exists
+         (cwds (when scanned (funcall claude-code-ide-process-cwd-function)))
+         (snapshot (claude-code-ide-process--snapshot
+                    (funcall claude-code-ide-process-list-function)))
+         (trees (claude-code-ide-process--instance-trees snapshot ids))
+         (all-survivors (claude-code-ide-process--job-survivors job))
+         (all-unverified (claude-code-ide-process--job-unverified job))
+         (leftover (mapcar (lambda (e) (plist-get e :pid))
+                           (append all-survivors all-unverified)))
+         (results
+          (mapcar
+           (lambda (item)
+             (let* ((track (car item))
+                    (own-members (claude-code-ide-process--track-members track))
+                    (own-groups (claude-code-ide-process--track-groups track))
+                    (mine (lambda (entry)
+                            (or (gethash (plist-get entry :pgid) own-groups)
+                                (gethash (plist-get entry :pid) own-members))))
+                    (root-alive (memq track (claude-code-ide-process--job-alive job)))
+                    (survivors (cl-remove-if-not mine all-survivors))
+                    (unverified (cl-remove-if-not mine all-unverified))
+                    (root-pid (claude-code-ide-process--track-pid track))
+                    (scan-failed (and (memq item scanned) (not (listp cwds))))
+                    (strays
+                     (append
+                      (when root-alive
+                        (list (claude-code-ide-process--stray (list :pid root-pid) 'cli)))
+                      ;; A root without a start time got no signal; when its
+                      ;; PID still runs, nobody knows whether it is the CLI
+                      (when-let* (((null (claude-code-ide-process--track-start track)))
+                                  (entry (claude-code-ide-process--entry-of snapshot root-pid)))
+                        (list (claude-code-ide-process--stray entry 'unverified)))
+                      (mapcar (lambda (e) (claude-code-ide-process--stray e 'survivor))
+                              survivors)
+                      (mapcar (lambda (e) (claude-code-ide-process--stray e 'unverified))
+                              unverified)
+                      (when (and (memq item scanned) (listp cwds))
+                        (claude-code-ide-process--strays-in
+                         (claude-code-ide-process--dirs-of (cdr item))
+                         cwds snapshot trees
+                         (append (claude-code-ide-process--job-exclude job)
+                                 leftover
+                                 (list root-pid)))))))
+               (cons track
+                     (append
+                      (list :status (cond ((or root-alive survivors) 'timeout)
+                                          (scan-failed 'error)
+                                          (strays 'strays)
+                                          (t 'stopped))
+                            :strays strays)
+                      (when scan-failed
+                        (list :reason "the scan of working folders failed (lsof)"))
+                      (list
+                           :ended (cl-remove-if-not
+                                   (lambda (pgid) (gethash pgid own-groups))
+                                   (reverse (claude-code-ide-process--job-ended job)))
+                           :escalated (gethash track (claude-code-ide-process--job-escalated job)))))))
+           items))
+         ;; The working folders of the strays that the records found: one
+         ;; lsof call for all of them
+         (missing (cl-mapcan (lambda (result)
+                               (cl-remove-if (lambda (s) (plist-get s :cwd))
+                                             (copy-sequence (plist-get (cdr result) :strays))))
+                             results)))
+    (when missing
+      (let ((found (make-hash-table))
+            (items (funcall claude-code-ide-process-cwd-function
+                            (delete-dups (mapcar (lambda (s) (plist-get s :pid)) missing)))))
+        (when (listp items)
+          (dolist (item items)
+            (puthash (plist-get item :pid) (plist-get item :cwd) found)))
+        (dolist (stray missing)
+          (plist-put stray :cwd (gethash (plist-get stray :pid) found)))))
+    (list :done results)))
+
+(defun claude-code-ide-process--make-job (items options)
+  "Return the job that stops ITEMS, a list of (TRACK . WORKTREE), with OPTIONS."
+  (let ((budget (plist-get options :budget)))
+    (claude-code-ide-process--job-create
+     :items items
+     :options options
+     :timeout (or (plist-get options :timeout) claude-code-ide-process-stop-timeout)
+     :kill-wait (or (plist-get options :kill-wait) claude-code-ide-process-kill-wait)
+     :escalate (if (plist-member options :escalate) (plist-get options :escalate) t)
+     :scan (if (plist-member options :scan) (plist-get options :scan) t)
+     :exclude (plist-get options :exclude)
+     :deadline (and (numberp budget) (+ (float-time) budget)))))
+
+(defun claude-code-ide-process--wait (predicate seconds)
+  "Wait up to SECONDS until PREDICATE returns non-nil; return its value.
+Process output and sentinels run during the wait."
+  (let ((deadline (+ (float-time) (max 0 seconds)))
+        (value (funcall predicate)))
+    (while (and (not value) (< (float-time) deadline))
+      (accept-process-output nil (min 0.05 (max 0.001 (- deadline (float-time)))))
+      (setq value (funcall predicate)))
+    value))
+
+(defun claude-code-ide-process--run-sync (job)
+  "Run JOB with waits, and return its results."
+  (let ((step (claude-code-ide-process--step-start job)))
+    (while (eq (car step) :wait)
+      (claude-code-ide-process--wait (nth 1 step)
+                                     (claude-code-ide-process--cap job (nth 2 step)))
+      (setq step (funcall (nth 3 step) job)))
+    (nth 1 step)))
+
+(defconst claude-code-ide-process--poll-interval 0.05
+  "Seconds between two checks of a stop that runs from timers.")
+
+(defun claude-code-ide-process--run-async (job callback)
+  "Run JOB from timers, and call CALLBACK with its results.
+Return the first timer."
+  (run-at-time 0 nil #'claude-code-ide-process--async-step
+               job #'claude-code-ide-process--step-start callback))
+
+(defun claude-code-ide-process--async-step (job step-function callback)
+  "Run STEP-FUNCTION of JOB, then poll its wait from timers.
+At the end call CALLBACK with the results."
+  (let ((step (condition-case err
+                  (funcall step-function job)
+                (error (claude-code-ide-process--error-done
+                        job (error-message-string err))))))
+    (if (eq (car step) :done)
+        (funcall callback (nth 1 step))
+      (claude-code-ide-process--async-poll
+       job (nth 1 step) (+ (float-time) (claude-code-ide-process--cap job (nth 2 step)))
+       (nth 3 step) callback))))
+
+(defun claude-code-ide-process--async-poll (job predicate deadline next callback)
+  "Run NEXT of JOB when PREDICATE is non-nil or DEADLINE passed; else poll again."
+  (if (or (ignore-errors (funcall predicate)) (>= (float-time) deadline))
+      (claude-code-ide-process--async-step job next callback)
+    (run-at-time claude-code-ide-process--poll-interval nil
+                 #'claude-code-ide-process--async-poll
+                 job predicate deadline next callback)))
 
 (defun claude-code-ide-process--finish (track result)
   "Forget TRACK after its stop RESULT, unless its CLI or groups survive.
-When they survive, keep TRACK, so that a later stop can end them."
-  (let ((id (claude-code-ide-instance-id (claude-code-ide-process--track-instance track))))
-    (if (eq (plist-get result :status) 'timeout)
+After `timeout' or `error', keep TRACK, so that a later stop can use it."
+  (let ((id (claude-code-ide-process--track-id track)))
+    (if (memq (plist-get result :status) '(timeout error))
         (puthash id track claude-code-ide-process--tracks)
       (when (eq (gethash id claude-code-ide-process--tracks) track)
         (claude-code-ide-process-untrack id)))))
@@ -925,6 +1197,69 @@ When they survive, keep TRACK, so that a later stop can end them."
 (defun claude-code-ide-process--empty-result ()
   "Return the stop result for an instance without a known process."
   (list :status 'stopped :strays nil :ended nil :escalated nil))
+
+(defun claude-code-ide-process--merge-track (old new)
+  "Copy the records of OLD into NEW, and return NEW."
+  (maphash (lambda (pgid group)
+             (unless (gethash pgid (claude-code-ide-process--track-groups new))
+               (puthash pgid group (claude-code-ide-process--track-groups new))))
+           (claude-code-ide-process--track-groups old))
+  (maphash (lambda (pid start)
+             (unless (gethash pid (claude-code-ide-process--track-members new))
+               (puthash pid start (claude-code-ide-process--track-members new))))
+           (claude-code-ide-process--track-members old))
+  new)
+
+(defun claude-code-ide-process--resolve (instance process)
+  "Return the records of INSTANCE for a stop, with PROCESS when given.
+INSTANCE is a descriptor or an instance ID.  When PROCESS has another
+PID than the records, the new records take over the old ones, so that
+the stop also ends the old groups.  A PROCESS without a PID keeps the
+records.  Without records, make new ones.  Return nil when nothing is
+known."
+  (let* ((track (claude-code-ide-process--track-of instance))
+         (descriptor (cond ((claude-code-ide-instance-p instance) instance)
+                           (track (claude-code-ide-process--track-instance track))
+                           (t (claude-code-ide-instance-by-id instance))))
+         (process-pid (claude-code-ide-process--process-pid process)))
+    (cond
+     ((and track process-pid
+           (not (eql process-pid (claude-code-ide-process--track-pid track))))
+      (when-let* ((new (claude-code-ide-process--new-track descriptor process)))
+        (claude-code-ide-process--merge-track track new)
+        (puthash (claude-code-ide-process--track-id new) new
+                 claude-code-ide-process--tracks)
+        new))
+     (track track)
+     (descriptor (claude-code-ide-process--new-track descriptor process)))))
+
+(defun claude-code-ide-process--items (instances options)
+  "Return (TRACKS . ITEMS) for INSTANCES with OPTIONS.
+TRACKS has one track or nil for each instance; ITEMS is the list of
+(TRACK . WORKTREE) of the known ones."
+  (let* ((tracks (mapcar (lambda (instance)
+                           (claude-code-ide-process--resolve
+                            instance (plist-get options :process)))
+                         instances))
+         (items (mapcar (lambda (track)
+                          (cons track (claude-code-ide-process--worktree-of
+                                       (claude-code-ide-process--track-instance track)
+                                       (plist-get options :worktree))))
+                        (delq nil (copy-sequence tracks)))))
+    (cons tracks items)))
+
+(defun claude-code-ide-process--collect (instances tracks results)
+  "Return the alist (INSTANCE-ID . RESULT) for INSTANCES in order.
+TRACKS has the track of each instance or nil; RESULTS is a list of
+\(TRACK . RESULT).  Each track is finished."
+  (dolist (pair results)
+    (claude-code-ide-process--finish (car pair) (cdr pair)))
+  (cl-mapcar (lambda (instance track)
+               (cons (claude-code-ide-process--instance-id instance)
+                     (if track
+                         (cdr (assq track results))
+                       (claude-code-ide-process--empty-result))))
+             instances tracks))
 
 ;;;###autoload
 (defun claude-code-ide-process-stop (instance &rest args)
@@ -944,6 +1279,7 @@ ARGS is a plist:
 
 - :timeout   seconds for step 3 (`claude-code-ide-process-stop-timeout').
 - :kill-wait seconds between the signals (`claude-code-ide-process-kill-wait').
+- :budget    seconds for all waits together, or nil for no limit.
 - :soft-end  a signal, a function of (INSTANCE PROCESS), or `none' (the
              caller already did the soft end).  Default: the provider's.
 - :escalate  nil to skip SIGTERM and SIGKILL of the CLI in step 3.
@@ -955,9 +1291,11 @@ ARGS is a plist:
 
 Return a plist:
 
-- :status   `stopped' (nothing is left), `strays' (only step 5 found
-            processes), or `timeout' (the CLI or a recorded process
-            survived SIGKILL, or the CLI did not exit without :escalate).
+- :status   `stopped' (nothing is left), `strays' (only processes that
+            the stop did not end are left), `timeout' (the CLI or a
+            recorded process survived SIGKILL, or the CLI did not exit
+            without :escalate), or `error' (ps failed; :reason says why,
+            and the records stay).
 - :strays   plists (:pid :command :cwd :reason ...).  :reason is `cli',
             `survivor', `unverified' (in a recorded group, but not proven
             to be the same group, so it got no signal) or `worktree'.
@@ -967,63 +1305,54 @@ Return a plist:
 Stray processes are only reported, never ended.  The call waits, so
 do not call it from `kill-buffer-hook'; use
 `claude-code-ide-process-stop-later' there."
-  (if-let* ((track (claude-code-ide-process--resolve instance (plist-get args :process))))
-      (let* ((worktree (claude-code-ide-process--worktree-of
-                        (claude-code-ide-process--track-instance track)
-                        (plist-get args :worktree)))
-             (result (cdar (claude-code-ide-process--stop-tracks
-                            (list (cons track worktree)) args))))
-        (claude-code-ide-process--finish track result)
-        result)
-    (claude-code-ide-process--empty-result)))
+  (cdar (apply #'claude-code-ide-process-stop-many (list instance) args)))
 
 (defun claude-code-ide-process-stop-many (instances &rest args)
   "Stop each of INSTANCES at the same time, with one shared wait.
 INSTANCES are descriptors or instance IDs.  ARGS are the keys of
-`claude-code-ide-process-stop', except :process and :worktree (each
-instance uses its own).  Return an alist (INSTANCE-ID . RESULT).
-`kill-emacs-hook' uses it with a short :timeout and :scan nil."
-  (let* ((tracks (mapcar (lambda (instance)
-                           (claude-code-ide-process--resolve instance nil))
-                         instances))
-         (items (mapcar (lambda (track)
-                          (cons track (claude-code-ide-process--worktree-of
-                                       (claude-code-ide-process--track-instance track) nil)))
-                        (delq nil (copy-sequence tracks))))
-         (stopped (when items
-                    (claude-code-ide-process--stop-tracks items args))))
-    (dolist (pair stopped)
-      (claude-code-ide-process--finish (car pair) (cdr pair)))
-    (cl-mapcar (lambda (instance track)
-                 (cons (claude-code-ide-process--instance-id instance)
-                       (if track
-                           (cdr (assq track stopped))
-                         (claude-code-ide-process--empty-result))))
-               instances tracks)))
+`claude-code-ide-process-stop'; :process and :worktree apply to each
+instance, so give them only for one.  Return an alist
+\(INSTANCE-ID . RESULT) in the order of INSTANCES.  `kill-emacs-hook'
+uses it with :budget `claude-code-ide-process-quit-timeout'."
+  (let* ((resolved (claude-code-ide-process--items instances args))
+         (results (when (cdr resolved)
+                    (claude-code-ide-process--run-sync
+                     (claude-code-ide-process--make-job (cdr resolved) args)))))
+    (claude-code-ide-process--collect instances (car resolved) results)))
 
 (defun claude-code-ide-process-stop-later (instance &rest args)
-  "Record the groups of INSTANCE now, and stop it from a timer.
-For `kill-buffer-hook': the buffer kill itself sends SIGHUP to the CLI
-after the hook, so :soft-end defaults to `none' here.  ARGS are as
-for `claude-code-ide-process-stop'.  Return the timer."
-  (let ((track (claude-code-ide-process--resolve instance (plist-get args :process))))
+  "Record the groups of INSTANCE now, and stop it from timers.
+For `kill-buffer-hook', which must not wait: the buffer kill itself
+sends SIGHUP to the CLI after the hook, so :soft-end defaults to
+`none' here.  The steps run from timers, and the command loop runs
+between them.  ARGS are as for `claude-code-ide-process-stop', plus
+:callback, a function called with the result.  Return the first timer."
+  (let* ((args (if (plist-member args :soft-end) args
+                 (append (list :soft-end 'none) args)))
+         (callback (plist-get args :callback))
+         (resolved (claude-code-ide-process--items (list instance) args))
+         (track (caar resolved)))
     (when track
-      ;; The record must exist after a buffer kill, also for a CLI that
-      ;; was never tracked; keep it under its instance ID
-      (puthash (claude-code-ide-instance-id (claude-code-ide-process--track-instance track))
-               track claude-code-ide-process--tracks)
+      ;; The records must exist after a buffer kill, also for a CLI
+      ;; that was never tracked; keep them under the instance ID
+      (puthash (claude-code-ide-process--track-id track) track
+               claude-code-ide-process--tracks)
       (ignore-errors
         (when-let* ((table (funcall claude-code-ide-process-list-function)))
-          (when (claude-code-ide-process--root-alive-p track table)
-            (claude-code-ide-process--record track table (float-time))))))
-    (let ((args (if (plist-member args :soft-end) args
-                  (append (list :soft-end 'none) args))))
-      (run-at-time 0 nil
-                   (lambda ()
-                     (condition-case err
-                         (apply #'claude-code-ide-process-stop instance args)
-                       (error (message "claude-code-ide-process: stop failed: %s"
-                                       (error-message-string err)))))))))
+          (claude-code-ide-process--record-if-alive
+           track (claude-code-ide-process--snapshot table) (float-time)))))
+    (let ((deliver (lambda (results)
+                     (let ((result (cdar (claude-code-ide-process--collect
+                                          (list instance) (car resolved) results))))
+                       (when callback
+                         (condition-case err
+                             (funcall callback result)
+                           (error (message "claude-code-ide-process: callback failed: %s"
+                                           (error-message-string err)))))))))
+      (if (cdr resolved)
+          (claude-code-ide-process--run-async
+           (claude-code-ide-process--make-job (cdr resolved) args) deliver)
+        (run-at-time 0 nil deliver nil)))))
 
 (provide 'claude-code-ide-process)
 
