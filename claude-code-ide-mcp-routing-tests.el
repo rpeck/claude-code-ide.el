@@ -1025,5 +1025,85 @@ secret wins over an extra header of the same name."
           (should (equal (alist-get 'headers server) '((X-Emacs-MCP-Token . "cci-test-token"))))
           (should (string-suffix-p secret (alist-get 'url server))))))))
 
+;;; Coordinator instances
+
+(defun claude-code-ide-mcp-routing-tests--config-headers (id)
+  "Return the headers alist of the generated config of the session ID."
+  (alist-get 'headers (claude-code-ide-mcp-routing-tests--server-config
+                       (claude-code-ide-mcp-server-get-config id))))
+
+(defun claude-code-ide-mcp-routing-tests--as-request-headers (headers)
+  "Turn the config HEADERS alist into web-server request headers."
+  (mapcar (lambda (header)
+            (cons (intern (concat ":" (upcase (format "%s" (car header))))) (cdr header)))
+          headers))
+
+(ert-deftest claude-code-ide-mcp-routing-test-coordinator-role-gets-credential ()
+  "An instance with the role \"coordinator\" gets the coordinator header.
+Its generated config can then call a coordinator tool.  An instance
+without that role, a session without a descriptor, and an older launch
+of a coordinator ID never get the header."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (let ((dir-c (claude-code-ide-mcp-routing-tests--make-worktree cci-test-dir "wt-c"))
+          (dir-w (claude-code-ide-mcp-routing-tests--make-worktree cci-test-dir "wt-w"))
+          (coordinator-header 'X-Emacs-MCP-Coordinator))
+      (claude-code-ide-make-tool :function (lambda () "coordinated")
+                                 :name "cci_test_coord" :description "A coordinator tool"
+                                 :scope 'coordinator)
+      ;; A coordinator instance and a worker instance
+      (setf (claude-code-ide-instance-role
+             (claude-code-ide-mcp-routing-tests--start "cci-test-inst-c" dir-c))
+            "coordinator")
+      (setf (claude-code-ide-instance-role
+             (claude-code-ide-mcp-routing-tests--start "cci-test-inst-w" dir-w))
+            "worker")
+      (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+      ;; The coordinator gets the credential, made when it was missing
+      (let ((headers (claude-code-ide-mcp-routing-tests--config-headers "cci-test-inst-c")))
+        (should (equal (alist-get coordinator-header headers)
+                       (claude-code-ide-mcp-server-coordinator-credential)))
+        (should (= (file-modes (claude-code-ide-mcp-server-coordinator-credential-file)) #o600))
+        (should (equal (alist-get 'X-Emacs-MCP-Instance-Secret headers)
+                       (claude-code-ide-mcp-routing-tests--secret "cci-test-inst-c")))
+        ;; With its own config, the coordinator sees and runs the coordinator tool
+        (let ((request (claude-code-ide-mcp-routing-tests--as-request-headers headers)))
+          (should (member "cci_test_coord"
+                          (claude-code-ide-mcp-routing-tests--tool-names "/mcp/cci-test-inst-c" request)))
+          (should (equal (claude-code-ide-mcp-routing-tests--call
+                          "/mcp/cci-test-inst-c" "cci_test_coord" nil request)
+                         "coordinated"))))
+      ;; Path placement keeps the coordinator header
+      (let ((claude-code-ide-mcp-server-secret-placement 'path))
+        (should (alist-get coordinator-header
+                           (claude-code-ide-mcp-routing-tests--config-headers "cci-test-inst-c"))))
+      ;; The worker and the session without a descriptor never get it
+      (let ((headers (claude-code-ide-mcp-routing-tests--config-headers "cci-test-inst-w")))
+        (should-not (alist-get coordinator-header headers))
+        (should-not (string-match-p "Coordinator" (format "%S" headers)))
+        (should (string-match-p
+                 "coordinator-only"
+                 (claude-code-ide-mcp-routing-tests--call
+                  "/mcp/cci-test-inst-w" "cci_test_coord" nil
+                  (claude-code-ide-mcp-routing-tests--as-request-headers headers)))))
+      (should-not (claude-code-ide-mcp-routing-tests--config-headers "cci-test-cowork"))
+      ;; A later launch of the worker ID with the coordinator role does not
+      ;; change the config of the older session
+      (claude-code-ide-instance-unregister "cci-test-inst-w")
+      (claude-code-ide-instance-register
+       (claude-code-ide-instance-create :id "cci-test-inst-w" :provider 'claude
+                                        :project-root dir-w :generation 2
+                                        :role "coordinator"))
+      (should-not (alist-get coordinator-header
+                             (claude-code-ide-mcp-routing-tests--config-headers "cci-test-inst-w"))))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-no-role-no-credential ()
+  "An instance without a role gets no coordinator header, and no file is made."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-routing-tests--start "cci-test-inst-a" cci-test-dir)
+    (should-not (claude-code-ide-instance-role (claude-code-ide-instance-by-id "cci-test-inst-a")))
+    (should-not (alist-get 'X-Emacs-MCP-Coordinator
+                           (claude-code-ide-mcp-routing-tests--config-headers "cci-test-inst-a")))
+    (should-not (file-exists-p (claude-code-ide-mcp-server-coordinator-credential-file)))))
+
 (provide 'claude-code-ide-mcp-routing-tests)
 ;;; claude-code-ide-mcp-routing-tests.el ends here

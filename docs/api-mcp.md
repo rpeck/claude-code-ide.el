@@ -178,22 +178,35 @@ A coordinator tool takes an explicit instance ID as an argument. It must not use
 
 ### What the scope protects against
 
-- **It protects against mistakes, and against other local clients.** An instance does not get the credential in its config, so it cannot call a coordinator tool by accident. A local program without the credential gets `coordinator-only` or 403.
+- **It protects against mistakes, and against other local clients.** Only an instance with the role `coordinator` gets the credential in its config (see below). So another instance cannot call a coordinator tool by accident. A local program without the credential gets `coordinator-only` or 403.
 - **It does not protect against an agent that runs as the same user and reads files.** Every instance runs as your user. An instance that reads the credential file (with a shell command, or with `emacs_eval`) can then send coordinator requests. The file mode `0600` stops other users only.
-- So do not treat the coordinator scope as a security boundary between instances. The threat model is an open question for the user.
+- So do not treat the coordinator scope as a security boundary between instances. **Decision (user):** this is the intended threat model.
 
 ### The file
 
 - **File:** `claude-code-ide-mcp-server-coordinator-credential-file`. The default (nil) is `coordinator-credential` in the report directory of the session registry. With the default registry settings, that is `~/.emacs-claude-code-ide-state-reports/coordinator-credential`.
 - **One path.** `claude-code-ide-mcp-server--report-directory` computes the report directory from the two registry options (`claude-code-ide-session-registry-report-directory` and `claude-code-ide-state-file`), and from their defaults when the registry is not loaded. So the path is the same whether or not the registry is loaded. A test checks that it equals the registry's own function.
 - **Value:** 64 hexadecimal characters, separate from every instance secret.
-- **Made:** when the server starts and a coordinator tool is registered, or when a coordinator tool is registered while the server runs. The file gets mode `0600`. A new folder gets mode `0700`.
-- **Kept:** across Emacs restarts, so that a coordinator keeps working.
+- **Made:** when the server starts and a coordinator tool is registered, when a coordinator tool is registered while the server runs, or when the config of a coordinator instance is generated. The file gets mode `0600`. A new folder gets mode `0700`.
+- **Kept:** across Emacs restarts, so that a coordinator keeps working. **Decision (user).**
 - **Refused:** a file that does not belong to the user, or that the group or others can read. Emacs then shows a message, and no request is a coordinator request.
 - **Replace it:** `M-x claude-code-ide-mcp-server-rotate-coordinator-credential`. Coordinators must read the file again.
 - **Use it:** read the file, and send its content in the header `X-Emacs-MCP-Coordinator` to `/mcp`. If the user configuration checks a global token, send that header too.
 
 A coordinator request to `/mcp/<id>` still needs the secret of that instance.
+
+### Coordinator instances
+
+**Decision (user):** an instance that Emacs launches with the role `coordinator` gets the credential in its generated MCP config automatically.
+
+- `claude-code-ide-mcp-server-get-config` reads the role from the instance descriptor of that launch generation (`claude-code-ide-instance-role`). The role is the string `"coordinator"`.
+- The config then has the header `X-Emacs-MCP-Coordinator` beside the instance secret, in every secret placement. The instance uses its own URL `/mcp/<instance-id>`, so its requests pass both checks.
+- No other session gets the header: not an instance with another role or no role, not a session without a descriptor (such as `cowork`), and not an older launch of an ID whose newer launch has the coordinator role.
+- The same `ps` rule as for the secret applies. For Claude Code, the config is on the command line today, so `ps` shows the credential too.
+
+### The `cowork` session
+
+**Decision (user):** the `cowork` session of `rp-emacs-mcp.el` stays as it is. It has no own credential and no secret; the global token of that configuration protects it.
 
 ## `get_capabilities`
 

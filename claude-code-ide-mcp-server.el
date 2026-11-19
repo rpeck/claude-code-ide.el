@@ -127,7 +127,10 @@ secrets of the instances.  Emacs makes the file with mode 0600 when
 the server starts and a coordinator tool exists, and accepts it only
 while no other user can read it.  This protects against mistakes and
 against other local clients, not against an agent that runs as the
-same user and reads the file; see docs/api-mcp.md.
+same user and reads the file; see docs/api-mcp.md.  An instance with
+the role \"coordinator\" gets the credential in its generated MCP
+config; no other session does.  The credential stays the same across
+Emacs restarts.
 nil means the file \"coordinator-credential\" in the report directory
 of the session registry (see
 `claude-code-ide-session-registry-report-directory')."
@@ -389,12 +392,18 @@ the last part of the URL path.  Other sessions keep the URL
 /mcp/<session-id> and get no secret.
 The headers of `claude-code-ide-mcp-server-extra-headers' come first;
 the secret header comes last and wins over one of the same name.
+An instance whose descriptor has the role \"coordinator\" also gets
+the coordinator credential in the header
+`claude-code-ide-mcp-server-coordinator-header' (made when missing).
+No other session ever gets it.
 Returns an alist suitable for JSON encoding."
   (when-let* ((port (claude-code-ide-mcp-server-get-port)))
     (let* ((key (and session-id (claude-code-ide-mcp-server--resolve-key session-id)))
            (entry (and key (gethash key claude-code-ide-mcp-server--sessions)))
            (instance-id (plist-get entry :instance-id))
            (secret (plist-get entry :secret))
+           (credential (and (claude-code-ide-mcp-server--coordinator-instance-p entry)
+                            (claude-code-ide-mcp-server-coordinator-credential t)))
            (in-path (and secret (eq claude-code-ide-mcp-server-secret-placement 'path)))
            (path (cond
                   ((and instance-id in-path) (format "/mcp/%s/%s" instance-id secret))
@@ -404,6 +413,9 @@ Returns an alist suitable for JSON encoding."
            (url (format "http://localhost:%d%s" port path))
            (headers (claude-code-ide-mcp-server--merge-header-lists
                      (list (claude-code-ide-mcp-server--extra-headers)
+                           (and credential
+                                `((,(intern claude-code-ide-mcp-server-coordinator-header)
+                                   . ,credential)))
                            (and secret (not in-path)
                                 `((,(intern claude-code-ide-mcp-server-secret-header)
                                    . ,secret))))))
@@ -412,6 +424,13 @@ Returns an alist suitable for JSON encoding."
       (when headers
         (setq config (append config `((headers . ,headers)))))
       `((mcpServers . ((emacs-tools . ,config)))))))
+
+(defun claude-code-ide-mcp-server--coordinator-instance-p (entry)
+  "Return non-nil when the session ENTRY belongs to a coordinator instance.
+That is: the descriptor of its launch has the role \"coordinator\"."
+  (when-let* ((instance (claude-code-ide-mcp-server--entry-instance entry))
+              (role (claude-code-ide-instance-role instance)))
+    (equal (format "%s" role) "coordinator")))
 
 (defun claude-code-ide-mcp-server--extra-headers ()
   "Return `claude-code-ide-mcp-server-extra-headers' with the values computed.
