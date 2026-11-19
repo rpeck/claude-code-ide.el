@@ -133,6 +133,7 @@ This document describes the control operations of claude-code-ide.el, the prompt
 | `earlier-prompts-pending` | queued or rejected | The instance is idle, but older prompts wait. They go first. |
 | `send-failed` | queued | The provider did not send the prompt. It waits for the next try. |
 | `no-submit` | rejected | The provider has no `submit-prompt`. Queued prompts of such an instance also become final with this reason. |
+| `held` | queued or rejected | A handover holds the delivery to the instance while it quiesces and stops it (`claude-code-ide-control-hold`). The prompt waits; with QUEUE nil it is rejected. |
 | `handed-over` | rejected, or queued | A handover moved the prompt to its target (`claude-code-ide-control-move-inbox`). The old record is `rejected` with this reason. The target has a `queued` copy with the same request ID and this reason. Follow the chain with `claude-code-ide-session-registry-chain-current`. |
 | `unknown-instance` | rejected | Neither this Emacs nor the registry knows the ID. |
 | `invalid-instance-id`, `empty-text` | rejected | The request is not valid. |
@@ -156,7 +157,7 @@ The state comes from `claude-code-ide-instance-state`.
 - **Only `idle` sends.** Every other state queues, because a provider does not yet report each of its dialogs reliably (plan §10).
 - **An instance that does not run** in this Emacs:
   - When the session registry marks it closed or archived, it is stopped.
-  - When the registry marks it `failed`, it is `failed`, with the reason `exit-code` (the CLI exited with an error code) or `error`. The state plist has the failure text as `:detail`.
+  - When the registry marks it `failed`, it is `failed`, with the reason `exit-code` (the CLI exited with an error code) or `error`. The state plist has the failure text as `:detail`. Like every `failed` state, it rejects a prompt unless QUEUE is t.
   - When the registry marks it `pending`, it is `working` with the reason `starting`.
   - When the registry has it open (as after a crash of Emacs), or this Emacs launched it before, it is `disconnected`.
   - Else it is unknown.
@@ -202,6 +203,8 @@ The state comes from `claude-code-ide-instance-state`.
 - **Old Emacs.** The files are read with the native JSON parser when Emacs has one, else with json.el.
 - `claude-code-ide-control-inbox-directory-of (INSTANCE-ID)` returns the folder.
 - `(claude-code-ide-control-move-inbox FROM TO)` moves the queued prompts of FROM to TO after a handover (plan §4.8). Each keeps its request ID; see the reason `handed-over`.
+- `(claude-code-ide-control-hold INSTANCE-ID)` and `(claude-code-ide-control-release INSTANCE-ID)` hold and release the delivery to an instance; `claude-code-ide-control-held-p` tells. A held instance gets no prompt, also when it is idle. The release delivers the queued prompts.
+- Two helpers for other files of the package: `(claude-code-ide-control--write-json-file FILE DATA)` writes any JSON value atomically (file 0600, folder 0700), and `(claude-code-ide-control--prune-folder DIR DAYS &optional REGEXP)` deletes the old files of a folder. The inbox uses both.
 
 ### The file
 
