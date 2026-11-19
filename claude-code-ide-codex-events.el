@@ -148,28 +148,21 @@ launch=\"$id.$gen\"
   } > \"$tmp\" || { rm -f \"$tmp\"; exit 0; }
   # Number the events of this launch in the order they are published
   lock=\"$dir/.$launch.lock\"
-  tries=0
-  until mkdir \"$lock\"; do
-    tries=$((tries + 1))
-    # Break only the lock of a holder that died; Emacs removes old locks
-    if [ \"$tries\" -eq 50 ]; then
-      holder=$(cat \"$lock/pid\")
-      if [ -n \"$holder\" ] && ! kill -0 \"$holder\"; then rm -rf \"$lock\"; fi
-    fi
-    if [ \"$tries\" -gt 400 ]; then rm -f \"$tmp\"; exit 0; fi
-    sleep 0.01
-  done
-  echo $$ > \"$lock/pid\"
-  seq=$(cat \"$dir/.$launch.seq\")
-  case $seq in ''|*[!0-9]*) seq=0 ;; esac
-  seq=$((seq + 1))
-  echo \"$seq\" > \"$dir/.$launch.seq.tmp\" && mv -f \"$dir/.$launch.seq.tmp\" \"$dir/.$launch.seq\"
-  mv \"$tmp\" \"$dir/$launch.$(printf %08d \"$seq\").$event.json\" || rm -f \"$tmp\"
-  rm -rf \"$lock\"
+  seqfile=\"$dir/.$launch.seq\"
+  prefix=\"$dir/$launch.\"
+  suffix=\".$event.json\"
+@LOCK_LOOP@
 )
 exit 0
 "
-  "Script that each Codex status hook runs.")
+  "Template of the script that each Codex status hook runs.
+`claude-code-ide-codex-events--script-text' fills in the lock loop.")
+
+(defun claude-code-ide-codex-events--script-text ()
+  "Return the Codex hook script, with the current time limit.
+The limit is in the script, not in the hook command, so a change of it
+needs no new trust: Codex trusts the hook command."
+  (claude-code-ide-session-status--fill-script claude-code-ide-codex-events--script))
 
 ;;; Data
 
@@ -283,7 +276,7 @@ It must be a regular file that only the user can write."
        (not (file-symlink-p file))
        (zerop (logand (file-modes file) #o022))
        (equal (claude-code-ide-session-registry--file-string file)
-              claude-code-ide-codex-events--script)))
+              (claude-code-ide-codex-events--script-text))))
 
 (defun claude-code-ide-codex-events--install-script ()
   "Write the hook script when it is missing or differs, and return its file.
@@ -296,7 +289,7 @@ the hook command, not the script."
   (let ((file (claude-code-ide-codex-events--script-file)))
     (unless (claude-code-ide-codex-events--script-ok-p file)
       (claude-code-ide-session-status--write-file-atomically
-       file claude-code-ide-codex-events--script #o700))
+       file (claude-code-ide-codex-events--script-text) #o700))
     file))
 
 (defun claude-code-ide-codex-events--command (event)
@@ -311,9 +304,10 @@ They do not depend on the instance, so one trust covers all launches."
   (apply #'append
          (mapcar (lambda (event)
                    (list "-c"
-                         (format "hooks.%s=[{hooks=[{type=\"command\",command=%s,timeout=5}]}]"
+                         (format "hooks.%s=[{hooks=[{type=\"command\",command=%s,timeout=%d}]}]"
                                  event
-                                 (json-encode-string (claude-code-ide-codex-events--command event)))))
+                                 (json-encode-string (claude-code-ide-codex-events--command event))
+                                 (claude-code-ide-session-status--hook-cli-timeout))))
                  claude-code-ide-codex-events--events)))
 
 (defun claude-code-ide-codex-events--remove-launch-files (instance-id generation)
@@ -323,10 +317,10 @@ They do not depend on the instance, so one trust covers all launches."
    (concat "\\`\\.?" (regexp-quote (format "%s.%d." instance-id generation)))))
 
 (defun claude-code-ide-codex-events--remove-stale-locks ()
-  "Delete counter locks older than three seconds.
+  "Delete counter locks and break tokens older than three seconds.
 See `claude-code-ide-session-status--remove-old-locks'."
   (claude-code-ide-session-status--remove-old-locks
-   (claude-code-ide-codex-events--events-directory) "\\`\\..+\\.lock\\'"))
+   (claude-code-ide-codex-events--events-directory) "\\`\\..+\\.lock\\(?:\\.break\\)?\\'"))
 
 ;;; Hook arguments
 

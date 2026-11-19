@@ -757,10 +757,9 @@ CONTENT is a JSON value as text; FIELDS are extra \"key\":value texts."
     (claude-code-ide-session-status--install-script)
     (let* ((script (claude-code-ide-session-status--script-file))
            (dir (expand-file-name "events" registry-dir))
-           ;; The script gives up after a number of tries for the lock.
-           ;; On a loaded machine the holder can be slow, so its `sleep'
-           ;; returns only when the lock is free: each writer tries once
-           ;; per release, however slow the machine is.
+           ;; The script gives up after a time limit.  Here `sleep'
+           ;; returns only when the lock is free, so each writer tries
+           ;; once per release, however slow the machine is.
            (bin (expand-file-name "bin" registry-dir))
            (process-environment
             (progn
@@ -801,30 +800,33 @@ It runs echo, cat, two mv and rm; that takes a few milliseconds on an
 idle machine.")
 
 (defun claude-code-ide-tests--script-lock-budget (script)
-  "Check the lock loop of the hook SCRIPT text for parallel writers.
-The loop sleeps a fixed time between tries and gives up after a number
-of tries.  A dead holder's lock must break before the end, and the
-tries must last at least as long as all other writers hold the lock."
-  (let ((limit (and (string-match "\"\\$tries\" -gt \\([0-9]+\\)" script)
-                    (string-to-number (match-string 1 script))))
-        (break (and (string-match "\"\\$tries\" -eq \\([0-9]+\\)" script)
-                    (string-to-number (match-string 1 script))))
-        (pause (and (string-match "^ *sleep \\([0-9.]+\\)$" script)
-                    (string-to-number (match-string 1 script)))))
-    (should (natnump limit))
-    (should (natnump break))
-    (should (and (numberp pause) (> pause 0)))
-    (should (< break limit))
-    ;; Each try sleeps at least PAUSE, so the tries last at least this long
-    (should (>= (* limit pause)
-                (* (1- claude-code-ide-tests--script-writers)
-                   claude-code-ide-tests--script-hold)))))
+  "Check the lock section of the hook SCRIPT text.
+It waits by real time and by a cap of tries, reads the clock at each
+try of 50 ms, breaks a dead lock only with the break token, lets a
+child sh hold the lock with its own PID, and rotates its error log.
+The limit must also outlast the time that all other writers hold the
+lock."
+  (let ((number (lambda (name)
+                  (and (string-match (format "^  %s=\\([0-9]+\\)$" name) script)
+                       (string-to-number (match-string 1 script)))))
+        (limit (claude-code-ide-session-status--hook-limit)))
+    (should (equal (funcall number "limit") limit))
+    (should (equal (funcall number "cap") (* 20 limit)))
+    (should (< (funcall number "brk") limit))
+    (dolist (part '("start=$(date +%s)" "now=$(date +%s)" "-gt \"$limit\" ] || [ \"$tries\" -ge \"$cap\""
+                    "if [ \"$waited\" -lt 0 ]; then waited=$((limit + 1)); fi"
+                    "if [ -z \"$start\" ] && [ -n \"$now\" ]; then start=$now; fi"
+                    "mkdir \"$lock.break\"" "rmdir \"$lock.break\""
+                    "sh -c 'echo $$ > \"$1/pid\"" "mv -f \"$log\" \"$log.1\"" "sleep 0.05"))
+      (should (string-search part script)))
+    (should (>= limit (* (1- claude-code-ide-tests--script-writers)
+                         claude-code-ide-tests--script-hold)))))
 
 (ert-deftest claude-code-ide-test-status-hook-script-lock-budget ()
-  "The tries of the status hook script give 20 parallel writers enough time.
+  "The time limit of the status hook script gives 20 parallel writers enough time.
 The parallel test above makes the waits independent of the speed of
 the machine; this test checks the numbers of the real loop."
-  (claude-code-ide-tests--script-lock-budget claude-code-ide-session-status--script))
+  (claude-code-ide-tests--script-lock-budget (claude-code-ide-session-status--script-text)))
 
 (ert-deftest claude-code-ide-test-status-drain-applies-in-order ()
   "Events are applied in sequence order; unknown launches are deleted."
@@ -873,7 +875,10 @@ the machine; this test checks the numbers of the real loop."
             (let ((commands (alist-get 'hooks (car (alist-get (intern event) hooks)))))
               (should commands)
               (dolist (command commands)
-                (should (equal (alist-get 'timeout command) 5)))))
+                (should (equal (alist-get 'timeout command)
+                               (claude-code-ide-session-status--hook-cli-timeout)))
+                (should (> (alist-get 'timeout command)
+                           claude-code-ide-session-status-hook-time-limit)))))
           ;; SessionStart has the id report and the status event
           (should (= 2 (length (alist-get 'hooks (car (alist-get 'SessionStart hooks))))))
           (should (gethash session claude-code-ide-session-status--by-session)))))))
@@ -977,6 +982,301 @@ project line."
           (claude-code-ide-session-registry-mode -1))
         (mapc #'kill-buffer buffers)
         (claude-code-ide-tests--clear-processes)))))
+
+;;; The time limit of the hook scripts
+
+(defun claude-code-ide-tests--held-lock-run (script args lock environment)
+  "Run the hook SCRIPT with ARGS while a live process holds LOCK.
+ENVIRONMENT holds more \"NAME=VALUE\" entries.  The holder is this
+Emacs, which runs.  Return (EXIT OUTPUT SECONDS) of the run."
+  (make-directory lock t)
+  (with-temp-file (expand-file-name "pid" lock) (insert (format "%d\n" (emacs-pid))))
+  (let ((process-environment (append environment process-environment))
+        (start (float-time)))
+    (with-temp-buffer
+      (insert "{\"session_id\":\"cci-test-held\"}")
+      (let ((exit (apply #'call-process-region (point-min) (point-max) "/bin/sh" t t nil
+                         script args)))
+        (list exit (buffer-string) (- (float-time) start))))))
+
+(ert-deftest claude-code-ide-test-status-hook-script-time-limit ()
+  "A hook whose lock stays held gives up after about the time limit, and exits 0.
+The script is a shell process, so the virtual clock of the tests cannot
+drive it; the check uses real time with a generous bound.  The hook
+drops its event, removes its temporary file, and writes one line to
+hook-errors.log in the events folder."
+  (claude-code-ide-tests--with-status
+    (let ((claude-code-ide-session-status-hook-time-limit 1))
+      (claude-code-ide-session-status--install-script)
+      (let* ((script (claude-code-ide-session-status--script-file))
+             (dir (expand-file-name "events" registry-dir))
+             (result (claude-code-ide-tests--held-lock-run
+                      script (list dir "n4" "Stop") (expand-file-name ".n4.lock" dir) nil)))
+        (should (equal (butlast result) '(0 "")))
+        ;; More than the limit, and far less than a count of tries on a slow machine
+        (should (>= (nth 2 result) 0.9))
+        (should (< (nth 2 result) 20))
+        (should-not (directory-files dir nil "\\`n4-"))
+        (should-not (directory-files dir nil "\\`\\.n4\\.in\\."))
+        (let ((log (claude-code-ide-session-registry--file-string
+                    (expand-file-name "hook-errors.log" dir))))
+          (should (string-match-p "Stop: no lock after [0-9]+ s .*\\.n4\\.lock); event dropped\n\\'" log))
+          (should (= 1 (length (split-string log "\n" t)))))))))
+
+(ert-deftest claude-code-ide-test-status-hook-script-holds-the-limit ()
+  "Emacs writes the time limit into the installed script, and the launch check sees it."
+  (claude-code-ide-tests--with-status
+    (let ((file (claude-code-ide-session-status--script-file)))
+      (let ((claude-code-ide-session-status-hook-time-limit 7))
+        (claude-code-ide-session-status--install-script)
+        (should (string-match-p "^  limit=7$" (claude-code-ide-session-registry--file-string file)))
+        (claude-code-ide-tests--script-lock-budget (claude-code-ide-session-status--script-text)))
+      ;; Another value: the next install writes it
+      (let ((claude-code-ide-session-status-hook-time-limit 10))
+        (claude-code-ide-session-status--install-script)
+        (should (equal (claude-code-ide-session-registry--file-string file)
+                       (claude-code-ide-session-status--script-text)))
+        (should (string-match-p "^  limit=10$" (claude-code-ide-session-registry--file-string file))))
+      ;; The default is 10 seconds, and the hook command has no limit in it
+      (should (= (default-value 'claude-code-ide-session-status-hook-time-limit) 10))
+      (should-not (string-match-p "limit" (claude-code-ide-session-status--command "n5" "Stop"))))))
+
+;;; Review fixes of the hook time limit
+
+(defun claude-code-ide-tests--shim-bin (dir &rest programs)
+  "Write shell PROGRAMS into DIR/bin, and return the PATH entry for them.
+Each element of PROGRAMS is (NAME . BODY), BODY a shell text after #!/bin/sh."
+  (let ((bin (expand-file-name "bin" dir)))
+    (make-directory bin t)
+    (dolist (program programs)
+      (let ((file (expand-file-name (car program) bin)))
+        (with-temp-file file (insert "#!/bin/sh\n" (cdr program)))
+        (set-file-modes file #o700)))
+    (concat "PATH=" bin ":" (getenv "PATH"))))
+
+(defun claude-code-ide-tests--run-guarded (shell script args environment &optional seconds)
+  "Run SCRIPT with ARGS under SHELL, with ENVIRONMENT, at most SECONDS (15).
+A script that does not end in time is killed.  Return (ENDED EXIT
+SECONDS)."
+  (let* ((process-environment (append environment process-environment))
+         (start (float-time))
+         (process (make-process :name "cci-test-hook" :command (append (list shell script) args)
+                                :connection-type 'pipe :noquery t :buffer nil)))
+    (process-send-string process "{}")
+    (process-send-eof process)
+    (let ((ended (claude-code-ide-tests--wait-until
+                  (lambda () (not (process-live-p process))) (or seconds 15))))
+      (unless ended (delete-process process))
+      (list (and ended t) (and ended (process-exit-status process)) (- (float-time) start)))))
+
+(defmacro claude-code-ide-tests--with-hook-dir (&rest body)
+  "Run BODY with the CC hook script installed for a limit of 1 s.
+BODY sees `script', the events folder `dir', and `registry-dir'."
+  (declare (indent 0))
+  `(claude-code-ide-tests--with-status
+     (let ((claude-code-ide-session-status-hook-time-limit 1))
+       (claude-code-ide-session-status--install-script)
+       (let ((script (claude-code-ide-session-status--script-file))
+             (dir (expand-file-name "events" registry-dir)))
+         (make-directory dir t)
+         ,@body))))
+
+(ert-deftest claude-code-ide-test-status-hook-cli-timeout-outlasts-limit ()
+  "The CLIs of both providers give a hook more time than the script limit.
+So a script always gives up before the CLI stops it."
+  (dolist (limit '(1 10 30))
+    (let ((claude-code-ide-session-status-hook-time-limit limit))
+      (should (> (claude-code-ide-session-status--hook-cli-timeout) limit))
+      (should (> (claude-code-ide-session-registry--hook-timeout) limit)))))
+
+(ert-deftest claude-code-ide-test-registry-hook-timeout-follows-limit ()
+  "Each hook of the CC --settings argument carries the timeout of the limit."
+  (claude-code-ide-tests--with-status
+    (let ((claude-code-ide-session-status-hook-time-limit 3)
+          (claude-code-ide-session-registry-hook-functions
+           (list (lambda (_session _key) '(("Stop" "true")))))
+          (session (make-claude-code-ide-mcp-session)))
+      (let ((hooks (alist-get 'hooks (json-read-from-string
+                                      (claude-code-ide-session-registry--hook-settings session "k8")))))
+        (should hooks)
+        (dolist (event hooks)
+          (dolist (group (append (cdr event) nil))
+            (dolist (command (append (alist-get 'hooks group) nil))
+              (should (= (alist-get 'timeout command) 8)))))))))
+
+(ert-deftest claude-code-ide-test-status-hook-break-needs-the-token ()
+  "A waiter breaks a dead lock only with the break token.
+While another waiter holds the token, the dead lock stays, and the hook
+gives up at its limit."
+  (claude-code-ide-tests--with-hook-dir
+    (let ((lock (expand-file-name ".n6.lock" dir)))
+      (make-directory lock t)
+      (with-temp-file (expand-file-name "pid" lock) (insert "999999\n"))
+      (make-directory (concat lock ".break"))
+      (pcase-let ((`(,ended ,exit ,seconds)
+                   (claude-code-ide-tests--run-guarded "/bin/sh" script (list dir "n6" "Stop") nil)))
+        (should ended)
+        (should (= exit 0))
+        (should (>= seconds 0.9)))
+      (should (file-exists-p lock))
+      (should-not (directory-files dir nil "\\`n6-")))))
+
+(ert-deftest claude-code-ide-test-status-hook-dead-lock-race ()
+  "Waiters that race to break one dead lock each write one event, with its own number."
+  (claude-code-ide-tests--with-status
+    (claude-code-ide-session-status--install-script)
+    (let ((script (claude-code-ide-session-status--script-file)))
+      (dolist (shell '("/bin/sh" "/bin/dash"))
+        (when (file-executable-p shell)
+          (let* ((dir (expand-file-name (concat "race-" (file-name-nondirectory shell)) registry-dir))
+                 (lock (expand-file-name ".n7.lock" dir)))
+            (make-directory lock t)
+            (with-temp-file (expand-file-name "pid" lock) (insert "999999\n"))
+            (with-temp-buffer
+              (should (zerop (call-process
+                              shell nil t nil "-c"
+                              (format "i=0; while [ $i -lt 5 ]; do echo '{}' | %s %s %s n7 Stop & i=$((i+1)); done; wait"
+                                      shell (shell-quote-argument script) (shell-quote-argument dir))))))
+            (should (equal (mapcar (lambda (file) (string-to-number (substring file 3 11)))
+                                   (directory-files dir nil "\\`n7-[0-9]+-Stop\\.json\\'"))
+                           '(1 2 3 4 5)))))))))
+
+(ert-deftest claude-code-ide-test-status-hook-clock-steps-back ()
+  "A clock that steps back counts as the end of the wait."
+  (claude-code-ide-tests--with-hook-dir
+    (let* ((count (expand-file-name "dates" registry-dir))
+           (path (claude-code-ide-tests--shim-bin
+                  registry-dir
+                  (cons "date" (concat "echo x >> " (shell-quote-argument count) "\n"
+                                       "if [ \"$(wc -l < " (shell-quote-argument count)
+                                       " | tr -d ' ')\" -le 1 ]; then echo 2000000000; else echo 1000000000; fi\n")))))
+      (make-directory (expand-file-name ".n8.lock" dir) t)
+      (with-temp-file (expand-file-name ".n8.lock/pid" dir) (insert (format "%d\n" (emacs-pid))))
+      (pcase-let ((`(,ended ,exit ,_seconds)
+                   (claude-code-ide-tests--run-guarded "/bin/sh" script (list dir "n8" "Stop") (list path))))
+        (should ended)
+        (should (= exit 0)))
+      (should-not (directory-files dir nil "\\`n8-")))))
+
+(ert-deftest claude-code-ide-test-status-hook-frozen-clock-cap ()
+  "A clock that does not move ends the wait by the cap of tries."
+  (claude-code-ide-tests--with-hook-dir
+    (let ((path (claude-code-ide-tests--shim-bin registry-dir (cons "date" "echo 1500000000\n"))))
+      (make-directory (expand-file-name ".n9.lock" dir) t)
+      (with-temp-file (expand-file-name ".n9.lock/pid" dir) (insert (format "%d\n" (emacs-pid))))
+      (pcase-let ((`(,ended ,exit ,_seconds)
+                   (claude-code-ide-tests--run-guarded "/bin/sh" script (list dir "n9" "Stop") (list path))))
+        (should ended)
+        (should (= exit 0)))
+      (should (string-match-p "and 20 tries"
+                              (claude-code-ide-session-registry--file-string
+                               (expand-file-name "hook-errors.log" dir)))))))
+
+(ert-deftest claude-code-ide-test-status-hook-first-date-fails ()
+  "When the first `date' fails, the wait counts from the first good one."
+  (claude-code-ide-tests--with-hook-dir
+    (let* ((count (expand-file-name "dates" registry-dir))
+           (path (claude-code-ide-tests--shim-bin
+                  registry-dir
+                  (cons "date" (concat "echo x >> " (shell-quote-argument count) "\n"
+                                       "if [ \"$(wc -l < " (shell-quote-argument count)
+                                       " | tr -d ' ')\" -le 1 ]; then exit 1; fi\n"
+                                       "exec /bin/date \"$@\"\n")))))
+      (make-directory (expand-file-name ".n10.lock" dir) t)
+      (with-temp-file (expand-file-name ".n10.lock/pid" dir) (insert (format "%d\n" (emacs-pid))))
+      (pcase-let ((`(,ended ,exit ,seconds)
+                   (claude-code-ide-tests--run-guarded "/bin/sh" script (list dir "n10" "Stop") (list path))))
+        (should ended)
+        (should (= exit 0))
+        (should (>= seconds 0.9))))))
+
+(ert-deftest claude-code-ide-test-status-hook-holder-pid ()
+  "The PID in the lock is that of the process that holds the lock."
+  (claude-code-ide-tests--with-status
+    (claude-code-ide-session-status--install-script)
+    (let ((script (claude-code-ide-session-status--script-file)))
+      (dolist (shell '("/bin/sh" "/bin/dash"))
+        (when (file-executable-p shell)
+          (let* ((dir (expand-file-name (concat "pid-" (file-name-nondirectory shell)) registry-dir))
+                 (log (expand-file-name (concat "mv-" (file-name-nondirectory shell)) registry-dir))
+                 (pid (expand-file-name ".n11.lock/pid" dir))
+                 (path (claude-code-ide-tests--shim-bin
+                        dir (cons "mv" (concat "if [ -f " (shell-quote-argument pid) " ]; then "
+                                               "echo \"$(cat " (shell-quote-argument pid) ") $PPID\" >> "
+                                               (shell-quote-argument log) "; fi\n"
+                                               "exec /bin/mv \"$@\"\n")))))
+            (make-directory dir t)
+            (pcase-let ((`(,ended ,exit ,_seconds)
+                         (claude-code-ide-tests--run-guarded shell script (list dir "n11" "Stop") (list path))))
+              (should ended)
+              (should (= exit 0)))
+            (should (directory-files dir nil "\\`n11-00000001-Stop\\.json\\'"))
+            ;; Each mv under the lock: the PID in the lock is its parent, the holder
+            (let ((lines (split-string (claude-code-ide-session-registry--file-string log) "\n" t)))
+              (should lines)
+              (dolist (line lines)
+                (let ((parts (split-string line " ")))
+                  (should (equal (car parts) (cadr parts))))))))))))
+
+(ert-deftest claude-code-ide-test-status-hook-few-clock-reads ()
+  "A waiting hook sleeps 50 ms between tries and reads the clock once a try.
+That keeps the forks of a waiting hook low on a loaded machine."
+  (claude-code-ide-tests--with-hook-dir
+    (let* ((dates (expand-file-name "dates" registry-dir))
+           (sleeps (expand-file-name "sleeps" registry-dir))
+           (path (claude-code-ide-tests--shim-bin
+                  registry-dir
+                  (cons "date" (concat "echo x >> " (shell-quote-argument dates) "\n"
+                                       "exec /bin/date \"$@\"\n"))
+                  (cons "sleep" (concat "echo \"$1\" >> " (shell-quote-argument sleeps) "\n"
+                                        "exec /bin/sleep \"$@\"\n")))))
+      (make-directory (expand-file-name ".n12.lock" dir) t)
+      (with-temp-file (expand-file-name ".n12.lock/pid" dir) (insert (format "%d\n" (emacs-pid))))
+      (pcase-let ((`(,ended ,_exit ,_seconds)
+                   (claude-code-ide-tests--run-guarded "/bin/sh" script (list dir "n12" "Stop") (list path))))
+        (should ended))
+      (let ((pauses (split-string (claude-code-ide-session-registry--file-string sleeps) "\n" t))
+            (reads (length (split-string (claude-code-ide-session-registry--file-string dates) "\n" t))))
+        (should pauses)
+        (dolist (pause pauses)
+          (should (>= (string-to-number pause) 0.05)))
+        ;; The start, one read a try (the last try has no sleep), and the log line
+        (should (<= reads (+ (length pauses) 3)))))))
+
+(ert-deftest claude-code-ide-test-status-hook-log-rotates ()
+  "At 64 KiB the error log moves to hook-errors.log.1, and the new line starts a new log."
+  (claude-code-ide-tests--with-hook-dir
+    (let ((log (expand-file-name "hook-errors.log" dir)))
+      (with-temp-file log (insert (make-string 65536 ?x)))
+      (claude-code-ide-tests--held-lock-run script (list dir "n13" "Stop")
+                                            (expand-file-name ".n13.lock" dir) nil)
+      (should (= (file-attribute-size (file-attributes (concat log ".1"))) 65536))
+      (should (= 1 (length (split-string (claude-code-ide-session-registry--file-string log) "\n" t)))))))
+
+(ert-deftest claude-code-ide-test-status-buffer-dropped-notice ()
+  "The status buffer tells of new dropped hook events until the user looks."
+  (claude-code-ide-tests--with-status
+    (let ((claude-code-ide-session-status--dropped-seen 0)
+          (claude-code-ide-session-status--dropped-cache nil)
+          (dir (claude-code-ide-session-status--events-directory)))
+      (should-not (claude-code-ide-session-status--dropped-entry))
+      (make-directory (expand-file-name "codex" dir) t)
+      (with-temp-file (expand-file-name "hook-errors.log" dir) (insert "a\nb\n"))
+      (with-temp-file (expand-file-name "codex/hook-errors.log.1" dir) (insert "c\n"))
+      (let ((entry (claude-code-ide-session-status--dropped-entry)))
+        (should (eq (car entry) claude-code-ide-session-status--dropped-id))
+        (should (string-prefix-p "3 status events dropped" (aref (cadr entry) 0))))
+      ;; The user looks: no notice
+      (cl-letf (((symbol-function 'display-buffer) #'ignore))
+        (claude-code-ide-session-status-show-dropped))
+      (should-not (claude-code-ide-session-status--dropped-entry))
+      ;; A new line: the notice comes back with it
+      (with-temp-file (expand-file-name "hook-errors.log" dir) (insert "a\nb\nd\n"))
+      (should (string-prefix-p "1 status event dropped"
+                               (aref (cadr (claude-code-ide-session-status--dropped-entry)) 0)))
+      (dolist (buffer (buffer-list))
+        (when (and (buffer-file-name buffer) (string-prefix-p dir (buffer-file-name buffer)))
+          (kill-buffer buffer))))))
 
 (provide 'claude-code-ide-session-status-tests)
 

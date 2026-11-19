@@ -302,14 +302,14 @@ source is listed too, and must not count."
       (should (= (file-modes dir) #o700))
       (should (zerop (logand (file-modes file) #o022)))
       (should (equal (claude-code-ide-session-registry--file-string file)
-                     claude-code-ide-codex-events--script))
+                     (claude-code-ide-codex-events--script-text)))
       ;; No temporary file stays
       (should (equal (directory-files dir nil "\\`[^.]") (list (file-name-nondirectory file))))
       ;; A changed script is replaced at the next launch
       (with-temp-file file (insert "#!/bin/sh\necho changed\n"))
       (claude-code-ide-codex-events--install-script)
       (should (equal (claude-code-ide-session-registry--file-string file)
-                     claude-code-ide-codex-events--script))
+                     (claude-code-ide-codex-events--script-text)))
       ;; A folder that others can use gets the private mode again
       (set-file-modes dir #o755)
       (claude-code-ide-codex-events--install-script)
@@ -353,8 +353,8 @@ does not depend on the speed of the machine, as a time would."
 (declare-function claude-code-ide-tests--script-lock-budget "claude-code-ide-session-status-tests")
 
 (ert-deftest claude-code-ide-codex-events-test-script-lock-budget ()
-  "The tries of the Codex hook script give 20 parallel writers enough time."
-  (claude-code-ide-tests--script-lock-budget claude-code-ide-codex-events--script))
+  "The time limit of the Codex hook script gives 20 parallel writers enough time."
+  (claude-code-ide-tests--script-lock-budget (claude-code-ide-codex-events--script-text)))
 
 (ert-deftest claude-code-ide-codex-events-test-script-exits-without-identity ()
   "The script records nothing without CCI_INSTANCE_ID or with CODEX_THREAD_ID."
@@ -416,7 +416,8 @@ does not depend on the speed of the machine, as a time would."
                      do (should (equal flag "-c"))
                      do (should (string-prefix-p (format "hooks.%s=[{hooks=[{type=\"command\",command=\"sh " event)
                                                  value))
-                     do (should (string-suffix-p (format " %s\",timeout=5}]}]" event) value)))
+                     do (should (string-suffix-p (format " %s\",timeout=%d}]}]" event
+                                                         (claude-code-ide-session-status--hook-cli-timeout)) value)))
             ;; The same for each instance and each call: one trust covers all
             (should (equal args (claude-code-ide-codex-status-hook-args b)))
             (should (equal args (claude-code-ide-codex-status-hook-args a)))
@@ -2006,6 +2007,101 @@ the entries of a good one."
           (unless (file-readable-p file)
             (should-not (claude-code-ide-transcript--codex-config-entries)))
         (set-file-modes file #o600)))))
+
+;;; The time limit of the hook script
+
+(declare-function claude-code-ide-tests--held-lock-run "claude-code-ide-session-status-tests")
+
+(defun claude-code-ide-codex-events-tests--script-env (dir id generation)
+  "Return the environment of a Codex hook for the launch ID GENERATION in DIR."
+  (list (concat "CCI_EVENTS_DIR=" dir) (concat "CCI_INSTANCE_ID=" id)
+        (format "CCI_GENERATION=%d" generation) "CODEX_THREAD_ID"))
+
+(ert-deftest claude-code-ide-codex-events-test-script-time-limit ()
+  "A Codex hook whose lock stays held gives up after about the time limit.
+Real time with a generous bound: the script is a shell process."
+  (claude-code-ide-codex-events-tests--with-codex
+    (let ((claude-code-ide-session-status-hook-time-limit 1))
+      (claude-code-ide-codex-events--install-script)
+      (let* ((dir (claude-code-ide-codex-events--private-directory
+                   (claude-code-ide-codex-events--events-directory)))
+             (result (claude-code-ide-tests--held-lock-run
+                      (claude-code-ide-codex-events--script-file) '("Stop")
+                      (expand-file-name ".cci-test-held.1.lock" dir)
+                      (claude-code-ide-codex-events-tests--script-env dir "cci-test-held" 1))))
+        (should (equal (butlast result) '(0 "")))
+        (should (>= (nth 2 result) 0.9))
+        (should (< (nth 2 result) 20))
+        (should-not (directory-files dir nil claude-code-ide-codex-events--file-regexp))
+        (should-not (directory-files dir nil "\\.in\\."))
+        (should (string-match-p "Stop: no lock after"
+                                (claude-code-ide-session-registry--file-string
+                                 (expand-file-name "hook-errors.log" dir))))))))
+
+(ert-deftest claude-code-ide-codex-events-test-script-dead-holder-and-writers ()
+  "The Codex hook breaks the lock of a dead holder, and serves 20 parallel writers."
+  (claude-code-ide-codex-events-tests--with-codex
+    (claude-code-ide-codex-events--install-script)
+    (let* ((dir (claude-code-ide-codex-events--private-directory
+                 (claude-code-ide-codex-events--events-directory)))
+           (script (claude-code-ide-codex-events--script-file))
+           (lock (expand-file-name ".cci-test-dead.1.lock" dir)))
+      ;; A holder that is not running
+      (make-directory lock t)
+      (with-temp-file (expand-file-name "pid" lock) (insert "999999\n"))
+      (let ((process-environment (append (claude-code-ide-codex-events-tests--script-env
+                                          dir "cci-test-dead" 1)
+                                         process-environment)))
+        (with-temp-buffer
+          (insert "{}")
+          (should (zerop (call-process-region (point-min) (point-max) "/bin/sh" nil nil nil
+                                              script "Stop")))))
+      (should (equal (directory-files dir nil "\\`cci-test-dead\\.")
+                     '("cci-test-dead.1.00000001.Stop.json")))
+      (should-not (file-exists-p lock))
+      ;; 20 writers at the same time: all events, numbered without gaps
+      (let ((process-environment (append (claude-code-ide-codex-events-tests--script-env
+                                          dir "cci-test-many" 2)
+                                         process-environment)))
+        (with-temp-buffer
+          (should (zerop (call-process
+                          "/bin/sh" nil t nil "-c"
+                          (format "i=0; while [ $i -lt 20 ]; do echo '{}' | /bin/sh %s Stop & i=$((i+1)); done; wait"
+                                  (shell-quote-argument script)))))
+          (should (equal (buffer-string) ""))))
+      (should (equal (mapcar (lambda (file) (string-to-number (nth 2 (split-string file "\\."))))
+                             (directory-files dir nil "\\`cci-test-many\\.2\\.[0-9]+\\.Stop\\.json\\'"))
+                     (number-sequence 1 20))))))
+
+(ert-deftest claude-code-ide-codex-events-test-script-limit-and-trust ()
+  "The Codex hook definition carries the CLI timeout of the limit.
+The command stays the same, but the timeout is limit + 5, so a new
+limit changes the definition and its trust: the next interactive start
+asks again.  The installed script holds the limit."
+  (claude-code-ide-codex-events-tests--with-codex
+    (let ((short (let ((claude-code-ide-session-status-hook-time-limit 3))
+                   (list (claude-code-ide-codex-events--hook-args)
+                         (claude-code-ide-codex-events--trust-key))))
+          (long (let ((claude-code-ide-session-status-hook-time-limit 10))
+                  (list (claude-code-ide-codex-events--hook-args)
+                        (claude-code-ide-codex-events--trust-key)))))
+      (should (cl-every (lambda (value) (string-suffix-p ",timeout=8}]}]" value))
+                        (cl-remove "-c" (car short) :test #'equal)))
+      (should (cl-every (lambda (value) (string-suffix-p ",timeout=15}]}]" value))
+                        (cl-remove "-c" (car long) :test #'equal)))
+      ;; The command is the same; the definition and the key are not
+      (should (equal (mapcar (lambda (value) (replace-regexp-in-string ",timeout=[0-9]+" "" value))
+                             (car short))
+                     (mapcar (lambda (value) (replace-regexp-in-string ",timeout=[0-9]+" "" value))
+                             (car long))))
+      (should-not (equal (cadr short) (cadr long)))
+      (let ((claude-code-ide-session-status-hook-time-limit 4))
+        (let ((file (claude-code-ide-codex-events--install-script)))
+          (should (string-match-p "^  limit=4$" (claude-code-ide-session-registry--file-string file)))
+          (let ((claude-code-ide-session-status-hook-time-limit 10))
+            (should-not (claude-code-ide-codex-events--script-ok-p file))
+            (claude-code-ide-codex-events--install-script)
+            (should (claude-code-ide-codex-events--script-ok-p file))))))))
 
 (provide 'claude-code-ide-codex-events-tests)
 
