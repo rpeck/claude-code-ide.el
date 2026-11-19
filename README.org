@@ -170,6 +170,10 @@ Use a local checkout to run a branch that is not on the package archives, for ex
 
 Sessions that already run when the registry turns on are recorded too, but without status hooks; =M-x claude-code-ide-session-registry-track-sessions= restarts them with hooks (see [[*Session Registry and Restore][Session Registry and Restore]]).
 
+*** Updating in a running Emacs
+
+After an update of the installed package, =M-x claude-code-ide-reload= loads its files again, each after the files that it requires, without a restart. Running sessions keep running. The command reports each file that fails to load, and it turns each package mode that is on off and on again, so that the mode gets the hooks of the new version. A checkout on =load-path= has no generated autoloads: run =M-x load-library RET claude-code-ide-reload RET= one time first. See [[file:docs/updating.md][docs/updating.md]] for the update command of each kind of install, and for what a reload cannot change.
+
 * Usage
 
 ** Basic Commands
