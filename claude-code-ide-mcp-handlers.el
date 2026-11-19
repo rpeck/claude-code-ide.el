@@ -119,6 +119,109 @@ Returns a cons cell (buffer-A . buffer-B)."
 (defvar claude-code-ide-mcp--ediff-frames (make-hash-table :test 'equal)
   "The dedicated diff frames by label: one frame per project, named \"ediff <label>\".")
 
+(defvar claude-code-ide-mcp--ediff-controls (make-hash-table :test 'equal)
+  "The ediff control buffers that run in each dedicated diff frame, by label.
+A frame with a live control buffer has an open ediff, also while the
+ediff is suspended and its windows show other buffers.")
+
+(defvar claude-code-ide-mcp--ediff-queue (make-hash-table :test 'equal)
+  "The diffs that wait for their dedicated frame, by label.
+Each element is (FILE-A FILE-B STARTUP-HOOKS), the oldest first.  See
+`claude-code-ide-ediff-files-in-frame'.")
+
+(defun claude-code-ide-mcp--ediff-frame-label-of (frame)
+  "Return the label of the dedicated diff frame FRAME, or nil."
+  (when (frame-live-p frame)
+    (or (frame-parameter frame 'claude-code-ide-ediff)
+        (catch 'found
+          (maphash (lambda (label f) (when (eq f frame) (throw 'found label)))
+                   claude-code-ide-mcp--ediff-frames)
+          nil))))
+
+(defun claude-code-ide-mcp-ediff-frame-p (frame)
+  "Return non-nil when FRAME is a live dedicated diff frame."
+  (and (claude-code-ide-mcp--ediff-frame-label-of frame) t))
+
+(defun claude-code-ide-mcp--ediff-live-controls (label)
+  "Return the live ediff control buffers of the frame LABEL.
+The dead ones are removed from the table."
+  (let ((live (cl-remove-if-not #'buffer-live-p
+                                (gethash label claude-code-ide-mcp--ediff-controls))))
+    (if live
+        (puthash label live claude-code-ide-mcp--ediff-controls)
+      (remhash label claude-code-ide-mcp--ediff-controls))
+    live))
+
+(defun claude-code-ide-mcp--ediff-label-busy-p (label)
+  "Return non-nil when the dedicated diff frame LABEL has an open ediff."
+  (let ((frame (gethash label claude-code-ide-mcp--ediff-frames)))
+    (or (claude-code-ide-mcp--ediff-live-controls label)
+        (and (frame-live-p frame)
+             (claude-code-ide-mcp--frame-shows-ediff-p frame)))))
+
+(defun claude-code-ide-mcp--ediff-label-in-use-p (label)
+  "Return non-nil when the frame LABEL has an open ediff or a waiting diff."
+  (or (claude-code-ide-mcp--ediff-label-busy-p label)
+      (gethash label claude-code-ide-mcp--ediff-queue)))
+
+(defun claude-code-ide-mcp--register-ediff-control (label buffer)
+  "Record the ediff control BUFFER as open in the dedicated diff frame LABEL.
+When BUFFER dies, the next waiting diff of LABEL opens."
+  (when (buffer-live-p buffer)
+    (puthash label (cons buffer (cl-remove buffer (claude-code-ide-mcp--ediff-live-controls label)))
+             claude-code-ide-mcp--ediff-controls)
+    (with-current-buffer buffer
+      (add-hook 'kill-buffer-hook
+                (lambda () (claude-code-ide-mcp--ediff-control-ended label (current-buffer)))
+                nil t))))
+
+(defun claude-code-ide-mcp--ediff-control-ended (label buffer)
+  "Forget the ediff control BUFFER of the frame LABEL, which dies now.
+Then the next waiting diff of LABEL opens."
+  (let ((others (cl-remove buffer (gethash label claude-code-ide-mcp--ediff-controls))))
+    (if others
+        (puthash label others claude-code-ide-mcp--ediff-controls)
+      (remhash label claude-code-ide-mcp--ediff-controls)))
+  (claude-code-ide-mcp--schedule-ediff-next label))
+
+(defun claude-code-ide-mcp--other-frame ()
+  "Return a live frame that is not a dedicated diff frame, or nil.
+A visible frame comes first.  Frames of the initial terminal of a
+daemon and child frames do not count."
+  (let ((candidates
+         (cl-remove-if (lambda (frame)
+                         (or (claude-code-ide-mcp-ediff-frame-p frame)
+                             (frame-parameter frame 'parent-frame)
+                             (equal (terminal-name (frame-terminal frame)) "initial_terminal")))
+                       (frame-list))))
+    (or (cl-find-if (lambda (frame) (eq (frame-visible-p frame) t)) candidates)
+        (car candidates))))
+
+(defun claude-code-ide-mcp-call-outside-ediff-frame (function)
+  "Call FUNCTION with a frame selected that is not a dedicated diff frame.
+When the selected frame is not a dedicated diff frame, call FUNCTION in
+it.  Otherwise call it in another frame, or in a new frame when no
+other frame exists, and keep the diff frame selected afterwards, so
+that a new window never goes into an open review.  When no other frame
+can be made, do not call FUNCTION and return nil.  Return the value of
+FUNCTION."
+  (if (not (claude-code-ide-mcp-ediff-frame-p (selected-frame)))
+      (funcall function)
+    (let ((frame (or (claude-code-ide-mcp--other-frame)
+                     (condition-case err
+                         (with-current-buffer (get-buffer-create "*scratch*")
+                           (make-frame))
+                       (error
+                        (claude-code-ide-debug "Cannot make a frame outside the diff frame: %s"
+                                               (error-message-string err))
+                        nil)))))
+      (if (frame-live-p frame)
+          (with-selected-frame frame
+            (funcall function))
+        (message "Not shown in the diff frame %s: no other frame"
+                 (frame-parameter (selected-frame) 'name))
+        nil))))
+
 (defun claude-code-ide-mcp--ediff-frame-label (dir)
   "The frame label for the project at DIR.
 A ticket worktree gives its tickets: deal-3565-3568 is \"DEAL-3565 + 3568\",
@@ -151,6 +254,7 @@ takes the text size of the frame the diff is launched from."
         ;; A new frame shows the current buffer; a Claude one would pull its side windows in.
         (with-current-buffer (get-buffer-create "*scratch*")
           (setq frame (make-frame `((name . ,(concat "ediff " label))
+                                    (claude-code-ide-ediff . ,label)
                                     (width . (text-pixels . ,(frame-text-width source)))
                                     (height . (text-pixels . ,(frame-text-height source)))))))
         (puthash label frame claude-code-ide-mcp--ediff-frames)))
@@ -174,9 +278,11 @@ With GENERATION, do nothing when a diff opened since it was taken."
   (when (or (null generation)
             (= generation claude-code-ide-mcp--ediff-generation))
     (maphash (lambda (label frame)
+               ;; A frame with an open ediff, also a suspended one, or
+               ;; with a waiting diff stays
                (when (and (frame-live-p frame)
                           (cdr (frame-list))
-                          (not (claude-code-ide-mcp--frame-shows-ediff-p frame)))
+                          (not (claude-code-ide-mcp--ediff-label-in-use-p label)))
                  (delete-frame frame)
                  (remhash label claude-code-ide-mcp--ediff-frames)
                  (when (eq frame claude-code-ide-mcp--ediff-frame)
@@ -190,20 +296,78 @@ so a diff that a session opens right after a quit keeps its frame."
   (let ((generation claude-code-ide-mcp--ediff-generation))
     (run-at-time 0.3 nil #'claude-code-ide-mcp--maybe-delete-ediff-frame generation)))
 
+(defun claude-code-ide-mcp--ediff-files-now (label file-a file-b startup-hooks)
+  "Compare FILE-A with FILE-B in the frame LABEL now, with STARTUP-HOOKS.
+Return the frame."
+  (let ((frame (claude-code-ide-mcp--ediff-frame nil label)))
+    (cl-incf claude-code-ide-mcp--ediff-generation)
+    (select-frame-set-input-focus frame)
+    (with-selected-frame frame
+      (let ((ediff-window-setup-function #'ediff-setup-windows-plain))
+        (ediff-files (expand-file-name file-a) (expand-file-name file-b)
+                     (append startup-hooks
+                             (list (lambda ()
+                                     (claude-code-ide-mcp--register-ediff-control
+                                      label (or ediff-control-buffer (current-buffer)))))))))
+    frame))
+
 ;;;###autoload
 (defun claude-code-ide-ediff-files-in-frame (label file-a file-b &optional startup-hooks)
   "Compare FILE-A with FILE-B in the dedicated diff frame \"ediff LABEL\".
 The frame is created when it is missing, selected and focused before the
 diff starts, and the whole ediff (its control panel and both buffers) stays
 in it.  A cleanup scheduled by an earlier quit cannot delete it.
-STARTUP-HOOKS go to `ediff-files'.  Returns the frame."
-  (let ((frame (claude-code-ide-mcp--ediff-frame nil label)))
-    (cl-incf claude-code-ide-mcp--ediff-generation)
-    (select-frame-set-input-focus frame)
-    (with-selected-frame frame
-      (let ((ediff-window-setup-function #'ediff-setup-windows-plain))
-        (ediff-files (expand-file-name file-a) (expand-file-name file-b) startup-hooks)))
-    frame))
+While the frame has an open ediff, the diff waits in the queue of the
+frame, and opens when the ediffs before it end.  So a second diff never
+replaces an open one.  STARTUP-HOOKS go to `ediff-files'.  Returns the
+frame."
+  (if (claude-code-ide-mcp--ediff-label-in-use-p label)
+      (let ((queue (append (gethash label claude-code-ide-mcp--ediff-queue)
+                           (list (list file-a file-b startup-hooks)))))
+        (puthash label queue claude-code-ide-mcp--ediff-queue)
+        (message "Diff of %s waits in frame ediff %s (%d waiting)"
+                 (file-name-nondirectory file-b) label (length queue))
+        ;; A queue whose ediff ended before it was filled opens at once
+        (claude-code-ide-mcp--schedule-ediff-next label)
+        (claude-code-ide-mcp--ediff-frame nil label))
+    (claude-code-ide-mcp--ediff-files-now label file-a file-b startup-hooks)))
+
+(defun claude-code-ide-mcp--ediff-next (label)
+  "Open the oldest waiting diff of the frame LABEL when the frame is free.
+Return the frame of the diff, or nil."
+  (let ((queue (gethash label claude-code-ide-mcp--ediff-queue)))
+    (when (and queue (not (claude-code-ide-mcp--ediff-label-busy-p label)))
+      (if (cdr queue)
+          (puthash label (cdr queue) claude-code-ide-mcp--ediff-queue)
+        (remhash label claude-code-ide-mcp--ediff-queue))
+      (condition-case err
+          (apply #'claude-code-ide-mcp--ediff-files-now label (car queue))
+        (error
+         (message "Cannot open the waiting diff of %s: %s"
+                  (nth 1 (car queue)) (error-message-string err))
+         ;; The diffs after it still open in turn
+         (claude-code-ide-mcp--schedule-ediff-next label)
+         nil)))))
+
+(defun claude-code-ide-mcp--schedule-ediff-next (label)
+  "Open the next waiting diff of the frame LABEL a moment from now.
+The delay lets the ediff that ended clean up its windows first."
+  (when (gethash label claude-code-ide-mcp--ediff-queue)
+    (run-at-time 0.3 nil #'claude-code-ide-mcp--ediff-next label)))
+
+(defun claude-code-ide-mcp--free-ediff-label (session)
+  "Return the label of a dedicated diff frame for SESSION without an open ediff.
+That is the label of the project of SESSION, or, while its frame has
+an open ediff or a waiting diff, the first free label \"LABEL <N>\"."
+  (let* ((dir (or (and session (claude-code-ide-mcp-session-project-dir session))
+                  default-directory))
+         (base (claude-code-ide-mcp--ediff-frame-label dir))
+         (label base)
+         (n 1))
+    (while (claude-code-ide-mcp--ediff-label-in-use-p label)
+      (setq n (1+ n)
+            label (format "%s <%d>" base n)))
+    label))
 
 (defun claude-code-ide-mcp--setup-diff-hooks (tab-name session saved-winconf)
   "Set up ediff hooks for TAB-NAME with SESSION and SAVED-WINCONF.
@@ -247,6 +411,9 @@ and the hook stays armed for ours."
       ;; Store the control buffer in our diff-info
       (setf (alist-get 'control-buffer diff-info) ediff-control-buffer)
       (puthash tab-name diff-info active-diffs)
+      ;; The dedicated frame has an open ediff until this one ends
+      (when-let* ((label (alist-get 'frame-label diff-info)))
+        (claude-code-ide-mcp--register-ediff-control label ediff-control-buffer))
 
       (with-current-buffer ediff-control-buffer
         ;; Set up quit hook with captured values in lexical closure
@@ -492,8 +659,18 @@ ARGUMENTS should contain:
               ;; Switch to the original tab
               (tab-bar-select-tab-by-name (alist-get 'name original-tab)))))))
 
+    ;; Without dedicated frames the diff opens in the selected frame;
+    ;; a dedicated diff frame there holds another review, so use
+    ;; another frame
+    (when (and (not claude-code-ide-ediff-frame)
+               (claude-code-ide-mcp-ediff-frame-p (selected-frame)))
+      (when-let* ((other (claude-code-ide-mcp--other-frame)))
+        (select-frame-set-input-focus other)))
+
     ;; Save current window configuration
-    (let* ((saved-winconf (unless claude-code-ide-ediff-frame
+    (let* ((frame-label (when claude-code-ide-ediff-frame
+                          (claude-code-ide-mcp--free-ediff-label session)))
+           (saved-winconf (unless claude-code-ide-ediff-frame
                             (current-window-configuration)))
            (buffers (claude-code-ide-mcp--create-diff-buffers
                      old-file-path new-file-contents tab-name))
@@ -510,6 +687,7 @@ ARGUMENTS should contain:
                    (new-file-path . ,new-file-path)
                    (file-exists . ,file-exists)
                    (saved-winconf . ,saved-winconf)
+                   (frame-label . ,frame-label)
                    (session . ,session)  ; Store the session reference
                    (created-at . ,(current-time)))
                  active-diffs))
@@ -527,7 +705,8 @@ ARGUMENTS should contain:
         (condition-case err
             (progn
               (when claude-code-ide-ediff-frame
-                (select-frame-set-input-focus (claude-code-ide-mcp--ediff-frame session))
+                (select-frame-set-input-focus
+                 (claude-code-ide-mcp--ediff-frame session frame-label))
                 (cl-incf claude-code-ide-mcp--ediff-generation)
                 (delete-other-windows))
               ;; Delete all side windows before starting ediff
