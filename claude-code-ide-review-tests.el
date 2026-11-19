@@ -225,10 +225,14 @@ inbox, goes out after the turn, and is delivered at the acknowledgement."
       ;; Emacs quits while the review runs: the review is marked, and
       ;; Emacs ends its process, with no sentinel of this Emacs
       (claude-code-ide-review--on-kill-emacs)
-      (let ((process (gethash id claude-code-ide-review--processes)))
+      (let* ((process (gethash id claude-code-ide-review--processes))
+             (pid (process-id process)))
         (claude-code-ide-review-tests--restart)
         (set-process-sentinel process #'ignore)
-        (delete-process process))
+        (delete-process process)
+        ;; The signal takes effect later on a loaded machine
+        (claude-code-ide-review-tests--wait
+         (lambda () (not (claude-code-ide-review--pid-live-p pid)))))
       (claude-code-ide-review-tests--write (expand-file-name "r.md" results) "cci-test saved")
       ;; A new Emacs, which knows no instance yet
       (setq claude-code-ide-instance--all nil
@@ -289,10 +293,14 @@ inbox, goes out after the turn, and is delivered at the acknowledgement."
                           :result-file "never.md")
                          :review-id)))
       (claude-code-ide-review--on-kill-emacs)
-      (let ((process (gethash id claude-code-ide-review--processes)))
+      (let* ((process (gethash id claude-code-ide-review--processes))
+             (pid (process-id process)))
         (claude-code-ide-review-tests--restart)
         (set-process-sentinel process #'ignore)
-        (delete-process process))
+        (delete-process process)
+        ;; The signal takes effect later on a loaded machine
+        (claude-code-ide-review-tests--wait
+         (lambda () (not (claude-code-ide-review--pid-live-p pid)))))
       (should (eq (claude-code-ide-review-tests--state id) 'running))
       (claude-code-ide-review-recover)
       (let ((text (nth 1 (car claude-code-ide-tests--control-sent))))
