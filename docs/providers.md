@@ -19,6 +19,7 @@ Make one with `claude-code-ide-provider-create` and keyword arguments.
 | `buffer-name-prefix` | The prefix of terminal buffer names, for example `"claude-code"`. |
 | `capabilities` | A list of symbols: exactly the operations that have a function. Leave it nil; registration fills it in. A list that names other operations is refused. |
 | One slot for each operation | A function, or nil when the provider does not support the operation. |
+| `ide-protocol` | Non-nil when the CLI speaks the IDE WebSocket protocol and reads the lock files in `~/.claude/ide/`. The default is nil. The `claude` provider sets it to t. It is not an operation, so it is not in `capabilities`. |
 
 The accessors are `claude-code-ide-provider-<slot>`, for example `claude-code-ide-provider-launch`.
 
@@ -69,6 +70,7 @@ Rules for each operation:
 | `claude-code-ide-provider-names` | `()` | The names of the registered providers, oldest first. |
 | `claude-code-ide-resolve-provider` | `(&optional NAME)` | The provider NAME. nil gives the default provider. A struct is returned as it is. An unknown name signals `user-error`. |
 | `claude-code-ide-provider-call` | `(PROVIDER OPERATION &rest ARGS)` | The result of the operation. PROVIDER is a struct or a name. |
+| `claude-code-ide-provider-ide-protocol-p` | `(PROVIDER)` | Non-nil when PROVIDER has `ide-protocol`. PROVIDER is a struct or a name. Only such a provider gets a WebSocket server and a lock file in `~/.claude/ide/` at a start. |
 | `claude-code-ide-provider-supports-p` | `(PROVIDER OPERATION)` | Non-nil when PROVIDER has a function for OPERATION. An unknown OPERATION signals an error. |
 | `claude-code-ide-provider-unavailable` | `(OPERATION)` | `(:status unavailable :capability OPERATION)`. |
 | `claude-code-ide-provider-unavailable-p` | `(RESULT)` | Non-nil when RESULT is the unavailable result. |
@@ -83,6 +85,7 @@ Rules for each operation:
 
 1. It calls `detect`. If `:available` is nil, it signals a `user-error` with the display name.
 2. It makes the instance descriptor, with a new launch generation.
+   - Only a provider with `ide-protocol` gets a WebSocket server and a lock file in `~/.claude/ide/`. Another provider gets only the MCP tools server.
 3. It calls `resume` when the spec continues, picks, or resumes. Otherwise it calls `launch`. The terminal runs the `:command` with the `:environment`.
 4. When the CLI exits with a code other than 0, it calls `exit-message` with the `:program` that `detect` found, and shows the text.
 

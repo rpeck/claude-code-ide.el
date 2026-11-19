@@ -106,6 +106,18 @@ A launch reads the shell environment policy of the user through
   :type 'number
   :group 'claude-code-ide-codex)
 
+(defcustom claude-code-ide-codex-coordinator-approved-tools
+  '("claude-code-ide-control-list-instances"
+    "claude-code-ide-control-inspect-instance")
+  "Coordinator tools that a Codex coordinator may call without approval.
+Only a Codex instance with the role \"coordinator\" gets coordinator
+tools, and these only read.  Every other coordinator tool, such as
+launch, resume, stop, submit-prompt and handover, asks for approval.
+An instance without that role gets no approval for any coordinator
+tool."
+  :type '(repeat string)
+  :group 'claude-code-ide-codex)
+
 (defvar claude-code-ide-codex-queue-functions nil
   "Functions called when a `codex queue' command of a prompt ends.
 Each function is called with INSTANCE and RESULT, the plist that
@@ -361,15 +373,36 @@ This reads the tool list itself, so that no advice of
                   (symbol-name (plist-get normalized :function)))))
           claude-code-ide-mcp-server-tools))
 
-(defun claude-code-ide-codex--approved-tool-names ()
+(defun claude-code-ide-codex--coordinator-tool-names ()
+  "Return the names of the registered MCP tools of the coordinator scope."
+  (delq nil
+        (mapcar (lambda (tool-spec)
+                  (let ((normalized (claude-code-ide--normalize-tool-spec tool-spec)))
+                    (when (eq (claude-code-ide-mcp-server-tool-scope normalized) 'coordinator)
+                      (or (plist-get normalized :name)
+                          (symbol-name (plist-get normalized :function))))))
+                claude-code-ide-mcp-server-tools)))
+
+(defun claude-code-ide-codex--coordinator-p (instance)
+  "Return non-nil when INSTANCE has the role \"coordinator\"."
+  (and instance
+       (equal (format "%s" (claude-code-ide-instance-role instance)) "coordinator")))
+
+(defun claude-code-ide-codex--approved-tool-names (&optional instance)
   "Return the MCP tools that Codex may call without approval.
 This follows `claude-code-ide-mcp-allowed-tools', as for Claude Code:
 `auto' gives the result of `claude-code-ide-mcp-server-get-tool-names',
 after its advice (an advice can remove a tool, such as `emacs_eval'),
 nil gives none, and a list or a string gives the tools that it names.
-Only registered tools count."
+Only registered tools count.
+
+A coordinator tool counts only when INSTANCE has the role
+\"coordinator\" and the tool is in
+`claude-code-ide-codex-coordinator-approved-tools'."
   (let* ((prefix "mcp__emacs-tools__")
          (all (claude-code-ide-codex--all-tool-names))
+         (coordinator-tools (claude-code-ide-codex--coordinator-tool-names))
+         (coordinator (claude-code-ide-codex--coordinator-p instance))
          (names (mapcar (lambda (name)
                           (if (string-prefix-p prefix name) (substring name (length prefix)) name))
                         (pcase claude-code-ide-mcp-allowed-tools
@@ -377,21 +410,28 @@ Only registered tools count."
                           ('nil nil)
                           ((pred stringp) (split-string claude-code-ide-mcp-allowed-tools nil t))
                           ((pred listp) claude-code-ide-mcp-allowed-tools)))))
-    (delete-dups (cl-remove-if-not (lambda (name) (member name all)) names))))
+    (delete-dups
+     (cl-remove-if-not (lambda (name)
+                         (and (member name all)
+                              (or (not (member name coordinator-tools))
+                                  (and coordinator
+                                       (member name claude-code-ide-codex-coordinator-approved-tools)))))
+                       names))))
 
-(defun claude-code-ide-codex--approval-args (server)
+(defun claude-code-ide-codex--approval-args (server &optional instance)
   "Return the -c arguments of the tool approvals of the MCP SERVER key.
 Every tool needs an approval by default, so a tool that appears later
 or that no rule names asks too.  Each tool of
-`claude-code-ide-codex--approved-tool-names' gets approval_mode
-\"approve\", unless its name cannot be a part of a dotted key."
+`claude-code-ide-codex--approved-tool-names' for INSTANCE gets
+approval_mode \"approve\", unless its name cannot be a part of a
+dotted key."
   (append (claude-code-ide-codex--config-arg
            (concat server ".default_tools_approval_mode") "\"prompt\"")
           (mapcan (lambda (name)
                     (claude-code-ide-codex--config-arg
                      (format "%s.tools.%s.approval_mode" server name) "\"approve\""))
                   (cl-remove-if-not #'claude-code-ide-codex--bare-key-p
-                                    (claude-code-ide-codex--approved-tool-names)))))
+                                    (claude-code-ide-codex--approved-tool-names instance)))))
 
 (defun claude-code-ide-codex--warn-plain-headers ()
   "Warn one time that MCP header values are in the argument list."
@@ -433,7 +473,7 @@ variables.  When the user's list cannot be read, the values go in
                        (if (and root (file-directory-p root)) root default-directory))))
            (url-args (claude-code-ide-codex--config-arg
                       (concat key ".url") (claude-code-ide-codex--toml-string url)))
-           (approval-args (claude-code-ide-codex--approval-args key)))
+           (approval-args (claude-code-ide-codex--approval-args key instance)))
       (cond
        ((null headers)
         (list :args (append url-args approval-args) :environment nil))
@@ -772,7 +812,9 @@ text of the screen.  It never sends keys."
 
 (defun claude-code-ide-codex--start (&optional continue resume)
   "Start a Codex instance for the current project.
-CONTINUE and RESUME are as for `claude-code-ide--start-session'."
+CONTINUE and RESUME are as for `claude-code-ide--start-session'.
+Codex becomes the current provider, as the menu toggle makes it."
+  (claude-code-ide-set-current-provider 'codex)
   (let ((claude-code-ide-default-provider 'codex))
     (claude-code-ide--start-session continue resume)))
 

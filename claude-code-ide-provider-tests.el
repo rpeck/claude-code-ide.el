@@ -55,9 +55,10 @@ cdr of its :cleanup key."
               ((symbol-function 'claude-code-ide--read-instance-name)
                (lambda (&rest _) (error "Must not prompt")))
               ((symbol-function 'claude-code-ide-mcp-create-session)
-               (lambda (dir session-id &optional instance-name)
+               (lambda (dir session-id &optional instance-name no-ide-server)
                  (claude-code-ide-tests--make-session
-                  dir :session-id session-id :instance-name instance-name :port 12345)))
+                  dir :session-id session-id :instance-name instance-name
+                  :port (unless no-ide-server 12345))))
               ((symbol-function 'claude-code-ide--create-terminal-session)
                (lambda (&rest args)
                  (setq launch-fn (nth 8 args)
@@ -340,11 +341,16 @@ cdr of its :cleanup key."
                         (car (claude-code-ide-tests--start-mocked
                               (claude-code-ide-start-spec-create :directory "/tmp/cci-test-m1/")
                               state))))
-                (opus (claude-code-ide-instance-of-session
-                       (car (claude-code-ide-tests--start-mocked
-                             (claude-code-ide-start-spec-create
-                              :directory "/tmp/cci-test-m2/" :extra-flags "--model opus")
-                             state)))))
+                (opus (let ((started (claude-code-ide-tests--start-mocked
+                                      (claude-code-ide-start-spec-create
+                                       :directory "/tmp/cci-test-m2/" :extra-flags "--model opus")
+                                      state)))
+                        ;; The claude launch sets the model of its flags,
+                        ;; as the terminal calls it at the spawn
+                        (cl-letf (((symbol-function 'claude-code-ide-mcp-server-ensure-server)
+                                   #'ignore))
+                          (funcall (cdr started)))
+                        (claude-code-ide-instance-of-session (car started)))))
             (should (eq (claude-code-ide-instance-model plain) 'unknown))
             (should (equal (claude-code-ide-format-value (claude-code-ide-instance-model plain))
                            "unknown"))

@@ -67,7 +67,12 @@ the result of each operation."
                 :documentation "Symbols of the supported operations.
 `claude-code-ide-register-provider' fills it in when it is nil, and
 refuses a list that does not name exactly the operations with a
-function."))
+function.")
+  (ide-protocol nil :type boolean
+                :documentation "Non-nil when the CLI speaks the IDE WebSocket protocol and
+reads the lock files in ~/.claude/ide/.  A start makes a WebSocket
+server and a lock file only for such a provider.  It is not an
+operation, so it is not in the capabilities."))
 
 (defconst claude-code-ide-provider-operations
   '(detect launch resume fork submit-prompt stop native-id status-events
@@ -125,6 +130,13 @@ Signal a `user-error' when no such provider is registered."
    ((claude-code-ide-get-provider (or name claude-code-ide-default-provider)))
    (t (user-error "No coding-agent provider named `%s' is registered"
                   (or name claude-code-ide-default-provider)))))
+
+(defun claude-code-ide-provider-ide-protocol-p (provider)
+  "Return non-nil when PROVIDER speaks the IDE WebSocket protocol.
+PROVIDER is a provider struct or a name; nil means the default provider."
+  (and (claude-code-ide-provider-ide-protocol
+        (claude-code-ide-resolve-provider provider))
+       t))
 
 (defun claude-code-ide-provider-supports-p (provider operation)
   "Return non-nil when PROVIDER has a function for OPERATION."

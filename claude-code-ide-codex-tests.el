@@ -803,6 +803,11 @@ The texts follow the captures and the reports of the T1 and T2 tests.")
 (ert-deftest claude-code-ide-test-codex-command-starts-codex ()
   "The Codex commands start with the codex provider."
   (let ((claude-code-ide-default-provider 'claude)
+        ;; The commands make Codex the current provider; keep that here
+        (claude-code-ide--current-provider nil)
+        (claude-code-ide--current-provider-read t)
+        (claude-code-ide-provider-file (make-temp-name
+                                        (expand-file-name "cci-test-provider-" temporary-file-directory)))
         (calls nil))
     (cl-letf (((symbol-function 'claude-code-ide--start-session)
                (lambda (&optional continue resume spec)
@@ -812,7 +817,9 @@ The texts follow the captures and the reports of the T1 and T2 tests.")
       (claude-code-ide-codex-resume))
     (should (equal (reverse calls)
                    '((codex nil nil nil) (codex t nil nil) (codex nil t nil))))
-    (should (eq claude-code-ide-default-provider 'claude))))
+    (should (eq claude-code-ide-default-provider 'claude))
+    (should (eq (claude-code-ide-current-provider) 'codex))
+    (ignore-errors (delete-file claude-code-ide-provider-file))))
 
 (provide 'claude-code-ide-codex-tests)
 
