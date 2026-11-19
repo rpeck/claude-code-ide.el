@@ -416,7 +416,8 @@ does not depend on the speed of the machine, as a time would."
                      do (should (equal flag "-c"))
                      do (should (string-prefix-p (format "hooks.%s=[{hooks=[{type=\"command\",command=\"sh " event)
                                                  value))
-                     do (should (string-suffix-p (format " %s\",timeout=5}]}]" event) value)))
+                     do (should (string-suffix-p (format " %s\",timeout=%d}]}]" event
+                                                         (claude-code-ide-session-status--hook-cli-timeout)) value)))
             ;; The same for each instance and each call: one trust covers all
             (should (equal args (claude-code-ide-codex-status-hook-args b)))
             (should (equal args (claude-code-ide-codex-status-hook-args a)))
@@ -2072,24 +2073,28 @@ Real time with a generous bound: the script is a shell process."
                              (directory-files dir nil "\\`cci-test-many\\.2\\.[0-9]+\\.Stop\\.json\\'"))
                      (number-sequence 1 20))))))
 
-(ert-deftest claude-code-ide-codex-events-test-script-limit-needs-no-trust ()
-  "The time limit is in the Codex script, not in the hook command.
-So the hook arguments and the trust key do not change with it: a new
-limit needs no new trust."
+(ert-deftest claude-code-ide-codex-events-test-script-limit-and-trust ()
+  "The Codex hook definition carries the CLI timeout of the limit.
+The command stays the same, but the timeout is limit + 5, so a new
+limit changes the definition and its trust: the next interactive start
+asks again.  The installed script holds the limit."
   (claude-code-ide-codex-events-tests--with-codex
-    (let ((args (let ((claude-code-ide-session-status-hook-time-limit 3))
-                  (list (claude-code-ide-codex-events--hook-args)
-                        (claude-code-ide-codex-events--trust-key)
-                        (claude-code-ide-codex-events--script-text))))
-          (other (let ((claude-code-ide-session-status-hook-time-limit 10))
+    (let ((short (let ((claude-code-ide-session-status-hook-time-limit 3))
                    (list (claude-code-ide-codex-events--hook-args)
-                         (claude-code-ide-codex-events--trust-key)
-                         (claude-code-ide-codex-events--script-text)))))
-      (should (equal (nth 0 args) (nth 0 other)))
-      (should (equal (nth 1 args) (nth 1 other)))
-      (should-not (equal (nth 2 args) (nth 2 other)))
-      (should-not (string-match-p "limit" (string-join (nth 0 args) " ")))
-      ;; The installed script holds the limit; the launch check rewrites another one
+                         (claude-code-ide-codex-events--trust-key))))
+          (long (let ((claude-code-ide-session-status-hook-time-limit 10))
+                  (list (claude-code-ide-codex-events--hook-args)
+                        (claude-code-ide-codex-events--trust-key)))))
+      (should (cl-every (lambda (value) (string-suffix-p ",timeout=8}]}]" value))
+                        (cl-remove "-c" (car short) :test #'equal)))
+      (should (cl-every (lambda (value) (string-suffix-p ",timeout=15}]}]" value))
+                        (cl-remove "-c" (car long) :test #'equal)))
+      ;; The command is the same; the definition and the key are not
+      (should (equal (mapcar (lambda (value) (replace-regexp-in-string ",timeout=[0-9]+" "" value))
+                             (car short))
+                     (mapcar (lambda (value) (replace-regexp-in-string ",timeout=[0-9]+" "" value))
+                             (car long))))
+      (should-not (equal (cadr short) (cadr long)))
       (let ((claude-code-ide-session-status-hook-time-limit 4))
         (let ((file (claude-code-ide-codex-events--install-script)))
           (should (string-match-p "^  limit=4$" (claude-code-ide-session-registry--file-string file)))
