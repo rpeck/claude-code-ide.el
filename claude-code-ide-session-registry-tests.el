@@ -295,9 +295,12 @@ the check of pending starts finds that its MCP session is gone."
            (no-buffer (make-claude-code-ide-mcp-session))
            (spec (claude-code-ide-tests--registry-spec :resume-id "crashed")))
       (unwind-protect
-          (let ((claude-code-ide-session-registry--start-key "crashed"))
-            ;; The CLI exits during the startup delay: cleanup, no start record
-            (claude-code-ide-session-registry--cli-args failed spec)
+          (progn
+            ;; The CLI exits during the startup delay: cleanup, no start
+            ;; record.  This start is not one of `--start-entry', so the
+            ;; end records the failure.
+            (let ((claude-code-ide-session-registry--start-key "crashed"))
+              (claude-code-ide-session-registry--cli-args failed spec))
             (should (eq (claude-code-ide-session-registry-entry-state
                          (claude-code-ide-tests--registry-get "crashed"))
                         'pending))
@@ -309,7 +312,8 @@ the check of pending starts finds that its MCP session is gone."
               (should (equal (claude-code-ide-session-registry-entry-session-id entry) "crashed"))
               (should (claude-code-ide-session-registry--restorable-p entry)))
             ;; The terminal never came up: no buffer, no cleanup at all
-            (claude-code-ide-session-registry--cli-args no-buffer spec)
+            (let ((claude-code-ide-session-registry--start-key "crashed"))
+              (claude-code-ide-session-registry--cli-args no-buffer spec))
             ;; It starts now, so a restore leaves it alone
             (should (equal (claude-code-ide-session-registry--live-keys) '("crashed")))
             (should-not (claude-code-ide-session-registry--restorable-p
@@ -729,27 +733,31 @@ back once, from the crashed Emacs's entry."
 
 (ert-deftest claude-code-ide-test-registry-restore-survives-failures ()
   "A quit or an error in one start of a restore does not stop the others."
-  (let ((timers '())
-        (started '())
-        (messages '()))
-    (cl-letf (((symbol-function 'run-with-timer)
-               (lambda (_secs _repeat fn &rest args) (push (cons fn args) timers)))
-              ((symbol-function 'claude-code-ide-session-registry--start-entry)
-               (lambda (entry _prompt)
-                 (pcase (claude-code-ide-session-registry-entry-key entry)
-                   ("a" (signal 'quit nil))
-                   ("b" (error "Directory /x does not exist"))
-                   (key (push key started)))))
-              ((symbol-function 'message)
-               (lambda (format-string &rest args) (push (apply #'format format-string args) messages))))
-      (claude-code-ide-session-registry--start-entries
-       (mapcar #'claude-code-ide-tests--registry-entry '("a" "b" "c")) "note")
-      (should (= 3 (length timers)))
-      (dolist (timer (reverse timers))
-        (apply (car timer) (cdr timer))))
-    (should (equal started '("c")))
-    (should (string-match-p "\\`Restored 1 session; failed: .*quit; .*Directory /x does not exist"
-                            (car messages)))))
+  (claude-code-ide-tests--with-registry
+    (let* ((config-dir (expand-file-name "claude" registry-dir))
+           (process-environment (cons (concat "CLAUDE_CONFIG_DIR=" config-dir) process-environment))
+           (entries (mapcar #'claude-code-ide-tests--registry-entry '("a" "b" "c")))
+           (timers '())
+           (started '())
+           (messages '()))
+      (claude-code-ide-session-registry--submit "setup" (lambda (_) entries))
+      (cl-letf (((symbol-function 'run-with-timer)
+                 (lambda (_secs _repeat fn &rest args) (push (cons fn args) timers)))
+                ((symbol-function 'claude-code-ide-session-registry--start-entry)
+                 (lambda (entry _prompt)
+                   (pcase (claude-code-ide-session-registry-entry-key entry)
+                     ("a" (signal 'quit nil))
+                     ("b" (error "Directory /x does not exist"))
+                     (key (push key started)))))
+                ((symbol-function 'message)
+                 (lambda (format-string &rest args) (push (apply #'format format-string args) messages))))
+        (claude-code-ide-session-registry--start-entries entries "note")
+        (should (= 3 (length timers)))
+        (dolist (timer (reverse timers))
+          (apply (car timer) (cdr timer))))
+      (should (equal started '("c")))
+      (should (string-match-p "\\`Restored 1 session; failed: .*quit; .*Directory /x does not exist"
+                              (car messages))))))
 
 (ert-deftest claude-code-ide-test-registry-hooks-with-shell-characters ()
   "A report directory with ;, & and | in its path still gets the hooks."
@@ -1415,6 +1423,302 @@ The new fields are nil, and a field with a wrong type is dropped."
       (should-not (claude-code-ide-session-registry-entry-failure entry))
       (should-not (claude-code-ide-session-registry-entry-worktree entry))
       (should-not (claude-code-ide-session-registry-entry-process-start-time entry)))))
+
+;;; Review fixes
+
+(ert-deftest claude-code-ide-test-registry-restore-skips-running-instance ()
+  "A restore skips an instance that runs, and an entry that changed after the plan.
+Neither becomes `failed'."
+  (claude-code-ide-tests--with-registry
+    (let* ((config-dir (expand-file-name "claude" registry-dir))
+           (process-environment (cons (concat "CLAUDE_CONFIG_DIR=" config-dir) process-environment))
+           (dir (claude-code-ide-tests--registry-project registry-dir "cci-test-dup"))
+           (claude-code-ide-restore-note nil)
+           (live-buffer (generate-new-buffer "*cci-test-dup-live*"))
+           (messages '()))
+      (unwind-protect
+          (progn
+            (claude-code-ide-session-registry--submit
+             "setup"
+             (lambda (_)
+               (list (claude-code-ide-tests--registry-entry
+                      "cci-test-dup" :session-id "cci-test-dup-native" :project-dir dir
+                      :emacs-pid 999999991)
+                     (claude-code-ide-tests--registry-entry
+                      "cci-test-stale" :session-id "cci-test-stale-native" :project-dir dir
+                      :emacs-pid 999999991 :started-at "2026-11-03T11:00:00Z"))))
+            (claude-code-ide-tests--with-mocked-starts
+              ;; The instance runs already, started outside the registry
+              (claude-code-ide-instance-register
+               (claude-code-ide-instance-create :id "cci-test-dup" :provider 'claude
+                                                :buffer live-buffer))
+              (claude-code-ide-tests--collect-messages messages
+                (claude-code-ide-restore-sessions)
+                ;; The user closes the other session before its timer fires
+                (claude-code-ide-session-registry--submit
+                 "user" (claude-code-ide-session-registry--change-archived "cci-test-stale"))
+                (claude-code-ide-tests--run-restore-timers timers))
+              (should-not claude-code-ide-tests--registry-launches))
+            (let ((dup (claude-code-ide-tests--registry-get "cci-test-dup")))
+              (should (eq (claude-code-ide-session-registry-entry-state dup) 'open))
+              (should-not (claude-code-ide-session-registry-entry-failure dup)))
+            (should (eq (claude-code-ide-session-registry-entry-state
+                         (claude-code-ide-tests--registry-get "cci-test-stale"))
+                        'archived))
+            (should (string-match-p
+                     "\\`Restored 0 sessions; skipped, running or changed: cci-test-dup .*; cci-test-stale "
+                     (claude-code-ide-tests--restore-message messages))))
+        (kill-buffer live-buffer)))))
+
+(ert-deftest claude-code-ide-test-registry-closed-pending-never-returns ()
+  "A report moves a pending entry to open, and the end closes a pending entry.
+So a session that the user ended never comes back at a restore."
+  (claude-code-ide-tests--with-registry
+    (let* ((config-dir (expand-file-name "claude" registry-dir))
+           (process-environment (cons (concat "CLAUDE_CONFIG_DIR=" config-dir) process-environment))
+           (picker (claude-code-ide-tests--make-session "/tmp/cci-test-picker/"))
+           (codex (claude-code-ide-tests--make-session "/tmp/cci-test-noprompt/")))
+      (unwind-protect
+          (progn
+            ;; Claude Code with the picker (-r): the id comes from the report
+            (claude-code-ide-session-registry--cli-args
+             picker (claude-code-ide-tests--registry-spec :resume t))
+            (let ((key (gethash picker claude-code-ide-session-registry--keys)))
+              (claude-code-ide-session-registry--on-start
+               picker (claude-code-ide-tests--registry-spec :resume t))
+              (should (eq (claude-code-ide-session-registry-entry-state
+                           (claude-code-ide-tests--registry-get key))
+                          'pending))
+              (with-temp-file (claude-code-ide-session-registry--report-file key)
+                (insert "{\"session_id\":\"cci-test-picked\",\"source\":\"resume\"}"))
+              (claude-code-ide-session-registry--submit "report" #'identity)
+              (let ((entry (claude-code-ide-tests--registry-get key)))
+                (should (equal (claude-code-ide-session-registry-entry-session-id entry)
+                               "cci-test-picked"))
+                (should (eq (claude-code-ide-session-registry-entry-state entry) 'open))))
+            ;; Codex without a prompt: the user kills its buffer
+            (let ((spec (claude-code-ide-tests--registry-spec :provider 'codex)))
+              (claude-code-ide-session-registry--on-start codex spec)
+              (let ((key (gethash codex claude-code-ide-session-registry--keys)))
+                (should (eq (claude-code-ide-session-registry-entry-state
+                             (claude-code-ide-tests--registry-get key))
+                            'pending))
+                (claude-code-ide-session-registry--on-end codex 'killed)
+                (let ((entry (claude-code-ide-tests--registry-get key)))
+                  (should (eq (claude-code-ide-session-registry-entry-state entry) 'closed))
+                  (should (equal (claude-code-ide-session-registry-entry-closed-by entry) "killed"))
+                  (should-not (claude-code-ide-session-registry--restorable-p entry))))))
+        (claude-code-ide-tests--clear-processes)))))
+
+(ert-deftest claude-code-ide-test-registry-prepare-hook ()
+  "The mode puts the prepare function into the start's hook and takes it out.
+A start that runs the hook saves the provisional entry.  With the fork
+slot of the start spec, a fork has no native ID and no --session-id."
+  (claude-code-ide-tests--with-registry
+    (let ((claude-code-ide-session-prepare-functions nil)
+          (claude-code-ide-cli-args-functions nil)
+          (claude-code-ide-session-start-functions nil)
+          (claude-code-ide-session-end-functions nil)
+          (claude-code-ide-session-rename-functions nil)
+          (claude-code-ide-event-functions nil)
+          (kill-emacs-hook nil)
+          (claude-code-ide-session-registry--watch nil)
+          (claude-code-ide-session-registry-mode nil)
+          (session (claude-code-ide-tests--make-session "/tmp/cci-test-prepare/")))
+      (unwind-protect
+          (cl-letf (((symbol-function 'claude-code-ide-session-registry--start-watch) #'ignore)
+                    ((symbol-function 'claude-code-ide-session-registry--adopt-running-sessions)
+                     (lambda () 0))
+                    ((symbol-function 'claude-code-ide-session-status--set-tracking) #'ignore))
+            (claude-code-ide-session-registry-mode 1)
+            (should (memq #'claude-code-ide-session-registry--on-prepare
+                          claude-code-ide-session-prepare-functions))
+            ;; What the start of claude-code-ide.el does before the spawn
+            (run-hook-with-args 'claude-code-ide-session-prepare-functions
+                                session (claude-code-ide-tests--registry-spec
+                                         :provider 'codex :directory "/tmp/cci-test-prepare/"))
+            (let ((key (gethash session claude-code-ide-session-registry--keys)))
+              (should (eq (claude-code-ide-session-registry-entry-state
+                           (claude-code-ide-tests--registry-get key))
+                          'pending)))
+            (claude-code-ide-session-registry-mode -1)
+            (should-not (memq #'claude-code-ide-session-registry--on-prepare
+                              claude-code-ide-session-prepare-functions))
+            ;; The fork slot of the start spec, when it exists
+            (cl-letf (((symbol-function 'claude-code-ide-start-spec-fork) (lambda (_spec) t)))
+              (let ((fork (claude-code-ide-tests--registry-spec :resume-id "cci-test-source")))
+                (should-not (claude-code-ide-session-registry--launch-native-id session fork))
+                (should-not (member "--session-id"
+                                    (claude-code-ide-session-registry--cli-args
+                                     (claude-code-ide-tests--make-session "/tmp/cci-test-prepare/")
+                                     (claude-code-ide-tests--registry-spec)))))))
+        (setq claude-code-ide-session-registry-mode nil)
+        (claude-code-ide-tests--clear-processes)))))
+
+(ert-deftest claude-code-ide-test-registry-pending-kind-before-queue ()
+  "The kind of a provisional entry is decided before the change is queued.
+A change that waits for the lock still gives `new' for a new entry,
+and `reopen' for an entry that only a queued change adds."
+  (claude-code-ide-tests--with-registry
+    (let ((lock (claude-code-ide-session-registry--lock-directory))
+          (claude-code-ide-session-registry-lock-wait 0.05)
+          (new (claude-code-ide-tests--make-session "/tmp/cci-test-kind/"))
+          (queued (claude-code-ide-tests--make-session "/tmp/cci-test-kind/")))
+      (unwind-protect
+          (cl-letf (((symbol-function 'run-with-timer) (lambda (&rest _) nil))
+                    ((symbol-function 'message) #'ignore))
+            (make-directory (file-name-directory lock) t)
+            (make-directory lock)
+            (claude-code-ide-session-registry--cli-args new (claude-code-ide-tests--registry-spec))
+            (should claude-code-ide-session-registry--queue)
+            (should (eq (gethash new claude-code-ide-session-registry--pending) 'new))
+            ;; An entry that a queued change adds
+            (claude-code-ide-session-registry--submit
+             "setup" (claude-code-ide-tests--registry-add "cci-test-queued"))
+            (let ((claude-code-ide-session-registry--start-key nil))
+              (puthash queued "cci-test-queued" claude-code-ide-session-registry--keys)
+              (claude-code-ide-session-registry--record-pending
+               queued (claude-code-ide-tests--registry-spec)))
+            (should (eq (gethash queued claude-code-ide-session-registry--pending) 'reopen)))
+        (ignore-errors (delete-directory lock))
+        (claude-code-ide-tests--clear-processes)))))
+
+(ert-deftest claude-code-ide-test-registry-corrupt-file-write-keeps-state-file ()
+  "A write after a load from the backup copies the unreadable file aside.
+A crash before the new file is in place still leaves a state file."
+  (claude-code-ide-tests--with-registry
+    (let ((file (claude-code-ide-session-registry--state-file))
+          (real-rename (symbol-function 'rename-file)))
+      (with-temp-file file (insert "not json"))
+      (with-temp-file (claude-code-ide-session-registry--backup-file)
+        (insert "{\"version\":2,\"sessions\":[]}"))
+      (cl-letf (((symbol-function 'display-warning) #'ignore))
+        (claude-code-ide-session-registry--load))
+      (should claude-code-ide-session-registry--loaded-from-backup)
+      (cl-letf (((symbol-function 'rename-file)
+                 (lambda (from to &rest args)
+                   (if (and (string-suffix-p ".tmp" from) (equal to file))
+                       (error "Simulated crash")
+                     (apply real-rename from to args)))))
+        (should-error (claude-code-ide-session-registry--write-file
+                       (list (claude-code-ide-tests--registry-entry "cci-test-corrupt")))))
+      (should (file-exists-p file))
+      (should (directory-files registry-dir nil "\\.corrupt-")))))
+
+(ert-deftest claude-code-ide-test-registry-strong-session-tables ()
+  "The tables of started and pending sessions hold their sessions strongly.
+A failed start must not disappear before the pending check sees it."
+  (should-not (hash-table-weakness (default-value 'claude-code-ide-session-registry--keys)))
+  (should-not (hash-table-weakness (default-value 'claude-code-ide-session-registry--pending))))
+
+(ert-deftest claude-code-ide-test-registry-failed-restore-attempts ()
+  "A restore tries a failed entry up to `claude-code-ide-session-registry-restore-attempts' times.
+Then the entry stays `failed' and only a reopen by hand starts it; a
+start that works counts from zero again."
+  (claude-code-ide-tests--with-registry
+    (let* ((config-dir (expand-file-name "claude" registry-dir))
+           (process-environment (cons (concat "CLAUDE_CONFIG_DIR=" config-dir) process-environment))
+           (gone (expand-file-name "cci-test-gone/" registry-dir))
+           (claude-code-ide-session-registry-restore-attempts 3)
+           (attempts 0))
+      (should (= (default-value 'claude-code-ide-session-registry-restore-attempts) 3))
+      (should (= (default-value 'claude-code-ide-session-registry-restore-grace) 60))
+      (claude-code-ide-session-registry--submit
+       "setup" (lambda (_) (list (claude-code-ide-tests--registry-entry
+                                  "cci-test-retry" :project-dir gone :emacs-pid 999999991))))
+      (dotimes (_ 4)
+        (when (claude-code-ide-session-registry--restorable-p
+               (claude-code-ide-tests--registry-get "cci-test-retry"))
+          (cl-incf attempts)
+          (should-error (claude-code-ide-session-registry--start-entry
+                         (claude-code-ide-tests--registry-get "cci-test-retry") nil))))
+      (should (= attempts 3))
+      (let ((entry (claude-code-ide-tests--registry-get "cci-test-retry")))
+        (should (eq (claude-code-ide-session-registry-entry-state entry) 'failed))
+        (should (= (claude-code-ide-session-registry-entry-failure-count entry) 3))
+        (should-not (car (claude-code-ide-session-registry--restore-plan)))
+        (should (claude-code-ide-session-registry--reopenable-p entry)))
+      ;; The folder exists again: a reopen by hand starts it
+      (make-directory gone t)
+      (cl-letf (((symbol-function 'claude-code-ide--start-session)
+                 (lambda (_continue _resume spec)
+                   (claude-code-ide-session-registry--submit
+                    "started"
+                    (claude-code-ide-session-registry--change-started
+                     (claude-code-ide-tests--registry-entry
+                      (claude-code-ide-start-spec-instance-id spec) :project-dir gone))))))
+        (claude-code-ide-reopen-session (claude-code-ide-tests--registry-get "cci-test-retry")))
+      (let ((entry (claude-code-ide-tests--registry-get "cci-test-retry")))
+        (should (eq (claude-code-ide-session-registry-entry-state entry) 'open))
+        (should (= (claude-code-ide-session-registry-entry-failure-count entry) 0))))))
+
+(ert-deftest claude-code-ide-test-registry-restore-context-reads-once ()
+  "A restore plan reads the live sessions once and each process once."
+  (claude-code-ide-tests--with-registry
+    (let* ((config-dir (expand-file-name "claude" registry-dir))
+           (process-environment (cons (concat "CLAUDE_CONFIG_DIR=" config-dir) process-environment))
+           (real-attributes (symbol-function 'process-attributes))
+           (real-live-keys (symbol-function 'claude-code-ide-session-registry--live-keys))
+           (calls 0)
+           (live-key-calls 0))
+      (claude-code-ide-session-registry--submit
+       "setup"
+       (lambda (_)
+         (mapcar (lambda (n)
+                   (claude-code-ide-tests--registry-entry
+                    (format "cci-test-ctx-%d" n) :session-id (format "cci-test-ctx-native-%d" n)
+                    :emacs-pid 999999991 :pid 999999992 :process-start-time 1.0))
+                 '(1 2 3 4 5))))
+      (cl-letf (((symbol-function 'process-attributes)
+                 (lambda (pid)
+                   (when (memql pid '(999999991 999999992)) (cl-incf calls))
+                   (funcall real-attributes pid)))
+                ((symbol-function 'claude-code-ide-session-registry--live-keys)
+                 (lambda () (cl-incf live-key-calls) (funcall real-live-keys))))
+        (should (= (length (car (claude-code-ide-session-registry--restore-plan))) 5)))
+      (should (<= calls 2))
+      (should (= live-key-calls 1)))))
+
+(ert-deftest claude-code-ide-test-registry-fork-gets-no-parent-id ()
+  "A fork start with the resume ID P never records P as the fork's ID.
+The entry and the descriptor stay without a native ID until the report
+of the fork gives its own ID, also when the entry had P before, and
+also for a start that saved no provisional entry."
+  (claude-code-ide-tests--with-registry
+    (let ((claude-code-ide-instance--all nil)
+          (claude-code-ide-instance--generations (make-hash-table :test 'equal)))
+      (dolist (provider '(claude codex))
+        (let* ((key (format "cci-test-fork-%s" provider))
+               (session (claude-code-ide-tests--make-session "/tmp/cci-test-fork/"))
+               (instance (claude-code-ide-instance-register
+                          (claude-code-ide-instance-create
+                           :id key :provider provider :generation 2 :session session)))
+               (spec (claude-code-ide-tests--registry-spec
+                      :provider provider :resume-id "cci-test-parent"
+                      :extra-flags "--model opus")))
+          ;; The entry held the parent conversation before
+          (claude-code-ide-session-registry--submit
+           "setup" (lambda (entries)
+                     (append entries (list (claude-code-ide-tests--registry-entry
+                                            key :provider provider
+                                            :session-id "cci-test-parent")))))
+          (cl-letf (((symbol-function 'claude-code-ide-start-spec-fork) (lambda (_spec) t)))
+            (let ((args (claude-code-ide-session-registry--cli-args session spec)))
+              (should-not (member "--session-id" args))
+              (should-not (member "cci-test-parent" args)))
+            ;; Claude Code saves its provisional entry in the arguments.
+            ;; Codex starts here without the prepare hook (a core
+            ;; without it): only the start records it.
+            (when (eq provider 'claude)
+              (should-not (claude-code-ide-session-registry-entry-session-id
+                           (claude-code-ide-tests--registry-get key))))
+            (claude-code-ide-session-registry--on-start session spec))
+          (let ((entry (claude-code-ide-tests--registry-get key)))
+            (should-not (claude-code-ide-session-registry-entry-session-id entry))
+            (should (eq (claude-code-ide-session-registry-entry-state entry) 'pending)))
+          (should-not (equal (claude-code-ide-instance-native-id instance) "cci-test-parent"))
+          (claude-code-ide-instance-unregister key)))
+      (claude-code-ide-tests--clear-processes))))
 
 (provide 'claude-code-ide-session-registry-tests)
 

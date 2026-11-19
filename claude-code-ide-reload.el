@@ -31,8 +31,10 @@
 ;; The running instances keep running.  A reload evaluates each file
 ;; again, so functions get their new definitions, but `defvar' and
 ;; `defcustom' keep their current values: the sessions, the instance
-;; descriptors and the registry state stay.  docs/updating.md tells
-;; what a reload cannot change.
+;; descriptors and the registry state stay.  Each global mode of the
+;; package that is on is turned off and on again after the files, so
+;; that it installs the hooks of the new version.  docs/updating.md
+;; tells what a reload cannot change.
 
 ;;; Code:
 
@@ -126,13 +128,60 @@ requires does not stop the sort: its files come in the order of FILES."
                        (format "Reload: %s failed to load: %s"
                                (file-name-nondirectory (car failure)) (cdr failure))
                        :error))
-    (message "Reloaded %d claude-code-ide file%s%s"
+    (dolist (failure (plist-get result :failed-modes))
+      (display-warning 'claude-code-ide
+                       (format "Reload: %s failed to turn off and on: %s"
+                               (car failure) (cdr failure))
+                       :error))
+    (message "Reloaded %d claude-code-ide file%s%s%s"
              (length loaded) (if (= (length loaded) 1) "" "s")
              (if failed
                  (format "; %d failed: %s" (length failed)
                          (mapconcat (lambda (failure) (file-name-nondirectory (car failure)))
                                     failed ", "))
+               "")
+             (if-let* ((modes (plist-get result :modes)))
+                 (format "; restarted %s" (mapconcat #'symbol-name modes ", "))
                ""))))
+
+(defun claude-code-ide-reload--global-modes (files)
+  "Return the global minor modes of the package that are on, in the order of FILES.
+A mode belongs to the package when its name starts with
+\"claude-code-ide-\".  A buffer-local mode does not count."
+  (let ((order (mapcar #'claude-code-ide-reload--feature files))
+        (modes '()))
+    (dolist (mode minor-mode-list)
+      (when (and (string-prefix-p "claude-code-ide-" (symbol-name mode))
+                 (fboundp mode)
+                 (boundp mode)
+                 (not (local-variable-if-set-p mode))
+                 (default-value mode))
+        (push mode modes)))
+    (sort modes
+          (lambda (a b)
+            (let ((position (lambda (mode)
+                              (or (cl-position
+                                   (when-let* ((file (symbol-file mode 'defun)))
+                                     (intern (file-name-base file)))
+                                   order)
+                                  (length order)))))
+              (< (funcall position a) (funcall position b)))))))
+
+(defun claude-code-ide-reload--restart-modes (modes)
+  "Turn MODES off, last first, and on again, first first.
+A new version of a mode installs its hooks only when its body runs, and
+a reload does not run it.  Return a list of (MODE . ERROR-MESSAGE) for
+each mode that failed."
+  (let ((failed '()))
+    (dolist (mode (reverse modes))
+      (condition-case err
+          (funcall mode -1)
+        (error (push (cons mode (error-message-string err)) failed))))
+    (dolist (mode modes)
+      (condition-case err
+          (funcall mode 1)
+        (error (push (cons mode (error-message-string err)) failed))))
+    (nreverse failed)))
 
 ;;;###autoload
 (defun claude-code-ide-reload (&optional directory all)
@@ -149,8 +198,16 @@ files still load.  Of each file, the newer of the .el and the .elc
 file loads.  The running instances keep running: `defvar' and
 `defcustom' keep their values.  This file loads last.
 
-Return a plist: :loaded, the files that loaded, in order, and :failed,
-a list of (FILE . ERROR-MESSAGE)."
+A reload does not run the body of a minor mode, so a mode that is on
+would keep the hooks of the old version.  After the files, each global
+mode of the package that was on is turned off and on again, for
+example `claude-code-ide-session-registry-mode' and
+`claude-code-ide-session-status-mode'.  The status buffer closes and
+opens again.
+
+Return a plist: :loaded, the files that loaded, in order, :failed, a
+list of (FILE . ERROR-MESSAGE), :modes, the modes that were turned off
+and on, and :failed-modes, a list of (MODE . ERROR-MESSAGE)."
   (interactive)
   (let* ((directory (file-name-as-directory
                      (expand-file-name (or directory (claude-code-ide-reload--directory)))))
@@ -163,6 +220,7 @@ a list of (FILE . ERROR-MESSAGE)."
                   (cl-remove-if-not (lambda (file)
                                       (featurep (claude-code-ide-reload--feature file)))
                                     files)))
+         (modes (claude-code-ide-reload--global-modes files))
          (loaded '())
          (failed '()))
     (let ((load-prefer-newer t))
@@ -173,7 +231,9 @@ a list of (FILE . ERROR-MESSAGE)."
               (push file loaded))
           (error
            (push (cons file (error-message-string err)) failed)))))
-    (let ((result (list :loaded (nreverse loaded) :failed (nreverse failed))))
+    (let ((result (list :loaded (nreverse loaded) :failed (nreverse failed)
+                        :modes modes
+                        :failed-modes (claude-code-ide-reload--restart-modes modes))))
       (claude-code-ide-reload--report result)
       result)))
 
