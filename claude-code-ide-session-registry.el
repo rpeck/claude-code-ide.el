@@ -751,8 +751,16 @@ and returns an alist of (EVENT . COMMANDS): EVENT is a hook event
 name such as \"Stop\", COMMANDS a list of shell command strings.
 The CLI accepts one --settings argument, so all hooks go into it.")
 
-(defconst claude-code-ide-session-registry--hook-timeout 5
-  "Seconds after which the CLI stops a hook and goes on.")
+(defvar claude-code-ide-session-status-hook-time-limit)
+
+(defun claude-code-ide-session-registry--hook-timeout ()
+  "Return the seconds after which the CLI stops a hook and goes on.
+That is the time limit of the status hook scripts plus 5 seconds, so
+that a script gives up before the CLI stops it; 5 without the status
+file."
+  (if (boundp 'claude-code-ide-session-status-hook-time-limit)
+      (+ 5 (max 1 (round claude-code-ide-session-status-hook-time-limit)))
+    5))
 
 (defun claude-code-ide-session-registry--hook-settings (session key)
   "Return the --settings JSON for SESSION with the entry KEY.
@@ -782,7 +790,7 @@ parse and is ignored until the next read.  The hooks of
                                                (mapcar (lambda (command)
                                                          `((type . "command")
                                                            (command . ,command)
-                                                           (timeout . ,claude-code-ide-session-registry--hook-timeout)))
+                                                           (timeout . ,(claude-code-ide-session-registry--hook-timeout))))
                                                        (cdr pair))))))))
                          events))))))
 

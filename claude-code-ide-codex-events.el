@@ -148,14 +148,10 @@ launch=\"$id.$gen\"
   } > \"$tmp\" || { rm -f \"$tmp\"; exit 0; }
   # Number the events of this launch in the order they are published
   lock=\"$dir/.$launch.lock\"
+  seqfile=\"$dir/.$launch.seq\"
+  prefix=\"$dir/$launch.\"
+  suffix=\".$event.json\"
 @LOCK_LOOP@
-  echo $$ > \"$lock/pid\"
-  seq=$(cat \"$dir/.$launch.seq\")
-  case $seq in ''|*[!0-9]*) seq=0 ;; esac
-  seq=$((seq + 1))
-  echo \"$seq\" > \"$dir/.$launch.seq.tmp\" && mv -f \"$dir/.$launch.seq.tmp\" \"$dir/.$launch.seq\"
-  mv \"$tmp\" \"$dir/$launch.$(printf %08d \"$seq\").$event.json\" || rm -f \"$tmp\"
-  rm -rf \"$lock\"
 )
 exit 0
 "
@@ -308,9 +304,10 @@ They do not depend on the instance, so one trust covers all launches."
   (apply #'append
          (mapcar (lambda (event)
                    (list "-c"
-                         (format "hooks.%s=[{hooks=[{type=\"command\",command=%s,timeout=5}]}]"
+                         (format "hooks.%s=[{hooks=[{type=\"command\",command=%s,timeout=%d}]}]"
                                  event
-                                 (json-encode-string (claude-code-ide-codex-events--command event)))))
+                                 (json-encode-string (claude-code-ide-codex-events--command event))
+                                 (claude-code-ide-session-status--hook-cli-timeout))))
                  claude-code-ide-codex-events--events)))
 
 (defun claude-code-ide-codex-events--remove-launch-files (instance-id generation)
@@ -320,10 +317,10 @@ They do not depend on the instance, so one trust covers all launches."
    (concat "\\`\\.?" (regexp-quote (format "%s.%d." instance-id generation)))))
 
 (defun claude-code-ide-codex-events--remove-stale-locks ()
-  "Delete counter locks older than three seconds.
+  "Delete counter locks and break tokens older than three seconds.
 See `claude-code-ide-session-status--remove-old-locks'."
   (claude-code-ide-session-status--remove-old-locks
-   (claude-code-ide-codex-events--events-directory) "\\`\\..+\\.lock\\'"))
+   (claude-code-ide-codex-events--events-directory) "\\`\\..+\\.lock\\(?:\\.break\\)?\\'"))
 
 ;;; Hook arguments
 

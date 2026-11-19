@@ -243,50 +243,94 @@ once a second from then on.")
   "Return the time limit of the status hooks as a whole number of seconds."
   (max 1 (round claude-code-ide-session-status-hook-time-limit)))
 
+(defun claude-code-ide-session-status--hook-cli-timeout ()
+  "Return the timeout that the CLI gives a status hook, in seconds.
+It is the time limit of the hook scripts plus 5 seconds, so that a
+script always gives up before the CLI stops it.  The Claude Code hooks
+and the Codex hooks both get it."
+  (+ 5 (claude-code-ide-session-status--hook-limit)))
+
 (defun claude-code-ide-session-status--lock-loop ()
-  "Return the shell text that waits for the lock $lock of a status hook.
-The text runs in the subshell of a hook script, which sets $dir, $tmp,
-$lock and $event.  It measures real time with `date +%s', so a slow
-machine does not make the wait longer: after more than
-`claude-code-ide-session-status-hook-time-limit' seconds it removes
-$tmp, writes one line to $dir/hook-errors.log (at most 64 KiB), and
-exits 0.  From `claude-code-ide-session-status--hook-break-after'
-seconds on (earlier for a short limit), it breaks the lock of a holder
-whose process is gone, once a second.  When `date' gives no number, a
-count of the tries stands in for the seconds."
+  "Return the shell text that numbers one event of a status hook under a lock.
+The text runs in the subshell of a hook script, which sets $dir, $tmp
+\(the temporary event file), $event, $lock, $seqfile (the counter of
+the launch), and $prefix and $suffix of the event file name.
+
+- It waits for the lock with `mkdir', a try each 50 ms.  It reads the
+  real time with `date +%s' at each try, and gives up after more than
+  `claude-code-ide-session-status-hook-time-limit' seconds, after 20
+  tries per second of the limit (a backstop that needs no clock), or
+  when the clock steps back.  It counts from the first `date' that
+  gives a number; without one, the tries count.
+- A hook that gives up removes $tmp, writes one line to
+  $dir/hook-errors.log, and exits 0.  At 64 KiB the log moves to
+  hook-errors.log.1 first.
+- From `claude-code-ide-session-status--hook-break-after' seconds on
+  \(earlier for a short limit), once a second, it looks at the PID of
+  the holder.  When that process is gone and the waiter gets the break
+  token $lock.break (an atomic `mkdir'), it breaks the lock only if
+  the PID is still the same; then it removes the token.  A waiter
+  without the token waits on.
+- A child `sh' holds the lock and numbers the event.  It writes its
+  own PID into $lock/pid, so a waiter sees the process that really
+  holds the lock."
   (let* ((limit (claude-code-ide-session-status--hook-limit))
-         (break (max 0 (min claude-code-ide-session-status--hook-break-after (1- limit)))))
-    (format "  # Wait for the lock at most %d s of real time, however slow the
-  # machine is.  Break the lock of a holder that died; Emacs removes old
-  # locks too.
+         (break (max 0 (min claude-code-ide-session-status--hook-break-after (1- limit))))
+         (cap (* 20 limit)))
+    (format "  # Wait for the lock at most %d s of real time, however slow the machine
+  # is, and at most %d tries, whatever the clock says.  Only the waiter
+  # with the break token breaks the lock of a holder that died, and only
+  # the lock that it saw dead.  Emacs removes old locks too.
   limit=%d
+  brk=%d
+  cap=%d
   start=$(date +%%s)
-  case $start in ''|*[!0-9]*) start=0 ;; esac
+  case $start in ''|*[!0-9]*) start= ;; esac
   tries=0
+  waited=0
   checked=-1
   until mkdir \"$lock\"; do
     tries=$((tries + 1))
     now=$(date +%%s)
-    case $now in ''|*[!0-9]*) now=$((start + tries / 100)) ;; esac
-    waited=$((now - start))
-    if [ \"$waited\" -ge %d ] && [ \"$waited\" -ne \"$checked\" ]; then
+    case $now in ''|*[!0-9]*) now= ;; esac
+    if [ -z \"$start\" ] && [ -n \"$now\" ]; then start=$now; fi
+    if [ -n \"$start\" ] && [ -n \"$now\" ]; then
+      waited=$((now - start))
+      if [ \"$waited\" -lt 0 ]; then waited=$((limit + 1)); fi
+    else
+      waited=$((tries / 20))
+    fi
+    if [ \"$waited\" -ge \"$brk\" ] && [ \"$waited\" -ne \"$checked\" ]; then
       checked=$waited
       holder=$(cat \"$lock/pid\")
-      if [ -n \"$holder\" ] && ! kill -0 \"$holder\"; then rm -rf \"$lock\"; continue; fi
+      if [ -n \"$holder\" ] && ! kill -0 \"$holder\" && mkdir \"$lock.break\"; then
+        if [ \"$(cat \"$lock/pid\")\" = \"$holder\" ]; then rm -rf \"$lock\"; fi
+        rmdir \"$lock.break\"
+        continue
+      fi
     fi
-    if [ \"$waited\" -gt \"$limit\" ]; then
+    if [ \"$waited\" -gt \"$limit\" ] || [ \"$tries\" -ge \"$cap\" ]; then
       rm -f \"$tmp\"
       log=\"$dir/hook-errors.log\"
       size=$(wc -c < \"$log\" | tr -d ' ')
       case $size in ''|*[!0-9]*) size=0 ;; esac
-      if [ \"$size\" -lt 65536 ]; then
-        echo \"$(date +%%Y-%%m-%%dT%%H:%%M:%%S) $event: no lock after $waited s ($lock); event dropped\" >> \"$log\"
-      fi
+      if [ \"$size\" -ge 65536 ]; then mv -f \"$log\" \"$log.1\"; fi
+      echo \"$(date +%%Y-%%m-%%dT%%H:%%M:%%S) $event: no lock after $waited s and $tries tries ($lock); event dropped\" >> \"$log\"
       exit 0
     fi
-    sleep 0.01
+    sleep 0.05
   done
-" limit limit break)))
+  # The child sh holds the lock and writes its own PID, so a waiter sees
+  # the process that really holds it
+  sh -c 'echo $$ > \"$1/pid\"
+seq=$(cat \"$2\")
+case $seq in \"\"|*[!0-9]*) seq=0 ;; esac
+seq=$((seq + 1))
+echo \"$seq\" > \"$2.tmp\" && mv -f \"$2.tmp\" \"$2\"
+mv \"$3\" \"$4$(printf %%08d \"$seq\")$5\" || rm -f \"$3\"
+rm -rf \"$1\"' sh \"$lock\" \"$seqfile\" \"$tmp\" \"$prefix\" \"$suffix\"
+  rm -f \"$tmp\"
+" limit cap limit break cap)))
 
 (defun claude-code-ide-session-status--fill-script (template)
   "Return the hook script TEMPLATE with its lock loop and time limit.
@@ -310,14 +354,10 @@ exec 2>/dev/null >/dev/null
   cat > \"$tmp\" || { rm -f \"$tmp\"; exit 0; }
   # Number the events of this launch in the order they are published
   lock=\"$dir/.$nonce.lock\"
+  seqfile=\"$dir/.$nonce.seq\"
+  prefix=\"$dir/$nonce-\"
+  suffix=\"-$event.json\"
 @LOCK_LOOP@
-  echo $$ > \"$lock/pid\"
-  seq=$(cat \"$dir/.$nonce.seq\")
-  case $seq in ''|*[!0-9]*) seq=0 ;; esac
-  seq=$((seq + 1))
-  echo \"$seq\" > \"$dir/.$nonce.seq.tmp\" && mv -f \"$dir/.$nonce.seq.tmp\" \"$dir/.$nonce.seq\"
-  mv \"$tmp\" \"$dir/$nonce-$(printf %08d \"$seq\")-$event.json\" || rm -f \"$tmp\"
-  rm -rf \"$lock\"
 )
 cat >/dev/null
 exit 0
@@ -472,10 +512,11 @@ file and renamed."
   (claude-code-ide-session-status--read-json-file file))
 
 (defun claude-code-ide-session-status--remove-stale-locks ()
-  "Delete counter locks older than three seconds.
+  "Delete counter locks and break tokens older than three seconds.
 See `claude-code-ide-session-status--remove-old-locks'."
   (claude-code-ide-session-status--remove-old-locks
-   (claude-code-ide-session-status--events-directory) "\\`\\.[0-9a-f]+\\.lock\\'"))
+   (claude-code-ide-session-status--events-directory)
+   "\\`\\.[0-9a-f]+\\.lock\\(?:\\.break\\)?\\'"))
 
 ;;; State machine
 
@@ -1808,9 +1849,82 @@ Each group starts with a header entry whose id is the group."
                           (claude-code-ide-session-status--group-rows group))))
           (claude-code-ide-session-status--group-by-project rows))))
 
+(defconst claude-code-ide-session-status--dropped-id 'claude-code-ide-dropped-events
+  "Entry ID of the line that tells of dropped hook events.")
+
+(defvar claude-code-ide-session-status--dropped-seen 0
+  "Number of lines of the hook error logs that the user has looked at.")
+
+(defvar claude-code-ide-session-status--dropped-cache nil
+  "Alist of FILE -> (SIZE TIME LINES) of the hook error logs read last.")
+
+(defun claude-code-ide-session-status--hook-error-logs ()
+  "Return the error logs of the status hooks of this Emacs, also the old ones.
+The Claude Code hooks write hook-errors.log in the events folder, the
+Codex hooks in its codex folder; at 64 KiB a log moves to its .1 file."
+  (let ((dir (claude-code-ide-session-status--events-directory)))
+    (cl-loop for folder in (list dir (expand-file-name "codex" dir))
+             append (list (expand-file-name "hook-errors.log" folder)
+                          (expand-file-name "hook-errors.log.1" folder)))))
+
+(defun claude-code-ide-session-status--log-lines (file)
+  "Return the number of lines in FILE, or 0 when it is missing.
+A file whose size and time did not change is not read again."
+  (if-let* ((attributes (file-attributes file)))
+      (let ((key (list (file-attribute-size attributes)
+                       (file-attribute-modification-time attributes)))
+            (cached (cdr (assoc file claude-code-ide-session-status--dropped-cache))))
+        (if (equal (butlast cached) key)
+            (car (last cached))
+          (let ((lines (with-temp-buffer
+                         (ignore-errors (insert-file-contents file))
+                         (count-lines (point-min) (point-max)))))
+            (setf (alist-get file claude-code-ide-session-status--dropped-cache nil nil #'equal)
+                  (append key (list lines)))
+            lines)))
+    0))
+
+(defun claude-code-ide-session-status--dropped-count ()
+  "Return the number of dropped hook events that the user did not look at.
+Each line of a hook error log is one event that a hook dropped because
+it got no lock in time.  When the logs have fewer lines than the user
+saw (both rotated), all their lines count as new."
+  (let ((total (apply #'+ (mapcar #'claude-code-ide-session-status--log-lines
+                                  (claude-code-ide-session-status--hook-error-logs)))))
+    (when (< total claude-code-ide-session-status--dropped-seen)
+      (setq claude-code-ide-session-status--dropped-seen 0))
+    (- total claude-code-ide-session-status--dropped-seen)))
+
+(defun claude-code-ide-session-status--dropped-entry ()
+  "Return the entry that tells of new dropped hook events, or nil."
+  (let ((count (claude-code-ide-session-status--dropped-count)))
+    (when (> count 0)
+      (list claude-code-ide-session-status--dropped-id
+            (vector (propertize
+                     (format "%d status event%s dropped: a hook got no lock in %d s.  RET shows the log."
+                             count (if (= count 1) "" "s")
+                             (claude-code-ide-session-status--hook-limit))
+                     'face 'warning)
+                    "" "" "" "" "" "")))))
+
+(defun claude-code-ide-session-status-show-dropped ()
+  "Show the error log of the status hooks, and mark its lines as seen.
+The status buffer then shows no notice until a hook drops another
+event."
+  (interactive)
+  (let ((logs (cl-remove-if-not #'file-exists-p
+                                (claude-code-ide-session-status--hook-error-logs))))
+    (setq claude-code-ide-session-status--dropped-seen
+          (apply #'+ (mapcar #'claude-code-ide-session-status--log-lines logs)))
+    (when logs
+      (display-buffer (find-file-noselect (car logs))))
+    (claude-code-ide-session-status--refresh)))
+
 (defun claude-code-ide-session-status--print-entry (id cols)
-  "Print the entry ID with COLS: a project header as one whole line."
-  (if (claude-code-ide-session-status--group-p id)
+  "Print the entry ID with COLS: a project header as one whole line.
+The notice of dropped hook events is one whole line too."
+  (if (or (claude-code-ide-session-status--group-p id)
+          (eq id claude-code-ide-session-status--dropped-id))
       (let ((start (point)))
         (insert (aref cols 0) "\n")
         (add-text-properties start (point) (list 'tabulated-list-id id
@@ -1857,7 +1971,10 @@ the line, or of the first session at a quota limit.
                              rows)))
     (when-let* ((buffer (get-buffer claude-code-ide-session-status--buffer-name)))
       (with-current-buffer buffer
-        (setq tabulated-list-entries (claude-code-ide-session-status--entries rows now))
+        (setq tabulated-list-entries
+              (let ((dropped (claude-code-ide-session-status--dropped-entry))
+                    (entries (claude-code-ide-session-status--entries rows now)))
+                (if dropped (cons dropped entries) entries)))
         (tabulated-list-print t))
       (dolist (window (get-buffer-window-list buffer nil t))
         (when (window-parameter window 'window-side)
@@ -1913,10 +2030,12 @@ With a prefix argument FORCE, restart it also while it is busy."
   "Go to the session on this line, or the first session of a project line."
   (interactive)
   (let ((id (or (tabulated-list-get-id) (user-error "No session on this line"))))
-    (claude-code-ide-session-status--visit-session
-     (if (claude-code-ide-session-status--group-p id)
-         (car (car (claude-code-ide-session-status--group-rows id)))
-       id))))
+    (if (eq id claude-code-ide-session-status--dropped-id)
+        (claude-code-ide-session-status-show-dropped)
+      (claude-code-ide-session-status--visit-session
+       (if (claude-code-ide-session-status--group-p id)
+           (car (car (claude-code-ide-session-status--group-rows id)))
+         id)))))
 
 (declare-function claude-code-ide-handover "claude-code-ide-handover"
                   (instance-id target-provider &optional method context interrupt force))
