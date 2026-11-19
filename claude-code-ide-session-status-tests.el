@@ -21,6 +21,7 @@
 
 (declare-function claude-code-ide-tests--make-session "claude-code-ide-tests")
 (declare-function claude-code-ide-tests--clear-processes "claude-code-ide-tests")
+(declare-function claude-code-ide-tests--wait-until "claude-code-ide-tests")
 
 (defmacro claude-code-ide-tests--with-status (&rest body)
   "Run BODY with an empty registry and no tracked sessions.
@@ -1277,6 +1278,216 @@ That keeps the forks of a waiting hook low on a loaded machine."
       (dolist (buffer (buffer-list))
         (when (and (buffer-file-name buffer) (string-prefix-p dir (buffer-file-name buffer)))
           (kill-buffer buffer))))))
+
+;;; The CLI status file of a session without hooks
+
+(defmacro claude-code-ide-tests--with-cli-file (&rest body)
+  "Run BODY with an untracked CC session whose CLI process is this Emacs.
+CLAUDE_CONFIG_DIR is a folder of the test, so the real ~/.claude is
+never read.  BODY sees `session', `instance', `file' (the CLI session
+file of the session) and `start' (the start time of this Emacs)."
+  (declare (indent 0))
+  `(claude-code-ide-tests--with-status
+     (claude-code-ide-tests--clear-processes)
+     (let* ((config (expand-file-name "claude-config" registry-dir))
+            (process-environment (cons (concat "CLAUDE_CONFIG_DIR=" config) process-environment))
+            (claude-code-ide-session-status--cli-file-cache (make-hash-table :test 'equal))
+            (claude-code-ide-instance--all nil)
+            (claude-code-ide-instance--generations (make-hash-table :test 'equal))
+            (buffer (generate-new-buffer "*cci-test-cli-file*"))
+            (session (claude-code-ide-tests--make-session "/tmp/cci-test-cli/" :buffer buffer
+                                                          :cli-pid (emacs-pid)))
+            (instance (claude-code-ide-instance-register
+                       (claude-code-ide-instance-create :id "cci-test-cli" :provider 'claude
+                                                        :session session :buffer buffer)))
+            (file (claude-code-ide-session-registry--cli-session-file (emacs-pid)))
+            (start (claude-code-ide-session-registry--process-start-time (emacs-pid))))
+       (ignore instance start)
+       (make-directory (file-name-directory file) t)
+       (unwind-protect
+           (progn ,@body)
+         (let ((kill-buffer-hook nil))
+           (kill-buffer buffer))
+         (claude-code-ide-tests--clear-processes)))))
+
+(defun claude-code-ide-tests--write-cli-file (file &rest fields)
+  "Write the CLI session FILE with FIELDS, a plist of JSON keys and values.
+The defaults are this Emacs as the process, its start time as
+procStart (in UTC, as the CLI writes it), and statusUpdatedAt 1000 s."
+  (let* ((start (claude-code-ide-session-registry--process-start-time (emacs-pid)))
+         (data `((pid . ,(emacs-pid))
+                 (sessionId . "cci-test-native")
+                 (cwd . "/tmp/cci-test-cli/")
+                 (procStart . ,(format-time-string "%a %b %e %H:%M:%S %Y" start t))
+                 (status . "idle")
+                 (statusUpdatedAt . 1000000)
+                 (updatedAt . 1000000))))
+    (while fields
+      (let ((key (intern (substring (symbol-name (pop fields)) 1)))
+            (value (pop fields)))
+        (if (eq value :absent)
+            (setq data (assq-delete-all key data))
+          (setf (alist-get key data) value))))
+    (with-temp-file file (insert (json-encode data)))))
+
+(defun claude-code-ide-tests--cli-state (session)
+  "Return (STATE REASON GUESS SOURCE SINCE) of SESSION from `--session-state'."
+  (let ((common (nth 1 (claude-code-ide-session-status--session-state session 2000.0))))
+    (list (plist-get common :state) (plist-get common :reason) (plist-get common :guess)
+          (plist-get common :source) (plist-get common :since))))
+
+(ert-deftest claude-code-ide-test-status-cli-file-states ()
+  "Each status of the CLI file of an untracked session gives its common state."
+  (claude-code-ide-tests--with-cli-file
+    (dolist (case '(("busy" working nil working "From CLI status: busy")
+                    ("idle" idle nil idle "From CLI status: idle")
+                    ("shell" waiting-for-task background-task tasks "From CLI status: shell")
+                    ("compacting" disconnected no-signal unobserved "not known")))
+      (claude-code-ide-tests--write-cli-file file :status (car case))
+      ;; Each case is a new file, with another time
+      (set-file-times file (time-add nil (random 1000)))
+      (should (equal (claude-code-ide-tests--cli-state session)
+                     (list (nth 1 case) (nth 2 case) nil 'cli-file 1000.0)))
+      (pcase-let ((`(,state ,_common ,detail ,since)
+                   (claude-code-ide-session-status--session-state session 2000.0)))
+        (should (eq state (nth 3 case)))
+        (should (string-match-p (nth 4 case) detail))
+        (should (= since 1000.0)))
+      ;; The instance state, the row, the detail and the snapshot say the same
+      (should (eq (plist-get (claude-code-ide-instance-state instance 2000.0) :state) (nth 1 case)))
+      (should (= (plist-get (claude-code-ide-instance-state instance 2000.0) :age) 1000.0))
+      (let ((row (assq session (claude-code-ide-session-status--rows 2000.0))))
+        (should (eq (nth 1 row) (nth 3 case)))
+        (should (= (nth 2 row) 1000.0)))
+      (let ((record (claude-code-ide-session-status--snapshot-instance instance 2000.0)))
+        (should (equal (alist-get 'state record) (symbol-name (nth 1 case))))
+        (should (string-match-p (nth 4 case) (alist-get 'detail record)))))
+    ;; No status at all
+    (claude-code-ide-tests--write-cli-file file :status :absent)
+    (set-file-times file (time-add nil 5000))
+    (should (equal (seq-take (claude-code-ide-tests--cli-state session) 2) '(disconnected no-signal)))))
+
+(ert-deftest claude-code-ide-test-status-cli-file-other-process ()
+  "A file of another process, or no file, gives no state of the CLI."
+  (claude-code-ide-tests--with-cli-file
+    ;; Another PID in the file
+    (claude-code-ide-tests--write-cli-file file :status "busy" :pid 1)
+    (should (equal (seq-take (claude-code-ide-tests--cli-state session) 2) '(disconnected no-signal)))
+    (should (string-match-p "of another process"
+                            (nth 2 (claude-code-ide-session-status--session-state session 2000.0))))
+    ;; Another start time: a reused PID
+    (claude-code-ide-tests--write-cli-file
+     file :status "busy" :procStart (format-time-string "%a %b %e %H:%M:%S %Y" (- start 3600) t))
+    (set-file-times file (time-add nil 10))
+    (should (equal (seq-take (claude-code-ide-tests--cli-state session) 2) '(disconnected no-signal)))
+    ;; No procStart: it cannot be checked
+    (claude-code-ide-tests--write-cli-file file :status "busy" :procStart :absent)
+    (set-file-times file (time-add nil 20))
+    (should (equal (seq-take (claude-code-ide-tests--cli-state session) 2) '(disconnected no-signal)))
+    ;; No file
+    (delete-file file)
+    (should (equal (seq-take (claude-code-ide-tests--cli-state session) 2) '(disconnected no-signal)))
+    (should (string-match-p "no CLI status file"
+                            (nth 2 (claude-code-ide-session-status--session-state session 2000.0))))
+    ;; The right file: busy
+    (claude-code-ide-tests--write-cli-file file :status "busy")
+    (should (eq (car (claude-code-ide-tests--cli-state session)) 'working))))
+
+(ert-deftest claude-code-ide-test-status-cli-file-read-once ()
+  "The CLI file is read only when its modification time changed, and never written."
+  (claude-code-ide-tests--with-cli-file
+    (claude-code-ide-tests--write-cli-file file :status "busy")
+    (let ((reads 0)
+          (read (symbol-function 'claude-code-ide-session-status--read-json-file))
+          (before (file-attribute-modification-time (file-attributes file))))
+      (cl-letf (((symbol-function 'claude-code-ide-session-status--read-json-file)
+                 (lambda (path) (cl-incf reads) (funcall read path))))
+        (dotimes (_ 5)
+          (claude-code-ide-session-status--session-state session 2000.0)
+          (claude-code-ide-instance-state instance 2000.0))
+        (should (= reads 1))
+        (should (equal (file-attribute-modification-time (file-attributes file)) before))
+        ;; The CLI writes it: one more read, and the new state
+        (claude-code-ide-tests--write-cli-file file :status "idle")
+        (set-file-times file (time-add nil 60))
+        (should (eq (car (claude-code-ide-tests--cli-state session)) 'idle))
+        (claude-code-ide-session-status--session-state session 2000.0)
+        (should (= reads 2))))))
+
+(ert-deftest claude-code-ide-test-status-cli-file-hooks-first ()
+  "A session with status hooks uses its hooks; the CLI file is only the fallback."
+  (claude-code-ide-tests--with-cli-file
+    (claude-code-ide-tests--write-cli-file file :status "idle")
+    (claude-code-ide-session-status--hooks session "k-cli")
+    (claude-code-ide-tests--feed (gethash session claude-code-ide-session-status--by-session)
+                                 '(("UserPromptSubmit" "{}")))
+    (let ((common (nth 1 (claude-code-ide-session-status--session-state session 2000.0))))
+      (should (eq (plist-get common :state) 'working))
+      (should-not (plist-get common :source)))
+    (should (eq (plist-get (claude-code-ide-instance-state instance 2000.0) :state) 'working))))
+
+;;; The display of the status buffer
+
+(defmacro claude-code-ide-tests--with-status-display (&rest body)
+  "Run BODY with the status modes off at the end, and one window in the frame."
+  (declare (indent 0))
+  `(claude-code-ide-tests--with-status
+     (claude-code-ide-tests--clear-processes)
+     (save-window-excursion
+       (delete-other-windows)
+       (unwind-protect
+           (progn ,@body)
+         (when claude-code-ide-session-status-mode
+           (cl-letf (((symbol-function 'claude-code-ide-session-status--stop-timers) #'ignore))
+             (claude-code-ide-session-status-mode -1)))
+         (when claude-code-ide-session-registry-mode
+           (claude-code-ide-session-registry-mode -1))
+         (when (get-buffer claude-code-ide-session-status--buffer-name)
+           (kill-buffer claude-code-ide-session-status--buffer-name))
+         (claude-code-ide-tests--clear-processes)))))
+
+(ert-deftest claude-code-ide-test-status-mode-displays-nothing ()
+  "Turning the status mode on creates the buffer but displays nothing."
+  (claude-code-ide-tests--with-status-display
+    (let ((shown 0)
+          (display (symbol-function 'display-buffer)))
+      (cl-letf (((symbol-function 'display-buffer)
+                 (lambda (&rest args) (cl-incf shown) (apply display args))))
+        (claude-code-ide-session-status-mode 1)
+        (should (get-buffer claude-code-ide-session-status--buffer-name))
+        (should (= shown 0))
+        (should-not (get-buffer-window claude-code-ide-session-status--buffer-name t))
+        ;; The command shows it
+        (claude-code-ide-show-session-status)
+        (should (= shown 1))
+        (should (get-buffer-window claude-code-ide-session-status--buffer-name t))))))
+
+(ert-deftest claude-code-ide-test-status-buffer-normal-window ()
+  "By default the status buffer shows in the selected window, not in a side window.
+Turning the mode off kills it and leaves the window."
+  (should (equal (default-value 'claude-code-ide-session-status-display-action)
+                 '((display-buffer-reuse-window display-buffer-same-window))))
+  (claude-code-ide-tests--with-status-display
+    (let ((window (selected-window)))
+      (claude-code-ide-show-session-status)
+      (should (eq (window-buffer window) (get-buffer claude-code-ide-session-status--buffer-name)))
+      (should-not (window-parameter window 'window-side))
+      (should (= (length (window-list)) 1))
+      (claude-code-ide-session-status-mode -1)
+      (should (window-live-p window))
+      (should-not (get-buffer claude-code-ide-session-status--buffer-name)))))
+
+(ert-deftest claude-code-ide-test-status-buffer-side-window-action ()
+  "A side-window action of the user still works, and the mode off closes that window."
+  (claude-code-ide-tests--with-status-display
+    (let ((claude-code-ide-session-status-display-action
+           '((display-buffer-in-side-window) (side . top) (slot . 0))))
+      (claude-code-ide-show-session-status)
+      (let ((window (get-buffer-window claude-code-ide-session-status--buffer-name)))
+        (should window)
+        (should (eq (window-parameter window 'window-side) 'top))
+        (claude-code-ide-session-status-mode -1)
+        (should-not (window-live-p window))))))
 
 (provide 'claude-code-ide-session-status-tests)
 

@@ -261,6 +261,27 @@ The Codex launch defines `(claude-code-ide-codex-screen-dialog BUFFER)`. It retu
 - The result stays until the next event of the main agent.
 - Without the function, no screen is read.
 
+## Claude Code sessions without status hooks
+
+A Claude Code CLI reads its hooks only at its start. A session that started before the status tracking was on has no hooks, and a restart would stop its work. Its state comes from the file that each CLI process keeps about itself: `~/.claude/sessions/<pid>.json` (in `CLAUDE_CONFIG_DIR` when that is set).
+
+- **Which sessions.** Only a Claude Code session without a status record uses the file. A session with hooks always uses its hooks.
+- **Which file.** The file of the session's CLI PID (`claude-code-ide-mcp-session-cli-pid`, from `ide_connected`, else the PID of its terminal process). The file must name that PID, and its `procStart` (UTC, for example "Tue Nov 17 22:25:15 2026") must be within 2 seconds of the start time of that process. So a file of an older process with a reused PID never gives its state.
+- **The states:**
+
+| `status` in the file | Common state | Status buffer |
+|---|---|---|
+| `busy` | `working` | WORKING |
+| `idle` | `idle` | WAITS FOR YOU |
+| `shell` (a background shell runs) | `waiting-for-task/background-task` | WAITS ON TASKS |
+| another value, none, no file, or a file of another process | `disconnected/no-signal` | NO SIGNAL |
+
+- The CLI reports these states itself, so `:guess` is nil. The state plist has the extra key `:source` with the value `cli-file`, and the detail starts with "From CLI status".
+- The state starts at `statusUpdatedAt` (milliseconds), else at `updatedAt`. So the status buffer shows its age.
+- `claude-code-ide-instance-state`, the status snapshot, and the control operations use the same state.
+- **Cheap polling.** The file is read when the status buffer, the snapshot, or a state call needs it, on the existing status timer, and only when its modification time changed. The start time of the process is checked at each use. Emacs never writes the file.
+- `T` in the status buffer still restarts such a session with hooks.
+
 ## Tracking
 
 - A launch record exists for the current launch of each tracked Codex instance.
