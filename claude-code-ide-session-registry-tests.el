@@ -2168,7 +2168,8 @@ restore from Lisp, and a restore without Codex entries, never call it."
         (restore t)
         (should (= trust-calls 1))
         (should (= (length starts) 3))
-        (should (cl-every #'cdr starts))
+        ;; The one question comes before the starts; the starts are never interactive
+        (should-not (cl-some #'cdr starts))
         ;; From Lisp, for example at the start of Emacs: never
         (restore nil)
         (should (= trust-calls 1))

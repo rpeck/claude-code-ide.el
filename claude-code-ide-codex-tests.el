@@ -364,7 +364,7 @@ The script runs in its own temporary folder; $D names that folder."
                               (claude-code-ide-codex--launch
                                instance (claude-code-ide-codex-tests--spec) nil))))
         (cl-letf (((symbol-function 'claude-code-ide-codex-status-hook-args)
-                   (lambda (inst) (push inst seen) hook-words))
+                   (lambda (inst &optional _interactive) (push inst seen) hook-words))
                   ((symbol-function 'claude-code-ide-codex-status-hook-env)
                    (lambda (_inst)
                      (list "CCI_INSTANCE_ID=cci-test-inst" "CCI_GENERATION=1"))))
@@ -810,7 +810,7 @@ The texts follow the captures and the reports of the T1 and T2 tests.")
                                         (expand-file-name "cci-test-provider-" temporary-file-directory)))
         (calls nil))
     (cl-letf (((symbol-function 'claude-code-ide--start-session)
-               (lambda (&optional continue resume spec)
+               (lambda (&optional continue resume spec _interactive)
                  (push (list claude-code-ide-default-provider continue resume spec) calls))))
       (claude-code-ide-codex)
       (claude-code-ide-codex-continue)
@@ -820,6 +820,83 @@ The texts follow the captures and the reports of the T1 and T2 tests.")
     (should (eq claude-code-ide-default-provider 'claude))
     (should (eq (claude-code-ide-current-provider) 'codex))
     (ignore-errors (delete-file claude-code-ide-provider-file))))
+
+(declare-function claude-code-ide-tests--start-mocked "claude-code-ide-provider-tests")
+(declare-function claude-code-ide-tests--cleanup-mocked "claude-code-ide-provider-tests")
+(declare-function claude-code-ide-tests--stub-provider "claude-code-ide-provider-tests")
+
+(ert-deftest claude-code-ide-test-codex-commands-mark-interactive-starts ()
+  "The six start commands pass `called-interactively-p' as the interactive flag.
+A call from Lisp passes nil.  No variable carries the flag."
+  (let ((claude-code-ide-default-provider 'claude)
+        (claude-code-ide--current-provider nil)
+        (claude-code-ide--current-provider-read t)
+        (claude-code-ide-provider-file (make-temp-name
+                                        (expand-file-name "cci-test-provider-" temporary-file-directory)))
+        (seen nil))
+    (cl-letf (((symbol-function 'claude-code-ide--start-session)
+               (lambda (&optional _continue _resume _spec interactive) (push interactive seen))))
+      (dolist (command '(claude-code-ide-codex claude-code-ide-codex-continue claude-code-ide-codex-resume
+                                               claude-code-ide claude-code-ide-continue claude-code-ide-resume))
+        (call-interactively command)
+        (funcall command)))
+    (should (equal (reverse seen) '(t nil t nil t nil t nil t nil t nil)))
+    (should-not (boundp 'claude-code-ide-interactive-start))
+    (ignore-errors (delete-file claude-code-ide-provider-file))))
+
+(ert-deftest claude-code-ide-test-codex-spec-interactive-slot ()
+  "The start spec has the `interactive' slot last, the launch spec gets it,
+and each Codex operation passes it to the status hook arguments."
+  (should (eq (car (last (mapcar #'car (cdr (cl-struct-slot-info 'claude-code-ide-start-spec)))))
+              'interactive))
+  (should-not (claude-code-ide-start-spec-interactive (claude-code-ide-start-spec-create)))
+  ;; The start copies the slot, or its INTERACTIVE argument, to the launch spec
+  (let ((claude-code-ide-instance--all nil)
+        (claude-code-ide-instance--generations (make-hash-table :test 'equal))
+        (claude-code-ide-provider--registry (copy-alist claude-code-ide-provider--registry))
+        (seen nil))
+    (claude-code-ide-tests--with-registry
+      (claude-code-ide-register-provider
+       (claude-code-ide-tests--stub-provider
+        :launch (lambda (_instance spec _args)
+                  (push (claude-code-ide-start-spec-interactive spec) seen)
+                  (list :command "cci-stub" :environment nil))))
+      (let ((original (symbol-function 'claude-code-ide--start-session)))
+        (dolist (case '((t nil) (nil nil) (nil t)))
+          (let ((state (list :cleanup nil)))
+            (unwind-protect
+                (cl-letf (((symbol-function 'claude-code-ide--start-session)
+                           (lambda (continue resume spec &optional _interactive)
+                             (funcall original continue resume spec (nth 1 case)))))
+                  (funcall (cdr (claude-code-ide-tests--start-mocked
+                                 (claude-code-ide-start-spec-create
+                                  :directory "/tmp/cci-test-stub/proj/" :provider 'cci-test-stub
+                                  :interactive (nth 0 case))
+                                 state))))
+              (claude-code-ide-tests--cleanup-mocked state))))))
+    (should (equal (reverse seen) '(t nil t))))
+  ;; Each Codex operation passes the slot on
+  (let ((claude-code-ide-mcp--sessions (make-hash-table :test 'equal))
+        (passed nil))
+    (claude-code-ide-codex-tests--with-mcp
+      (cl-letf (((symbol-function 'claude-code-ide-codex-status-hook-args)
+                 (lambda (_instance &optional interactive) (push interactive passed) nil)))
+        (let ((instance (claude-code-ide-codex-tests--instance)))
+          (dolist (interactive '(t nil))
+            (claude-code-ide-codex--launch instance (claude-code-ide-codex-tests--spec :interactive interactive) nil)
+            (claude-code-ide-codex--resume instance (claude-code-ide-codex-tests--spec :interactive interactive
+                                                                                      :resume-id "cci-test-id")
+                                           nil)
+            (claude-code-ide-codex--resume instance (claude-code-ide-codex-tests--spec :interactive interactive
+                                                                                      :continue t)
+                                           nil)
+            (claude-code-ide-codex--resume instance (claude-code-ide-codex-tests--spec :interactive interactive
+                                                                                      :resume t)
+                                           nil)
+            (claude-code-ide-codex--fork instance (claude-code-ide-codex-tests--spec :interactive interactive
+                                                                                    :resume-id "cci-test-id")
+                                         nil)))))
+    (should (equal (reverse passed) '(t t t t t nil nil nil nil nil)))))
 
 (provide 'claude-code-ide-codex-tests)
 

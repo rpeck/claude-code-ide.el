@@ -816,7 +816,13 @@ instance holds, or nil.  The new launch gets a higher one.")
   (fork nil :type boolean
         :documentation "Non-nil to start a new native conversation from the
 history of RESUME-ID, with the provider's fork operation.  The native
-ID of the instance is `unknown' until the CLI reports the new one."))
+ID of the instance is `unknown' until the CLI reports the new one.")
+  (interactive nil :type boolean
+               :documentation "Non-nil when the user asked for this start now.
+The interactive start commands set it from `called-interactively-p'.
+Only such a start may ask the user a question, for example whether to
+trust the Codex status hooks.  A restore at Emacs start, a coordinator
+launch or a timer leaves it nil."))
 
 (defvar claude-code-ide-cli-args-functions nil
   "Functions that add arguments to the Claude CLI command line.
@@ -2302,7 +2308,7 @@ child whose PID ghostel keeps in the process property
        (or (process-get process 'ghostel--native-pid)
            (process-id process))))
 
-(defun claude-code-ide--start-session (&optional continue resume spec)
+(defun claude-code-ide--start-session (&optional continue resume spec interactive)
   "Start a new Claude Code instance for the current project.
 If CONTINUE is non-nil, start Claude with the -c (continue) flag.
 If RESUME is non-nil, start Claude with the -r (resume) flag.
@@ -2325,7 +2331,10 @@ This function handles:
 
 SPEC's provider, else `claude-code-ide-default-provider', checks the
 CLI, builds the command and the environment, and words the exit
-messages."
+messages.  INTERACTIVE is non-nil when the user asked for this start
+now; SPEC's `interactive' slot, when it is set, wins over it.  The
+provider's operations see the value in the `interactive' slot of their
+spec."
   (let* ((provider (claude-code-ide--spec-provider spec))
          (display (claude-code-ide-provider-display-name provider))
          ;; Only a CLI that speaks the IDE protocol gets a WebSocket
@@ -2367,7 +2376,11 @@ messages."
                                    (claude-code-ide-instance-new-id))
                   :last-generation (and spec (claude-code-ide-start-spec-last-generation spec))
                   :role (and spec (claude-code-ide-start-spec-role spec))
-                  :fork fork))
+                  :fork fork
+                  ;; A SPEC whose slot is set wins over INTERACTIVE
+                  :interactive (and (or (and spec (claude-code-ide-start-spec-interactive spec))
+                                        interactive)
+                                    t)))
          (resume-id (claude-code-ide-start-spec-resume-id launch))
          (_fork-ok (when (and fork (not resume-id))
                      (user-error "A fork needs the native ID of the conversation to fork")))
@@ -2690,8 +2703,9 @@ Return its name."
                                   names nil t nil nil (symbol-name current))))
     (intern (if (string-empty-p choice) (symbol-name current) choice))))
 
-(defun claude-code-ide--start-current-provider (&optional continue resume)
+(defun claude-code-ide--start-current-provider (&optional continue resume interactive)
   "Start an instance of the current provider; CONTINUE and RESUME as usual.
+INTERACTIVE goes to the `interactive' slot of the start spec.
 With a prefix argument, ask for the provider first, and make it the
 current one.  The start then asks for the instance name, as it does
 with a prefix argument."
@@ -2699,7 +2713,7 @@ with a prefix argument."
                   (claude-code-ide-set-current-provider (claude-code-ide--read-provider))
                 (claude-code-ide-current-provider))))
     (let ((claude-code-ide-default-provider name))
-      (claude-code-ide--start-session continue resume))))
+      (claude-code-ide--start-session continue resume nil interactive))))
 
 ;;;###autoload
 (defun claude-code-ide ()
@@ -2713,7 +2727,7 @@ prompts for an optional instance name.  Use `claude-code-ide-toggle',
 `claude-code-ide-switch-to-buffer' or `claude-code-ide-list-sessions'
 to reach running instances."
   (interactive)
-  (claude-code-ide--start-current-provider))
+  (claude-code-ide--start-current-provider nil nil (called-interactively-p 'any)))
 
 ;;;###autoload
 (defun claude-code-ide-resume ()
@@ -2722,7 +2736,7 @@ This starts the CLI with its conversation picker (Claude Code: -r).
 With a prefix argument, ask for the provider first.  Always creates a
 new instance."
   (interactive)
-  (claude-code-ide--start-current-provider nil t))
+  (claude-code-ide--start-current-provider nil t (called-interactively-p 'any)))
 
 ;;;###autoload
 (defun claude-code-ide-continue ()
@@ -2732,7 +2746,7 @@ current directory).  With a prefix argument, ask for the provider
 first.  Always creates a new instance; a second continued instance
 forks the same conversation."
   (interactive)
-  (claude-code-ide--start-current-provider t))
+  (claude-code-ide--start-current-provider t nil (called-interactively-p 'any)))
 
 ;;;###autoload
 (defun claude-code-ide-check-status ()

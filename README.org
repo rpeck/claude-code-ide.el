@@ -240,6 +240,8 @@ A provider is a coding-agent CLI. The package has two: =claude= (Claude Code) an
 - A Codex instance gets no IDE server and no lock file in =~/.claude/ide/=, because Codex does not speak that protocol. It uses only the MCP tools server.
 - Codex never gets =claude-code-ide-cli-extra-flags= or the Claude Code model. Its flags and its model come from =claude-code-ide-codex-extra-flags=.
 - You answer the Codex folder trust dialog yourself, one time for each repository.
+- Codex runs the status hooks only after you trust them. You need not remember a command for it: the first Codex start from a command (=M-x=, or the menu) shows the hook commands and asks you one time. After your yes, Emacs writes the trust through Codex, and the instance starts with status. After a no, the instance runs without status, and Emacs does not ask again until you restart Emacs.
+- =M-x claude-code-ide-restore-sessions= asks at most one time for the whole restore. The automatic restore at the start of Emacs, a coordinator launch and a timer never ask; they get the hooks only when Emacs knows that they are trusted. See [[file:docs/status-events.md][docs/status-events.md]], section "Hook trust".
 - Options: =claude-code-ide-codex-cli-path=, =claude-code-ide-codex-extra-flags=, =claude-code-ide-codex-remove-openai-api-key= (default t), =claude-code-ide-codex-no-alt-screen= (default t), =claude-code-ide-codex-skip-update-check= (default t), =claude-code-ide-codex-config-read-timeout= (5 s), =claude-code-ide-codex-queue-timeout= (30 s), =claude-code-ide-codex-coordinator-approved-tools=.
 
 ** Stopping Instances
@@ -712,7 +714,8 @@ Turn the mode off to close the buffer. =M-x claude-code-ide-show-session-status=
 
 Codex instances are in the same buffer. Each line shows the provider, the model (=unknown= when not known), and the common state with its reason (a =?= marks a guess).
 
-- =M-x claude-code-ide-codex-trust-hooks= shows the Codex status hooks and, after a confirmation, trusts them in =~/.codex/config.toml=. Codex runs a hook only after you trust it.
+- A Codex start asks you to trust its status hooks when they are not trusted yet (see Codex). =M-x claude-code-ide-codex-trust-hooks= is the manual way, for example after a no: it shows the hooks and, after a confirmation, trusts them in =~/.codex/config.toml=. An instance that started without hooks gets status after its restart.
+- =claude-code-ide-codex-events-trust-timeout= (default 5) is the number of seconds that a start from a command waits for the hook trust check.
 - =claude-code-ide-session-status-snapshot= (default =t=) writes =<report directory>/status/<emacs pid>.json= for coordinators; see [[file:docs/status-schema.md][docs/status-schema.md]].
 
 Each state says who waits for whom. They are listed in the order of the buffer: what needs you first.
