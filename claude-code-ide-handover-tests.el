@@ -1471,6 +1471,100 @@ needs a person, and nothing starts."
       (claude-code-ide-handover--recover-at-start)
       (should (equal calls '((nil)))))))
 
+;;; With the review tracking
+
+(defvar claude-code-ide-review-directory)
+(defvar claude-code-ide-review-check-interval)
+(defvar claude-code-ide-review--records)
+(defvar claude-code-ide-review--processes)
+(defvar claude-code-ide-review--loaded)
+(defvar claude-code-ide-review--foreign)
+(defvar claude-code-ide-review--scan-time)
+(defvar claude-code-ide-review--warned)
+(defvar claude-code-ide-review--timer)
+
+(defmacro claude-code-ide-handover-tests--with-review (&rest body)
+  "Run BODY in `claude-code-ide-handover-tests--with', with an empty review folder."
+  (declare (indent 0))
+  `(claude-code-ide-handover-tests--with
+     (let ((claude-code-ide-review-directory
+            (expand-file-name "reviews" claude-code-ide-handover-tests--root))
+           (claude-code-ide-review-check-interval nil)
+           (claude-code-ide-review--records (make-hash-table :test 'equal))
+           (claude-code-ide-review--processes (make-hash-table :test 'equal))
+           (claude-code-ide-review--loaded nil)
+           (claude-code-ide-review--foreign (make-hash-table :test 'equal))
+           (claude-code-ide-review--scan-time nil)
+           (claude-code-ide-review--warned nil)
+           (claude-code-ide-review--timer nil))
+       (unwind-protect
+           (progn ,@body)
+         (maphash (lambda (_id process)
+                    (when (process-live-p process) (delete-process process)))
+                  claude-code-ide-review--processes)))))
+
+(defun claude-code-ide-handover-tests--wait-for (predicate)
+  "Run the process sentinels until PREDICATE is true, up to 10 seconds."
+  (let ((deadline (+ (float-time) 10)))
+    (while (not (funcall predicate))
+      (when (> (float-time) deadline)
+        (error "Timeout in a handover test"))
+      (accept-process-output nil 0.05))))
+
+(ert-deftest claude-code-ide-test-handover-with-review-process ()
+  "A real review process in the worktree is left alone by the stop and the scan.
+Its result, which arrives after the commit, goes to the target through
+`claude-code-ide-session-registry-chain-current'."
+  (require 'claude-code-ide-review)
+  (claude-code-ide-handover-tests--with-review
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (let* ((go (expand-file-name "cci-test-go" worktree))
+           (track (claude-code-ide-review-track
+                   "cci-test-src"
+                   :command (list "sh" "-c"
+                                  (format "while [ ! -e %s ]; do sleep 0.1; done; printf '%%s' cci-test-review-result > review.txt"
+                                          (shell-quote-argument go)))
+                   :directory worktree :result-file "review.txt" :review-id "cci-test-rev"))
+           (pid (plist-get track :pid))
+           (stop-args nil)
+           (scan-args nil))
+      (should (eq (plist-get track :status) 'ok))
+      (should (member pid (claude-code-ide-review-process-ids)))
+      ;; The stop reports the review process as still running in the worktree
+      (setq claude-code-ide-handover-tests--stop-result
+            `(:status strays :strays ((:pid ,pid :command "sh -c ..." :cwd ,worktree :reason worktree))))
+      (cl-letf* ((stop (symbol-function 'claude-code-ide-process-stop-later))
+                 ((symbol-function 'claude-code-ide-process-stop-later)
+                  (lambda (instance &rest args) (setq stop-args args) (apply stop instance args)))
+                 ((symbol-function 'claude-code-ide-process-worktree-strays)
+                  (lambda (&rest args) (setq scan-args args) nil)))
+        (let* ((result (claude-code-ide-handover-session "cci-test-src" 'cci-test-b))
+               (id (plist-get result :handover-id)))
+          (claude-code-ide-handover-tests--run-timers 20)
+          ;; (1) Left alone: excluded from the stop, no stray, and it still runs
+          (should (memql pid (plist-get stop-args :exclude)))
+          (should (eq (plist-get (claude-code-ide-handover-status id) :stage) 'target-started))
+          (should-not (plist-get (claude-code-ide-handover-status id) :strays))
+          (claude-code-ide-handover--scan (gethash id claude-code-ide-handover--runs))
+          (should (memql pid (cadr scan-args)))
+          (should (process-live-p (gethash "cci-test-rev" claude-code-ide-review--processes)))
+          ;; The handover commits
+          (let ((target (claude-code-ide-handover-tests--deliver result)))
+            (should (eq (plist-get (claude-code-ide-handover-status id) :status) 'committed))
+            (should (equal (claude-code-ide-session-registry-chain-current "cci-test-src") target))
+            ;; (2) The review ends after the commit: its result goes to the target
+            (write-region "" nil go nil 'silent)
+            (claude-code-ide-handover-tests--wait-for
+             (lambda () (not (process-live-p (gethash "cci-test-rev" claude-code-ide-review--processes)))))
+            (claude-code-ide-review--tick)
+            (should (eq (plist-get (claude-code-ide-control-request-status target "review:cci-test-rev")
+                                   :result)
+                        'queued))
+            (should-not (claude-code-ide-control--pending-records "cci-test-src"))
+            (should (string-match-p "cci-test-review-result"
+                                    (claude-code-ide-control--record-text
+                                     (car (claude-code-ide-control--pending-records target)))))))))))
+
 (provide 'claude-code-ide-handover-tests)
 
 ;;; claude-code-ide-handover-tests.el ends here
