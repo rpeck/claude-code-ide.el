@@ -633,8 +633,10 @@ When the mode turns on, it also records the instances that already run in this E
 
 | State      | Meaning                                                                             |
 |------------+-------------------------------------------------------------------------------------|
+| =pending=  | Emacs starts the instance, or it runs and its conversation ID is not known yet (a Codex conversation before its first prompt). |
 | =open=     | The instance runs, or it ran when its Emacs crashed. =claude-code-ide-restore-sessions= starts these again. |
 | =closed=   | The instance ended, its buffer was killed, or Emacs exited normally. =claude-code-ide-reopen-session= starts it again. |
+| =failed=   | The last restore or reopen failed; the list shows why. A restore tries it again, up to 3 times in a row. |
 | =archived= | The work is done. No command starts it again.                                     |
 
 An exit of Emacs marks its running instances =closed=, with =closed_by= set to =emacs-exit=. After a crash this cannot happen, so they stay =open=. An end of Emacs by a signal also runs the exit, so a restore takes both: the =open= instances of an Emacs that crashed, and the instances that the last Emacs closed at its exit.
@@ -666,7 +668,7 @@ The state file holds only what Emacs knows. The conversation, its title and its 
 
 #+begin_src json
 {
-  "version": 2,
+  "version": 3,
   "sessions": [
     {
       "instance_id": "5afe576e-88a4-4ecf-b317-1cd4b509ca6d",
@@ -687,13 +689,22 @@ The state file holds only what Emacs knows. The conversation, its title and its 
       "closed_at": null,
       "closed_by": null,
       "emacs_pid": 41022,
-      "host": "laptop"
+      "host": "laptop",
+      "worktree": "/home/me/src/app/",
+      "pid": 41388,
+      "process_start_time": 1794201164.0,
+      "emacs_start_time": 1794190002.0,
+      "failure": null,
+      "failure_count": 0,
+      "failed_at": null,
+      "native_id_generation": null
     }
   ]
 }
 #+end_src
 
-- The state file is now =~/.emacs-claude-code-ide-state-v2.json= (=-v2= before the extension of =claude-code-ide-state-file=). The old version 1 file is read and migrated one time, while the version 2 file does not exist. Emacs never writes the version 1 file.
+- The state file is now =~/.emacs-claude-code-ide-state-v3.json= (=-v3= before the extension of =claude-code-ide-state-file=), with version 3. While it does not exist, the version 2 file (=-v2=), else the version 1 file, is read and migrated one time. Emacs never writes or moves the version 1 or version 2 file, so an older version of the package keeps working with its own file. docs/session-schema.md describes all versions.
+- =pid= and =process_start_time= identify the process of the last launch; a restore never starts an instance whose process still runs. =failure= and =failure_count= say why the last restore failed and how many restores failed in a row.
 - =instance_id= is the instance ID, which never changes.
 - =native_id= is the current CLI session id. Emacs starts a new conversation with =--session-id <new UUID>=. A SessionStart hook, passed with =--settings=, reports a new id after =/clear=, =/resume=, or a start with =-c= or =-r=. The reports go to a directory next to the state file (=claude-code-ide-session-registry-report-directory=).
 - =provider=, =generation= and =role= say which CLI runs the instance, how often it was launched, and its optional role.
@@ -701,7 +712,7 @@ The state file holds only what Emacs knows. The conversation, its title and its 
 - =model= and =extra_flags= come from =claude-code-ide-cli-extra-flags= at start. Session flags (=-c=, =-r=, =--resume=, =--session-id=, =--fork-session=) are not stored.
 - =closed_by= is =exited= (the CLI ended), =killed= (Emacs ended a running CLI) or =emacs-exit=.
 
-Every change goes through one queue. The queue writes under a lock directory (=<state-file>.lock=), writes a temporary file and renames it over the state file, and keeps the previous version as =<state-file>.bak=. If the state file cannot be read, the registry uses the =.bak= file, shows a warning, and moves the unreadable file aside on the next write.
+Every change goes through one queue. The queue writes under a lock directory (=<state-file>.lock=), writes a temporary file and renames it over the state file, and keeps the previous version as =<state-file>.bak=. If the state file cannot be read, the registry uses the =.bak= file, shows a warning, and on the next write copies the unreadable file aside (=.corrupt-<time>=) before it renames the new file over it.
 
 ** Session Status
 
