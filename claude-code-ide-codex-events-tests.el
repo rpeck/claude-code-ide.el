@@ -134,6 +134,26 @@ are synthetic.")
   "The real trust check.
 `claude-code-ide-codex-events-tests--with-codex' replaces it.")
 
+(defun claude-code-ide-codex-events-tests--trust-pairs ()
+  "Return the (STATE-KEY . HASH) of the status hooks of the fake app-server."
+  (cl-loop for event in claude-code-ide-codex-events--events
+           for index from 0
+           collect (cons (format "/<session-flags>/config.toml:%s:0:0" (downcase event))
+                         (format "sha256:hash%d" index))))
+
+(defun claude-code-ide-codex-events-tests--trust-toml (&optional pairs)
+  "Return the config.toml records that trust PAIRS (default: all status hooks)."
+  (mapconcat (lambda (pair)
+               (format "[hooks.state.\"%s\"]\ntrusted_hash = \"%s\"\n\n" (car pair) (cdr pair)))
+             (or pairs (claude-code-ide-codex-events-tests--trust-pairs))
+             ""))
+
+(defun claude-code-ide-codex-events-tests--write-config (text)
+  "Write TEXT as the config.toml of the test CODEX_HOME."
+  (let ((file (claude-code-ide-codex-events--config-file)))
+    (make-directory (file-name-directory file) t)
+    (with-temp-file file (insert text))))
+
 (defmacro claude-code-ide-codex-events-tests--with-codex (&rest body)
   "Run BODY with no instances, no Codex launches and a temporary report folder.
 Timers and file watches are not started, and the trust check does not
@@ -159,8 +179,13 @@ refer to the report folder as `registry-dir'."
        (cl-letf (((symbol-function 'claude-code-ide-codex-events--ensure-timers) #'ignore)
                  ((symbol-function 'claude-code-ide-session-status--ensure-timers) #'ignore)
                  ((symbol-function 'claude-code-ide-codex-events--start-trust-check) #'ignore))
+         (claude-code-ide-codex-events-tests--write-config
+          (concat "[tui]\nscreen_reader_detection_done = true\n\n"
+                  (claude-code-ide-codex-events-tests--trust-toml)))
          (claude-code-ide-codex-events--remember-trust
-          (claude-code-ide-codex-events--trust-key) '(:status trusted :message nil))
+          (claude-code-ide-codex-events--trust-key)
+          (list :status 'trusted :message nil
+                :trust (claude-code-ide-codex-events-tests--trust-pairs)))
          ,@body))))
 
 (defun claude-code-ide-codex-events-tests--instance (id generation &optional buffer)
@@ -220,7 +245,9 @@ REFUSE-WRITE, config/batchWrite gets a method error."
               "      printf '%s\\n' \"$line\" >> " (shell-quote-argument (expand-file-name "writes.log" dir)) "\n"
               (if refuse-write
                   "      printf '{\"id\":%s,\"error\":{\"code\":-32601,\"message\":\"method not found\"}}\\n' \"$id\" ;;\n"
-                "      list=\"$list.trusted\"; printf '{\"id\":%s,\"result\":{\"status\":\"ok\"}}\\n' \"$id\" ;;\n")
+                (concat "      cat " (shell-quote-argument (expand-file-name "trusted.toml" dir))
+                        " >> \"$CODEX_HOME/config.toml\"\n"
+                        "      list=\"$list.trusted\"; printf '{\"id\":%s,\"result\":{\"status\":\"ok\"}}\\n' \"$id\" ;;\n"))
               "  esac\n"
               "done\n"))
     (set-file-modes file #o700)
@@ -760,6 +787,12 @@ trusted after a write."
                (insert (claude-code-ide-codex-events-tests--hooks-json ,trust)))
              (with-temp-file (concat hooks-file ".trusted")
                (insert (claude-code-ide-codex-events-tests--hooks-json "trusted")))
+             (with-temp-file (expand-file-name "trusted.toml" ,dir)
+               (insert (claude-code-ide-codex-events-tests--trust-toml)))
+             ;; The config file has the trust records when the hooks are trusted
+             (claude-code-ide-codex-events-tests--write-config
+              (concat "[tui]\nscreen_reader_detection_done = true\n\n"
+                      (if (equal ,trust "trusted") (claude-code-ide-codex-events-tests--trust-toml) "")))
              (let ((claude-code-ide-codex-events-program
                     (claude-code-ide-codex-events-tests--fake-server ,dir hooks-file ,refuse))
                    (claude-code-ide-codex-events-trust-timeout 5))
@@ -1030,25 +1063,57 @@ The result is cached like an untrusted one."
             (claude-code-ide-codex-events-tests--kill-instances)))))))
 
 (ert-deftest claude-code-ide-codex-events-test-lazy-trust-cache ()
-  "A valid trusted cache entry needs no app-server.
-The key holds the hook definitions and the Codex config path; the entry
-holds while the config file keeps its time and size."
+  "A trusted cache entry holds while config.toml still has its trust records.
+The key holds the hook definitions and the Codex config path.  Other
+writes to config.toml keep the entry; a changed or removed
+trusted_hash, a disabled hook, or a broken file end it, without an
+error."
   (claude-code-ide-codex-events-tests--with-lazy-trust (dir "untrusted")
-    (let ((key (claude-code-ide-codex-events--trust-key))
-          (config (claude-code-ide-codex-events--config-file)))
+    (let* ((key (claude-code-ide-codex-events--trust-key))
+           (config (claude-code-ide-codex-events--config-file))
+           (pairs (claude-code-ide-codex-events-tests--trust-pairs))
+           (trusted (claude-code-ide-codex-events-tests--trust-toml pairs))
+           (remember (lambda ()
+                       (claude-code-ide-codex-events--remember-trust
+                        key (list :status 'trusted :message nil :trust pairs))))
+           (valid (lambda (text)
+                    (claude-code-ide-codex-events-tests--write-config text)
+                    (funcall remember)
+                    (and (claude-code-ide-codex-events--cached-trust key) t))))
       (should (string-prefix-p (expand-file-name "codex-home" registry-dir) config))
       (should (string-suffix-p (concat "|" config) key))
-      (make-directory (file-name-directory config) t)
-      (with-temp-file config (insert "[tui]\n"))
-      (claude-code-ide-codex-events--remember-trust key '(:status trusted :message nil))
+      (claude-code-ide-codex-events-tests--write-config trusted)
+      (funcall remember)
       (pcase-let ((`(,args ,_env ,launch) (claude-code-ide-codex-events-tests--start "cci-test-cache" t)))
         (should args)
         (should (eq (claude-code-ide-codex-events--launch-trust launch) 'trusted)))
       (should (= servers 0))
       (should (= asked 0))
-      ;; A change of the config file ends the entry
-      (with-temp-file config (insert "[tui]\nscreen_reader_detection_done = true\n"))
+      ;; A write that a Codex terminal makes at its start keeps the entry
+      (claude-code-ide-codex-events-tests--write-config
+       (concat "[tui]\nscreen_reader_detection_done = true\n\n[tui.model_availability_nux]\n\"gpt-6.1-sol\" = 5\n\n"
+               trusted "[projects.\"/tmp/cci-test\"]\ntrust_level = \"trusted\"\n"))
+      (should (claude-code-ide-codex-events--cached-trust key))
+      (should (car (claude-code-ide-codex-events-tests--start "cci-test-cache2")))
+      (should (= servers 0))
+      ;; A changed trusted_hash, a removed one, a disabled hook, a broken file
+      (should-not (funcall valid (replace-regexp-in-string "sha256:hash3\"" "sha256:other\"" trusted)))
+      (should-not (funcall valid (claude-code-ide-codex-events-tests--trust-toml (cdr pairs))))
+      (should-not (funcall valid (concat trusted "[hooks.state.\"" (car (nth 2 pairs)) "\"]\nenabled = false\n")))
+      (should-not (funcall valid (concat trusted "[[[ broken\n")))
+      (should-not (funcall valid ""))
+      (delete-file config)
+      (funcall remember)
       (should-not (claude-code-ide-codex-events--cached-trust key))
+      ;; The invalid entry left the cache; a start without a user gets no hooks
+      (should-not (gethash key claude-code-ide-codex-events--trust-cache))
+      (should-not (car (claude-code-ide-codex-events-tests--start "cci-test-cache3")))
+      ;; The same records as dotted keys in one table count too
+      (should (funcall valid (concat "[hooks]\n"
+                                     (mapconcat (lambda (pair)
+                                                  (format "state.\"%s\".trusted_hash = \"%s\"\n"
+                                                          (car pair) (cdr pair)))
+                                                pairs ""))))
       ;; Another CODEX_HOME is another key
       (let ((process-environment (cons (concat "CODEX_HOME=" (expand-file-name "other" registry-dir))
                                        process-environment)))

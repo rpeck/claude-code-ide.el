@@ -76,7 +76,9 @@ Emacs settles the trust before a Codex instance spawns, so that the user never n
    - The Codex launch, resume, and fork operations pass the slot to `claude-code-ide-codex-status-hook-args`, as its optional 2nd argument.
    - Other starts (a restore at Emacs start, a coordinator launch, a timer, a call from Lisp) have nil.
 2. **The cache.** The key holds a SHA-256 hash of the hook definitions (the hook arguments, which contain the script path) and the path of the Codex config file (in `CODEX_HOME`, else `~/.codex`).
-   - Each result (`trusted`, `untrusted`, or `disabled`) holds only while `config.toml` keeps the modification time and the size of the check. Otherwise the next start checks again.
+   - A `trusted` result stores the exact `hooks.state` key and the `currentHash` that `hooks/list` reported for each of our hooks. A start reads `config.toml` (read only, with the tolerant TOML reader of `claude-code-ide-transcript.el`), and the entry is valid while each key has `trusted_hash` equal to its stored hash and no `enabled = false`. Other writes do not matter: a Codex terminal writes the file at each start (`[tui]` keys).
+   - The entry is invalid when a key is missing, a hash differs, a hook is disabled, or the file is missing, unreadable, or has a TOML form that the reader does not know. No error comes from it. Then an interactive start checks again (and asks if needed), and another start gets no hooks and starts the background check.
+   - An `untrusted` or `disabled` result holds only while `config.toml` keeps the modification time and the size of the check, because `/hooks` in a terminal can trust or enable the hooks.
    - Other hook definitions (a new package version) or another `CODEX_HOME` give another key. They miss the cache, and the next interactive start asks again.
 3. **The check.** On a cache miss, Emacs starts `codex app-server` with the hook arguments, over stdio, in the project folder, and sends `initialize`, `initialized`, and `hooks/list` with the project folder in `cwds`.
    - Starts of the same key share one running check and one app-server.
