@@ -50,7 +50,7 @@ Do not use `Authorization: Bearer`. The web-server package fails on that header.
 
 The order is:
 
-1. The advice of a user configuration on `claude-code-ide-mcp-http-server--handle-post` runs first. For example, it checks the global token, the `Origin`, and the `Host`.
+1. Before the body, the filter checks the head (see [The body](#the-body)), and the functions of `claude-code-ide-mcp-http-server-head-functions` run. After the body, the advice of a user configuration on `claude-code-ide-mcp-http-server--handle-post` runs first. For example, it checks the global token, the `Origin`, and the `Host`.
 2. **Requests from web pages** (`claude-code-ide-mcp-http-server--transport-refusal`). These checks run before the body is read:
    - A request with an `Origin` header gets 403. A browser adds this header; local MCP clients send none.
    - A request whose `Content-Type` is not `application/json` (parameters such as `; charset=utf-8` are allowed) gets 415. A web page can send this type only after a CORS preflight. The server never answers a preflight, and its replies have no CORS header (no `Access-Control-Allow-Origin`).
@@ -78,24 +78,48 @@ Other rules:
 
 ### The body
 
-The filter of the connections (`claude-code-ide-mcp-http-server--filter`) reads each request before web-server sees it. It gives web-server the request only when the headers and `Content-Length` bytes of body are there.
+The filter of the connections (`claude-code-ide-mcp-http-server--filter`) reads each request before web-server sees it. **The filter is the authority.** It refuses every head that web-server could read in another way. It gives web-server exactly one request: the head and exactly `Content-Length` bytes of body.
 
 - **Why.** The web-server package calls the handler as soon as the headers end, with the part of the body that has arrived until then. It does not read `Content-Length`. Python's `http.client` (and so `urllib`, and the stdio bridge of `rp-emacs-mcp.el`) sends the headers and the body in two writes. When Emacs reads the headers alone, the handler sees an empty or partial body.
   - Before this filter, such a request got a JSON-RPC error with `id` null (`End of file while parsing JSON`), and its tool did not run. A client that waits for its own `id` waited until its time limit. A client that was still sending got `Connection reset by peer`.
-- **One place.** The filter is the only code that depends on how web-server reads a request (tested with web-server 20210708.2242). It calls `ws-filter` once, with the whole request. Every handler and every advice on a handler sees whole requests only. The filter keeps each part of the body as it comes, and joins the parts once.
-- **Checks before the body.** For a POST to `/mcp…`, the filter runs these checks on the path and the headers, before it reads the body. A refused request gets its reply at once, and no body is kept:
-  1. `Origin` and `Content-Type` (403, 415), as in [The check](#the-check).
-  2. `claude-code-ide-mcp-server-check-request` (403), as in [The check](#the-check).
-  3. The body length:
+- **One place.** The filter is the only code that depends on how web-server reads a request (tested with web-server 20210708.2242). It calls `ws-filter` once. Every handler and every advice on a handler sees whole requests only. The filter keeps each part of the body as it comes, and joins the parts once.
+- **The head** (`claude-code-ide-mcp-http-server--parse-head`) gets 400 when web-server could read it in another way:
+  - A lone CR or LF outside the CRLF line breaks. web-server would start a new line there, for example a request line `POST /mcp/…` that the filter did not see.
+  - A request line that is not `METHOD PATH HTTP/x.y`, or a method that is not one of web-server's methods in upper case. web-server matches the method without case, so `post` would be a POST to web-server.
+  - A header line that is not `NAME: VALUE` with one colon and one space. The value is all the text after `": "`, as web-server takes it, so `Content-Length:  5` (two spaces) is not a plain integer.
+  - An `Authorization` header: web-server parses its value in its own way.
+  - A header section above 64 KiB gets 431, also when it comes in one read.
+- **Checks before the body.** The filter runs these checks on the head, in this order. A refused request gets its reply at once, and no body is kept:
+  1. A multipart or form `Content-Type` (`multipart/…`, `application/x-www-form-urlencoded`), on every path: 415. Two `Content-Type` headers: 400. web-server parses such bodies itself, and it uses the last `Content-Type`.
+  2. For a POST to `/mcp…`: `Origin` and `Content-Type` (403, 415), and `claude-code-ide-mcp-server-check-request` (403), as in [The check](#the-check).
+  3. The body length (`claude-code-ide-mcp-http-server--body-length`, the one parser of `Content-Length`):
      - `Transfer-Encoding` (for example `chunked`): 411. The server reads only `Content-Length`.
      - A POST without `Content-Length`: 411.
-     - A `Content-Length` that is not a plain non-negative integer, or two different values: 400.
+     - A `Content-Length` that is not plain digits, or two different values: 400.
      - A `Content-Length` above `claude-code-ide-mcp-http-server-max-body-bytes` (default 16 MiB): 413.
+  4. The functions of `claude-code-ide-mcp-http-server-head-functions` (see below).
   - The reply of a refusal has a JSON-RPC error with `id` null. After the reply, the server ends its side of the connection and drops the data that still comes, so that the client does not lose the reply to a reset.
+- **After the body.** Bytes after `Content-Length` bytes of body (for example a pipelined request) are dropped. If web-server leaves the connection open after it has the request, the filter answers 400 and closes it.
 - **Time limit.** A connection must send its whole request within `claude-code-ide-mcp-http-server-body-timeout` seconds (default 30). Then it gets 408 and is closed, and the filter forgets it. The limit also closes a connection that sends nothing.
-- **Header limit.** A header section above 64 KiB gets 431.
 - **`Expect: 100-continue`.** A request with this header and no body yet gets `HTTP/1.1 100 Continue` first. curl sends this header for a body of 1 MB or more. Without the reply, curl waits 1 s before it sends the body.
-- **The handler.** It still makes all the checks of [The check](#the-check). A body that is shorter than its `Content-Length` (only possible when the filter is not in use) gets 400 and is never parsed.
+- **The handler.**
+  - It uses the session check that the filter made on the head. It does not check, or read the coordinator credential, a second time.
+  - It runs the transport checks again, as a cheap assertion that cannot disagree.
+  - It reads `Content-Length` with the parser of the filter. A bad value, or a body shorter than the value, gets 400 and is never parsed. Without the filter, for example in a test, it makes the session check itself.
+
+### Checks of a user configuration: `claude-code-ide-mcp-http-server-head-functions`
+
+- **What it is.** An abnormal hook. Each function gets `METHOD` (upper case), `PATH` (without the query), and `HEADERS` (an alist from a keyword such as `:X-EMACS-MCP-TOKEN` to the value). It returns nil to let the request pass, or `(STATUS . REASON)` (or a `STATUS` alone) to refuse it.
+- **When it runs.** In the filter, for every request, after the built-in checks and before any body is read. The functions run until one refuses. A function that signals an error refuses with 500.
+- **Why.** An advice on `claude-code-ide-mcp-http-server--handle-post` runs only after the whole body has arrived. A check that needs only the head (a global token, the `Host`) belongs in this hook: a refused client then sends no body.
+- **Example** (a token check like the guard of `rp-emacs-mcp.el`):
+
+  ```elisp
+  (add-hook 'claude-code-ide-mcp-http-server-head-functions
+            (lambda (_method _path headers)
+              (unless (equal (alist-get :X-EMACS-MCP-TOKEN headers) (rp-emacs-mcp-token))
+                '(403 . "bad or missing token"))))
+  ```
 
 ### Replies
 
@@ -261,7 +285,7 @@ Results:
 
 ## Compatibility with `rp-emacs-mcp.el`
 
-- **The guard advice** on `claude-code-ide-mcp-http-server--handle-post` still runs first. The entry point keeps its name and its argument.
+- **The guard advice** on `claude-code-ide-mcp-http-server--handle-post` still runs first. The entry point keeps its name and its argument. It runs after the whole body has arrived. The same check can move to `claude-code-ide-mcp-http-server-head-functions`, which refuses before the body (see [the example](#checks-of-a-user-configuration-claude-code-ide-mcp-http-server-head-functions)).
 - **The token advice** on `claude-code-ide-mcp-server-get-config` still adds its header. The merge advice keeps the secret beside it. A future version of that configuration can use `claude-code-ide-mcp-server-extra-headers` instead.
 - **The `cowork` session** registers itself with `claude-code-ide-mcp-server-register-session`. It has no descriptor, so it has no secret. Its bridge reaches it by its exact key, `/mcp/cowork`, with `Content-Type: application/json` and no `Origin`, so the new checks accept it. Its context advice on `claude-code-ide-mcp-server-get-session-context` still works, because tools call that function.
 - **The approval advice** on `claude-code-ide-mcp-server-get-tool-names` is unchanged. `get_capabilities` is a new name in that list.
