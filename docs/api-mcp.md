@@ -7,6 +7,7 @@ This document describes how a request finds its instance, how the server checks 
 - Code: `claude-code-ide-mcp-server.el` (sessions, secrets, context, scopes) and `claude-code-ide-mcp-http-server.el` (HTTP).
 - Tools: `claude-code-ide-emacs-tools.el`.
 - Tests: `claude-code-ide-mcp-routing-tests.el`.
+  - The tests mock web-server, except `claude-code-ide-mcp-routing-test-web-server-split-body`. That test runs only when the web-server package is on the `load-path`, and it is skipped otherwise. To run it, put the package folder first in `EMACSLOADPATH`, for example `EMACSLOADPATH=~/.emacs.d/elpa/web-server-20210708.2242: ./scripts/compile-and-test.sh`.
 - Instances and providers: [session-schema.md](session-schema.md) and [providers.md](providers.md).
 
 ## Sessions
@@ -74,6 +75,17 @@ Other rules:
 - No tool runs for a refused request.
 - The secret is compared in a time that does not depend on its content.
 - The debug log shows the path as `/mcp/<id>/<secret>`, never the secret.
+
+### The body
+
+The handler reads a request only when its whole body has arrived (`claude-code-ide-mcp-http-server--await-body`).
+
+- **Why.** The web-server package calls the handler as soon as the headers end, with the part of the body that has arrived until then. It does not read `Content-Length`. Python's `http.client` (and so `urllib`, and the stdio bridge of `rp-emacs-mcp.el`) sends the headers and the body in two writes. When Emacs reads the headers alone, the handler sees an empty or partial body.
+  - Before this check, such a request got a JSON-RPC error with `id` null (`End of file while parsing JSON`), and its tool did not run. A client that waits for its own `id` waited until its time limit. A client that was still sending got `Connection reset by peer`.
+- **What the handler does.** When the body has fewer bytes than `Content-Length`, the handler clears the `active` slot of the request and returns `:keep-alive` to web-server. web-server then parses the request again, and calls the handler again, when the next data arrives. No timer runs and nothing waits.
+- **Advice runs again.** An advice on `claude-code-ide-mcp-http-server--handle-post` (such as the guard of `rp-emacs-mcp.el`) runs once for each part, before the body is complete. It must not read the body.
+- **`Expect: 100-continue`.** A request with this header and no body yet gets `HTTP/1.1 100 Continue` first. curl sends this header for a body of 1 MB or more. Without the reply, curl waits 1 s before it sends the body.
+- **No `Content-Length`.** The handler reads the body that it has.
 
 ### Replies
 
