@@ -746,6 +746,9 @@ Codex instances are in the same buffer. Each line shows the provider, the model 
   - A new value changes the Codex hook definitions: the next Codex start from a command asks you once to trust the hooks again.
   - The value is written into the hook scripts of the report directory, which all Emacs processes with the same state file share; the last start sets it for all of them.
 - =claude-code-ide-session-status-snapshot= (default =t=) writes =<report directory>/status/<emacs pid>.json= for coordinators; see [[file:docs/status-schema.md][docs/status-schema.md]].
+- A Codex instance without status hooks gets a guessed state from the rollout file of its conversation (a turn runs, ended, or failed). It is =UNTRACKED= when no rollout file is known.
+- =claude-code-ide-codex-events-error-kind-states= sets which Codex error kinds are a quota limit (=FAILED= with the reason =quota-limit=) and which are an error. By default, =usage_limit_exceeded=, =session_budget_exceeded= and =usage_not_included= are quota limits, and short limits such as =rate_limit_exceeded= and =server_overloaded= are errors. For other kinds, the texts decide: =claude-code-ide-session-status-quota-regexp=, and =claude-code-ide-session-status-transient-regexp= for short limits ("per minute", "retry after", "try again in 5 s"), which are never a quota limit.
+- =claude-code-ide-codex-events-not-included-action= (default =ask=) sets what happens when you act on a Codex session whose plan does not include Codex (=RET=, =w=, or =H= on its row). =ask= asks: =c= continue (keep the session), =h= hand over, =s= stop. The other values, =continue=, =handover= and =stop=, do that without a question. A coordinator never gets the question.
 
 Each state says who waits for whom. They are listed in the order of the buffer: what needs you first.
 
