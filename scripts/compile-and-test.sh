@@ -38,42 +38,14 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT" || exit 1
 echo "Running compile and test checks..." >&2
 
-# Use $EMACS, else emacs on PATH, else a macOS application bundle such
-# as "Emacs.app" or "Emacs 30.1.app" (the last one in sort order wins)
-if [ -z "$EMACS" ]; then
-    if command -v emacs >/dev/null 2>&1; then
-        EMACS=emacs
-    else
-        EMACS=emacs
-        for app in /Applications/Emacs*.app ~/Applications/Emacs*.app; do
-            if [ -x "$app/Contents/MacOS/Emacs" ]; then
-                EMACS="$app/Contents/MacOS/Emacs"
-            fi
-        done
-    fi
-fi
+# Find Emacs (EMACS) and the package folders
+# shellcheck source=scripts/common.sh
+source "$SCRIPT_DIR/common.sh"
 
 # Mocking primitives with cl-letf makes Emacs 29+ native-compile a
 # trampoline, which fails where the C toolchain is broken; mocks work
 # without trampolines in batch mode.
 NO_TRAMPOLINES="(setq native-comp-enable-subr-trampolines nil)"
-
-# Function to check if Emacs package directory exists
-find_emacs_package() {
-    local package="$1"
-    # Check common locations
-    for dir in \
-        ~/.emacs.d/.cache/straight/repos/"$package" \
-        ~/.emacs.d/elpa/"$package"* \
-        ~/.config/emacs/.cache/straight/repos/"$package" \
-        ~/.config/emacs/elpa/"$package"*; do
-        if [ -d "$dir" ]; then
-            echo "$dir"
-            return 0
-        fi
-    done
-    return 1
-}
 
 # Build load path for dependencies
 LOAD_PATH="-L ."
@@ -96,6 +68,12 @@ done
 
 if VTERM_DIR=$(find_emacs_package "emacs-libvterm"); then
     LOAD_PATH="$LOAD_PATH -L $VTERM_DIR"
+fi
+
+# The MCP tests that use the real web-server package run when it is
+# found, and are skipped otherwise
+if WEB_SERVER_DIR=$(find_newest_elpa_package "web-server"); then
+    LOAD_PATH="$LOAD_PATH -L $WEB_SERVER_DIR"
 fi
 
 # STEP 1: Compile all elisp files
