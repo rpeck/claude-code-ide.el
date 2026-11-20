@@ -1136,12 +1136,64 @@ EXTRA is a plist of :target-native to set the target's native ID, and
         (progn
           (make-directory dir t)
           (write-region "{}\n{}\n" nil file nil 'silent)
-          (should (equal (claude-code-ide-handover--codex-rollout "cci-test-0001") file))
-          (should-not (claude-code-ide-handover--codex-rollout "cci-test-0002"))
-          (should-not (claude-code-ide-handover--codex-rollout "../x"))
+          (should (equal (claude-code-ide-codex-rollout-file "cci-test-0001") file))
+          (should-not (claude-code-ide-codex-rollout-file "cci-test-0002"))
+          (should-not (claude-code-ide-codex-rollout-file "../x"))
           (should (equal (claude-code-ide-handover--transcript-file 'codex "cci-test-0001") file))
           (should (= (claude-code-ide-handover--line-count file) 2)))
       (delete-directory home t))))
+
+(ert-deftest claude-code-ide-test-handover-transcript-by-provider ()
+  "Without a leg file or an entry path, the transcript operation of the provider finds it.
+It gets a detached descriptor with the native ID, then the ID of the
+entry, and the key and folder of the entry."
+  (let* ((dir (make-temp-file "cci-test-handover-transcript-" t))
+         (file (expand-file-name "cci-test-found.jsonl" dir))
+         (claude-code-ide-provider--registry (copy-alist claude-code-ide-provider--registry))
+         (calls nil)
+         (entry (claude-code-ide-session-registry-entry-create
+                 :key "cci-test-key" :session-id "cci-test-entry-id" :project-dir dir
+                 :provider 'cci-test-p)))
+    (unwind-protect
+        (progn
+          (write-region "{}\n" nil file nil 'silent)
+          (claude-code-ide-register-provider
+           (claude-code-ide-provider-create
+            :name 'cci-test-p
+            :transcript (lambda (instance what)
+                          (push (list (claude-code-ide-instance-id instance)
+                                      (claude-code-ide-instance-native-id instance)
+                                      (claude-code-ide-instance-project-root instance)
+                                      what)
+                                calls)
+                          (if (equal (claude-code-ide-instance-native-id instance)
+                                     "cci-test-entry-id")
+                              file
+                            'unknown))))
+          (should (equal (claude-code-ide-handover--transcript-file
+                          'cci-test-p "cci-test-live-id" entry)
+                         file))
+          (should (equal (reverse calls)
+                         `(("cci-test-key" "cci-test-live-id" ,dir file)
+                           ("cci-test-key" "cci-test-entry-id" ,dir file))))
+          ;; A provider that is not registered gives nil, not an error
+          (should-not (claude-code-ide-handover--transcript-file 'cci-test-none "x" entry))
+          ;; The Claude Code operation finds the file from the ID and folder of the entry
+          (let* ((config (expand-file-name "claude" dir))
+                 (process-environment (cons (concat "CLAUDE_CONFIG_DIR=" config) process-environment))
+                 (project (expand-file-name "proj" dir))
+                 (cc-file (expand-file-name
+                           "cci-test-cc-id.jsonl"
+                           (expand-file-name (claude-code-ide-session-registry--project-slug project)
+                                             (expand-file-name "projects" config))))
+                 (cc-entry (claude-code-ide-session-registry-entry-create
+                            :key "cci-test-cc-key" :session-id "cci-test-cc-id" :project-dir project
+                            :provider 'claude)))
+            (make-directory (file-name-directory cc-file) t)
+            (write-region "{}\n" nil cc-file nil 'silent)
+            (should (equal (claude-code-ide-handover--transcript-file 'claude nil cc-entry)
+                           cc-file))))
+      (delete-directory dir t))))
 
 ;;; Review fixes
 
