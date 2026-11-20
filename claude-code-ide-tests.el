@@ -2624,15 +2624,16 @@ sibling instance."
       (should (string-match "transport.*:.*http" json-str)))))
 
 (ert-deftest claude-code-ide-mcp-server-test-ws-send-fix ()
-  "Test that ws-send is called with process, not request."
-  ;; Test that verifies our fix for the wrong-type-argument error
-  ;; Skip test if web-server is not available
-  (skip-unless (condition-case nil
-                   (progn (require 'web-server) t)
-                 (error nil)))
+  "Test that ws-send is called with process, not request.
+A reply ends with a throw to `close-connection', which the process
+filter of web-server catches; the test catches it in the same way.
+The test mocks every web-server function that it calls, so it runs
+with and without the real web-server package."
   (require 'claude-code-ide-mcp-http-server)
   (let ((mock-process (make-claude-code-ide-mcp-server-tests--mock-process))
-        (mock-request (make-claude-code-ide-mcp-server-tests--mock-request)))
+        (mock-request (make-claude-code-ide-mcp-server-tests--mock-request))
+        (claude-code-ide-mcp-server-tests--last-response nil)
+        (claude-code-ide-mcp-server-tests--last-response-status nil))
     ;; Set the process in the request
     (setf (claude-code-ide-mcp-server-tests--mock-request-process mock-request) mock-process)
     ;; Mock the ws-* functions
@@ -2642,14 +2643,17 @@ sibling instance."
                #'claude-code-ide-mcp-server-tests--mock-ws-send)
               ((symbol-function 'ws-send-404)
                #'claude-code-ide-mcp-server-tests--mock-ws-send-404))
-      ;; Test send-json-response
-      (claude-code-ide-mcp-http-server--send-json-response
-       mock-request 200 '((test . "data")))
+      ;; Test send-json-response: it replies, then closes the connection
+      (should (eq nil (catch 'close-connection
+                        (claude-code-ide-mcp-http-server--send-json-response
+                         mock-request 200 '((test . "data")))
+                        :no-throw)))
       (should (equal claude-code-ide-mcp-server-tests--last-response-status 200))
       (should (string-match "test.*:.*data" claude-code-ide-mcp-server-tests--last-response))
 
-      ;; Test handle-get (404 response)
-      (claude-code-ide-mcp-http-server--handle-get mock-request)
+      ;; Test handle-get (404 response); the real ws-send-404 throws too
+      (catch 'close-connection
+        (claude-code-ide-mcp-http-server--handle-get mock-request))
       (should (equal claude-code-ide-mcp-server-tests--last-response-status 404)))))
 
 ;;; MCP Server Session Context Tests
