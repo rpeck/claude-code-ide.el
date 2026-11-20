@@ -720,6 +720,38 @@ rejection of the review: the review tracks the copy at the target."
       ;; A file that does not exist is not a deleted one
       (should-not (claude-code-ide-review--prune (car old-final) (cdr old-final))))))
 
+(ert-deftest claude-code-ide-test-review-prune-one-file ()
+  "The prune of one record checks only its own file; it never lists the folder."
+  (claude-code-ide-review-tests--with-review
+    (let* ((record (claude-code-ide-review--record-create
+                    :review-id "cci-test-one" :owner "cci-test-owner" :state 'rejected
+                    :emacs-pid (emacs-pid) :result-file "/nonexistent/cci-test"))
+           (file (progn (claude-code-ide-review--write record)
+                        (claude-code-ide-review--file "cci-test-one"))))
+      (set-file-times file (time-subtract nil (* (1+ claude-code-ide-review-done-days) 86400)))
+      (cl-letf (((symbol-function 'directory-files)
+                 (lambda (&rest _) (error "No folder listing expected"))))
+        (should (claude-code-ide-review--prune file record)))
+      (should-not (file-exists-p file))
+      ;; The folder prune of the inbox uses the same one-file check
+      (let* ((dir (make-temp-file "cci-test-prune-" t))
+             (old (expand-file-name "0a.json" dir))
+             (young (expand-file-name "0b.json" dir))
+             (checked nil)
+             (check (symbol-function 'claude-code-ide-control-prune-file)))
+        (unwind-protect
+            (progn
+              (write-region "{}" nil old nil 'silent)
+              (write-region "{}" nil young nil 'silent)
+              (set-file-times old (time-subtract nil (* 3 86400)))
+              (cl-letf (((symbol-function 'claude-code-ide-control-prune-file)
+                         (lambda (file days) (push file checked) (funcall check file days))))
+                (claude-code-ide-control-prune-folder dir 2))
+              (should (equal (sort checked #'string<) (list old young)))
+              (should-not (file-exists-p old))
+              (should (file-exists-p young)))
+          (delete-directory dir t))))))
+
 (ert-deftest claude-code-ide-test-review-uses-public-control-api ()
   "The review file calls only public functions of the control file."
   (let ((file (expand-file-name "claude-code-ide-review.el"

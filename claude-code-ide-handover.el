@@ -553,10 +553,16 @@ of the Codex sessions folder as its fallback."
 (defun claude-code-ide-handover--transcript-file (provider native-id &optional entry leg)
   "Return the transcript file of the conversation NATIVE-ID of PROVIDER, or nil.
 It is the :transcript of LEG, else the transcript path of the registry
-ENTRY, else the file that the `transcript' operation of PROVIDER gives
-for NATIVE-ID or the native ID of ENTRY."
+ENTRY, else for Claude Code the session file of ENTRY (its ID in its
+folder), else the file that the `transcript' operation of PROVIDER
+gives for NATIVE-ID or the native ID of ENTRY.  So the delivery check
+and the source leg read the same Claude Code file as before."
   (let ((candidates (list (plist-get leg :transcript)
-                          (and entry (claude-code-ide-session-registry-entry-transcript-path entry)))))
+                          (and entry (claude-code-ide-session-registry-entry-transcript-path entry))
+                          ;; A Claude Code entry finds its file from its ID and folder
+                          (and entry (eq provider 'claude)
+                               (ignore-errors
+                                 (claude-code-ide-session-registry--transcript-file entry))))))
     (or (cl-find-if (lambda (file) (and (stringp file) (file-readable-p file))) candidates)
         (claude-code-ide-handover--provider-transcript
          provider

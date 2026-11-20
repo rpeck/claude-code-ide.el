@@ -366,7 +366,8 @@ starts it by hand, and a start that works counts from zero again."
 
 (defvar claude-code-ide-session-registry--transcript-cache
   (make-hash-table :test 'equal)
-  "Values read from transcripts, keyed by kind, file, time and size.")
+  "Values read from transcripts: (KIND FILE) -> (STAMP . VALUE).
+STAMP is the time and size of FILE when VALUE was read.")
 
 ;;; Small helpers
 
@@ -2297,25 +2298,36 @@ The CLI replaces each character that is not a letter or a digit with -."
                                           (expand-file-name "~/.claude")))))))
         (and (file-exists-p file) file))))))
 
-(defun claude-code-ide-session-registry--grep-last (file &rest args)
-  "Return the last line that grep with ARGS prints for FILE, or nil.
+;; The transcript helpers below serve the transcript operations of both
+;; providers, so they have public names.
+
+(defun claude-code-ide-session-registry-grep-lines (file &rest args)
+  "Return the lines that grep with ARGS prints for FILE, or nil.
 Transcripts can be hundreds of megabytes, too large to read in full."
-  (car (last (ignore-errors
-               (apply #'process-lines-ignore-status "grep" (append args (list "--" file)))))))
+  (ignore-errors
+    (apply #'process-lines-ignore-status "grep" (append args (list "--" file)))))
 
-(defun claude-code-ide-session-registry--cached (kind file fn)
-  "Return FN applied to FILE, cached under KIND until FILE changes."
+(defun claude-code-ide-session-registry-grep-last (file &rest args)
+  "Return the last line that grep with ARGS prints for FILE, or nil."
+  (car (last (apply #'claude-code-ide-session-registry-grep-lines file args))))
+
+(defun claude-code-ide-session-registry-cached (kind file fn)
+  "Return FN applied to FILE, cached under KIND until FILE changes.
+KIND is any value that `equal' compares.  The cache keeps one value
+for each KIND and FILE, with the time and size of FILE: a changed file
+replaces its value, so the cache does not grow with each change."
   (let* ((attributes (file-attributes file))
-         (stamp (list kind file
-                      (file-attribute-modification-time attributes)
+         (stamp (list (file-attribute-modification-time attributes)
                       (file-attribute-size attributes)))
-         (value (gethash stamp claude-code-ide-session-registry--transcript-cache 'none)))
-    (when (eq value 'none)
-      (setq value (funcall fn file))
-      (puthash stamp value claude-code-ide-session-registry--transcript-cache))
-    value))
+         (key (list kind file))
+         (cell (gethash key claude-code-ide-session-registry--transcript-cache)))
+    (if (and cell (equal (car cell) stamp))
+        (cdr cell)
+      (let ((value (funcall fn file)))
+        (puthash key (cons stamp value) claude-code-ide-session-registry--transcript-cache)
+        value))))
 
-(defun claude-code-ide-session-registry--line-field (line field)
+(defun claude-code-ide-session-registry-line-field (line field)
   "Return the string FIELD of the JSON object on LINE, or nil."
   (when line
     (let ((value (alist-get field (ignore-errors
@@ -2324,22 +2336,22 @@ Transcripts can be hundreds of megabytes, too large to read in full."
 
 (defun claude-code-ide-session-registry--transcript-title (file)
   "Return the title of the transcript FILE: the /rename title or the summary."
-  (claude-code-ide-session-registry--cached
+  (claude-code-ide-session-registry-cached
    'title file
    (lambda (file)
-     (or (claude-code-ide-session-registry--line-field
-          (claude-code-ide-session-registry--grep-last file "-F" "\"type\":\"custom-title\"")
+     (or (claude-code-ide-session-registry-line-field
+          (claude-code-ide-session-registry-grep-last file "-F" "\"type\":\"custom-title\"")
           'customTitle)
-         (claude-code-ide-session-registry--line-field
-          (claude-code-ide-session-registry--grep-last file "-F" "\"type\":\"summary\"")
+         (claude-code-ide-session-registry-line-field
+          (claude-code-ide-session-registry-grep-last file "-F" "\"type\":\"summary\"")
           'summary)))))
 
 (defun claude-code-ide-session-registry--transcript-model (file)
   "Return the model of the last assistant message in the transcript FILE."
-  (claude-code-ide-session-registry--cached
+  (claude-code-ide-session-registry-cached
    'model file
    (lambda (file)
-     (let ((match (claude-code-ide-session-registry--grep-last
+     (let ((match (claude-code-ide-session-registry-grep-last
                    file "-o" "-E" "\"model\":\"claude-[^\"]+\"")))
        (and match
             (string-match "\"model\":\"\\([^\"]+\\)\"" match)
@@ -2355,11 +2367,11 @@ Transcripts can be hundreds of megabytes, too large to read in full."
 A resumed session would otherwise get a derived name, and other
 sessions address it by its name."
   (when-let* ((file (claude-code-ide-session-registry--transcript-file entry)))
-    (claude-code-ide-session-registry--cached
+    (claude-code-ide-session-registry-cached
      'custom-title file
      (lambda (file)
-       (claude-code-ide-session-registry--line-field
-        (claude-code-ide-session-registry--grep-last file "-F" "\"type\":\"custom-title\"")
+       (claude-code-ide-session-registry-line-field
+        (claude-code-ide-session-registry-grep-last file "-F" "\"type\":\"custom-title\"")
         'customTitle)))))
 
 (defun claude-code-ide-session-registry--model (entry)
@@ -2399,31 +2411,32 @@ stored one) as --model, and the title that the user gave as --name."
 (defvar claude-code-ide-session-registry-restore-flags-functions nil
   "Deprecated: an alist of a provider name and its restore flag function.
 Set the `restore-flags' slot of the provider instead.  For one release,
-a provider whose slot is nil still gets the flags of its entry here.
-The function is called with the registry entry and returns the flag
-string of the start spec.")
+an entry here still wins over the slot, as before.  The function is
+called with the registry entry and returns the flag string of the
+start spec.")
 
 ;; Deprecated in 1.2.0: the `restore-flags' slot of the provider struct
-;; replaces the table.  It stays as a fallback for one release, for
-;; providers of other packages that add an entry; remove it after that.
+;; replaces the table.  For one release, an entry of the table still
+;; wins over the slot, so that a user or a package that set an entry
+;; keeps its flags; remove the table after that.
 (make-obsolete-variable 'claude-code-ide-session-registry-restore-flags-functions
                         "set the `restore-flags' slot of the provider instead."
                         "1.2.0")
 
 (defun claude-code-ide-session-registry--restore-flags (entry)
   "Return the flag string that restores ENTRY, as its provider wants it.
-The function in the `restore-flags' slot of the provider of ENTRY gives
-it.  A provider without one gets no flags, unless the deprecated
-`claude-code-ide-session-registry-restore-flags-functions' has an entry
-for it.  So a Codex restore never gets the Claude Code flags --model
-and --name."
+An entry of the provider of ENTRY in the deprecated
+`claude-code-ide-session-registry-restore-flags-functions' gives it.
+Else the function in the `restore-flags' slot of the provider does.  A
+provider without either gets no flags.  So a Codex restore never gets
+the Claude Code flags --model and --name."
   (let* ((name (claude-code-ide-session-registry-entry-provider entry))
          (provider (and name (symbolp name) (claude-code-ide-get-provider name)))
-         ;; A provider made before a reload of the struct has no slot
-         (fn (or (and provider (ignore-errors (claude-code-ide-provider-restore-flags provider)))
-                 (with-suppressed-warnings
+         (fn (or (with-suppressed-warnings
                      ((obsolete claude-code-ide-session-registry-restore-flags-functions))
-                   (alist-get name claude-code-ide-session-registry-restore-flags-functions)))))
+                   (alist-get name claude-code-ide-session-registry-restore-flags-functions))
+                 ;; A provider made before a reload of the struct has no slot
+                 (and provider (ignore-errors (claude-code-ide-provider-restore-flags provider))))))
     (or (and fn (funcall fn entry)) "")))
 
 (declare-function claude-code-ide-codex-prepare-trust "claude-code-ide-codex-events" (&optional directory))

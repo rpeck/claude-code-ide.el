@@ -1383,11 +1383,9 @@ as their own entries), `array' or `other'.  An unknown form signals
     (nreverse entries)))
 
 (defun claude-code-ide-transcript--codex-config-file ()
-  "Return the configuration file of Codex.
-It is config.toml in CODEX_HOME when that is set, else in HOME/.codex."
-  (expand-file-name "config.toml"
-                    (or (getenv "CODEX_HOME")
-                        (expand-file-name ".codex" (or (getenv "HOME") "~")))))
+  "Return the configuration file of Codex: config.toml in the Codex home.
+See `claude-code-ide-codex-home' for the rule of CODEX_HOME."
+  (expand-file-name "config.toml" (claude-code-ide-codex-home)))
 
 (defun claude-code-ide-transcript--codex-config-entries ()
   "Return the TOML entries of the Codex configuration file, or nil.

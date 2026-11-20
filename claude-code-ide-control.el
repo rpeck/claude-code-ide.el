@@ -524,13 +524,19 @@ left-over of an interrupted move, and is deleted."
 REGEXP defaults to the names of the inbox files (hex digits and
 \".json\").  Other files of the package, such as the review file, use
 it too."
-  (let ((limit (* days 86400)))
-    (when (file-directory-p dir)
-      (dolist (file (directory-files dir t (or regexp "\\`[0-9a-f]+\\.json\\'") t))
-        (when-let* ((attributes (file-attributes file)))
-          (when (> (float-time (time-subtract nil (file-attribute-modification-time attributes)))
-                   limit)
-            (ignore-errors (delete-file file))))))))
+  (when (file-directory-p dir)
+    (dolist (file (directory-files dir t (or regexp "\\`[0-9a-f]+\\.json\\'") t))
+      (claude-code-ide-control-prune-file file days))))
+
+(defun claude-code-ide-control-prune-file (file days)
+  "Delete FILE when it is older than DAYS, and return non-nil then.
+The age is that of its last change.  A file that does not exist gives
+nil.  A delete that fails is ignored; the result is still non-nil."
+  (when-let* ((attributes (file-attributes file)))
+    (when (> (float-time (time-subtract nil (file-attribute-modification-time attributes)))
+             (* days 86400))
+      (ignore-errors (delete-file file))
+      t)))
 
 (defun claude-code-ide-control--prune-done (instance-id)
   "Delete the final records of INSTANCE-ID that are too old.
