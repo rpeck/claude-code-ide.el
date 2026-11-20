@@ -20,6 +20,7 @@ Make one with `claude-code-ide-provider-create` and keyword arguments.
 | `capabilities` | A list of symbols: exactly the operations that have a function. Leave it nil; registration fills it in. A list that names other operations is refused. |
 | One slot for each operation | A function, or nil when the provider does not support the operation. |
 | `ide-protocol` | Non-nil when the CLI speaks the IDE WebSocket protocol and reads the lock files in `~/.claude/ide/`. The default is nil. The `claude` provider sets it to t. It is not an operation, so it is not in `capabilities`. |
+| `restore-flags` | A function `(ENTRY)` of a session registry record that returns the flag string of the restore start spec, or nil. nil (the default) means no extra flags: the options of the provider give its flags and its model. It is the last slot. It is not an operation, so it is not in `capabilities`. See "Restore flags" below. |
 
 The accessors are `claude-code-ide-provider-<slot>`, for example `claude-code-ide-provider-launch`.
 
@@ -46,7 +47,7 @@ In this table:
 | `status-events` | `(INSTANCE)` | An alist `((EVENT-NAME COMMAND ...) ...)`: the status hooks that the launch gives the CLI. nil means none. |
 | `map-event` | `(PROVIDER-EVENT DATA)` | A symbol of `claude-code-ide-event-names`: the common event of a provider event. |
 | `mcp-setup` | `(INSTANCE)` | The MCP configuration in the format of the provider, or nil. |
-| `transcript` | `(INSTANCE WHAT)` | WHAT is `file`, `title`, or `model`. The result is the value, or `unknown`. |
+| `transcript` | `(INSTANCE WHAT)` | WHAT is `file`, `title`, or `model`. The result is a string, or `unknown`. A `file` is an absolute path of a readable file. See "The transcript operation" below. |
 | `exit-message` | `(EXIT-CODE SPEC PROGRAM)` | A message for a CLI that ended with EXIT-CODE, or nil. PROGRAM is the CLI that ran. |
 
 Rules for each operation:
@@ -55,6 +56,39 @@ Rules for each operation:
 - **The environment** is a list of strings. `"NAME=VALUE"` sets a variable. `"NAME"` without `=` removes a variable. The entries go in front of the environment of Emacs.
 - **An unknown value** is the symbol `unknown`. An operation never guesses a value.
 - **Credentials.** An operation does not copy, print, or store login files, tokens, or API keys.
+
+### The transcript operation
+
+- **The arguments.** `(INSTANCE WHAT)`. INSTANCE is an instance descriptor. It need not be live or registered: a caller that has only a native ID makes a detached descriptor, for example `(claude-code-ide-instance-create :id ID :provider 'codex :native-id NATIVE-ID :project-root DIR)`. WHAT is one of these symbols:
+  - `file`: the absolute path of the transcript file of the current native conversation of INSTANCE.
+  - `title`: the title of that conversation.
+  - `model`: the model of the last turn of that conversation.
+- **The result.** A string, or the symbol `unknown` when the value cannot be found (for example, before the CLI writes the file). Use `claude-code-ide-known-or-nil` to get nil in place of `unknown`. Another WHAT signals an error.
+- **The cost.** The operation never reads a whole large transcript. Callers can call it often, for example from a status refresh.
+- **Through `claude-code-ide-provider-call`.** A provider without the operation gives the unavailable result `(:status unavailable :capability transcript)`. A provider that is not registered (its file is not loaded) signals `user-error`, so check `claude-code-ide-get-provider` first.
+
+| Provider | `file` | `title` | `model` |
+|---|---|---|---|
+| `claude` | The transcript path of the CLI report, else `<CLAUDE_CONFIG_DIR>/projects/<project slug>/<native ID>.jsonl`. | The `/rename` title, else the summary. | The model of the last assistant message. |
+| `codex` | The rollout file of the native ID: `claude-code-ide-codex-rollout-file`. | The last `thread_name` of the native ID in `<CODEX_HOME>/session_index.jsonl`. | The `model` of the last `turn_context` record of the rollout file. |
+
+**The Codex rollout file.** `(claude-code-ide-codex-rollout-file NATIVE-ID)` returns the absolute path of the rollout file of the Codex conversation NATIVE-ID, or nil. The `transcript` operation of `codex` calls it with the native ID of INSTANCE. The steps:
+
+1. NATIVE-ID must be letters, digits, and `-`. Another value gives nil.
+2. A cache by native ID gives the path of an earlier find, when the file still exists.
+3. A native ID that is a UUID version 7 holds its creation time. The function looks in the day folders `<CODEX_HOME>/sessions/YYYY/MM/DD/` of the day before, the day of, and the day after that time, for `rollout-*-<NATIVE-ID>.jsonl`.
+4. Else, as a fallback, it searches all of `<CODEX_HOME>/sessions/` for that name, and takes the last match by name. A miss of this search is kept for `claude-code-ide-codex-rollout-retry-seconds` (5 s), so frequent calls for a conversation without a rollout file yet do not search again each time.
+
+CODEX_HOME is the environment variable when it is set and not empty, else `~/.codex`. A compressed rollout (`.jsonl.zst`) is not found, because the transcript readers cannot read it.
+
+### Restore flags
+
+`claude-code-ide-restore-sessions` restores a session registry record with a start spec. The flag string of the spec comes from the `restore-flags` slot of the provider of the record:
+
+- The `claude` provider gives the stored flags, the model of the transcript (else the stored model) as `--model`, and the title that the user gave as `--name`.
+- The `codex` provider sets the slot to nil: a Codex restore gets no flags. The Codex options give the Codex flags and the model.
+- A provider with nil in the slot gets no flags.
+- **Deprecated fallback.** For one release, a provider with nil in the slot that has an entry in `claude-code-ide-session-registry-restore-flags-functions` still gets the flags of that entry. Set the slot in place of the table. The table goes away in the next release.
 
 ### Two operations that §4.1 of the plan does not list
 
