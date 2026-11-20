@@ -912,6 +912,64 @@ Used by tests that create real per-instance WebSocket servers."
             (should (member "TERM_PROGRAM=emacs" mock-ghostel-env))
             (should (member "FORCE_CODE_TERMINAL=true" mock-ghostel-env))))))))
 
+(ert-deftest claude-code-ide-test-terminal-stop-asks-nothing ()
+  "The terminal process of each backend lets its buffer die without a question.
+A stop kills the terminal buffer.  A process whose query flag is t
+makes `kill-buffer' ask \"Buffer has a running process; kill it?\",
+and nobody answers it for a coordinator; in a daemon it blocks Emacs.
+The stubs start a real process with the default query flag t, as
+`eat-exec' and `make-process' do."
+  (dolist (backend '(vterm eat ghostel))
+    (let* ((processes nil)
+           (start (lambda (buffer)
+                    (with-current-buffer buffer
+                      (let ((process (make-process :name "cci-test-terminal" :buffer buffer
+                                                   :command '("sleep" "30")
+                                                   :connection-type 'pipe)))
+                        (push process processes)
+                        process))))
+           (questions nil)
+           (claude-code-ide-terminal-backend backend)
+           (claude-code-ide--cli-available t)
+           (name (format "*cci-test-stop-%s*" backend)))
+      (unwind-protect
+          (cl-letf (((symbol-function 'claude-code-ide--terminal-ensure-backend) #'ignore)
+                    ((symbol-function 'claude-code-ide--build-claude-command)
+                     (lambda (&rest _) "claude"))
+                    ((symbol-function 'executable-find) (lambda (_) "/bin/claude"))
+                    ((symbol-function 'vterm)
+                     (lambda (buffer-name)
+                       (let ((buffer (get-buffer-create buffer-name)))
+                         (funcall start buffer)
+                         buffer)))
+                    ((symbol-function 'eat-mode) #'ignore)
+                    ((symbol-function 'eat-exec)
+                     (lambda (buffer &rest _) (funcall start buffer)))
+                    ((symbol-function 'ghostel-exec)
+                     (lambda (buffer &rest _) (funcall start buffer)))
+                    ((symbol-function 'yes-or-no-p)
+                     (lambda (prompt) (push prompt questions) nil))
+                    ((symbol-function 'y-or-n-p)
+                     (lambda (prompt) (push prompt questions) nil)))
+            (let* ((result (claude-code-ide--create-terminal-session
+                            name "/tmp" 12345 nil nil "cci-test-session"))
+                   (process (cdr result)))
+              (should (processp process))
+              (should (process-live-p process))
+              ;; The backend is in the values, so a failure names it
+              (should (equal (list backend nil)
+                             (list backend (process-query-on-exit-flag process))))
+              ;; The kill of the buffer, as a stop does it, asks nothing
+              (kill-buffer (car result))
+              (should (equal (list backend nil) (list backend questions)))
+              (should-not (buffer-live-p (car result)))))
+        (dolist (process processes)
+          (when (process-live-p process)
+            (delete-process process)))
+        (when (get-buffer name)
+          (let ((kill-buffer-query-functions nil))
+            (kill-buffer name)))))))
+
 (ert-deftest claude-code-ide-test-resolve-program ()
   "Test CLI program resolution for terminal exec APIs."
   ;; A bare name resolves to an absolute path via `executable-find'.

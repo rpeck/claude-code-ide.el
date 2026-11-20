@@ -2084,6 +2084,9 @@ Signals an error if terminal fails to initialize."
                 (let ((process (get-buffer-process buffer)))
                   (unless process
                     (error "Failed to create eat process.  Please ensure eat is properly installed"))
+                  ;; A stop kills the buffer; it must not ask whether to
+                  ;; kill the running process (as the vterm setup does)
+                  (set-process-query-on-exit-flag process nil)
                   (cons buffer process)))))
 
            ;; ghostel backend
@@ -2123,6 +2126,9 @@ Signals an error if terminal fails to initialize."
                   (claude-code-ide--apply-ghostel-evil-escape)
                   (unless process
                     (error "Failed to create ghostel process.  Please ensure ghostel is properly installed"))
+                  ;; A stop kills the buffer; it must not ask whether to
+                  ;; kill the running process, whatever ghostel sets
+                  (set-process-query-on-exit-flag process nil)
                   ;; Chain ghostel's own sentinel so its buffer-local timers,
                   ;; focus-change hook, and `ghostel-exit-functions' still run
                   ;; when `claude-code-ide--start-session' installs its own
