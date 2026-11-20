@@ -16,7 +16,7 @@ This package integrates coding-agent CLIs with Emacs via the Model Context Proto
 **Support Files:**
 - `claude-code-ide-provider.el` - Provider interface: the provider struct, the provider registry, and `claude-code-ide-provider-call`. Only a provider with `ide-protocol` gets a WebSocket server and a lock file in `~/.claude/ide/`.
 - `claude-code-ide-instance.el` - Instance descriptors, launch generations, common events, and common states
-- `claude-code-ide-codex.el` - The Codex provider: command lines, MCP config and the user's exclude list, approvals, `codex queue` prompts in the background, native ID, and the dialog scan
+- `claude-code-ide-codex.el` - The Codex provider: command lines, MCP config and the user's exclude list, approvals, `codex queue` prompts in the background, native ID, the transcript operation (rollout file, title, model; the lookup is `claude-code-ide-codex-rollout-file`), and the dialog scan
 - `claude-code-ide-codex-events.el` - Codex status: hook script, hook arguments, the hook trust at each start (cache by the config trust records, one question for a start or a restore of the user, trust command), event mapping, Codex states
 - `claude-code-ide-control.el` - Control operations for coordinators: list, inspect, launch, resume, submit-prompt, stop; the durable prompt inbox; MCP coordinator tools
 - `claude-code-ide-handover.el` - Handover of an instance to a new conversation of either provider: the preflight, the stages saved before each step, the stop with stray checks, the document and the pointer prompt, the delivery watch, recovery with claims, the one writer rule, the control operation and tools, and `request_handover`. See docs/handover.md
