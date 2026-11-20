@@ -791,11 +791,14 @@ the folders of SESSIONS do not change."
        (< (- now (plist-get cached :miss)) claude-code-ide-codex-rollout-miss-seconds)
        (equal (plist-get cached :stamp) (claude-code-ide-codex--folders-stamp sessions))))
 
-(defun claude-code-ide-codex-rollout-file (native-id)
+(defun claude-code-ide-codex-rollout-file (native-id &optional directory)
   "Return the absolute path of the rollout file of the conversation NATIVE-ID.
 Return nil when NATIVE-ID is not a full UUID, or when no readable file
-is found in the sessions folder of the Codex home.  Of several files,
-the newest by name wins.  The lookup is cheap:
+is found in the sessions folder of the Codex home.  DIRECTORY is the
+working folder of the Codex session, for a relative CODEX_HOME; see
+`claude-code-ide-codex-home'.  Codex writes the ID in lower case, so
+an ID in upper case finds the same file.  Of several files, the newest
+by name wins.  The lookup is cheap:
 - A found file is given from a cache.  After
   `claude-code-ide-codex-rollout-recheck-seconds', the day folders are
   checked again for a newer file.
@@ -805,7 +808,8 @@ the newest by name wins.  The lookup is cheap:
   is kept for `claude-code-ide-codex-rollout-miss-seconds', unless the
   sessions folder or the day folder of today changes."
   (when (claude-code-ide-codex--uuid-p native-id)
-    (let* ((sessions (expand-file-name "sessions" (claude-code-ide-codex-home)))
+    (let* ((native-id (downcase native-id))
+           (sessions (expand-file-name "sessions" (claude-code-ide-codex-home directory)))
            (key (cons sessions native-id))
            (cached (gethash key claude-code-ide-codex--rollout-cache))
            (old (let ((file (plist-get cached :file)))
@@ -835,13 +839,15 @@ the newest by name wins.  The lookup is cheap:
   "Return VALUE when it is a string that is not empty, else nil."
   (and (stringp value) (not (string-empty-p value)) value))
 
-(defun claude-code-ide-codex--session-title (native-id)
+(defun claude-code-ide-codex--session-title (native-id &optional directory)
   "Return the last thread name of NATIVE-ID in the Codex session index, or nil.
 The index is session_index.jsonl in the Codex home: one short line for
-each name that a conversation gets."
+each name that a conversation gets.  DIRECTORY is as for
+`claude-code-ide-codex-rollout-file'."
   (require 'claude-code-ide-session-registry)
-  (let ((file (expand-file-name "session_index.jsonl" (claude-code-ide-codex-home))))
-    (when (and (stringp native-id) (file-readable-p file))
+  (let ((file (expand-file-name "session_index.jsonl" (claude-code-ide-codex-home directory)))
+        (native-id (and (stringp native-id) (downcase native-id))))
+    (when (and native-id (file-readable-p file))
       (claude-code-ide-session-registry-cached
        (list 'codex-title native-id) file
        (lambda (file)
@@ -887,12 +893,16 @@ the session index) or `model' (from the rollout file).  INSTANCE can be
 a detached descriptor that holds only a native ID."
   (unless (memq what '(file title model))
     (error "Unknown transcript value: %S" what))
-  (let ((native (claude-code-ide-known-or-nil (claude-code-ide-codex--native-id instance))))
+  (let ((native (claude-code-ide-known-or-nil (claude-code-ide-codex--native-id instance)))
+        ;; The working folder of the session, for a relative CODEX_HOME
+        (directory (or (claude-code-ide-known-or-nil (claude-code-ide-instance-worktree instance))
+                       (claude-code-ide-known-or-nil
+                        (claude-code-ide-instance-project-root instance)))))
     (claude-code-ide-or-unknown
      (and native
           (if (eq what 'title)
-              (claude-code-ide-codex--session-title native)
-            (when-let* ((file (claude-code-ide-codex-rollout-file native)))
+              (claude-code-ide-codex--session-title native directory)
+            (when-let* ((file (claude-code-ide-codex-rollout-file native directory)))
               (if (eq what 'file) file (claude-code-ide-codex--rollout-model file))))))))
 
 (defun claude-code-ide-codex--map-event (provider-event data)

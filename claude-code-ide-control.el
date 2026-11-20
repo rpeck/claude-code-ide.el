@@ -248,7 +248,7 @@ is (:status ok :instance-id ID :provider P :generation N
            :instance-id instance-id
            :role role))))))))
 
-(defun claude-code-ide-control--registry-entry (instance-id)
+(defun claude-code-ide-control-registry-entry (instance-id)
   "Return the session registry entry of INSTANCE-ID, or nil.
 The registry is read only while `claude-code-ide-session-registry-mode'
 is on, because otherwise its file is not kept up to date."
@@ -256,14 +256,6 @@ is on, because otherwise its file is not kept up to date."
     (ignore-errors
       (claude-code-ide-session-registry--find
        (claude-code-ide-session-registry--entries) instance-id))))
-
-;; The public name calls the internal one through its symbol, so that
-;; one replacement of the internal function (as in the tests) changes
-;; both.
-(defalias 'claude-code-ide-control-registry-entry 'claude-code-ide-control--registry-entry
-  "Return the session registry entry of INSTANCE-ID, or nil.
-The registry is read only while `claude-code-ide-session-registry-mode'
-is on, because otherwise its file is not kept up to date.")
 
 (cl-defun claude-code-ide-control-resume (instance-id &key prompt directory native-id provider)
   "Start the instance INSTANCE-ID again and resume its conversation.
@@ -273,7 +265,7 @@ and PROVIDER give them.  PROMPT is the first message.  The instance
 keeps its instance ID and gets the next launch generation.  The result
 is that of `claude-code-ide-control-launch'."
   (let ((entry (and (claude-code-ide-control-valid-id-p instance-id)
-                    (claude-code-ide-control--registry-entry instance-id))))
+                    (claude-code-ide-control-registry-entry instance-id))))
     (cond
      ((not (claude-code-ide-control-valid-id-p instance-id))
       (claude-code-ide-control--error 'invalid-instance-id instance-id))
@@ -680,7 +672,7 @@ not run, the session registry decides:
         (instance (claude-code-ide-instance-by-id instance-id)))
     (if (and instance (claude-code-ide-instance-live-p instance))
         state
-      (let* ((entry (claude-code-ide-control--registry-entry instance-id))
+      (let* ((entry (claude-code-ide-control-registry-entry instance-id))
              (entry-state (and entry (claude-code-ide-session-registry-entry-state entry))))
         (cond
          ((memq entry-state '(closed archived)) 'stopped)
@@ -1346,14 +1338,6 @@ tool is added to the MCP tools when the control tools are set up."
 (when (and claude-code-ide-control-enable-mcp-tools
            (claude-code-ide-control-scope-enforced-p))
   (claude-code-ide-control-setup-mcp-tools))
-
-;;; Earlier internal names
-
-;; These helpers were internal before 1.2.0 and now have public names.
-;; The handover file and its tests still use these internal names.
-(defalias 'claude-code-ide-control--state-of #'claude-code-ide-control-state-of)
-(defalias 'claude-code-ide-control--json #'claude-code-ide-control-json)
-(defalias 'claude-code-ide-control--blank-p #'claude-code-ide-control-blank-p)
 
 (provide 'claude-code-ide-control)
 

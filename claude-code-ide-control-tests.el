@@ -87,7 +87,7 @@ are those of the test."
           (claude-code-ide-tests--control-buffers nil))
      (claude-code-ide-register-provider (claude-code-ide-tests--control-provider))
      (unwind-protect
-         (cl-letf (((symbol-function 'claude-code-ide-control--registry-entry)
+         (cl-letf (((symbol-function 'claude-code-ide-control-registry-entry)
                     (lambda (id)
                       (cdr (assoc id claude-code-ide-tests--control-registry))))
                    ((symbol-function 'run-at-time)
@@ -744,16 +744,32 @@ The two instances have the same display name."
             (should-not (file-exists-p file))
             (should (file-exists-p young))))
       (delete-directory dir t)))
-  ;; Other files still call these internal names
-  (dolist (pair '((claude-code-ide-control--state-of . claude-code-ide-control-state-of)
-                  (claude-code-ide-control--json . claude-code-ide-control-json)
-                  (claude-code-ide-control--blank-p . claude-code-ide-control-blank-p)
-                  (claude-code-ide-control-registry-entry . claude-code-ide-control--registry-entry)))
-    (should (eq (indirect-function (car pair)) (indirect-function (cdr pair)))))
+  ;; The internal names are gone: every file calls the public ones
   (dolist (name '(claude-code-ide-control--now claude-code-ide-control--refresh
                                                claude-code-ide-control--valid-id-p
-                                               claude-code-ide-control--json-decode))
-    (should-not (fboundp name))))
+                                               claude-code-ide-control--json-decode
+                                               claude-code-ide-control--state-of
+                                               claude-code-ide-control--json
+                                               claude-code-ide-control--blank-p
+                                               claude-code-ide-control--registry-entry))
+    (should-not (fboundp name)))
+  (should (functionp (indirect-function 'claude-code-ide-control-registry-entry))))
+
+(ert-deftest claude-code-ide-test-control-no-internal-calls-in-other-files ()
+  "The handover file and its tests call no removed internal control name."
+  (dolist (base '("claude-code-ide-handover" "claude-code-ide-handover-tests"))
+    (let ((file (expand-file-name (concat base ".el")
+                                  (file-name-directory (locate-library base))))
+          (found nil))
+      (with-temp-buffer
+        (insert-file-contents file)
+        (emacs-lisp-mode)
+        (goto-char (point-min))
+        (while (re-search-forward
+                "claude-code-ide-control--\\(state-of\\|json\\|blank-p\\|registry-entry\\)\\_>" nil t)
+          (unless (nth 8 (syntax-ppss))
+            (push (match-string 0) found))))
+      (should-not found))))
 
 (ert-deftest claude-code-ide-test-control-operations-table ()
   "Each operation has a function; handover and track-review come later."

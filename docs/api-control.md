@@ -295,7 +295,7 @@ Other files of the package, such as `claude-code-ide-review.el`, use these publi
 | `claude-code-ide-control-prune-folder` | `(DIR DAYS &optional REGEXP)` | Deletes the files of DIR whose names match REGEXP (default: the inbox file names) and that are older than DAYS. |
 | `claude-code-ide-control-prune-file` | `(FILE DAYS)` | Deletes FILE when it is older than DAYS, and returns non-nil then. A missing file gives nil. `prune-folder` uses it for each file. |
 
-The internal names `claude-code-ide-control--state-of`, `--registry-entry`, `--json`, and `--blank-p` still work, because the handover file and its tests use them. The other internal names are gone.
+All the internal names (`claude-code-ide-control--NAME`) of these helpers are gone. Every file and test calls the public names.
 
 ## Options
 

@@ -1105,25 +1105,62 @@ LINES are the records, one string each.  Return the file."
                                                        claude-code-ide-codex--home))
         (should-not (fboundp name))))))
 
-(ert-deftest claude-code-ide-test-codex-home-one-rule ()
-  "An empty or a relative CODEX_HOME counts as unset, for the rollouts and the config."
+(ert-deftest claude-code-ide-test-codex-home-follows-codex ()
+  "CODEX_HOME as Codex reads it: unset or empty gives ~/.codex, absolute stays,
+relative is relative to the working folder of the session, and ~ is not expanded."
   (require 'claude-code-ide-transcript)
-  (let ((default (file-name-as-directory (expand-file-name "~/.codex"))))
-    (dolist (value '("" "relative/codex"))
-      (let ((process-environment (cons (concat "CODEX_HOME=" value) process-environment)))
+  (let ((default (file-name-as-directory (expand-file-name "~/.codex")))
+        (project "/tmp/cci-test-project/")
+        (default-directory "/tmp/cci-test-default/"))
+    (dolist (environment '("CODEX_HOME=" "CODEX_HOME"))
+      (let ((process-environment (cons environment process-environment)))
         (should (equal (claude-code-ide-codex-home) default))
+        (should (equal (claude-code-ide-codex-home project) default))
         (should (equal (claude-code-ide-transcript--codex-config-file)
                        (expand-file-name "config.toml" default)))))
-    (let ((process-environment (cons "CODEX_HOME" process-environment)))
-      (should (equal (claude-code-ide-codex-home) default)))
-    (let* ((dir (make-temp-file "cci-test-codex-home-" t))
-           (process-environment (cons (concat "CODEX_HOME=" dir) process-environment)))
-      (unwind-protect
-          (progn
-            (should (equal (claude-code-ide-codex-home) (file-name-as-directory dir)))
-            (should (equal (claude-code-ide-transcript--codex-config-file)
-                           (expand-file-name "config.toml" dir))))
-        (delete-directory dir t)))))
+    (let ((process-environment (cons "CODEX_HOME=/tmp/cci-test-abs/codex" process-environment)))
+      (should (equal (claude-code-ide-codex-home) "/tmp/cci-test-abs/codex/"))
+      (should (equal (claude-code-ide-codex-home project) "/tmp/cci-test-abs/codex/")))
+    (let ((process-environment (cons "CODEX_HOME=rel/codex" process-environment)))
+      (should (equal (claude-code-ide-codex-home project) "/tmp/cci-test-project/rel/codex/"))
+      (should (equal (claude-code-ide-codex-home) "/tmp/cci-test-default/rel/codex/"))
+      (should (equal (claude-code-ide-transcript--codex-config-file)
+                     "/tmp/cci-test-default/rel/codex/config.toml")))
+    ;; Codex does not expand a leading ~: it is a folder named ~
+    (let ((process-environment (cons "CODEX_HOME=~/codex" process-environment)))
+      (should (equal (claude-code-ide-codex-home project) "/tmp/cci-test-project/~/codex/")))))
+
+(ert-deftest claude-code-ide-test-codex-transcript-relative-home ()
+  "With a relative CODEX_HOME, the transcript operation looks in the folder of the instance."
+  (let* ((project (make-temp-file "cci-test-codex-project-" t))
+         (home (expand-file-name "cci-rel-home" project))
+         (time (claude-code-ide-codex-tests--days-ago 4))
+         (id (claude-code-ide-codex-tests--uuid7 time))
+         (file (claude-code-ide-codex-tests--rollout home time id))
+         (process-environment (cons "CODEX_HOME=cci-rel-home" process-environment))
+         (default-directory temporary-file-directory)
+         (claude-code-ide-codex--rollout-cache (make-hash-table :test 'equal))
+         (instance (claude-code-ide-instance-create :id "cci-test-rel" :provider 'codex
+                                                    :native-id id :project-root project)))
+    (unwind-protect
+        (should (equal (claude-code-ide-provider-call 'codex 'transcript instance 'file) file))
+      (delete-directory project t))))
+
+(ert-deftest claude-code-ide-test-codex-rollout-file-uppercase-id ()
+  "An uppercase native ID finds the rollout in the day folders, like the full search."
+  (claude-code-ide-codex-tests--with-home
+    (let* ((time (claude-code-ide-codex-tests--days-ago 6))
+           (id (claude-code-ide-codex-tests--uuid7 time))
+           (file (claude-code-ide-codex-tests--rollout home time id)))
+      (cl-letf (((symbol-function 'directory-files-recursively)
+                 (lambda (&rest _) (error "No full search expected"))))
+        (should (equal (claude-code-ide-codex-rollout-file (upcase id)) file))))
+    ;; A UUID version 4 has no day folders: the full search finds it too
+    (let* ((id (upcase claude-code-ide-codex-tests--uuid4))
+           (file (claude-code-ide-codex-tests--rollout
+                  home (claude-code-ide-codex-tests--days-ago 30) claude-code-ide-codex-tests--uuid4))
+           (case-fold-search nil))
+      (should (equal (claude-code-ide-codex-rollout-file id) file)))))
 
 (ert-deftest claude-code-ide-test-codex-transcript-operation ()
   "The transcript operation gives the rollout file, the index title and the rollout model."
