@@ -9,6 +9,19 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$PROJECT_ROOT" || exit 1
 
+# Find Emacs (EMACS) the same way as compile-and-test.sh
+# shellcheck source=scripts/common.sh
+source "$SCRIPT_DIR/common.sh"
+
+# transient gives the indent rules of its own macros; recent releases
+# depend on cond-let and llama
+LOAD_PATH=""
+for package in transient cond-let llama; do
+    if PACKAGE_DIR=$(find_emacs_package "$package"); then
+        LOAD_PATH="$LOAD_PATH -L $PACKAGE_DIR"
+    fi
+done
+
 # Function to format and clean a single Elisp file
 process_file() {
     local file="$1"
@@ -25,16 +38,10 @@ process_file() {
         *.el)
             echo "Formatting and cleaning: $file" >&2
 
-            emacs -batch -L . --eval "(progn
-                (require 'transient nil t)
-                (require 'claude-code-ide-mcp-server nil t)
-                (find-file \"$file\")
-                (emacs-lisp-mode)
-                (setq-local indent-tabs-mode nil)
-                (setq-local lisp-indent-function 'lisp-indent-function)
-                (delete-trailing-whitespace)
-                (indent-region (point-min) (point-max))
-                (save-buffer))" >&2
+            # The indent rules of the project macros come from the
+            # source text; see scripts/format-elisp.el
+            "$EMACS" -batch -L . $LOAD_PATH -l "$SCRIPT_DIR/format-elisp.el" \
+                -f format-elisp-batch "$file" >&2
 
             if [ $? -eq 0 ]; then
                 echo "✓ Formatted and cleaned: $file" >&2
