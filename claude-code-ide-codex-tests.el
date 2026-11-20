@@ -26,6 +26,8 @@
 (declare-function claude-code-ide-tests--clear-processes "claude-code-ide-tests")
 (declare-function claude-code-ide-tests--wait-until "claude-code-ide-tests")
 (declare-function claude-code-ide-tests--call-with-clock "claude-code-ide-tests")
+(declare-function claude-code-ide-tests--advance-clock "claude-code-ide-tests")
+(defvar claude-code-ide-tests--clock)
 (defvar claude-code-ide-tests--wait-limit)
 
 ;;; Helpers
@@ -1064,6 +1066,104 @@ Later lookups and rechecks do not search all of sessions again."
       (let ((claude-code-ide-codex-rollout-miss-seconds 0))
         (should-not (claude-code-ide-codex-rollout-file "cc1e5000-0000-4000-8000-ffffffffffff"))
         (should (= (hash-table-count claude-code-ide-codex--rollout-cache) 1))))))
+
+(defun claude-code-ide-codex-tests--local-time (days-ago hour minute second)
+  "Return the local time DAYS-AGO days before today at HOUR:MINUTE:SECOND."
+  (let ((day (decode-time (time-subtract nil (* days-ago 86400)))))
+    (float-time (encode-time (list second minute hour (nth 3 day) (nth 4 day) (nth 5 day)
+                                   nil -1 nil)))))
+
+(ert-deftest claude-code-ide-test-codex-rollout-recheck-after-midnight ()
+  "A recheck after midnight reads the day folder of the last check again.
+Codex writes a resume rollout at 23:59:45 into the folder of that day;
+the next recheck runs after midnight and must find it."
+  (claude-code-ide-codex-tests--with-home
+    (claude-code-ide-tests--call-with-clock
+     (lambda ()
+       (let* ((evening (claude-code-ide-codex-tests--local-time 20 23 59 30))
+              (id (claude-code-ide-codex-tests--uuid7 (- evening (* 10 86400))))
+              (old (claude-code-ide-codex-tests--rollout home (- evening (* 10 86400)) id)))
+         (setq claude-code-ide-tests--clock evening)
+         (should (equal (claude-code-ide-codex-rollout-file id) old))
+         ;; The resume rollout of 23:59:45, in the folder of that evening
+         (let ((resume (claude-code-ide-codex-tests--rollout home (+ evening 15) id)))
+           (claude-code-ide-tests--advance-clock 90)
+           (should-not (equal (format-time-string "%F" evening)
+                              (format-time-string "%F" claude-code-ide-tests--clock)))
+           (cl-letf (((symbol-function 'directory-files-recursively)
+                      (lambda (&rest _) (error "No full search expected"))))
+             (should (equal (claude-code-ide-codex-rollout-file id) resume))
+             ;; Later rechecks keep it
+             (claude-code-ide-tests--advance-clock 3600)
+             (should (equal (claude-code-ide-codex-rollout-file id) resume)))))))))
+
+(ert-deftest claude-code-ide-test-codex-rollout-recheck-after-days ()
+  "A recheck after days without a lookup reads the folders of those days.
+After more than `claude-code-ide-codex-rollout-recheck-max-days', it runs
+the full search one time, and the cached file stays a candidate."
+  (claude-code-ide-codex-tests--with-home
+    (claude-code-ide-tests--call-with-clock
+     (lambda ()
+       (let* ((sessions (expand-file-name "sessions" home))
+              (walks 0)
+              (walk (symbol-function 'directory-files-recursively))
+              (start (claude-code-ide-codex-tests--local-time 40 12 0 0))
+              (id (claude-code-ide-codex-tests--uuid7 (- start (* 10 86400))))
+              (old (claude-code-ide-codex-tests--rollout home (- start (* 10 86400)) id)))
+         (cl-letf (((symbol-function 'directory-files-recursively)
+                    (lambda (dir &rest args)
+                      (when (equal dir sessions) (setq walks (1+ walks)))
+                      (apply walk dir args))))
+           (setq claude-code-ide-tests--clock start)
+           (should (equal (claude-code-ide-codex-rollout-file id) old))
+           (should (= walks 1))
+           ;; 3 days without a lookup; a resume wrote a rollout on day 2
+           (let ((second (claude-code-ide-codex-tests--rollout home (+ start (* 2 86400)) id)))
+             (claude-code-ide-tests--advance-clock (* 3 86400))
+             (should (equal (claude-code-ide-codex-rollout-file id) second))
+             (should (= walks 1))
+             ;; 10 more days; a resume wrote a rollout on day 7 of them.
+             ;; The gap passes the limit: one full search
+             (let ((third (claude-code-ide-codex-tests--rollout home (+ start (* 10 86400)) id)))
+               (claude-code-ide-tests--advance-clock (* 10 86400))
+               (should (equal (claude-code-ide-codex-rollout-file id) third))
+               (should (= walks 2))
+               ;; The cached file stays a candidate of the full search,
+               ;; also when the search finds nothing
+               (claude-code-ide-tests--advance-clock (* 10 86400))
+               (cl-letf (((symbol-function 'directory-files-recursively)
+                          (lambda (&rest _) (setq walks (1+ walks)) nil)))
+                 (should (equal (claude-code-ide-codex-rollout-file id) third)))
+               (should (= walks 3))))))))))
+
+(ert-deftest claude-code-ide-test-codex-rollout-cache-limit-lowered ()
+  "A lower limit trims the cache to it in one insert; the oldest entries go first.
+A found entry can go too.  A limit of 0 or less keeps no entries."
+  (claude-code-ide-codex-tests--with-home
+    (let ((claude-code-ide-codex-rollout-miss-seconds 1e9)
+          (claude-code-ide-codex-rollout-cache-limit 1000))
+      ;; Ten entries at times 100..109; the oldest one is a found file
+      (dotimes (i 10)
+        (claude-code-ide-codex--rollout-cache-put
+         (cons "s" (format "id-%d" i))
+         (if (= i 0)
+             (list :file "/x/rollout.jsonl" :time (+ 100 i))
+           (list :miss (+ 100 i) :stamp nil))
+         (+ 100 i)))
+      (should (= (hash-table-count claude-code-ide-codex--rollout-cache) 10))
+      (let ((claude-code-ide-codex-rollout-cache-limit 4))
+        (claude-code-ide-codex--rollout-cache-put
+         (cons "s" "id-new") (list :miss 200 :stamp nil) 200)
+        (should (= (hash-table-count claude-code-ide-codex--rollout-cache) 4))
+        (should (equal (sort (hash-table-keys claude-code-ide-codex--rollout-cache)
+                             (lambda (a b) (string< (cdr a) (cdr b))))
+                       '(("s" . "id-7") ("s" . "id-8") ("s" . "id-9") ("s" . "id-new"))))
+        (should-not (gethash (cons "s" "id-0") claude-code-ide-codex--rollout-cache)))
+      (dolist (limit '(0 -1))
+        (let ((claude-code-ide-codex-rollout-cache-limit limit))
+          (claude-code-ide-codex--rollout-cache-put
+           (cons "s" "id-none") (list :miss 300 :stamp nil) 300)
+          (should (= (hash-table-count claude-code-ide-codex--rollout-cache) 0)))))))
 
 (ert-deftest claude-code-ide-test-codex-rollout-file-miss-and-folder-change ()
   "A full-search miss holds for a minute, unless the sessions folder changes."
