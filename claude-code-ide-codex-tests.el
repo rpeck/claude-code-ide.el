@@ -169,11 +169,13 @@ The wait ends after `claude-code-ide-tests--wait-limit' seconds."
     (should (equal (claude-code-ide-provider-buffer-name-prefix provider) "codex"))
     (should (equal (claude-code-ide-provider-capabilities provider)
                    '(detect launch resume fork submit-prompt stop native-id
-                            map-event mcp-setup exit-message)))
+                            map-event mcp-setup transcript exit-message)))
     ;; The stop of Claude Code fits: it kills the terminal buffer
     (should (eq (claude-code-ide-provider-stop provider) #'claude-code-ide--claude-stop))
-    (should (claude-code-ide-provider-unavailable-p
-             (claude-code-ide-provider-call provider 'transcript nil 'file)))))
+    (should-not (claude-code-ide-provider-unavailable-p
+                 (claude-code-ide-provider-call
+                  provider 'transcript (claude-code-ide-instance-create :id "cci-test-x") 'file)))
+    (should-not (claude-code-ide-provider-restore-flags provider))))
 
 (ert-deftest claude-code-ide-test-codex-detect ()
   "detect finds the CLI with executable-find and reads codex --version."
@@ -904,6 +906,125 @@ and each Codex operation passes it to the status hook arguments."
                                                                                     :resume-id "cci-test-id")
                                          nil)))))
     (should (equal (reverse passed) '(t t t t t nil nil nil nil nil)))))
+
+;;; Transcripts
+
+(defmacro claude-code-ide-codex-tests--with-home (&rest body)
+  "Run BODY with CODEX_HOME at a new folder `home', and empty caches."
+  (declare (indent 0))
+  `(let* ((home (make-temp-file "cci-test-codex-home-" t))
+          (process-environment (cons (concat "CODEX_HOME=" home) process-environment))
+          (claude-code-ide-codex--rollout-cache (make-hash-table :test 'equal))
+          (claude-code-ide-codex--transcript-cache (make-hash-table :test 'equal)))
+     (unwind-protect
+         (progn ,@body)
+       (delete-directory home t))))
+
+(defun claude-code-ide-codex-tests--uuid7 (time)
+  "Return a synthetic UUID version 7 for TIME, a float of seconds."
+  (let ((hex (format "%012x" (floor (* time 1000)))))
+    (format "%s-%s-7cc1-8000-00000000c1e5" (substring hex 0 8) (substring hex 8 12))))
+
+(defun claude-code-ide-codex-tests--rollout (home time native-id &optional lines)
+  "Write the rollout file of NATIVE-ID in the day folder of TIME under HOME.
+LINES are the records, one string each.  Return the file."
+  (let* ((dir (expand-file-name (format-time-string "sessions/%Y/%m/%d" time) home))
+         (file (expand-file-name
+                (format "rollout-%s-%s.jsonl" (format-time-string "%Y-%m-%dT%H-%M-%S" time)
+                        native-id)
+                dir)))
+    (make-directory dir t)
+    (write-region (mapconcat (lambda (line) (concat line "\n")) (or lines '("{}")) "")
+                  nil file nil 'silent)
+    file))
+
+(ert-deftest claude-code-ide-test-codex-uuid7-time ()
+  "A UUID version 7 gives its creation time; other IDs give nil."
+  (let ((time 1795000000.5))
+    (should (= (claude-code-ide-codex--uuid7-time (claude-code-ide-codex-tests--uuid7 time))
+               time)))
+  (should-not (claude-code-ide-codex--uuid7-time "75c27dc7-5907-4bad-b20b-f1fcab252f7c"))
+  (should-not (claude-code-ide-codex--uuid7-time "cci-test-0001"))
+  (should-not (claude-code-ide-codex--uuid7-time nil)))
+
+(ert-deftest claude-code-ide-test-codex-rollout-file-day-folders ()
+  "A UUID version 7 ID finds its rollout in the day folders, without a full search."
+  (claude-code-ide-codex-tests--with-home
+    (let* ((time (float-time (encode-time (list 0 0 12 18 11 2026 nil -1 nil))))
+           (id (claude-code-ide-codex-tests--uuid7 time))
+           (searched nil))
+      (cl-letf (((symbol-function 'directory-files-recursively)
+                 (lambda (&rest _) (setq searched t) nil)))
+        ;; No file yet: the day folders miss, and the full search runs once
+        (make-directory (expand-file-name "sessions" home) t)
+        (should-not (claude-code-ide-codex-rollout-file id))
+        (should searched)
+        (setq searched nil)
+        ;; The file of the next day is found at once, even in the retry time
+        (let ((file (claude-code-ide-codex-tests--rollout home (+ time 86400) id)))
+          (should (equal (claude-code-ide-codex-rollout-file id) file))
+          (should (file-name-absolute-p (claude-code-ide-codex-rollout-file id)))
+          (should-not searched))))))
+
+(ert-deftest claude-code-ide-test-codex-rollout-file-cache-and-search ()
+  "The search is the fallback; a found file is cached; a miss waits for the retry time."
+  (claude-code-ide-codex-tests--with-home
+    (let ((time (float-time (encode-time (list 0 0 10 18 11 2026 nil -1 nil))))
+          (claude-code-ide-codex-rollout-retry-seconds 3600))
+      (should-not (claude-code-ide-codex-rollout-file "cci-test-0001"))
+      (make-directory (expand-file-name "sessions" home) t)
+      (should-not (claude-code-ide-codex-rollout-file "cci-test-0001"))
+      (should-not (claude-code-ide-codex-rollout-file "../x"))
+      (should-not (claude-code-ide-codex-rollout-file nil))
+      (let ((file (claude-code-ide-codex-tests--rollout home time "cci-test-0001")))
+        ;; A recent miss does not search again
+        (should-not (claude-code-ide-codex-rollout-file "cci-test-0001"))
+        (let ((claude-code-ide-codex-rollout-retry-seconds 0))
+          (should (equal (claude-code-ide-codex-rollout-file "cci-test-0001") file)))
+        ;; The cache gives it without a look at the folders
+        (cl-letf (((symbol-function 'directory-files-recursively)
+                   (lambda (&rest _) (error "No search expected")))
+                  ((symbol-function 'directory-files)
+                   (lambda (&rest _) (error "No folder read expected"))))
+          (should (equal (claude-code-ide-codex-rollout-file "cci-test-0001") file)))
+        ;; A file that is gone is not given from the cache
+        (delete-file file)
+        (let ((claude-code-ide-codex-rollout-retry-seconds 0))
+          (should-not (claude-code-ide-codex-rollout-file "cci-test-0001")))))))
+
+(ert-deftest claude-code-ide-test-codex-transcript-operation ()
+  "The transcript operation gives the rollout file, the index title and the rollout model."
+  (claude-code-ide-codex-tests--with-home
+    (let* ((time (float-time (encode-time (list 0 0 9 18 11 2026 nil -1 nil))))
+           (id (claude-code-ide-codex-tests--uuid7 time))
+           (other (claude-code-ide-codex-tests--uuid7 (+ time 60)))
+           (file (claude-code-ide-codex-tests--rollout
+                  home time id
+                  (list "{\"type\":\"session_meta\",\"payload\":{\"id\":\"x\"}}"
+                        "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-cci-test-1\"}}"
+                        "{\"type\":\"response_item\",\"payload\":{\"model\":\"not-this\"}}"
+                        "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-cci-test-2\"}}")))
+           (instance (claude-code-ide-instance-create :id "cci-test-inst" :provider 'codex
+                                                      :native-id id))
+           (blank (claude-code-ide-instance-create :id "cci-test-blank" :provider 'codex)))
+      (write-region
+       (concat (format "{\"id\":\"%s\",\"thread_name\":\"cci-test first\",\"updated_at\":\"x\"}\n" id)
+               (format "{\"id\":\"%s\",\"thread_name\":\"cci-test other\",\"updated_at\":\"x\"}\n" other)
+               (format "{\"id\":\"%s\",\"thread_name\":\"cci-test renamed\",\"updated_at\":\"x\"}\n" id))
+       nil (expand-file-name "session_index.jsonl" home) nil 'silent)
+      (should (equal (claude-code-ide-provider-call 'codex 'transcript instance 'file) file))
+      (should (equal (claude-code-ide-provider-call 'codex 'transcript instance 'title)
+                     "cci-test renamed"))
+      (should (equal (claude-code-ide-provider-call 'codex 'transcript instance 'model)
+                     "gpt-cci-test-2"))
+      ;; Without a native ID or a file, each value is unknown
+      (dolist (what '(file title model))
+        (should (eq (claude-code-ide-provider-call 'codex 'transcript blank what) 'unknown)))
+      (setf (claude-code-ide-instance-native-id blank) other)
+      (should (eq (claude-code-ide-provider-call 'codex 'transcript blank 'model) 'unknown))
+      (should (equal (claude-code-ide-provider-call 'codex 'transcript blank 'title)
+                     "cci-test other"))
+      (should-error (claude-code-ide-provider-call 'codex 'transcript instance 'size)))))
 
 (provide 'claude-code-ide-codex-tests)
 
