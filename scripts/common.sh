@@ -54,4 +54,16 @@ find_newest_elpa_package() {
     return 1
 }
 
+# Print the absolute path of FILE with all symbolic links resolved
+resolve_path() {
+    local file="$1"
+    if command -v realpath >/dev/null 2>&1; then
+        realpath "$file" 2>/dev/null && return 0
+    fi
+    if readlink -f / >/dev/null 2>&1; then
+        readlink -f "$file" 2>/dev/null && return 0
+    fi
+    python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$file" 2>/dev/null
+}
+
 find_emacs
