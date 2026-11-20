@@ -1407,7 +1407,9 @@ NO SIGNAL stays for sessions with hooks that send no event."
                 'untracked))
     (dolist (fields '((:status "compacting") (:status :absent) (:pid 1)))
       (apply #'claude-code-ide-tests--write-cli-file file fields)
-      (should (equal (seq-take (claude-code-ide-tests--cli-state session) 2) '(disconnected untracked))))
+      ;; No source gives an UNTRACKED state
+      (should (equal (seq-take (claude-code-ide-tests--cli-state session) 4)
+                     '(disconnected untracked nil nil))))
     (should-not (claude-code-ide-session-status--urgent-p 'untracked))))
 
 (ert-deftest claude-code-ide-test-status-cli-file-pid-reuse ()
@@ -1497,7 +1499,7 @@ is never written."
     (let ((common (nth 1 (claude-code-ide-session-status--session-state
                           session (claude-code-ide-tests--cli-next-now)))))
       (should (eq (plist-get common :state) 'working))
-      (should-not (plist-get common :source)))
+      (should (eq (plist-get common :source) 'hooks)))
     (should (eq (plist-get (claude-code-ide-instance-state instance (claude-code-ide-tests--cli-next-now))
                            :state)
                 'working))))
