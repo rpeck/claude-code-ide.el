@@ -72,7 +72,11 @@ function.")
                 :documentation "Non-nil when the CLI speaks the IDE WebSocket protocol and
 reads the lock files in ~/.claude/ide/.  A start makes a WebSocket
 server and a lock file only for such a provider.  It is not an
-operation, so it is not in the capabilities."))
+operation, so it is not in the capabilities.")
+  (restore-flags nil :documentation "(ENTRY) -> flag string of a restore, or nil.
+ENTRY is a session registry record.  nil means no extra flags: the
+options of the provider give its flags.  It is not an operation, so it
+is not in the capabilities."))
 
 (defconst claude-code-ide-provider-operations
   '(detect launch resume fork submit-prompt stop native-id status-events

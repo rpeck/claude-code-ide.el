@@ -2396,20 +2396,35 @@ stored one) as --model, and the title that the user gave as --name."
              (when model (concat " --model " (shell-quote-argument model)))
              (when title (concat " --name " (shell-quote-argument title)))))))
 
-(defvar claude-code-ide-session-registry-restore-flags-functions
-  '((claude . claude-code-ide-session-registry--claude-restore-flags))
-  "Alist of a provider name and the function that gives its restore flags.
+(defvar claude-code-ide-session-registry-restore-flags-functions nil
+  "Deprecated: an alist of a provider name and its restore flag function.
+Set the `restore-flags' slot of the provider instead.  For one release,
+a provider whose slot is nil still gets the flags of its entry here.
 The function is called with the registry entry and returns the flag
-string of the start spec.  A provider without an entry gets no flags:
-its own options give its flags and its model.  So a Codex restore
-never gets the Claude Code flags --model and --name.")
+string of the start spec.")
+
+;; Deprecated in 1.2.0: the `restore-flags' slot of the provider struct
+;; replaces the table.  It stays as a fallback for one release, for
+;; providers of other packages that add an entry; remove it after that.
+(make-obsolete-variable 'claude-code-ide-session-registry-restore-flags-functions
+                        "set the `restore-flags' slot of the provider instead."
+                        "1.2.0")
 
 (defun claude-code-ide-session-registry--restore-flags (entry)
-  "Return the flag string that restores ENTRY, as its provider wants it."
-  (if-let* ((fn (alist-get (claude-code-ide-session-registry-entry-provider entry)
-                           claude-code-ide-session-registry-restore-flags-functions)))
-      (funcall fn entry)
-    ""))
+  "Return the flag string that restores ENTRY, as its provider wants it.
+The function in the `restore-flags' slot of the provider of ENTRY gives
+it.  A provider without one gets no flags, unless the deprecated
+`claude-code-ide-session-registry-restore-flags-functions' has an entry
+for it.  So a Codex restore never gets the Claude Code flags --model
+and --name."
+  (let* ((name (claude-code-ide-session-registry-entry-provider entry))
+         (provider (and name (symbolp name) (claude-code-ide-get-provider name)))
+         ;; A provider made before a reload of the struct has no slot
+         (fn (or (and provider (ignore-errors (claude-code-ide-provider-restore-flags provider)))
+                 (with-suppressed-warnings
+                     ((obsolete claude-code-ide-session-registry-restore-flags-functions))
+                   (alist-get name claude-code-ide-session-registry-restore-flags-functions)))))
+    (or (and fn (funcall fn entry)) "")))
 
 (declare-function claude-code-ide-codex-prepare-trust "claude-code-ide-codex-events" (&optional directory))
 

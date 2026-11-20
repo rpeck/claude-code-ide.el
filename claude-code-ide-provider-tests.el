@@ -141,6 +141,20 @@ cdr of its :cleanup key."
     (should (equal (claude-code-ide-provider-capabilities provider)
                    claude-code-ide-provider-operations))))
 
+(ert-deftest claude-code-ide-test-provider-restore-flags-slot ()
+  "The restore-flags slot is last, nil by default, and not a capability."
+  (let ((claude-code-ide-provider--registry (copy-alist claude-code-ide-provider--registry))
+        (plain (claude-code-ide-provider-create :name 'cci-test-plain)))
+    (should (eq (car (last (mapcar #'car (cdr (cl-struct-slot-info 'claude-code-ide-provider)))))
+                'restore-flags))
+    (should-not (claude-code-ide-provider-restore-flags plain))
+    (should-not (memq 'restore-flags claude-code-ide-provider-operations))
+    (let ((with (claude-code-ide-register-provider
+                 (claude-code-ide-provider-create :name 'cci-test-flags :restore-flags #'ignore
+                                                  :stop #'ignore))))
+      (should (equal (claude-code-ide-provider-capabilities with) '(stop)))
+      (should (eq (claude-code-ide-provider-restore-flags with) #'ignore)))))
+
 (ert-deftest claude-code-ide-test-provider-capabilities-checked ()
   "Registration derives the capabilities, and refuses ones that disagree."
   (let ((claude-code-ide-provider--registry (copy-alist claude-code-ide-provider--registry)))
