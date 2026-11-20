@@ -703,11 +703,36 @@ sessions folder again for the same native ID only when the sessions
 folder or the day folder of today changed.  The day folders are always
 checked.")
 
+(defvar claude-code-ide-codex-rollout-cache-limit 1000
+  "Most entries of the rollout cache.
+When a new entry would pass the limit, the oldest entry goes.")
+
 (defvar claude-code-ide-codex--rollout-cache (make-hash-table :test 'equal)
   "Rollout lookups by (SESSIONS-FOLDER . NATIVE-ID).
 A value is (:file FILE :time TIME) for a found file, checked at TIME,
 or (:miss TIME :stamp STAMP) after a full search that found no file;
-STAMP is that of `claude-code-ide-codex--folders-stamp'.")
+STAMP is that of `claude-code-ide-codex--folders-stamp'.  Use
+`claude-code-ide-codex--rollout-cache-put' to add an entry.")
+
+(defun claude-code-ide-codex--rollout-cache-put (key value now)
+  "Put VALUE under KEY in the rollout cache at time NOW.
+A new KEY first removes the misses that expired, and, at
+`claude-code-ide-codex-rollout-cache-limit' entries, the oldest entry,
+so the cache stays small however many IDs have no rollout."
+  (let ((cache claude-code-ide-codex--rollout-cache))
+    (unless (gethash key cache)
+      (let ((oldest nil) (oldest-time nil))
+        (maphash (lambda (other entry)
+                   (let ((time (or (plist-get entry :miss) (plist-get entry :time) 0)))
+                     (if (and (plist-get entry :miss)
+                              (>= (- now time) claude-code-ide-codex-rollout-miss-seconds))
+                         (remhash other cache)
+                       (when (or (null oldest-time) (< time oldest-time))
+                         (setq oldest other oldest-time time)))))
+                 cache)
+        (when (and oldest (>= (hash-table-count cache) claude-code-ide-codex-rollout-cache-limit))
+          (remhash oldest cache))))
+    (puthash key value cache)))
 
 (declare-function claude-code-ide-session-registry-cached "claude-code-ide-session-registry"
                   (kind file fn))
@@ -799,14 +824,17 @@ working folder of the Codex session, for a relative CODEX_HOME; see
 `claude-code-ide-codex-home'.  Codex writes the ID in lower case, so
 an ID in upper case finds the same file.  Of several files, the newest
 by name wins.  The lookup is cheap:
-- A found file is given from a cache.  After
-  `claude-code-ide-codex-rollout-recheck-seconds', the day folders are
-  checked again for a newer file.
-- Else the day folders are checked: those of the creation time of a
-  UUID version 7 ID, and that of today.
-- Else the whole sessions folder is searched.  A miss of that search
-  is kept for `claude-code-ide-codex-rollout-miss-seconds', unless the
-  sessions folder or the day folder of today changes."
+- The first lookup of NATIVE-ID in this Emacs searches the whole
+  sessions folder one time, and takes the newest match by name.
+- After that, a found file is given from a cache.  After
+  `claude-code-ide-codex-rollout-recheck-seconds', the day folders
+  (today, and the creation days of a UUID version 7 ID) are checked
+  again for a newer file.
+- A miss of the full search is kept for
+  `claude-code-ide-codex-rollout-miss-seconds', unless the sessions
+  folder or the day folder of today changes.  In that time, only the
+  day folders are checked.
+- The cache is small: see `claude-code-ide-codex--rollout-cache-put'."
   (when (claude-code-ide-codex--uuid-p native-id)
     (let* ((native-id (downcase native-id))
            (sessions (expand-file-name "sessions" (claude-code-ide-codex-home directory)))
@@ -821,18 +849,24 @@ by name wins.  The lookup is cheap:
         old)
        (t
         (let* ((recent-miss (claude-code-ide-codex--recent-miss-p cached sessions now))
-               (file (or (claude-code-ide-codex--newest
-                          (list old (claude-code-ide-codex--rollout-in-day-folders sessions native-id)))
-                         (unless recent-miss
-                           (claude-code-ide-codex--search-rollout sessions native-id)))))
+               (file (cond
+                      ;; A recheck of a found file: the day folders hold a newer one
+                      (old (claude-code-ide-codex--newest
+                            (list old (claude-code-ide-codex--rollout-in-day-folders
+                                       sessions native-id))))
+                      ;; A miss that holds: only the cheap day folders
+                      (recent-miss
+                       (claude-code-ide-codex--rollout-in-day-folders sessions native-id))
+                      ;; The first lookup: the full search, so no older day folder wins
+                      (t (claude-code-ide-codex--search-rollout sessions native-id)))))
           (cond
            ((and file (file-readable-p file))
-            (puthash key (list :file file :time now) claude-code-ide-codex--rollout-cache)
+            (claude-code-ide-codex--rollout-cache-put key (list :file file :time now) now)
             file)
            (t
             (unless recent-miss
-              (puthash key (list :miss now :stamp (claude-code-ide-codex--folders-stamp sessions))
-                       claude-code-ide-codex--rollout-cache))
+              (claude-code-ide-codex--rollout-cache-put
+               key (list :miss now :stamp (claude-code-ide-codex--folders-stamp sessions)) now))
             nil))))))))
 
 (defun claude-code-ide-codex--non-empty (value)

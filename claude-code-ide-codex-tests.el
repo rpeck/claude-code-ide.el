@@ -987,8 +987,10 @@ LINES are the records, one string each.  Return the file."
            (searched nil))
       (cl-letf (((symbol-function 'directory-files-recursively)
                  (lambda (&rest _) (setq searched t) nil)))
-        ;; No file yet: the day folders miss, and the full search runs once
-        (make-directory (expand-file-name "sessions" home) t)
+        ;; No file yet: the full search runs once.  The year folder
+        ;; exists already, so the new file below does not change the
+        ;; sessions folder, and the miss holds.
+        (make-directory (expand-file-name (format-time-string "sessions/%Y" (+ time 86400)) home) t)
         (should-not (claude-code-ide-codex-rollout-file id))
         (should searched)
         (setq searched nil)
@@ -1014,6 +1016,54 @@ LINES are the records, one string each.  Return the file."
         ;; The cache now holds the newer file
         (let ((claude-code-ide-codex-rollout-recheck-seconds 3600))
           (should (equal (claude-code-ide-codex-rollout-file id) newer)))))))
+
+(ert-deftest claude-code-ide-test-codex-rollout-file-newest-on-first-lookup ()
+  "The first lookup of an ID searches all of sessions once; the newest rollout wins.
+A newer rollout in a day folder that is neither today nor near the
+creation day counts, also when the creation day holds an older one.
+Later lookups and rechecks do not search all of sessions again."
+  (claude-code-ide-codex-tests--with-home
+    (let* ((sessions (expand-file-name "sessions" home))
+           (walks 0)
+           (walk (symbol-function 'directory-files-recursively)))
+      (cl-letf (((symbol-function 'directory-files-recursively)
+                 (lambda (dir &rest args)
+                   ;; It calls itself for each subfolder: count the walks of sessions
+                   (when (equal dir sessions) (setq walks (1+ walks)))
+                   (apply walk dir args))))
+        ;; An older rollout on the creation day, newer ones 10 and 20 days later
+        (let* ((created (claude-code-ide-codex-tests--days-ago 30))
+               (id (claude-code-ide-codex-tests--uuid7 created))
+               (newest (progn
+                         (claude-code-ide-codex-tests--rollout home created id)
+                         (claude-code-ide-codex-tests--rollout home (+ created (* 10 86400)) id)
+                         (claude-code-ide-codex-tests--rollout home (+ created (* 20 86400)) id))))
+          (should (equal (claude-code-ide-codex-rollout-file id) newest))
+          (should (= walks 1))
+          (let ((claude-code-ide-codex-rollout-recheck-seconds 0))
+            (should (equal (claude-code-ide-codex-rollout-file id) newest))
+            (should (equal (claude-code-ide-codex-rollout-file id) newest)))
+          (should (= walks 1)))
+        ;; Two rollouts, neither on the creation day nor today
+        (let* ((created (claude-code-ide-codex-tests--days-ago 60))
+               (id (claude-code-ide-codex-tests--uuid7 created))
+               (newer (progn
+                        (claude-code-ide-codex-tests--rollout home (+ created (* 10 86400)) id)
+                        (claude-code-ide-codex-tests--rollout home (+ created (* 20 86400)) id))))
+          (should (equal (claude-code-ide-codex-rollout-file id) newer)))))))
+
+(ert-deftest claude-code-ide-test-codex-rollout-cache-bounded ()
+  "Misses of many IDs do not grow the rollout cache without bound."
+  (claude-code-ide-codex-tests--with-home
+    (make-directory (expand-file-name "sessions" home) t)
+    (let ((claude-code-ide-codex-rollout-cache-limit 50))
+      (dotimes (i 200)
+        (should-not (claude-code-ide-codex-rollout-file (format "cc1e5000-0000-4000-8000-%012x" i))))
+      (should (<= (hash-table-count claude-code-ide-codex--rollout-cache) 50))
+      ;; Expired misses go away when a new entry comes
+      (let ((claude-code-ide-codex-rollout-miss-seconds 0))
+        (should-not (claude-code-ide-codex-rollout-file "cc1e5000-0000-4000-8000-ffffffffffff"))
+        (should (= (hash-table-count claude-code-ide-codex--rollout-cache) 1))))))
 
 (ert-deftest claude-code-ide-test-codex-rollout-file-miss-and-folder-change ()
   "A full-search miss holds for a minute, unless the sessions folder changes."
@@ -1151,10 +1201,16 @@ relative is relative to the working folder of the session, and ~ is not expanded
   (claude-code-ide-codex-tests--with-home
     (let* ((time (claude-code-ide-codex-tests--days-ago 6))
            (id (claude-code-ide-codex-tests--uuid7 time))
-           (file (claude-code-ide-codex-tests--rollout home time id)))
-      (cl-letf (((symbol-function 'directory-files-recursively)
-                 (lambda (&rest _) (error "No full search expected"))))
-        (should (equal (claude-code-ide-codex-rollout-file (upcase id)) file))))
+           (file (claude-code-ide-codex-tests--rollout home time id))
+           (case-fold-search nil))
+      ;; The first lookup is the full search
+      (should (equal (claude-code-ide-codex-rollout-file (upcase id)) file))
+      ;; A recheck reads only the day folders, and finds the newer file of today
+      (let ((newer (claude-code-ide-codex-tests--rollout home (float-time) id))
+            (claude-code-ide-codex-rollout-recheck-seconds 0))
+        (cl-letf (((symbol-function 'directory-files-recursively)
+                   (lambda (&rest _) (error "No full search expected"))))
+          (should (equal (claude-code-ide-codex-rollout-file (upcase id)) newer)))))
     ;; A UUID version 4 has no day folders: the full search finds it too
     (let* ((id (upcase claude-code-ide-codex-tests--uuid4))
            (file (claude-code-ide-codex-tests--rollout
