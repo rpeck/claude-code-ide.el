@@ -22,6 +22,28 @@ for package in transient cond-let llama; do
     fi
 done
 
+# Return 0 when FILE (after symbolic links are resolved) is inside
+# PROJECT_ROOT, and not under .git/, a tmp/ folder, or a path that Git
+# ignores
+project_file_p() {
+    local file real root relative
+    file="$1"
+    real=$(resolve_path "$file") || return 1
+    root=$(resolve_path "$PROJECT_ROOT") || return 1
+    case "$real" in
+        "$root"/*) relative="${real#"$root"/}" ;;
+        *) return 1 ;;
+    esac
+    case "/$relative" in
+        */.git/*|*/tmp/*) return 1 ;;
+    esac
+    if command -v git >/dev/null 2>&1 \
+            && git -C "$root" check-ignore -q -- "$relative" 2>/dev/null; then
+        return 1
+    fi
+    return 0
+}
+
 # Function to format and clean a single Elisp file
 process_file() {
     local file="$1"
@@ -52,8 +74,21 @@ process_file() {
             fi
             ;;
         *)
-            # For other text files, just clean whitespace
-            sed -i -e 's/[[:space:]]*$//' -e '$a\' "$file" 2>/dev/null
+            # For other text files, just clean whitespace.  Write back
+            # through the same file (not sed -i, which differs between
+            # GNU and BSD sed and replaces a symbolic link with a copy)
+            local cleaned
+            cleaned=$(mktemp) || return 1
+            if sed -e 's/[[:space:]]*$//' "$file" > "$cleaned"; then
+                if ! cmp -s "$cleaned" "$file"; then
+                    cat "$cleaned" > "$file"
+                fi
+                # End the file with a newline
+                if [ -s "$file" ] && [ -n "$(tail -c 1 "$file")" ]; then
+                    echo >> "$file"
+                fi
+            fi
+            rm -f "$cleaned"
             echo "Cleaned whitespace in: $file" >&2
             ;;
     esac
@@ -71,6 +106,13 @@ if [ "$1" = "--hook" ]; then
 
     # Check if file exists
     if [ -z "$FILE_PATH" ] || [ ! -f "$FILE_PATH" ]; then
+        exit 0
+    fi
+
+    # A session also edits files outside the repository (for example a
+    # user's init file).  Process only files of this repository, and
+    # skip them silently otherwise
+    if ! project_file_p "$FILE_PATH"; then
         exit 0
     fi
 

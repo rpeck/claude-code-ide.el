@@ -142,6 +142,16 @@ if [ $COMPILE_EXIT_CODE -eq 0 ] && [ $NATIVE_COMPILE_EXIT_CODE -eq 0 ]; then
         echo "✗ Tests failed!" >&2
         TEST_FAILED=1
     fi
+
+    # The format hook must change files of this repository only
+    echo "" >&2
+    echo "=== Running the format hook test ===" >&2
+    if "$SCRIPT_DIR/test-format-hook.sh"; then
+        echo "✓ Format hook test passed!" >&2
+    else
+        echo "✗ Format hook test failed!" >&2
+        TEST_FAILED=1
+    fi
 else
     echo "" >&2
     echo "=== Skipping tests due to compilation errors ===" >&2
