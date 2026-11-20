@@ -2168,23 +2168,72 @@ asks again.  The installed script holds the limit."
       (claude-code-ide-codex-events-tests--kill-instances))))
 
 (ert-deftest claude-code-ide-codex-events-test-error-kinds ()
-  "The error kind `usage_limit_exceeded' is a quota limit; other kinds use the text."
+  "The kinds of the alist decide; another kind, or none, leaves it to the text."
   (should (equal (claude-code-ide-codex-events--error-kind "usage_limit_exceeded") "usage_limit_exceeded"))
   (should (equal (claude-code-ide-codex-events--error-kind '((http_connection_failed (http_status_code . 429))))
                  "http_connection_failed"))
   (should-not (claude-code-ide-codex-events--error-kind nil))
+  (should-not (claude-code-ide-codex-events--error-kind ""))
   (should-not (claude-code-ide-codex-events--error-kind 42))
   (should (eq (claude-code-ide-codex-events--quota-failure-p "usage_limit_exceeded" "") t))
-  (should (claude-code-ide-codex-events--quota-failure-p "usageLimitExceeded" nil))
+  ;; The user's answer: a session budget is a quota limit
+  (should (eq (claude-code-ide-codex-events--failure-kind "session_budget_exceeded" nil) 'quota-limit))
+  (should (eq (claude-code-ide-codex-events--failure-kind "usage_not_included" nil) 'not-included))
+  ;; The rollout writes snake case only
+  (should-not (claude-code-ide-codex-events--quota-failure-p "usageLimitExceeded" nil))
   (should-not (claude-code-ide-codex-events--quota-failure-p
                "rate_limit_exceeded" "exceeded retry limit, last status: 429 Too Many Requests"))
   (should-not (claude-code-ide-codex-events--quota-failure-p
                '((response_too_many_failed_attempts (http_status_code . 429))) "exceeded retry limit"))
   (should-not (claude-code-ide-codex-events--quota-failure-p "server_overloaded" nil))
+  ;; A known short kind wins over a quota text
+  (should-not (claude-code-ide-codex-events--quota-failure-p
+               "rate_limit_exceeded" (car claude-code-ide-codex-events-tests--quota-texts)))
+  (should-not (claude-code-ide-codex-events--quota-failure-p
+               "server_overloaded" "You exceeded your current quota"))
   ;; Another kind: the text decides
   (should (claude-code-ide-codex-events--quota-failure-p
            "other" "Quota exceeded. Check your plan and billing details."))
   (should-not (claude-code-ide-codex-events--quota-failure-p "other" "model_not_found")))
+
+(ert-deftest claude-code-ide-codex-events-test-error-kind-states-option ()
+  "`claude-code-ide-codex-events-error-kind-states' maps each kind to its state."
+  (let ((claude-code-ide-codex-events-error-kind-states
+         '(("rate_limit_exceeded" . quota-limit) ("usage_limit_exceeded" . error))))
+    (should (eq (claude-code-ide-codex-events--failure-kind "rate_limit_exceeded" "cci-test") 'quota-limit))
+    (should (eq (claude-code-ide-codex-events--failure-kind "usage_limit_exceeded"
+                                                            (car claude-code-ide-codex-events-tests--quota-texts))
+                'error))
+    ;; A kind that is no longer in the list: the text decides
+    (should (eq (claude-code-ide-codex-events--failure-kind "server_overloaded" "cci-test") 'error))
+    (should (eq (claude-code-ide-codex-events--failure-kind
+                 "server_overloaded" (car claude-code-ide-codex-events-tests--quota-texts))
+                'quota-limit)))
+  (let ((claude-code-ide-codex-events-not-included-regexp "cci-test-not-included"))
+    (should (eq (claude-code-ide-codex-events--failure-kind nil "cci-test-not-included") 'not-included))
+    (should (eq (claude-code-ide-codex-events--failure-kind
+                 nil "To use Codex with your ChatGPT plan, upgrade to Plus: https://chatgpt.com/explore/plus.")
+                'quota-limit))))
+
+(ert-deftest claude-code-ide-codex-events-test-short-limits-are-no-quota ()
+  "Texts of per-minute limits from other providers are never a quota limit."
+  (dolist (text '(;; Gemini
+                  "Quota exceeded for quota metric 'Generate Content API requests per minute' and limit 'GenerateContent request limit per minute' of service 'generativelanguage.googleapis.com' for consumer 'project_number:000000'."
+                  "429 RESOURCE_EXHAUSTED. Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests, limit: 15, model: gemini-2.0-flash. Please retry in 41.2s."
+                  ;; Azure OpenAI
+                  "Requests to the ChatCompletions_Create Operation under Azure OpenAI API version 2024-02-01 have exceeded token rate limit of your current OpenAI S0 pricing tier. Please retry after 6 seconds."
+                  "Your quota for this deployment is exhausted for now (RPM). Try again in 3 seconds."
+                  ;; OpenAI
+                  "Rate limit reached for gpt-5.6-terra in organization org-cci on tokens per min (TPM): Limit 30000, Used 29500. Please try again in 1.2s."))
+    (should-not (claude-code-ide-session-status--quota-text-p text))
+    (should-not (claude-code-ide-codex-events--quota-failure-p "other" text)))
+  ;; A daily quota and a usage limit with a time stay quota limits
+  (should (claude-code-ide-session-status--quota-text-p
+           "Quota exceeded for quota metric 'Generate Content API requests per day'"))
+  (should (claude-code-ide-session-status--quota-text-p
+           "You exceeded your current quota, please check your plan and billing details."))
+  (should (claude-code-ide-session-status--quota-text-p
+           "You’ve hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus), or try again at 3:05 PM.")))
 
 ;;; The rollout file of an instance without hooks
 
@@ -2227,15 +2276,17 @@ asks again.  The installed script holds the limit."
 
 (defmacro claude-code-ide-codex-events-tests--with-rollout (&rest body)
   "Run BODY with the Codex instance `instance' without hooks, and `file'.
-`file' is the rollout file of the instance.  A fake Codex provider gives `file' as the transcript of the native ID
-of the tests, and `unknown' for another; `calls' counts its calls.
-The file is in the report folder; BODY writes it."
+`file' is the rollout file of the instance.  A fake Codex provider
+gives `file' as the transcript of the native ID of the tests, and
+`unknown' for another; `calls' counts its calls.  The file is in the
+report folder; BODY writes it."
   (declare (indent 0))
   `(claude-code-ide-codex-events-tests--with-codex
      (let* ((native claude-code-ide-codex-events-tests--native)
             (file (expand-file-name (format "rollout-2026-11-20T10-00-00-%s.jsonl" native) registry-dir))
             (calls 0)
             (claude-code-ide-codex-events--rollout-cache (make-hash-table :test 'eq :weakness 'key))
+            (claude-code-ide-codex-events--state-cache (make-hash-table :test 'eq :weakness 'key))
             (claude-code-ide-provider--registry
              (list (cons 'codex
                          (claude-code-ide-provider-create
@@ -2268,22 +2319,26 @@ The file is in the report folder; BODY writes it."
   (claude-code-ide-codex-events--instance-detail
    instance (cl-incf claude-code-ide-codex-events-tests--now)))
 
+(defun claude-code-ide-codex-events-tests--touch (file seconds)
+  "Set the modification time of FILE to SECONDS (a float time)."
+  (set-file-times file (seconds-to-time seconds)))
+
 (ert-deftest claude-code-ide-codex-events-test-rollout-states ()
-  "The last turn record of the rollout gives the state of an instance without hooks."
+  "The last turn record of the rollout gives the state, always as a guess."
   (claude-code-ide-codex-events-tests--with-rollout
     (claude-code-ide-codex-events-tests--append file (claude-code-ide-codex-events-tests--meta))
-    ;; No turn yet: idle, a guess
+    ;; No turn yet
     (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(idle nil t rollout nil)))
     (claude-code-ide-codex-events-tests--append file (claude-code-ide-codex-events-tests--started "t1" 1000))
-    (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(working nil nil rollout 1000.0)))
+    (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(working nil t rollout 1000.0)))
     (should (equal (claude-code-ide-codex-events-tests--detail instance)
                    "From rollout: a turn runs · No status hooks"))
     (claude-code-ide-codex-events-tests--append file (claude-code-ide-codex-events-tests--complete "t1" 1010))
-    (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(idle nil nil rollout 1010.0)))
+    (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(idle nil t rollout 1010.0)))
     ;; An interrupt
     (claude-code-ide-codex-events-tests--append file (claude-code-ide-codex-events-tests--started "t2" 1020)
                                                 (claude-code-ide-codex-events-tests--aborted "t2" 1025))
-    (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(idle nil nil rollout 1025.0)))
+    (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(idle nil t rollout 1025.0)))
     (should (string-prefix-p "From rollout: interrupted" (claude-code-ide-codex-events-tests--detail instance)))
     ;; A usage limit, by its error kind
     (claude-code-ide-codex-events-tests--append
@@ -2292,16 +2347,22 @@ The file is in the report folder; BODY writes it."
       "t3" 1031 `((message . ,(car claude-code-ide-codex-events-tests--quota-texts))
                   (codex_error_info . "usage_limit_exceeded"))))
     (should (equal (claude-code-ide-codex-events-tests--full-state instance)
-                   '(failed quota-limit nil rollout 1031.0)))
+                   '(failed quota-limit t rollout 1031.0)))
     (should (string-prefix-p "From rollout: Quota limit: You’ve hit your usage limit"
                              (claude-code-ide-codex-events-tests--detail instance)))
+    ;; A session budget is a quota limit too (the user's answer)
+    (claude-code-ide-codex-events-tests--append
+     file (claude-code-ide-codex-events-tests--started "t3b" 1032)
+     (claude-code-ide-codex-events-tests--complete
+      "t3b" 1033 '((message . "cci-test budget") (codex_error_info . "session_budget_exceeded"))))
+    (should (equal (seq-take (claude-code-ide-codex-events-tests--full-state instance) 2) '(failed quota-limit)))
     ;; A rate limit after the retries: an error
     (claude-code-ide-codex-events-tests--append
      file (claude-code-ide-codex-events-tests--started "t4" 1040)
      (claude-code-ide-codex-events-tests--complete
       "t4" 1041 '((message . "exceeded retry limit, last status: 429 Too Many Requests")
                   (codex_error_info (response_too_many_failed_attempts (http_status_code . 429))))))
-    (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(failed error nil rollout 1041.0)))
+    (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(failed error t rollout 1041.0)))
     (should (string-match-p "Error: exceeded retry limit" (claude-code-ide-codex-events-tests--detail instance)))
     ;; The model_not_found record of a real Codex 0.164.0 run
     (claude-code-ide-codex-events-tests--append
@@ -2312,8 +2373,77 @@ The file is in the report folder; BODY writes it."
     (should (equal (seq-take (claude-code-ide-codex-events-tests--full-state instance) 2) '(failed error)))
     ;; The next prompt starts a turn
     (claude-code-ide-codex-events-tests--append file (claude-code-ide-codex-events-tests--started "t6" 1060))
-    (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(working nil nil rollout 1060.0)))
+    (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(working nil t rollout 1060.0)))
     (should (= (hash-table-count claude-code-ide-codex-events--rollout-cache) 1))))
+
+(ert-deftest claude-code-ide-codex-events-test-rollout-error-without-text ()
+  "A turn error without a kind and a message is \"unknown error\"; a kind alone shows."
+  (claude-code-ide-codex-events-tests--with-rollout
+    (claude-code-ide-codex-events-tests--append
+     file (claude-code-ide-codex-events-tests--meta)
+     (claude-code-ide-codex-events-tests--started "t1" 1000)
+     (claude-code-ide-codex-events-tests--complete "t1" 1001 '((message . "") (codex_error_info . nil))))
+    (should (equal (seq-take (claude-code-ide-codex-events-tests--full-state instance) 2) '(failed error)))
+    (should (equal (claude-code-ide-codex-events-tests--detail instance)
+                   "From rollout: Error: unknown error · No status hooks"))
+    (claude-code-ide-codex-events-tests--append
+     file (claude-code-ide-codex-events-tests--started "t2" 1010)
+     (claude-code-ide-codex-events-tests--complete "t2" 1011 '((message . " ") (codex_error_info . "server_overloaded"))))
+    (should (string-prefix-p "From rollout: Error: server_overloaded"
+                             (claude-code-ide-codex-events-tests--detail instance)))))
+
+(ert-deftest claude-code-ide-codex-events-test-rollout-turn-of-a-killed-process ()
+  "A turn that started before the launch did not end: it is no running turn."
+  (claude-code-ide-codex-events-tests--with-rollout
+    (setf (claude-code-ide-instance-process-start-time instance) 1500.0)
+    (claude-code-ide-codex-events-tests--append file (claude-code-ide-codex-events-tests--meta)
+                                                (claude-code-ide-codex-events-tests--started "t1" 1000))
+    (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(idle nil t rollout nil)))
+    (should (string-prefix-p "From rollout: a turn of an earlier run did not end"
+                             (claude-code-ide-codex-events-tests--detail instance)))
+    ;; A turn of this launch runs
+    (claude-code-ide-codex-events-tests--append file (claude-code-ide-codex-events-tests--started "t2" 1500))
+    (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(working nil t rollout 1500.0)))
+    ;; With a launch record, its time counts
+    (let ((launch (claude-code-ide-codex-events--track instance)))
+      (setf (claude-code-ide-codex-events--launch-hooks launch) nil
+            (claude-code-ide-codex-events--launch-registered launch) 1600.0)
+      (should (eq (car (claude-code-ide-codex-events-tests--full-state instance)) 'idle)))))
+
+(ert-deftest claude-code-ide-codex-events-test-rollout-after-input ()
+  "A RET in the terminal without a rollout record after it stops the trust in the rollout."
+  (claude-code-ide-codex-events-tests--with-rollout
+    (claude-code-ide-codex-events-tests--append file (claude-code-ide-codex-events-tests--meta)
+                                                (claude-code-ide-codex-events-tests--complete "t1" 1000))
+    (claude-code-ide-codex-events-tests--touch file 1000.0)
+    (let ((buffer (claude-code-ide-instance-buffer instance)))
+      (should (eq (car (claude-code-ide-codex-events-tests--full-state instance)) 'idle))
+      ;; The state watches the terminal for RET
+      (with-current-buffer buffer
+        (should (memq #'claude-code-ide-codex-events--note-input post-command-hook))
+        (let ((last-command-event ?a))
+          (claude-code-ide-codex-events--note-input))
+        (should-not claude-code-ide-codex-events--last-input)
+        (let ((last-command-event ?\r))
+          (claude-code-ide-codex-events--note-input))
+        (should claude-code-ide-codex-events--last-input)
+        ;; A RET at 3000 (after /new, for example), and no record since
+        (setq claude-code-ide-codex-events--last-input 3000.0))
+      ;; Within the grace time the rollout still counts
+      (should (eq (plist-get (claude-code-ide-instance-state instance 3002.0) :state) 'idle))
+      (should (equal (seq-take (let ((state (claude-code-ide-instance-state instance 3010.0)))
+                                 (list (plist-get state :state) (plist-get state :reason)
+                                       (plist-get state :source)))
+                               3)
+                     '(disconnected untracked nil)))
+      (should (equal (claude-code-ide-codex-events--instance-detail instance 3011.0)
+                     "No status hooks; no rollout record since the last input in the terminal"))
+      ;; Codex writes a record after the RET: the rollout counts again
+      (claude-code-ide-codex-events-tests--append file (claude-code-ide-codex-events-tests--started "t2" 3001))
+      (claude-code-ide-codex-events-tests--touch file 3001.0)
+      (should (equal (let ((state (claude-code-ide-instance-state instance 3020.0)))
+                       (list (plist-get state :state) (plist-get state :guess) (plist-get state :source)))
+                     '(working t rollout))))))
 
 (ert-deftest claude-code-ide-codex-events-test-rollout-read-on-change ()
   "The rollout is read only when it changes, from the end of the last read, never written."
@@ -2330,13 +2460,10 @@ The file is in the report folder; BODY writes it."
         (should reads)
         (let ((size (file-attribute-size (file-attributes file)))
               (time (file-attribute-modification-time (file-attributes file))))
-          ;; No change: no read, and the result of one refresh is kept
+          ;; No change: no read
           (setq reads nil)
           (dotimes (_ 3)
             (should (eq (car (claude-code-ide-codex-events-tests--full-state instance)) 'working)))
-          (let ((now (cl-incf claude-code-ide-codex-events-tests--now)))
-            (should (equal (claude-code-ide-codex-events--rollout-state instance now)
-                           (claude-code-ide-codex-events--rollout-state instance now))))
           (should-not reads)
           ;; The file grows: only the new bytes are read
           (claude-code-ide-codex-events-tests--append file (claude-code-ide-codex-events-tests--complete "t1" 1010))
@@ -2354,8 +2481,64 @@ The file is in the report folder; BODY writes it."
           (delete-file file)
           (claude-code-ide-codex-events-tests--append file (claude-code-ide-codex-events-tests--meta)
                                                       (claude-code-ide-codex-events-tests--started "t9" 1100))
-          (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(working nil nil rollout 1100.0)))
+          (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(working nil t rollout 1100.0)))
           (should (assq 0 reads)))))))
+
+(defun claude-code-ide-codex-events-tests--same-size-line (line size)
+  "Return LINE, a JSON record and its newline, padded to SIZE bytes."
+  (let ((pad (- size (string-bytes line))))
+    (should (>= pad 0))
+    (concat (substring line 0 -2) (make-string pad ? ) "}\n")))
+
+(ert-deftest claude-code-ide-codex-events-test-rollout-rewritten-in-place ()
+  "A new time with the same size, or a new inode, checks the owner and reads again."
+  (claude-code-ide-codex-events-tests--with-rollout
+    (let* ((started (claude-code-ide-codex-events-tests--started "t1" 1000))
+           (complete (claude-code-ide-codex-events-tests--complete "t1" 1010))
+           (size (max (string-bytes started) (string-bytes complete))))
+      (claude-code-ide-codex-events-tests--append
+       file (claude-code-ide-codex-events-tests--meta)
+       (claude-code-ide-codex-events-tests--same-size-line started size))
+      (claude-code-ide-codex-events-tests--touch file 1000.0)
+      (should (eq (car (claude-code-ide-codex-events-tests--full-state instance)) 'working))
+      ;; The same size, another last record, a new time
+      (let ((coding-system-for-write 'utf-8-unix))
+        (with-temp-buffer
+          (insert (claude-code-ide-codex-events-tests--meta)
+                  (claude-code-ide-codex-events-tests--same-size-line complete size))
+          (write-region nil nil file nil 'silent)))
+      (claude-code-ide-codex-events-tests--touch file 1001.0)
+      (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(idle nil t rollout 1010.0)))
+      ;; The same size again, now of another conversation
+      (let ((coding-system-for-write 'utf-8-unix))
+        (with-temp-buffer
+          (insert (claude-code-ide-codex-events-tests--meta "cci-test-0012-0000-4000-8000-000000000000")
+                  (claude-code-ide-codex-events-tests--same-size-line complete size))
+          (write-region nil nil file nil 'silent)))
+      (claude-code-ide-codex-events-tests--touch file 1002.0)
+      (should (equal (seq-take (claude-code-ide-codex-events-tests--full-state instance) 2)
+                     '(disconnected untracked)))
+      ;; A larger file of the conversation with a new inode: read from the start
+      (let ((new (concat file ".new")))
+        (let ((coding-system-for-write 'utf-8-unix))
+          (with-temp-file new
+            (insert (claude-code-ide-codex-events-tests--meta)
+                    (claude-code-ide-codex-events-tests--started "t7" 1070)
+                    (claude-code-ide-codex-events-tests--rollout-record
+                     "response_item" '((type . "message") (text . "cci-test padding padding padding"))))))
+        (rename-file new file t))
+      (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(working nil t rollout 1070.0)))
+      ;; A larger file of another conversation with a new inode
+      (let ((new (concat file ".new")))
+        (let ((coding-system-for-write 'utf-8-unix))
+          (with-temp-file new
+            (insert (claude-code-ide-codex-events-tests--meta "cci-test-0012-0000-4000-8000-000000000000")
+                    (claude-code-ide-codex-events-tests--started "t8" 1080)
+                    (claude-code-ide-codex-events-tests--rollout-record
+                     "response_item" `((type . "message") (text . ,(make-string 300 ?p)))))))
+        (rename-file new file t))
+      (should (equal (seq-take (claude-code-ide-codex-events-tests--full-state instance) 2)
+                     '(disconnected untracked))))))
 
 (ert-deftest claude-code-ide-codex-events-test-rollout-partial-line ()
   "A line that Codex still writes counts only when its newline is there."
@@ -2370,7 +2553,22 @@ The file is in the report folder; BODY writes it."
       (claude-code-ide-codex-events-tests--append file (substring line 40 -1))
       (should (eq (car (claude-code-ide-codex-events-tests--full-state instance)) 'idle))
       (claude-code-ide-codex-events-tests--append file "\n")
-      (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(working nil nil rollout 1020.0))))))
+      (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(working nil t rollout 1020.0))))))
+
+(ert-deftest claude-code-ide-codex-events-test-rollout-partial-session-record ()
+  "A session record without its newline yet is \"not readable yet\", not another conversation."
+  (claude-code-ide-codex-events-tests--with-rollout
+    (let ((meta (claude-code-ide-codex-events-tests--meta)))
+      (claude-code-ide-codex-events-tests--append file (substring meta 0 30))
+      (should (equal (seq-take (claude-code-ide-codex-events-tests--full-state instance) 4)
+                     '(disconnected untracked nil nil)))
+      (should (equal (claude-code-ide-codex-events-tests--detail instance)
+                     "No status hooks; rollout file not readable yet"))
+      (should-not (plist-get (gethash instance claude-code-ide-codex-events--rollout-cache) :owner))
+      ;; Codex ends the line: the file is of the conversation
+      (claude-code-ide-codex-events-tests--append file (substring meta 30)
+                                                  (claude-code-ide-codex-events-tests--started "t1" 1000))
+      (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(working nil t rollout 1000.0))))))
 
 (ert-deftest claude-code-ide-codex-events-test-rollout-small-chunks ()
   "Lines longer than a chunk, look-alike records and over-long lines are handled."
@@ -2387,28 +2585,30 @@ The file is in the report folder; BODY writes it."
        ;; Another record type with a turn payload type is no turn record
        (claude-code-ide-codex-events-tests--rollout-record
         "response_item" `((type . "task_complete") (text . ,text))))
-      (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(working nil nil rollout 1000.0)))
+      (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(working nil t rollout 1000.0)))
       ;; A line above the limit is skipped; the record before it counts
       (claude-code-ide-codex-events-tests--append
        file (claude-code-ide-codex-events-tests--complete "t1" 1010)
        (claude-code-ide-codex-events-tests--rollout-record
         "response_item" `((type . "message") (text . ,(make-string 2000 ?y)))))
-      (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(idle nil nil rollout 1010.0))))))
+      (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(idle nil t rollout 1010.0))))))
 
 (ert-deftest claude-code-ide-codex-events-test-rollout-of-this-conversation-only ()
   "Only the rollout of the conversation of the instance gives a state."
   (claude-code-ide-codex-events-tests--with-rollout
-    ;; The file is not there yet
+    ;; The file is not there yet; the detail says once that hooks are missing
     (should (equal (seq-take (claude-code-ide-codex-events-tests--full-state instance) 4)
                    '(disconnected untracked nil nil)))
-    (should (string-match-p "not readable" (claude-code-ide-codex-events-tests--detail instance)))
-    ;; A file whose first record is of another conversation
+    (should (equal (claude-code-ide-codex-events-tests--detail instance)
+                   "No status hooks; rollout file not readable"))
+    ;; A file whose session record is of another conversation
     (claude-code-ide-codex-events-tests--append
      file (claude-code-ide-codex-events-tests--meta "cci-test-0012-0000-4000-8000-000000000000")
      (claude-code-ide-codex-events-tests--started "t1" 1000))
     (should (equal (seq-take (claude-code-ide-codex-events-tests--full-state instance) 4)
                    '(disconnected untracked nil nil)))
-    (should (string-match-p "another conversation" (claude-code-ide-codex-events-tests--detail instance)))
+    (should (equal (claude-code-ide-codex-events-tests--detail instance)
+                   "No status hooks; the rollout file is of another conversation"))
     (delete-file file)
     (claude-code-ide-codex-events-tests--append file (claude-code-ide-codex-events-tests--meta)
                                                 (claude-code-ide-codex-events-tests--started "t1" 1000))
@@ -2424,7 +2624,7 @@ The file is in the report folder; BODY writes it."
     (should (= calls 0))
     (setf (claude-code-ide-instance-native-id instance) native)
     (should (eq (car (claude-code-ide-codex-events-tests--full-state instance)) 'working))
-    ;; No transcript operation (the provider of this release), no provider, or an error
+    ;; No transcript operation, no provider, or an error
     (dolist (registry (list (list (cons 'codex (claude-code-ide-provider-create :name 'codex)))
                             nil
                             (list (cons 'codex (claude-code-ide-provider-create
@@ -2447,8 +2647,9 @@ The file is in the report folder; BODY writes it."
       (should (= calls 0))
       ;; A launch without hooks: the rollout, with the trust problem in the detail
       (setf (claude-code-ide-codex-events--launch-hooks launch) nil
+            (claude-code-ide-codex-events--launch-registered launch) 900.0
             (claude-code-ide-codex-events--launch-trust-detail launch) "cci-test: hooks not trusted")
-      (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(working nil nil rollout 1000.0)))
+      (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(working nil t rollout 1000.0)))
       (should (equal (claude-code-ide-codex-events-tests--detail instance)
                      "From rollout: a turn runs · cci-test: hooks not trusted"))
       ;; A dialog on the screen of a launch without hooks
@@ -2460,7 +2661,8 @@ The file is in the report folder; BODY writes it."
       (should (claude-code-ide-session-status--write-snapshot t (cl-incf claude-code-ide-codex-events-tests--now)))
       (let ((record (car (alist-get 'instances (claude-code-ide-codex-events-tests--read-snapshot)))))
         (should (equal (alist-get 'source record) "rollout"))
-        (should (equal (alist-get 'state record) "working")))
+        (should (equal (alist-get 'state record) "working"))
+        (should (eq (alist-get 'guess record) t)))
       ;; No launch record and no known conversation: UNTRACKED, without a source
       (remhash "cci-test-rollout" claude-code-ide-codex-events--launches)
       (setf (claude-code-ide-instance-native-id instance) 'unknown)
@@ -2468,7 +2670,174 @@ The file is in the report folder; BODY writes it."
       (let ((record (car (alist-get 'instances (claude-code-ide-codex-events-tests--read-snapshot)))))
         (should (assq 'source record))
         (should (null (alist-get 'source record)))
-        (should (equal (alist-get 'reason record) "untracked"))))))
+        (should (equal (alist-get 'reason record) "untracked"))
+        (should (equal (alist-get 'detail record) "No status hooks"))))))
+
+(ert-deftest claude-code-ide-codex-events-test-shared-helpers ()
+  "The rollout reader uses the transcript parsers; both fallbacks share one memo helper."
+  (claude-code-ide-codex-events-tests--with-rollout
+    (claude-code-ide-codex-events-tests--append file (claude-code-ide-codex-events-tests--meta)
+                                                (claude-code-ide-codex-events-tests--started "t1" 1000))
+    (let ((meta 0) (parse 0) (memo nil)
+          (original-meta (symbol-function 'claude-code-ide-transcript-codex-meta))
+          (original-parse (symbol-function 'claude-code-ide-transcript--parse-line))
+          (original-memo (symbol-function 'claude-code-ide-session-status--once-per-refresh)))
+      (cl-letf (((symbol-function 'claude-code-ide-transcript-codex-meta)
+                 (lambda (name) (cl-incf meta) (funcall original-meta name)))
+                ((symbol-function 'claude-code-ide-transcript--parse-line)
+                 (lambda (line) (cl-incf parse) (funcall original-parse line)))
+                ((symbol-function 'claude-code-ide-session-status--once-per-refresh)
+                 (lambda (table key now compute &optional stamp)
+                   (push table memo)
+                   (funcall original-memo table key now compute stamp))))
+        (should (eq (car (claude-code-ide-codex-events-tests--full-state instance)) 'working))
+        (should (= meta 1))
+        (should (> parse 0))
+        (should (memq claude-code-ide-codex-events--state-cache memo))
+        (setq memo nil)
+        (claude-code-ide-session-status--cli-state (claude-code-ide-tests--make-session "/tmp/cci-test-memo/") 5.0)
+        (should (memq claude-code-ide-session-status--cli-cache memo))))))
+
+(ert-deftest claude-code-ide-codex-events-test-state-once-per-refresh ()
+  "The state of a row is computed once for each refresh; a change counts as a new one."
+  (claude-code-ide-codex-events-tests--with-codex
+    (unwind-protect
+        (let* ((claude-code-ide-codex-events--state-cache (make-hash-table :test 'eq :weakness 'key))
+               (instance (claude-code-ide-codex-events-tests--instance "cci-test-once" 1))
+               (count 0)
+               (original (symbol-function 'claude-code-ide-codex-events--state)))
+          (claude-code-ide-codex-events--track instance)
+          (claude-code-ide-codex-events-tests--feed "cci-test-once" 1 '(("SessionStart" "{}") ("UserPromptSubmit" "{}")))
+          (cl-letf (((symbol-function 'claude-code-ide-codex-events--state)
+                     (lambda (launch now) (cl-incf count) (funcall original launch now))))
+            (should (eq (plist-get (claude-code-ide-instance-state instance 1000.0) :state) 'working))
+            (should (equal (claude-code-ide-codex-events--instance-detail instance 1000.0) "Working"))
+            (claude-code-ide-session-status--snapshot-instance instance 1000.0)
+            (should (= count 1))
+            ;; An event at the same time is a change
+            (claude-code-ide-codex-events-tests--feed "cci-test-once" 1 '(("Stop" "{\"last_assistant_message\":\"done\"}")))
+            (should (eq (plist-get (claude-code-ide-instance-state instance 1000.0) :state) 'idle))
+            (should (= count 2))
+            ;; A new refresh
+            (claude-code-ide-codex-events--instance-detail instance 1001.0)
+            (should (= count 3))))
+      (claude-code-ide-codex-events-tests--kill-instances))))
+
+;;; A plan without Codex
+
+(defconst claude-code-ide-codex-events-tests--not-included
+  "To use Codex with your ChatGPT plan, upgrade to Plus: https://chatgpt.com/explore/plus."
+  "The Codex 0.164.0 text of `usage_not_included'.")
+
+(defmacro claude-code-ide-codex-events-tests--with-not-included (&rest body)
+  "Run BODY with `instance', a Codex instance whose plan does not include Codex.
+The stubs record `visits', `handovers' and `stops'; `choices' are the
+answers of `read-multiple-choice', and `asked' counts its calls."
+  (declare (indent 0))
+  `(claude-code-ide-codex-events-tests--with-codex
+     (require 'claude-code-ide-handover)
+     (require 'claude-code-ide-control)
+     (let ((claude-code-ide-codex-events--state-cache (make-hash-table :test 'eq :weakness 'key))
+           (instance (claude-code-ide-codex-events-tests--instance "cci-test-plan" 1))
+           (visits 0) (handovers nil) (stops nil) (choices nil) (asked 0))
+       (unwind-protect
+           (cl-letf (((symbol-function 'claude-code-ide-session-status--visit-session)
+                      (lambda (_item) (cl-incf visits)))
+                     ((symbol-function 'claude-code-ide-handover--read-args)
+                      (lambda (&optional id) (list id 'claude)))
+                     ((symbol-function 'claude-code-ide-handover)
+                      (lambda (id target &rest _) (push (list id target) handovers)))
+                     ((symbol-function 'claude-code-ide-control-stop)
+                      (lambda (id) (push id stops) (list :status 'ok :instance-id id :result 'stopped)))
+                     ((symbol-function 'read-multiple-choice)
+                      (lambda (_prompt options &rest _)
+                        (cl-incf asked)
+                        (assq (pop choices) options))))
+             (claude-code-ide-codex-events--track instance)
+             (claude-code-ide-codex-events-tests--feed
+              "cci-test-plan" 1
+              (list '("UserPromptSubmit" "{}")
+                    (list "PostModelRequest"
+                          (json-encode `((status . "failed")
+                                         (error . ,claude-code-ide-codex-events-tests--not-included))))))
+             ,@body)
+         (claude-code-ide-codex-events-tests--kill-instances)))))
+
+(ert-deftest claude-code-ide-codex-events-test-not-included-state ()
+  "A plan without Codex is failed/quota-limit, with its own detail and mark."
+  (claude-code-ide-codex-events-tests--with-not-included
+    (let ((state (claude-code-ide-instance-state instance 1000.0)))
+      (should (equal (list (plist-get state :state) (plist-get state :reason) (plist-get state :not-included))
+                     '(failed quota-limit t))))
+    (should (string-prefix-p "Not included in the plan: To use Codex"
+                             (claude-code-ide-codex-events--instance-detail instance 1000.0)))
+    ;; The snapshot of a coordinator has the state, the reason and the detail
+    (let ((record (claude-code-ide-session-status--snapshot-instance instance 1000.0)))
+      (should (equal (alist-get 'reason record) "quota-limit"))
+      (should (string-prefix-p "Not included in the plan" (alist-get 'detail record))))
+    ;; A usage limit has no such mark
+    (claude-code-ide-codex-events-tests--feed
+     "cci-test-plan" 1
+     (list '("UserPromptSubmit" "{}")
+           (list "PostModelRequest"
+                 (json-encode `((status . "failed") (error . ,(car claude-code-ide-codex-events-tests--quota-texts)))))))
+    (should-not (plist-get (claude-code-ide-instance-state instance 1001.0) :not-included))
+    (should (eq (claude-code-ide-codex-events--failure-kind "usage_not_included" "cci-test") 'not-included))))
+
+(ert-deftest claude-code-ide-codex-events-test-not-included-ask ()
+  "With `ask', the visit and the handover key ask: c continues, h hands over, s stops."
+  (claude-code-ide-codex-events-tests--with-not-included
+    (should (eq claude-code-ide-codex-events-not-included-action 'ask))
+    ;; c on a visit: the terminal shows, nothing else
+    (setq choices '(?c))
+    (claude-code-ide-session-status--visit-item instance)
+    (should (equal (list asked visits handovers stops) '(1 1 nil nil)))
+    ;; c on the handover key: nothing
+    (setq choices '(?c))
+    (cl-letf (((symbol-function 'claude-code-ide-session-status--handover-instance) (lambda () instance)))
+      (claude-code-ide-session-status-handover))
+    (should (equal (list asked visits handovers stops) '(2 1 nil nil)))
+    ;; h: a handover of this instance, once
+    (setq choices '(?h))
+    (claude-code-ide-session-status--visit-item instance)
+    (should (equal handovers '(("cci-test-plan" claude))))
+    (setq choices '(?h))
+    (cl-letf (((symbol-function 'claude-code-ide-session-status--handover-instance) (lambda () instance)))
+      (claude-code-ide-session-status-handover))
+    (should (= (length handovers) 2))
+    (should (= visits 1))
+    ;; s: the stop of this instance
+    (setq choices '(?s))
+    (claude-code-ide-session-status--visit-item instance)
+    (should (equal stops '("cci-test-plan")))
+    (should (= visits 1))
+    ;; Another state asks nothing
+    (claude-code-ide-codex-events-tests--feed "cci-test-plan" 1 '(("UserPromptSubmit" "{}")))
+    (setq asked 0)
+    (claude-code-ide-session-status--visit-item instance)
+    (should (= asked 0))
+    (should (= visits 2))))
+
+(ert-deftest claude-code-ide-codex-events-test-not-included-action-values ()
+  "Each value of `claude-code-ide-codex-events-not-included-action' acts without a question."
+  (claude-code-ide-codex-events-tests--with-not-included
+    (let ((claude-code-ide-codex-events-not-included-action 'continue))
+      (claude-code-ide-session-status--visit-item instance)
+      (cl-letf (((symbol-function 'claude-code-ide-session-status--handover-instance) (lambda () instance)))
+        (claude-code-ide-session-status-handover))
+      (should (equal (list asked visits handovers stops) '(0 1 nil nil))))
+    (let ((claude-code-ide-codex-events-not-included-action 'handover))
+      (claude-code-ide-session-status--visit-item instance)
+      (should (equal (list asked visits handovers stops) '(0 1 (("cci-test-plan" claude)) nil))))
+    (let ((claude-code-ide-codex-events-not-included-action 'stop))
+      (claude-code-ide-session-status--visit-item instance)
+      (should (equal (list asked visits (length handovers) stops) '(0 1 1 ("cci-test-plan")))))
+    ;; `claude-code-ide-visit-waiting-session' acts on the row too
+    (let ((claude-code-ide-codex-events-not-included-action 'stop))
+      (cl-letf (((symbol-function 'claude-code-ide-session-status--rows)
+                 (lambda (&rest _) (list (list instance 'quota 1000.0 "cci-test" nil)))))
+        (claude-code-ide-visit-waiting-session))
+      (should (= (length stops) 2)))))
 
 (provide 'claude-code-ide-codex-events-tests)
 

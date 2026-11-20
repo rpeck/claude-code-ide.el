@@ -99,10 +99,10 @@ Code: `claude-code-ide-session-status.el`, section "Status snapshot". The common
 | `waiting-for-user` | `approval`, `question`, `dialog` | The agent waits for an answer. Do not type into the terminal. |
 | `waiting-for-task` | `subagent`, `background-task`, `other-instance` | The agent waits for its own background work. |
 | `disconnected` | `untracked`, `no-signal` | No status events come. `untracked`: the launch has no status hooks, or its Codex hooks were not trusted at the launch. `no-signal`: the launch has hooks, but no event came since its start. No reason: the process is gone, or the session ended. |
-| `failed` | `quota-limit`, `exit-code`, `error` | The last turn failed. `quota-limit`: the account reached its usage limit. |
+| `failed` | `quota-limit`, `exit-code`, `error` | The last turn failed. `quota-limit`: the account reached its usage limit, or its plan does not include Codex (the detail starts with "Not included in the plan"). |
 
 - `failed/quota-limit` needs a usage limit of the account: a Claude Code `billing_error`, or an error text that says a usage or plan limit was reached. A short rate limit is `failed/error`. [status-events.md](status-events.md), section "Quota limits", has the full table.
-- A guess is not an event. Examples: a reply that ends with a question (`waiting-for-user/question`, guess), and a Codex approval after 10 seconds without a screen check.
+- A guess is not an event. Examples: a reply that ends with a question (`waiting-for-user/question`, guess), a Codex approval after 10 seconds without a screen check, and each state from a rollout file.
 
 ### Sources
 
@@ -110,7 +110,7 @@ Code: `claude-code-ide-session-status.el`, section "Status snapshot". The common
 |---|---|---|
 | `"hooks"` | both | The status hooks of the launch. Also the states that Emacs infers from them, such as `working/starting` and `disconnected/no-signal`. |
 | `"cli-file"` | `claude` | The launch has no hooks. The state comes from the CLI status file of the process, `<config>/sessions/<pid>.json`. |
-| `"rollout"` | `codex` | The launch has no hooks. The state comes from the last turn record of the rollout file of the conversation. An approval or a question shows as `working`. |
+| `"rollout"` | `codex` | The launch has no hooks. The state comes from the last turn record of the rollout file of the conversation. It is always a guess (`guess` true): the terminal can be in another conversation. An approval or a question shows as `working`. |
 | `"screen"` | `codex` | The launch has no hooks, and its terminal shows a startup dialog: `waiting-for-user/dialog` or `waiting-for-user/approval`. |
 | null | both | No source gives the state: `disconnected/untracked`, or a process that is gone. |
 

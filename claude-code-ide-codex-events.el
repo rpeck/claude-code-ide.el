@@ -192,7 +192,9 @@ The user answered the approval then, or a reviewer did."))
 Events with another session ID come from a nested session.")
   (phase 'starting :type symbol
          :documentation "`starting', `working', `idle', `failed' or `ended'.")
-  (failure nil :documentation "`error' or `quota-limit' in the `failed' phase.")
+  (failure nil :documentation "`error', `quota-limit' or `not-included' in the `failed' phase.
+`not-included': the plan of the account does not include Codex; its
+state is `failed/quota-limit'.")
   (detail "" :type string)
   (since 0.0 :type float :documentation "Time the phase started.")
   (registered 0.0 :type float)
@@ -519,30 +521,98 @@ See `claude-code-ide-session-status-quota-regexp'.  A failed
 `PostModelRequest' has only this text, not the error kind."
   (claude-code-ide-session-status--quota-text-p error))
 
-(defconst claude-code-ide-codex-events--quota-kinds
-  '("usage_limit_exceeded" "usageLimitExceeded")
-  "Codex error kinds (`codex_error_info') of a usage limit of the account.
-The rollout writes the kind in snake case, the app-server in camel
-case.  `rate_limit_exceeded', `server_overloaded' and the other kinds
-are no quota limit.")
+(defcustom claude-code-ide-codex-events-error-kind-states
+  '(("usage_limit_exceeded" . quota-limit)
+    ("session_budget_exceeded" . quota-limit)
+    ("usage_not_included" . quota-limit)
+    ("rate_limit_exceeded" . error)
+    ("server_overloaded" . error)
+    ("response_too_many_failed_attempts" . error)
+    ("http_connection_failed" . error)
+    ("response_stream_connection_failed" . error)
+    ("response_stream_disconnected" . error)
+    ("internal_server_error" . error)
+    ("flex_unavailable" . error)
+    ("context_window_exceeded" . error)
+    ("cyber_policy" . error)
+    ("misalignment_policy_violation" . error)
+    ("too_many_denials" . error)
+    ("unauthorized" . error)
+    ("bad_request" . error)
+    ("thread_rollback_failed" . error)
+    ("sandbox_error" . error)
+    ("active_turn_not_steerable" . error))
+  "The state of a failed Codex turn for each error kind.
+Each element is (KIND . STATE).  KIND is a `codex_error_info' of the
+rollout file, in snake case, such as \"usage_limit_exceeded\".  STATE
+is `quota-limit' (the state `failed/quota-limit') or `error' (the
+state `failed/error').  For a kind that is not in the list, such as
+\"other\", or for no kind, the error text decides; see
+`claude-code-ide-session-status-quota-regexp'.  The hooks give no
+kind, only the text."
+  :type '(alist :key-type (string :tag "Error kind")
+                :value-type (choice (const :tag "failed/quota-limit" quota-limit)
+                                    (const :tag "failed/error" error)))
+  :group 'claude-code-ide)
+
+(defcustom claude-code-ide-codex-events-not-included-regexp
+  "usage[_ ]not[_ ]included\\|with your chatgpt plan, upgrade to"
+  "Regexp for a Codex error text that says the plan does not include Codex.
+It is matched without case.  Such a failure is `failed/quota-limit'
+with the detail \"Not included in the plan\", and
+`claude-code-ide-codex-events-not-included-action' decides what a
+visit of the session does."
+  :type 'regexp
+  :group 'claude-code-ide)
 
 (defun claude-code-ide-codex-events--error-kind (info)
   "Return the name of the Codex error kind INFO, or nil.
 INFO is a string such as \"usage_limit_exceeded\", or an object with
 one key such as ((http_connection_failed (http_status_code . 429)))."
   (cond
-   ((stringp info) info)
+   ((and (stringp info) (not (string-empty-p info))) info)
    ((and (consp info) (consp (car info)) (symbolp (caar info)))
     (symbol-name (caar info)))))
 
+(defun claude-code-ide-codex-events--failure-kind (info text)
+  "Return the failure of a turn error of kind INFO with the TEXT.
+The result is `not-included' (the plan does not include Codex),
+`quota-limit' or `error'.  A kind in
+`claude-code-ide-codex-events-error-kind-states' decides first;
+another kind, or none, leaves it to the text."
+  (let* ((kind (claude-code-ide-codex-events--error-kind info))
+         (state (cdr (assoc kind claude-code-ide-codex-events-error-kind-states)))
+         (not-included (or (equal kind "usage_not_included")
+                           (and (stringp text)
+                                (let ((case-fold-search t))
+                                  (string-match-p claude-code-ide-codex-events-not-included-regexp
+                                                  text))))))
+    (pcase state
+      ('error 'error)
+      ('quota-limit (if not-included 'not-included 'quota-limit))
+      (_ (cond
+          (not-included 'not-included)
+          ((claude-code-ide-codex-events--quota-error-p text) 'quota-limit)
+          (t 'error))))))
+
 (defun claude-code-ide-codex-events--quota-failure-p (info message)
   "Return non-nil when a turn error of kind INFO with MESSAGE is a quota limit.
-The kind `usage_limit_exceeded' is one.  For another kind, or none, the
-MESSAGE text decides (`claude-code-ide-codex-events--quota-error-p')."
-  (or (and (member (claude-code-ide-codex-events--error-kind info)
-                   claude-code-ide-codex-events--quota-kinds)
-           t)
-      (claude-code-ide-codex-events--quota-error-p message)))
+See `claude-code-ide-codex-events--failure-kind'."
+  (and (memq (claude-code-ide-codex-events--failure-kind info message)
+             '(quota-limit not-included))
+       t))
+
+(defun claude-code-ide-codex-events--failure-detail (failure text &optional prefix)
+  "Return the detail of a FAILURE (see `--failure-kind') with the error TEXT.
+PREFIX, when non-nil, comes first."
+  (claude-code-ide-session-status--one-line
+   (format "%s%s: %s"
+           (or prefix "")
+           (pcase failure
+             ('not-included "Not included in the plan")
+             ('quota-limit "Quota limit")
+             (_ "Error"))
+           text)))
 
 (defun claude-code-ide-codex-events--apply (launch event data &optional now)
   "Change LAUNCH for the Codex hook EVENT with the input DATA, at time NOW.
@@ -619,16 +689,14 @@ for the user too."
         ((and main (equal (alist-get 'status data) "failed"))
          ;; No Stop follows a failed request
          (let* ((error (alist-get 'error data))
-                (text (if (stringp error) error "model request failed"))
-                (quota (claude-code-ide-codex-events--quota-error-p error)))
+                (text (if (and (stringp error) (not (string-blank-p error)))
+                          error
+                        "model request failed"))
+                (failure (claude-code-ide-codex-events--failure-kind nil error)))
            (claude-code-ide-codex-events--forget-agent launch nil)
            (claude-code-ide-codex-events--set-phase
-            launch 'failed
-            (claude-code-ide-session-status--one-line
-             (format "%s: %s" (if quota "Quota limit" "Error") text))
-            now)
-           (setf (claude-code-ide-codex-events--launch-failure launch)
-                 (if quota 'quota-limit 'error))))
+            launch 'failed (claude-code-ide-codex-events--failure-detail failure text) now)
+           (setf (claude-code-ide-codex-events--launch-failure launch) failure)))
         ;; Codex retries a failed request: a later answer ends the failure
         ((and main (memq (claude-code-ide-codex-events--launch-phase launch) '(starting failed)))
          (setf (claude-code-ide-codex-events--launch-failure launch) nil)
@@ -678,7 +746,9 @@ reports the state."
     (cond
      ((eq phase 'ended) (list 'disconnected nil since nil detail))
      ((eq phase 'failed)
-      (list 'failed (or (claude-code-ide-codex-events--launch-failure launch) 'error)
+      (list 'failed (pcase (claude-code-ide-codex-events--launch-failure launch)
+                      ((or 'quota-limit 'not-included) 'quota-limit)
+                      (_ 'error))
             since nil detail))
      ((and blocker (eq (claude-code-ide-codex-events--blocker-kind blocker) 'question))
       (list 'waiting-for-user 'question (claude-code-ide-codex-events--blocker-since blocker)
@@ -728,9 +798,10 @@ reports the state."
           (list 'idle nil since nil detail))))
      (t (list 'working nil since nil detail)))))
 
-(defun claude-code-ide-codex-events--detail (launch now)
-  "Return the detail text of LAUNCH at NOW, with a trust problem."
-  (let ((detail (nth 4 (claude-code-ide-codex-events--state launch now)))
+(defun claude-code-ide-codex-events--detail (launch state)
+  "Return the detail text of LAUNCH with a trust problem.
+STATE is the result of `claude-code-ide-codex-events--state' for LAUNCH."
+  (let ((detail (nth 4 state))
         (problem (claude-code-ide-codex-events--trust-problem launch)))
     (if (and problem (not (equal detail problem)))
         (concat detail " · " problem)
@@ -744,9 +815,11 @@ reports the state."
 ;; `event_msg' record `task_started' at the start of a turn, and
 ;; `task_complete' (with `error' when the turn failed) or `turn_aborted'
 ;; at its end.  For a Codex instance without status hooks, the last of
-;; these records gives the state.  The Codex provider finds the file
-;; (its `transcript' operation); this file reads it, only when it
-;; changed, and never writes it.
+;; these records gives the state, as a guess: the terminal can show
+;; another conversation than the native ID of the instance, after /new
+;; or a fork.  The Codex provider finds the file (its `transcript'
+;; operation); this file reads it, only when it changed, and never
+;; writes it.
 
 (defconst claude-code-ide-codex-events--turn-regexp
   "\"type\":\"\\(?:task_started\\|task_complete\\|turn_aborted\\)\""
@@ -761,15 +834,44 @@ key and a value.  The parsed line must still be an `event_msg'.")
   "Longest line of a rollout file that the reader reads, in bytes.
 A longer line is skipped; a turn record is much shorter.")
 
+(defcustom claude-code-ide-codex-events-rollout-input-grace 5
+  "Seconds that Codex has to write the rollout file after a RET in the terminal.
+For a Codex instance without status hooks, a RET in its terminal
+after which the rollout file gets no record for this time makes the
+state `disconnected/untracked': the terminal can be in another
+conversation, for example after /new."
+  :type 'number
+  :group 'claude-code-ide)
+
 (defvar claude-code-ide-codex-events--rollout-cache (make-hash-table :test 'eq :weakness 'key)
   "INSTANCE -> plist of what its rollout file gave, weak in INSTANCE.
 :native and :file are the conversation and its rollout file.  :stamp is
-the modification time and the size of the file at the last read.
-:owner is non-nil when the first record of the file is the
-`session_meta' of :native.  :end is the byte after the last whole line
+\(MTIME SIZE INODE DEVICE) of the file at the last read, or nil.
+:owner is `yes' when the session record of the file is of :native,
+`no' when it is of another conversation, and nil when the file has no
+whole session record yet.  :end is the byte after the last whole line
 read, where the next read starts.  :turn is the last turn record (see
-`claude-code-ide-codex-events--turn-of-record').  :now and :result
-keep the result of one refresh.")
+`claude-code-ide-codex-events--turn-of-record').  :pid and :start are
+the terminal PID and the start of its process.")
+
+(defvar claude-code-ide-codex-events--state-cache (make-hash-table :test 'eq :weakness 'key)
+  "INSTANCE -> the state and detail of one refresh; weak in INSTANCE.
+See `claude-code-ide-codex-events--state-and-detail'.")
+
+(defvar-local claude-code-ide-codex-events--last-input nil
+  "Float time of the last RET in this Codex terminal buffer, or nil.")
+
+(defun claude-code-ide-codex-events--note-input ()
+  "Note the time of a RET in the Codex terminal buffer.
+This is a function of the local `post-command-hook' of the buffer."
+  (when (memq last-command-event '(?\r ?\n return))
+    (setq claude-code-ide-codex-events--last-input (float-time))))
+
+(defun claude-code-ide-codex-events--watch-input (buffer)
+  "Note each RET in the terminal BUFFER from now on."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (add-hook 'post-command-hook #'claude-code-ide-codex-events--note-input nil t))))
 
 (defun claude-code-ide-codex-events--rollout-file (instance)
   "Return the rollout file of the conversation of INSTANCE, or nil.
@@ -786,20 +888,18 @@ error, there is no file."
       (and (stringp file) (file-name-absolute-p file) file))))
 
 (defun claude-code-ide-codex-events--rollout-line ()
-  "Return the JSON of the line at point, in a buffer of rollout file bytes.
-Return nil when the line is not valid JSON."
-  (condition-case nil
-      (claude-code-ide-session-status--parse-json
-       (decode-coding-string
-        (buffer-substring-no-properties (line-beginning-position) (line-end-position))
-        'utf-8))
-    (error nil)))
+  "Return the JSON object of the line at point, in a buffer of file bytes, or nil."
+  (claude-code-ide-transcript--parse-line
+   (decode-coding-string
+    (buffer-substring-no-properties (line-beginning-position) (line-end-position))
+    'utf-8)))
 
 (defun claude-code-ide-codex-events--turn-of-record (record)
   "Return the turn record RECORD of a rollout file as a plist, or nil.
-The plist has :kind (`started', `complete' or `aborted'), :time (the
-float time of the start or the end, or nil) and, for a failed turn,
-:error-kind and :error-message.  Other records give nil."
+The plist has :kind (`started', `complete' or `aborted') and :time
+\(the float time of the start or the end, or nil).  A failed turn also
+has :error t, :error-kind (the error kind, or nil) and :error-message
+\(a non-blank text, or nil).  Other records give nil."
   (let ((payload (alist-get 'payload record)))
     (when (and (equal (alist-get 'type record) "event_msg") (consp payload))
       (let ((number (lambda (field)
@@ -810,11 +910,15 @@ float time of the start or the end, or nil) and, for a failed turn,
           ("task_complete"
            (let ((error (alist-get 'error payload)))
              (append (list :kind 'complete :time (funcall number 'completed_at))
-                     (and (consp error)
-                          (list :error-kind (claude-code-ide-codex-events--error-kind
-                                             (alist-get 'codex_error_info error))
-                                :error-message (let ((text (alist-get 'message error)))
-                                                 (if (stringp text) text "")))))))
+                     (when error
+                       (let ((message (if (consp error) (alist-get 'message error) error)))
+                         (list :error t
+                               :error-kind (and (consp error)
+                                                (claude-code-ide-codex-events--error-kind
+                                                 (alist-get 'codex_error_info error)))
+                               :error-message (and (stringp message)
+                                                   (not (string-blank-p message))
+                                                   message)))))))
           ("turn_aborted" (list :kind 'aborted :time (funcall number 'completed_at))))))))
 
 (defun claude-code-ide-codex-events--rollout-scan (file from to)
@@ -860,57 +964,53 @@ backward, one chunk at a time, until the turn record is found."
               (setq pos (+ start (1- first)))))))
       (cons turn (or end from)))))
 
-(defun claude-code-ide-codex-events--rollout-owner-p (file native)
-  "Return non-nil when the first record of the rollout FILE is of NATIVE.
-That record is the `session_meta' of the conversation, with its ID."
-  (with-temp-buffer
-    (set-buffer-multibyte nil)
-    (let ((size claude-code-ide-codex-events--rollout-chunk)
-          (record nil)
-          (done nil))
-      (while (not done)
-        (erase-buffer)
-        (let ((read (cadr (insert-file-contents-literally file nil 0 size))))
-          (goto-char (point-min))
-          (cond
-           ((search-forward "\n" nil t)
-            (goto-char (match-beginning 0))
-            (setq record (claude-code-ide-codex-events--rollout-line)
-                  done t))
-           ((or (< read size) (>= size claude-code-ide-codex-events--rollout-line-limit))
-            (setq done t))
-           (t (setq size (* 2 size))))))
-      (and (equal (alist-get 'type record) "session_meta")
-           (equal (alist-get 'id (alist-get 'payload record)) native)))))
+(defun claude-code-ide-codex-events--rollout-owner (file native)
+  "Return whose session the rollout FILE is: `yes' for NATIVE, else `no'.
+Return nil when FILE has no whole session record yet: Codex writes it
+first, and a line without its newline does not parse."
+  (when-let* ((meta (claude-code-ide-transcript-codex-meta file)))
+    (if (equal (plist-get meta :id) native) 'yes 'no)))
+
+(defun claude-code-ide-codex-events--rollout-stamp (attributes)
+  "Return (MTIME SIZE INODE DEVICE) of the file ATTRIBUTES."
+  (list (file-attribute-modification-time attributes)
+        (file-attribute-size attributes)
+        (file-attribute-inode-number attributes)
+        (file-attribute-device-number attributes)))
 
 (defun claude-code-ide-codex-events--rollout-read (entry file)
   "Bring ENTRY up to date with the rollout FILE, and return ENTRY.
-The file is read only when its modification time or size changed
-since the last read.  A file that grew is read from the end of the
-last read on; another file, or a file that shrank, is read again."
+The file is read only when its stamp changed since the last read.  A
+file of the conversation that grew, with the same inode, is read only
+from the end of the last read on.  Any other change (a new file, a
+new inode, the same or a smaller size, another owner) checks the owner
+again and reads the file again from the start."
   (let* ((attributes (file-attributes file))
-         (size (file-attribute-size attributes))
-         (stamp (and attributes (list (file-attribute-modification-time attributes) size))))
+         (stamp (and attributes (claude-code-ide-codex-events--rollout-stamp attributes)))
+         (old (plist-get entry :stamp)))
     (cond
      ((null stamp)
       (plist-put entry :stamp nil)
-      (plist-put entry :file nil))
-     ((not (equal stamp (plist-get entry :stamp)))
-      ;; Read again from the start, and check the owner again, unless
-      ;; the file of the owner grew
-      (let ((again (not (and (plist-get entry :owner)
-                             (equal file (plist-get entry :file))
-                             (plist-get entry :end)
-                             (<= (plist-get entry :end) size)))))
+      (plist-put entry :file nil)
+      (plist-put entry :owner nil))
+     ((equal stamp old))
+     (t
+      (let* ((size (nth 1 stamp))
+             (grew (and (eq (plist-get entry :owner) 'yes)
+                        (equal file (plist-get entry :file))
+                        old
+                        (equal (nthcdr 2 stamp) (nthcdr 2 old))
+                        (> size (nth 1 old))
+                        (<= (or (plist-get entry :end) 0) size))))
         (condition-case nil
             (progn
-              (when again
+              (unless grew
                 (plist-put entry :file file)
                 (plist-put entry :turn nil)
                 (plist-put entry :end 0)
-                (plist-put entry :owner (claude-code-ide-codex-events--rollout-owner-p
+                (plist-put entry :owner (claude-code-ide-codex-events--rollout-owner
                                          file (plist-get entry :native))))
-              (when (plist-get entry :owner)
+              (when (eq (plist-get entry :owner) 'yes)
                 (let ((scan (claude-code-ide-codex-events--rollout-scan
                              file (plist-get entry :end) size)))
                   (when (car scan)
@@ -919,7 +1019,8 @@ last read on; another file, or a file that shrank, is read again."
               (plist-put entry :stamp stamp))
           ;; The file went away, or cannot be read now: try again next time
           (file-error (plist-put entry :stamp nil)
-                      (plist-put entry :file nil))))))
+                      (plist-put entry :file nil)
+                      (plist-put entry :owner nil))))))
     entry))
 
 (defun claude-code-ide-codex-events--rollout-entry (instance native)
@@ -931,84 +1032,132 @@ A new conversation starts a new entry."
       (puthash instance entry claude-code-ide-codex-events--rollout-cache))
     entry))
 
-(defun claude-code-ide-codex-events--rollout-turn-state (turn)
+(defun claude-code-ide-codex-events--launch-start (instance launch entry)
+  "Return the start of the current launch of INSTANCE as a float time, or nil.
+That is the time when Emacs tracked LAUNCH, else the start of the
+terminal process.  ENTRY keeps the start of each PID that Emacs asked."
+  (or (and launch (claude-code-ide-codex-events--launch-registered launch))
+      (let ((start (claude-code-ide-known-or-nil (claude-code-ide-instance-process-start-time instance))))
+        (and (numberp start) (float start)))
+      (let ((pid (claude-code-ide-known-or-nil (claude-code-ide-instance-pid instance))))
+        (when (integerp pid)
+          (unless (equal (plist-get entry :pid) pid)
+            (plist-put entry :pid pid)
+            (plist-put entry :start (claude-code-ide-session-registry--process-start-time pid)))
+          (plist-get entry :start)))))
+
+(defun claude-code-ide-codex-events--rollout-turn-state (turn start)
   "Return (STATE . DETAIL) of the last TURN record of a rollout file.
-TURN nil is a conversation without a turn yet."
+TURN nil is a conversation without a turn yet.  START is the start of
+the launch, or nil.  Each state is a guess, with :source `rollout'."
   (let ((since (plist-get turn :time))
-        (make (lambda (state reason since guess detail)
-                (cons (append (claude-code-ide-instance-make-state state reason since guess)
-                              (list :source 'rollout))
+        (make (lambda (state reason since detail &optional extra)
+                (cons (append (claude-code-ide-instance-make-state state reason since t)
+                              (list :source 'rollout)
+                              extra)
                       detail))))
     (pcase (plist-get turn :kind)
-      ('started (funcall make 'working nil since nil "From rollout: a turn runs"))
-      ('aborted (funcall make 'idle nil since nil "From rollout: interrupted"))
+      ('started
+       ;; The time has whole seconds.  A turn that started before the
+       ;; launch did not end: its process was killed.
+       (if (and start since (< (+ since 1.0) start))
+           (funcall make 'idle nil nil "From rollout: a turn of an earlier run did not end")
+         (funcall make 'working nil since "From rollout: a turn runs")))
+      ('aborted (funcall make 'idle nil since "From rollout: interrupted"))
       ('complete
-       (if-let* ((kind (or (plist-get turn :error-kind) (plist-get turn :error-message))))
-           (let* ((message (or (plist-get turn :error-message) ""))
-                  (quota (claude-code-ide-codex-events--quota-failure-p
-                          (plist-get turn :error-kind) message)))
-             (funcall make 'failed (if quota 'quota-limit 'error) since nil
-                      (claude-code-ide-session-status--one-line
-                       (format "From rollout: %s: %s" (if quota "Quota limit" "Error")
-                               (if (string-empty-p message) kind message)))))
-         (funcall make 'idle nil since nil "From rollout: turn ended")))
-      (_ (funcall make 'idle nil nil t "From rollout: no turn yet")))))
+       (if (plist-get turn :error)
+           (let* ((message (plist-get turn :error-message))
+                  (kind (plist-get turn :error-kind))
+                  (failure (claude-code-ide-codex-events--failure-kind kind message)))
+             (funcall make 'failed (if (eq failure 'error) 'error 'quota-limit) since
+                      (claude-code-ide-codex-events--failure-detail
+                       failure (or message kind "unknown error") "From rollout: ")
+                      (and (eq failure 'not-included) (list :not-included t))))
+         (funcall make 'idle nil since "From rollout: turn ended")))
+      (_ (funcall make 'idle nil nil "From rollout: no turn yet")))))
 
-(defun claude-code-ide-codex-events--rollout-state-now (instance)
-  "Return (STATE . DETAIL) of INSTANCE from its rollout file, or nil.
-See `claude-code-ide-codex-events--rollout-state'."
+(defun claude-code-ide-codex-events--rollout-state (instance launch now)
+  "Return (STATE . DETAIL) of INSTANCE, without status hooks, from its rollout.
+LAUNCH is the launch record of INSTANCE, or nil.  STATE is a common
+state plist.  The last turn record of the rollout file of the
+conversation gives it, as a guess, with :source `rollout':
+
+- `task_started': `working'.  A turn that started before the launch
+  did not end, because its process was killed: `idle'.
+- `task_complete' without an error, or `turn_aborted': `idle'.
+- `task_complete' with an error: `failed/quota-limit' or
+  `failed/error'; see `claude-code-ide-codex-events--failure-kind'.
+- No turn record: `idle'.
+
+An approval or a question shows as `working': the rollout has no
+record of them.  These cases are `disconnected/untracked' without
+:source: a file that cannot be read, a file without a whole session
+record yet, a file whose session record is of another conversation,
+and a RET in the terminal at NOW after which the file got no record
+for `claude-code-ide-codex-events-rollout-input-grace' seconds.
+Without a known conversation or rollout file, return nil.  DETAIL does
+not say that the hooks are missing; the caller adds that."
   (when-let* ((native (claude-code-ide-known-or-nil (claude-code-ide-instance-native-id instance)))
               (file (claude-code-ide-codex-events--rollout-file instance)))
-    (let ((entry (claude-code-ide-codex-events--rollout-read
-                  (claude-code-ide-codex-events--rollout-entry instance native) file)))
+    (let* ((entry (claude-code-ide-codex-events--rollout-read
+                   (claude-code-ide-codex-events--rollout-entry instance native) file))
+           (stamp (plist-get entry :stamp))
+           (buffer (claude-code-ide-instance-buffer instance))
+           (input (and (buffer-live-p buffer)
+                       (buffer-local-value 'claude-code-ide-codex-events--last-input buffer)))
+           (untracked (lambda (detail)
+                        (cons (claude-code-ide-instance-make-state 'disconnected 'untracked) detail))))
       (cond
-       ((null (plist-get entry :stamp))
-        (cons (claude-code-ide-instance-make-state 'disconnected 'untracked)
-              "No status hooks; rollout file not readable"))
-       ((not (plist-get entry :owner))
-        (cons (claude-code-ide-instance-make-state 'disconnected 'untracked)
-              "No status hooks; the rollout file is of another conversation"))
-       (t (claude-code-ide-codex-events--rollout-turn-state (plist-get entry :turn)))))))
-
-(defun claude-code-ide-codex-events--rollout-state (instance &optional now)
-  "Return (STATE . DETAIL) of INSTANCE, without status hooks, from its rollout.
-STATE is a common state plist.  The last turn record of the rollout
-file of the conversation gives it, with :source `rollout':
-
-- `task_started': `working'.
-- `task_complete' without an error, or `turn_aborted': `idle'.
-- `task_complete' with an error: `failed/quota-limit' for a usage
-  limit (`claude-code-ide-codex-events--quota-failure-p'), else
-  `failed/error'.
-- No turn record: `idle', a guess.
-
-The records report the turn, so they are no guess, and the state starts
-at the time of the record.  An approval or a question shows as
-`working': the rollout has no record of them.  The first record of the
-file must be the `session_meta' of the conversation of INSTANCE, else
-the state is `disconnected/untracked' without :source; so is a file
-that cannot be read.  Without a known conversation or rollout file,
-return nil.  The result is computed once for each NOW (one refresh)."
-  (let* ((now (or now (float-time)))
-         (entry (gethash instance claude-code-ide-codex-events--rollout-cache)))
-    (if (and entry (equal (plist-get entry :now) now))
-        (plist-get entry :result)
-      (let ((result (claude-code-ide-codex-events--rollout-state-now instance)))
-        (when-let* ((entry (gethash instance claude-code-ide-codex-events--rollout-cache)))
-          (plist-put entry :now now)
-          (plist-put entry :result result))
-        result))))
+       ((null stamp) (funcall untracked "rollout file not readable"))
+       ((null (plist-get entry :owner)) (funcall untracked "rollout file not readable yet"))
+       ((eq (plist-get entry :owner) 'no)
+        (funcall untracked "the rollout file is of another conversation"))
+       ((and input
+             (> input (+ (float-time (car stamp)) 1.0))
+             (> (- now input) claude-code-ide-codex-events-rollout-input-grace))
+        (funcall untracked "no rollout record since the last input in the terminal"))
+       (t (claude-code-ide-codex-events--rollout-turn-state
+           (plist-get entry :turn)
+           (claude-code-ide-codex-events--launch-start instance launch entry)))))))
 
 ;;; The state of an instance
 
 (defun claude-code-ide-codex-events--launch-state (launch now source)
   "Return (STATE . DETAIL) of LAUNCH at NOW; STATE has :source SOURCE.
-A nil SOURCE gives no :source."
-  (pcase-let ((`(,state ,reason ,since ,guess ,_detail)
-               (claude-code-ide-codex-events--state launch now)))
-    (cons (append (claude-code-ide-instance-make-state state reason since guess)
-                  (and source (list :source source)))
-          (claude-code-ide-codex-events--detail launch now))))
+A nil SOURCE gives no :source.  A launch whose plan does not include
+Codex has :not-included t."
+  (let ((state (claude-code-ide-codex-events--state launch now)))
+    (pcase-let ((`(,common ,reason ,since ,guess ,_detail) state))
+      (cons (append (claude-code-ide-instance-make-state common reason since guess)
+                    (and source (list :source source))
+                    (and (eq common 'failed)
+                         (eq (claude-code-ide-codex-events--launch-failure launch) 'not-included)
+                         (list :not-included t)))
+            (claude-code-ide-codex-events--detail launch state)))))
+
+(defun claude-code-ide-codex-events--compute-state (instance now)
+  "Return (STATE . DETAIL) of the Codex INSTANCE at NOW.
+See `claude-code-ide-codex-events--state-and-detail'."
+  (let ((launch (claude-code-ide-codex-events--launch-of instance)))
+    (cond
+     ((and launch (claude-code-ide-codex-events--launch-hooks launch))
+      (claude-code-ide-codex-events--launch-state launch now 'hooks))
+     ((and launch (assq (claude-code-ide-codex-events--launch-dialog launch)
+                        claude-code-ide-codex-events--dialog-details))
+      (claude-code-ide-codex-events--launch-state launch now 'screen))
+     (t
+      (let ((problem (or (and launch (claude-code-ide-codex-events--trust-problem launch))
+                         "No status hooks"))
+            (rollout (progn
+                       (claude-code-ide-codex-events--watch-input
+                        (claude-code-ide-instance-buffer instance))
+                       (claude-code-ide-codex-events--rollout-state instance launch now))))
+        (cond
+         ((and rollout (plist-get (car rollout) :source))
+          (cons (car rollout) (concat (cdr rollout) " · " problem)))
+         (rollout (cons (car rollout) (concat problem "; " (cdr rollout))))
+         (launch (claude-code-ide-codex-events--launch-state launch now nil))
+         (t (cons (claude-code-ide-instance-make-state 'disconnected 'untracked) problem))))))))
 
 (defun claude-code-ide-codex-events--state-and-detail (instance now)
   "Return (STATE . DETAIL) of the Codex INSTANCE at NOW.
@@ -1019,21 +1168,20 @@ STATE is a common state plist.  Its :source tells what gave it:
   (`screen').
 - Else the rollout file of the conversation (`rollout'), when one is
   known; see `claude-code-ide-codex-events--rollout-state'.
-- Else `disconnected/untracked', without :source."
-  (let ((launch (claude-code-ide-codex-events--launch-of instance)))
-    (cond
-     ((and launch (claude-code-ide-codex-events--launch-hooks launch))
-      (claude-code-ide-codex-events--launch-state launch now 'hooks))
-     ((and launch (assq (claude-code-ide-codex-events--launch-dialog launch)
-                        claude-code-ide-codex-events--dialog-details))
-      (claude-code-ide-codex-events--launch-state launch now 'screen))
-     ((when-let* ((rollout (claude-code-ide-codex-events--rollout-state instance now)))
-        (cons (car rollout)
-              (concat (cdr rollout) " · "
-                      (or (and launch (claude-code-ide-codex-events--trust-problem launch))
-                          "No status hooks")))))
-     (launch (claude-code-ide-codex-events--launch-state launch now nil))
-     (t (cons (claude-code-ide-instance-make-state 'disconnected 'untracked) "No status hooks")))))
+- Else `disconnected/untracked', without :source.
+
+The result is computed once for each NOW (one refresh), while the
+launch record, the conversation and the last input do not change."
+  (let ((launch (claude-code-ide-codex-events--launch-of instance))
+        (buffer (claude-code-ide-instance-buffer instance)))
+    (claude-code-ide-session-status--once-per-refresh
+     claude-code-ide-codex-events--state-cache instance now
+     (lambda () (claude-code-ide-codex-events--compute-state instance now))
+     (list (and launch (copy-sequence launch))
+           (claude-code-ide-instance-native-id instance)
+           (claude-code-ide-instance-generation instance)
+           (and (buffer-live-p buffer)
+                (buffer-local-value 'claude-code-ide-codex-events--last-input buffer))))))
 
 (defun claude-code-ide-codex-events--instance-state (instance now)
   "Return the common state of the Codex INSTANCE at NOW, or nil.
@@ -1050,6 +1198,82 @@ of `claude-code-ide-instance-state-functions'."
 This is a function of `claude-code-ide-session-status-detail-functions'."
   (when (eq (claude-code-ide-instance-provider instance) 'codex)
     (cdr (claude-code-ide-codex-events--state-and-detail instance now))))
+
+;;; A plan without Codex
+
+(declare-function claude-code-ide-handover "claude-code-ide-handover"
+                  (instance-id target-provider &optional method context interrupt force))
+(declare-function claude-code-ide-handover--read-args "claude-code-ide-handover"
+                  (&optional instance-id))
+(declare-function claude-code-ide-control-stop "claude-code-ide-control" (instance-id))
+
+(defcustom claude-code-ide-codex-events-not-included-action 'ask
+  "What Emacs does when you act on a Codex session whose plan lacks Codex.
+Such a session is `failed/quota-limit' with the detail \"Not included
+in the plan\".  You act on it with RET or a click on its row, with
+`claude-code-ide-visit-waiting-session', or with the handover key of
+the status buffer.  The values:
+
+- `ask': ask, with c (continue), h (hand over) and s (stop).
+- `continue': keep the session and send nothing.  A visit shows its
+  terminal; the handover key does nothing.
+- `handover': hand the work over to a new conversation
+  (`claude-code-ide-handover', which asks for the target).
+- `stop': end the session (`claude-code-ide-control-stop').
+
+A coordinator never gets this question: it reads the state and the
+detail."
+  :type '(choice (const :tag "Ask each time" ask)
+                 (const :tag "Continue" continue)
+                 (const :tag "Hand over" handover)
+                 (const :tag "Stop" stop))
+  :group 'claude-code-ide)
+
+(defun claude-code-ide-codex-events--not-included-choice ()
+  "Return the action for a session whose plan lacks Codex.
+See `claude-code-ide-codex-events-not-included-action'."
+  (if (eq claude-code-ide-codex-events-not-included-action 'ask)
+      (pcase (car (read-multiple-choice
+                   "The plan of this account does not include Codex"
+                   '((?c "continue" "Keep the session and send nothing")
+                     (?h "hand over" "Hand the work over to a new conversation")
+                     (?s "stop" "End the session"))))
+        (?h 'handover)
+        (?s 'stop)
+        (_ 'continue))
+    claude-code-ide-codex-events-not-included-action))
+
+(defun claude-code-ide-codex-events--act (instance command)
+  "Take over COMMAND of the user on INSTANCE when its plan lacks Codex.
+COMMAND is `visit' or `handover'.  Return non-nil when this function
+did the action.  This is a function of
+`claude-code-ide-session-status-act-functions'."
+  (when (and (eq (claude-code-ide-instance-provider instance) 'codex)
+             (plist-get (claude-code-ide-instance-state instance) :not-included))
+    (let ((id (claude-code-ide-instance-id instance)))
+      (pcase (claude-code-ide-codex-events--not-included-choice)
+        ('handover
+         (unless (and (require 'claude-code-ide-handover nil t)
+                      (fboundp 'claude-code-ide-handover))
+           (user-error "The handover file is not available"))
+         (apply #'claude-code-ide-handover (claude-code-ide-handover--read-args id))
+         t)
+        ('stop
+         (unless (and (require 'claude-code-ide-control nil t)
+                      (fboundp 'claude-code-ide-control-stop))
+           (user-error "The control file is not available"))
+         (let ((result (claude-code-ide-control-stop id)))
+           (message "Codex session %s: %s" (claude-code-ide-format-value
+                                            (claude-code-ide-instance-display-name instance))
+                    (if (eq (plist-get result :status) 'ok)
+                        "stopped"
+                      (or (plist-get result :message) (format "%s" (plist-get result :status))))))
+         t)
+        ;; Continue: a visit shows the terminal, the handover key does nothing
+        (_ (and (eq command 'handover)
+                (progn (message "The Codex session stays") t)))))))
+
+(add-hook 'claude-code-ide-session-status-act-functions #'claude-code-ide-codex-events--act)
 
 (add-hook 'claude-code-ide-instance-state-functions
           #'claude-code-ide-codex-events--instance-state)
