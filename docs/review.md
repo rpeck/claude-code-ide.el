@@ -124,8 +124,8 @@ Emacs reads the result file as UTF-8 text. A file that cannot be used gives the 
 
 - Path: `<report directory>/reviews/<hash>.json`, where `<hash>` is the first 32 hex digits of the SHA-256 of the review ID. `claude-code-ide-review-directory` changes the folder.
 - The folder has mode 0700 and each file mode 0600, because the result text can be private.
-- Each write goes to a temporary file in the same folder, then `rename-file`.
-- Final records are deleted after `claude-code-ide-review-done-days` days (default 7). Until then, the review ID is a duplicate.
+- Each write goes to a temporary file in the same folder, then `rename-file`. The inbox helper `claude-code-ide-control-write-json-file` does it (docs/api-control.md, "Helpers for other files").
+- Final records are deleted after `claude-code-ide-review-done-days` days (default 7), with `claude-code-ide-control-prune-folder`. A record that is not final stays. Until then, the review ID is a duplicate.
 
 The fields (version 1):
 
