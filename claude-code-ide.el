@@ -2082,6 +2082,7 @@ Signals an error if terminal fails to initialize."
 (declare-function claude-code-ide-session-registry--transcript-file "claude-code-ide-session-registry" (entry))
 (declare-function claude-code-ide-session-registry--transcript-title "claude-code-ide-session-registry" (file))
 (declare-function claude-code-ide-session-registry--transcript-model "claude-code-ide-session-registry" (file))
+(declare-function claude-code-ide-session-registry--claude-restore-flags "claude-code-ide-session-registry" (entry))
 (declare-function claude-code-ide-session-registry--read-report "claude-code-ide-session-registry" (key))
 (declare-function claude-code-ide-session-registry--report-transcript-path "claude-code-ide-session-registry" (report))
 (declare-function claude-code-ide-session-registry--cli-session-of "claude-code-ide-session-registry" (session))
@@ -2294,7 +2295,8 @@ SPEC describes the start, and PROGRAM is the CLI that ran."
     :transcript #'claude-code-ide--claude-transcript
     :exit-message #'claude-code-ide--claude-exit-message
     ;; Claude Code finds Emacs through the lock files in ~/.claude/ide/
-    :ide-protocol t))
+    :ide-protocol t
+    :restore-flags #'claude-code-ide-session-registry--claude-restore-flags))
   "The provider of the Claude Code CLI.")
 
 (defun claude-code-ide--spec-provider (spec)

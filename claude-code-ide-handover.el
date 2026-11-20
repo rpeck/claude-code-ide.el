@@ -527,28 +527,36 @@ writer for each working tree."
    ((consp data)
     (cdr (or (assq (intern key) data) (assoc key data))))))
 
-(defun claude-code-ide-handover--codex-home ()
-  "Return the Codex home folder."
-  (file-name-as-directory
-   (or (and (getenv "CODEX_HOME") (not (string-empty-p (getenv "CODEX_HOME")))
-            (getenv "CODEX_HOME"))
-       (expand-file-name ".codex" "~"))))
-
-(defun claude-code-ide-handover--codex-rollout (native-id)
-  "Return the Codex rollout file of the conversation NATIVE-ID, or nil.
-The Codex provider has no transcript operation, so this searches the
-sessions folder of the Codex home."
-  (when (and (stringp native-id) (string-match-p "\\`[0-9A-Za-z-]+\\'" native-id))
-    (let ((dir (expand-file-name "sessions" (claude-code-ide-handover--codex-home))))
-      (when (file-directory-p dir)
-        (car (last (sort (directory-files-recursively
-                          dir (concat "\\`rollout-.*" (regexp-quote native-id) "\\.jsonl\\'"))
-                         #'string<)))))))
+(defun claude-code-ide-handover--provider-transcript (provider native-ids entry)
+  "Return the transcript file that the `transcript' operation of PROVIDER gives.
+The operation gets a detached descriptor for each ID of NATIVE-IDS in
+turn, with the instance ID and folder of the registry ENTRY.  Return
+the first readable file, or nil.  The Codex operation keeps the search
+of the Codex sessions folder as its fallback."
+  (when (and provider (symbolp provider) (claude-code-ide-get-provider provider))
+    (cl-some
+     (lambda (native-id)
+       (let ((file (ignore-errors
+                     (claude-code-ide-provider-call
+                      provider 'transcript
+                      (claude-code-ide-instance-create
+                       :id (and entry (claude-code-ide-session-registry-entry-key entry))
+                       :provider provider
+                       :native-id native-id
+                       :project-root (or (and entry (claude-code-ide-session-registry-entry-project-dir
+                                                     entry))
+                                         'unknown))
+                      'file))))
+         (and (stringp file) (file-readable-p file) file)))
+     (delete-dups (cl-remove-if-not #'stringp native-ids)))))
 
 (defun claude-code-ide-handover--transcript-file (provider native-id &optional entry leg)
   "Return the transcript file of the conversation NATIVE-ID of PROVIDER, or nil.
 It is the :transcript of LEG, else the transcript path of the registry
-ENTRY, else for Codex the rollout file of NATIVE-ID."
+ENTRY, else for Claude Code the session file of ENTRY (its ID in its
+folder), else the file that the `transcript' operation of PROVIDER
+gives for NATIVE-ID or the native ID of ENTRY.  So the delivery check
+and the source leg read the same Claude Code file as before."
   (let ((candidates (list (plist-get leg :transcript)
                           (and entry (claude-code-ide-session-registry-entry-transcript-path entry))
                           ;; A Claude Code entry finds its file from its ID and folder
@@ -556,7 +564,10 @@ ENTRY, else for Codex the rollout file of NATIVE-ID."
                                (ignore-errors
                                  (claude-code-ide-session-registry--transcript-file entry))))))
     (or (cl-find-if (lambda (file) (and (stringp file) (file-readable-p file))) candidates)
-        (and (eq provider 'codex) (claude-code-ide-handover--codex-rollout native-id)))))
+        (claude-code-ide-handover--provider-transcript
+         provider
+         (list native-id (and entry (claude-code-ide-session-registry-entry-session-id entry)))
+         entry))))
 
 (defun claude-code-ide-handover--line-count (file)
   "Return the number of lines of FILE, or nil when it cannot be read."

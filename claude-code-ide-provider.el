@@ -72,7 +72,11 @@ function.")
                 :documentation "Non-nil when the CLI speaks the IDE WebSocket protocol and
 reads the lock files in ~/.claude/ide/.  A start makes a WebSocket
 server and a lock file only for such a provider.  It is not an
-operation, so it is not in the capabilities."))
+operation, so it is not in the capabilities.")
+  (restore-flags nil :documentation "(ENTRY) -> flag string of a restore, or nil.
+ENTRY is a session registry record.  nil means no extra flags: the
+options of the provider give its flags.  It is not an operation, so it
+is not in the capabilities."))
 
 (defconst claude-code-ide-provider-operations
   '(detect launch resume fork submit-prompt stop native-id status-events
@@ -164,6 +168,20 @@ instead of signaling an error."
     (if (claude-code-ide-provider-supports-p provider operation)
         (apply (cl-struct-slot-value 'claude-code-ide-provider operation provider) args)
       (claude-code-ide-provider-unavailable operation))))
+
+;;; The Codex home
+
+;; The Codex provider and the transcript readers both need the Codex
+;; home, and neither file loads the other, so the one rule is here.
+(defun claude-code-ide-codex-home ()
+  "Return the Codex home folder as an absolute directory name.
+It is CODEX_HOME when that is an absolute file name.  An empty or a
+relative CODEX_HOME counts as unset, so the folder is ~/.codex."
+  (let ((home (getenv "CODEX_HOME")))
+    (file-name-as-directory
+     (expand-file-name (if (and home (> (length home) 0) (file-name-absolute-p home))
+                           home
+                         "~/.codex")))))
 
 (provide 'claude-code-ide-provider)
 

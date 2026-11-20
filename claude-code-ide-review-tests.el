@@ -696,6 +696,77 @@ rejection of the review: the review tracks the copy at the target."
 
 ;;; Records, arguments and the control slot
 
+(ert-deftest claude-code-ide-test-review-prune-final-only ()
+  "An old final record is deleted; a young one and an old one that is not final stay."
+  (claude-code-ide-review-tests--with-review
+    (let* ((old (time-subtract nil (* (1+ claude-code-ide-review-done-days) 86400)))
+           (make (lambda (id state)
+                   (let ((record (claude-code-ide-review--record-create
+                                  :review-id id :owner "cci-test-owner" :state state
+                                  :emacs-pid (emacs-pid) :result-file "/nonexistent/cci-test")))
+                     (claude-code-ide-review--write record)
+                     (cons (claude-code-ide-review--file id) record))))
+           (old-final (funcall make "cci-test-old-final" 'delivered))
+           (young-final (funcall make "cci-test-young-final" 'delivered))
+           (old-running (funcall make "cci-test-old-running" 'running)))
+      (set-file-times (car old-final) old)
+      (set-file-times (car old-running) old)
+      (should (claude-code-ide-review--prune (car old-final) (cdr old-final)))
+      (should-not (file-exists-p (car old-final)))
+      (should-not (claude-code-ide-review--prune (car young-final) (cdr young-final)))
+      (should (file-exists-p (car young-final)))
+      (should-not (claude-code-ide-review--prune (car old-running) (cdr old-running)))
+      (should (file-exists-p (car old-running)))
+      ;; A file that does not exist is not a deleted one
+      (should-not (claude-code-ide-review--prune (car old-final) (cdr old-final))))))
+
+(ert-deftest claude-code-ide-test-review-prune-one-file ()
+  "The prune of one record checks only its own file; it never lists the folder."
+  (claude-code-ide-review-tests--with-review
+    (let* ((record (claude-code-ide-review--record-create
+                    :review-id "cci-test-one" :owner "cci-test-owner" :state 'rejected
+                    :emacs-pid (emacs-pid) :result-file "/nonexistent/cci-test"))
+           (file (progn (claude-code-ide-review--write record)
+                        (claude-code-ide-review--file "cci-test-one"))))
+      (set-file-times file (time-subtract nil (* (1+ claude-code-ide-review-done-days) 86400)))
+      (cl-letf (((symbol-function 'directory-files)
+                 (lambda (&rest _) (error "No folder listing expected"))))
+        (should (claude-code-ide-review--prune file record)))
+      (should-not (file-exists-p file))
+      ;; The folder prune of the inbox uses the same one-file check
+      (let* ((dir (make-temp-file "cci-test-prune-" t))
+             (old (expand-file-name "0a.json" dir))
+             (young (expand-file-name "0b.json" dir))
+             (checked nil)
+             (check (symbol-function 'claude-code-ide-control-prune-file)))
+        (unwind-protect
+            (progn
+              (write-region "{}" nil old nil 'silent)
+              (write-region "{}" nil young nil 'silent)
+              (set-file-times old (time-subtract nil (* 3 86400)))
+              (cl-letf (((symbol-function 'claude-code-ide-control-prune-file)
+                         (lambda (file days) (push file checked) (funcall check file days))))
+                (claude-code-ide-control-prune-folder dir 2))
+              (should (equal (sort checked #'string<) (list old young)))
+              (should-not (file-exists-p old))
+              (should (file-exists-p young)))
+          (delete-directory dir t))))))
+
+(ert-deftest claude-code-ide-test-review-uses-public-control-api ()
+  "The review file calls only public functions of the control file."
+  (let ((file (expand-file-name "claude-code-ide-review.el"
+                                (file-name-directory (locate-library "claude-code-ide-review"))))
+        (found nil))
+    (with-temp-buffer
+      (insert-file-contents file)
+      (emacs-lisp-mode)
+      (goto-char (point-min))
+      (while (re-search-forward "claude-code-ide-control--[a-z0-9-]+" nil t)
+        ;; Names in docstrings and comments do not count
+        (unless (nth 8 (syntax-ppss))
+          (push (match-string 0) found))))
+    (should-not found)))
+
 (ert-deftest claude-code-ide-test-review-record-file ()
   "The record is a private JSON file that a new Emacs reads back."
   (claude-code-ide-review-tests--with-review

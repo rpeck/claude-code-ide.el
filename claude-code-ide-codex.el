@@ -688,6 +688,213 @@ drops the events of nested sessions."
       (claude-code-ide-instance-set-property
        instance :codex-native-id-generation (plist-get event :generation)))))
 
+;;; Transcripts
+
+(defvar claude-code-ide-codex-rollout-recheck-seconds 60
+  "Seconds after which a found rollout file is checked again.
+`claude-code-ide-codex-rollout-file' then looks in the day folders for
+a newer rollout file of the same native ID, which Codex can write at
+a resume, and takes the newest one by name.")
+
+(defvar claude-code-ide-codex-rollout-miss-seconds 60
+  "Seconds that a miss of the full search for a rollout file is kept.
+In that time, `claude-code-ide-codex-rollout-file' searches the whole
+sessions folder again for the same native ID only when the sessions
+folder or the day folder of today changed.  The day folders are always
+checked.")
+
+(defvar claude-code-ide-codex--rollout-cache (make-hash-table :test 'equal)
+  "Rollout lookups by (SESSIONS-FOLDER . NATIVE-ID).
+A value is (:file FILE :time TIME) for a found file, checked at TIME,
+or (:miss TIME :stamp STAMP) after a full search that found no file;
+STAMP is that of `claude-code-ide-codex--folders-stamp'.")
+
+(declare-function claude-code-ide-session-registry-cached "claude-code-ide-session-registry"
+                  (kind file fn))
+(declare-function claude-code-ide-session-registry-grep-last "claude-code-ide-session-registry"
+                  (file &rest args))
+(declare-function claude-code-ide-session-registry-grep-lines "claude-code-ide-session-registry"
+                  (file &rest args))
+(declare-function claude-code-ide-session-registry-line-field "claude-code-ide-session-registry"
+                  (line field))
+
+(defconst claude-code-ide-codex--uuid-regexp
+  (concat "\\`[0-9a-fA-F]\\{8\\}-[0-9a-fA-F]\\{4\\}-[0-9a-fA-F]\\{4\\}"
+          "-[0-9a-fA-F]\\{4\\}-[0-9a-fA-F]\\{12\\}\\'")
+  "A full UUID: the form of a Codex native conversation ID.")
+
+(defun claude-code-ide-codex--uuid-p (native-id)
+  "Return non-nil when NATIVE-ID is a full UUID."
+  (and (stringp native-id) (string-match-p claude-code-ide-codex--uuid-regexp native-id)))
+
+(defun claude-code-ide-codex--uuid7-time (native-id)
+  "Return the creation time of NATIVE-ID in seconds, or nil.
+Only a UUID version 7 holds a time: its first 48 bits are milliseconds
+since the epoch."
+  (when (and (stringp native-id)
+             (string-match (concat "\\`\\([0-9a-fA-F]\\{8\\}\\)-\\([0-9a-fA-F]\\{4\\}\\)"
+                                   "-7[0-9a-fA-F]\\{3\\}-[0-9a-fA-F]\\{4\\}-[0-9a-fA-F]\\{12\\}\\'")
+                           native-id))
+    (/ (string-to-number (concat (match-string 1 native-id) (match-string 2 native-id)) 16)
+       1000.0)))
+
+(defun claude-code-ide-codex--rollout-regexp (native-id)
+  "Return the regexp of the name of the rollout file of NATIVE-ID.
+The name is rollout-, the start time, -, the full native ID, .jsonl."
+  (concat "\\`rollout-[0-9-]+T[0-9-]+-" (regexp-quote native-id) "\\.jsonl\\'"))
+
+(defun claude-code-ide-codex--day-folder (sessions time)
+  "Return the day folder of SESSIONS for TIME, in local time as Codex names it."
+  (expand-file-name (format-time-string "%Y/%m/%d" time) sessions))
+
+(defun claude-code-ide-codex--day-folders (sessions native-id)
+  "Return the day folders of SESSIONS that can hold the rollout of NATIVE-ID.
+They are the day before, the day of, and the day after the creation
+time of a UUID version 7 ID, and the day of today, which holds the
+rollout of a resume today."
+  (delete-dups
+   (append (when-let* ((time (claude-code-ide-codex--uuid7-time native-id)))
+             (mapcar (lambda (offset)
+                       (claude-code-ide-codex--day-folder sessions (+ time (* offset 86400))))
+                     '(-1 0 1)))
+           (list (claude-code-ide-codex--day-folder sessions nil)))))
+
+(defun claude-code-ide-codex--newest (files)
+  "Return the last of FILES by name, or nil."
+  (car (last (sort (delete-dups (delq nil (copy-sequence files))) #'string<))))
+
+(defun claude-code-ide-codex--rollout-in-day-folders (sessions native-id)
+  "Return the newest rollout file of NATIVE-ID in its day folders, or nil.
+The day folders are those of SESSIONS; see
+`claude-code-ide-codex--day-folders'."
+  (let ((regexp (claude-code-ide-codex--rollout-regexp native-id)))
+    (claude-code-ide-codex--newest
+     (mapcan (lambda (dir)
+               (and (file-directory-p dir) (directory-files dir t regexp t)))
+             (claude-code-ide-codex--day-folders sessions native-id)))))
+
+(defun claude-code-ide-codex--search-rollout (sessions native-id)
+  "Return the newest rollout file of NATIVE-ID by name in all of SESSIONS, or nil."
+  (claude-code-ide-codex--newest
+   (directory-files-recursively sessions (claude-code-ide-codex--rollout-regexp native-id))))
+
+(defun claude-code-ide-codex--folders-stamp (sessions)
+  "Return the modification times of SESSIONS and of its day folder of today."
+  (mapcar (lambda (dir) (file-attribute-modification-time (file-attributes dir)))
+          (list sessions (claude-code-ide-codex--day-folder sessions nil))))
+
+(defun claude-code-ide-codex--recent-miss-p (cached sessions now)
+  "Return non-nil when CACHED is a miss that still holds at NOW.
+A miss holds for `claude-code-ide-codex-rollout-miss-seconds', while
+the folders of SESSIONS do not change."
+  (and (plist-get cached :miss)
+       (< (- now (plist-get cached :miss)) claude-code-ide-codex-rollout-miss-seconds)
+       (equal (plist-get cached :stamp) (claude-code-ide-codex--folders-stamp sessions))))
+
+(defun claude-code-ide-codex-rollout-file (native-id)
+  "Return the absolute path of the rollout file of the conversation NATIVE-ID.
+Return nil when NATIVE-ID is not a full UUID, or when no readable file
+is found in the sessions folder of the Codex home.  Of several files,
+the newest by name wins.  The lookup is cheap:
+- A found file is given from a cache.  After
+  `claude-code-ide-codex-rollout-recheck-seconds', the day folders are
+  checked again for a newer file.
+- Else the day folders are checked: those of the creation time of a
+  UUID version 7 ID, and that of today.
+- Else the whole sessions folder is searched.  A miss of that search
+  is kept for `claude-code-ide-codex-rollout-miss-seconds', unless the
+  sessions folder or the day folder of today changes."
+  (when (claude-code-ide-codex--uuid-p native-id)
+    (let* ((sessions (expand-file-name "sessions" (claude-code-ide-codex-home)))
+           (key (cons sessions native-id))
+           (cached (gethash key claude-code-ide-codex--rollout-cache))
+           (old (let ((file (plist-get cached :file)))
+                  (and file (file-readable-p file) file)))
+           (now (float-time)))
+      (cond
+       ((not (file-directory-p sessions)) nil)
+       ((and old (< (- now (plist-get cached :time)) claude-code-ide-codex-rollout-recheck-seconds))
+        old)
+       (t
+        (let* ((recent-miss (claude-code-ide-codex--recent-miss-p cached sessions now))
+               (file (or (claude-code-ide-codex--newest
+                          (list old (claude-code-ide-codex--rollout-in-day-folders sessions native-id)))
+                         (unless recent-miss
+                           (claude-code-ide-codex--search-rollout sessions native-id)))))
+          (cond
+           ((and file (file-readable-p file))
+            (puthash key (list :file file :time now) claude-code-ide-codex--rollout-cache)
+            file)
+           (t
+            (unless recent-miss
+              (puthash key (list :miss now :stamp (claude-code-ide-codex--folders-stamp sessions))
+                       claude-code-ide-codex--rollout-cache))
+            nil))))))))
+
+(defun claude-code-ide-codex--non-empty (value)
+  "Return VALUE when it is a string that is not empty, else nil."
+  (and (stringp value) (not (string-empty-p value)) value))
+
+(defun claude-code-ide-codex--session-title (native-id)
+  "Return the last thread name of NATIVE-ID in the Codex session index, or nil.
+The index is session_index.jsonl in the Codex home: one short line for
+each name that a conversation gets."
+  (require 'claude-code-ide-session-registry)
+  (let ((file (expand-file-name "session_index.jsonl" (claude-code-ide-codex-home))))
+    (when (and (stringp native-id) (file-readable-p file))
+      (claude-code-ide-session-registry-cached
+       (list 'codex-title native-id) file
+       (lambda (file)
+         (let ((line (claude-code-ide-session-registry-grep-last
+                      file "-F" (format "\"id\":\"%s\"" native-id))))
+           (and (equal (claude-code-ide-session-registry-line-field line 'id) native-id)
+                (claude-code-ide-codex--non-empty
+                 (claude-code-ide-session-registry-line-field line 'thread_name)))))))))
+
+(defun claude-code-ide-codex--model-of-matches (lines)
+  "Return the model of the last turn_context record in the grep LINES, or nil.
+LINES come from grep -n -o: \"N:\\\"type\\\":\\\"turn_context\\\"\" marks the
+record on line N, and the first \"N:\\\"model\\\":\\\"M\\\"\" of that line
+gives its model M."
+  (let ((record nil) (model nil))
+    (dolist (line lines)
+      (when (string-match "\\`\\([0-9]+\\):\\(.*\\)\\'" line)
+        (let ((number (match-string 1 line)) (match (match-string 2 line)))
+          (cond
+           ((string-prefix-p "\"type\"" match)
+            (setq record number model nil))
+           ((and (equal number record) (null model)
+                 (string-match "\\`\"model\":\"\\([^\"]*\\)\"\\'" match))
+            (setq model (match-string 1 match)))))))
+    (claude-code-ide-codex--non-empty model)))
+
+(defun claude-code-ide-codex--rollout-model (file)
+  "Return the model of the last turn_context record of the rollout FILE, or nil.
+grep prints only the short matches, never the whole records, which can
+be large."
+  (require 'claude-code-ide-session-registry)
+  (claude-code-ide-session-registry-cached
+   'codex-model file
+   (lambda (file)
+     (claude-code-ide-codex--model-of-matches
+      (claude-code-ide-session-registry-grep-lines
+       file "-n" "-o" "-E" "\"type\":\"turn_context\"|\"model\":\"[^\"]*\"")))))
+
+(defun claude-code-ide-codex--transcript (instance what)
+  "Return WHAT of the rollout of the conversation of INSTANCE, or `unknown'.
+WHAT is `file' (the absolute path of the rollout file), `title' (from
+the session index) or `model' (from the rollout file).  INSTANCE can be
+a detached descriptor that holds only a native ID."
+  (unless (memq what '(file title model))
+    (error "Unknown transcript value: %S" what))
+  (let ((native (claude-code-ide-known-or-nil (claude-code-ide-codex--native-id instance))))
+    (claude-code-ide-or-unknown
+     (and native
+          (if (eq what 'title)
+              (claude-code-ide-codex--session-title native)
+            (when-let* ((file (claude-code-ide-codex-rollout-file native)))
+              (if (eq what 'file) file (claude-code-ide-codex--rollout-model file))))))))
+
 (defun claude-code-ide-codex--map-event (provider-event data)
   "Return the common event of the Codex hook event PROVIDER-EVENT with DATA.
 The Codex event adapter of the `codex-status' part maps it, when it is
@@ -867,7 +1074,11 @@ start offers to trust them."
     :native-id #'claude-code-ide-codex--native-id
     :map-event #'claude-code-ide-codex--map-event
     :mcp-setup #'claude-code-ide-codex--mcp-setup
-    :exit-message #'claude-code-ide-codex--exit-message))
+    :transcript #'claude-code-ide-codex--transcript
+    :exit-message #'claude-code-ide-codex--exit-message
+    ;; A Codex restore gets no flags: the Codex options give the Codex
+    ;; flags and the model, never the Claude Code --model and --name
+    :restore-flags nil))
   "The provider of the Codex CLI.")
 
 (add-hook 'claude-code-ide-event-functions #'claude-code-ide-codex--note-session-start)

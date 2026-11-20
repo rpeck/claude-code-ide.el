@@ -37,7 +37,10 @@
 ;;
 ;; Each operation is also an MCP tool with the coordinator scope.
 ;; docs/api-control.md describes the operations, the inbox and the
-;; tools.
+;; tools, and the helpers that other files of the package (such as
+;; the review file) use: `claude-code-ide-control-valid-id-p',
+;; `claude-code-ide-control-state-of', `claude-code-ide-control-refresh'
+;; and the others of its section "Helpers for other files".
 
 ;;; Code:
 
@@ -133,7 +136,7 @@ An operation without a function returns (:status unavailable
           (when instance-id (list :instance-id instance-id))
           (when message (list :message message))))
 
-(defun claude-code-ide-control--valid-id-p (id)
+(defun claude-code-ide-control-valid-id-p (id)
   "Return non-nil when ID can name an instance or a folder of the inbox."
   (and (stringp id)
        (<= 1 (length id) 128)
@@ -254,6 +257,14 @@ is on, because otherwise its file is not kept up to date."
       (claude-code-ide-session-registry--find
        (claude-code-ide-session-registry--entries) instance-id))))
 
+;; The public name calls the internal one through its symbol, so that
+;; one replacement of the internal function (as in the tests) changes
+;; both.
+(defalias 'claude-code-ide-control-registry-entry 'claude-code-ide-control--registry-entry
+  "Return the session registry entry of INSTANCE-ID, or nil.
+The registry is read only while `claude-code-ide-session-registry-mode'
+is on, because otherwise its file is not kept up to date.")
+
 (cl-defun claude-code-ide-control-resume (instance-id &key prompt directory native-id provider)
   "Start the instance INSTANCE-ID again and resume its conversation.
 The session registry gives the directory, the provider and the native
@@ -261,10 +272,10 @@ ID of the instance.  Without a registry entry, DIRECTORY, NATIVE-ID
 and PROVIDER give them.  PROMPT is the first message.  The instance
 keeps its instance ID and gets the next launch generation.  The result
 is that of `claude-code-ide-control-launch'."
-  (let ((entry (and (claude-code-ide-control--valid-id-p instance-id)
+  (let ((entry (and (claude-code-ide-control-valid-id-p instance-id)
                     (claude-code-ide-control--registry-entry instance-id))))
     (cond
-     ((not (claude-code-ide-control--valid-id-p instance-id))
+     ((not (claude-code-ide-control-valid-id-p instance-id))
       (claude-code-ide-control--error 'invalid-instance-id instance-id))
      ((when-let* ((instance (claude-code-ide-instance-by-id instance-id)))
         (claude-code-ide-instance-live-p instance))
@@ -362,7 +373,7 @@ The key is the inbox folder of an instance.  The first use of a folder
 reads its files; after that, the writes of this file keep the index
 current, and the events read no files.")
 
-(defun claude-code-ide-control--now ()
+(defun claude-code-ide-control-now ()
   "Return the current time as an ISO 8601 string in UTC."
   (format-time-string "%FT%TZ" nil t))
 
@@ -377,7 +388,7 @@ current, and the events read no files.")
   "Return the inbox folder of INSTANCE-ID.
 Its pending requests are files in it; the final ones are in its
 subfolder done.  Signal an error for an ID that cannot name a folder."
-  (unless (claude-code-ide-control--valid-id-p instance-id)
+  (unless (claude-code-ide-control-valid-id-p instance-id)
     (error "Not a valid instance ID: %S" instance-id))
   (file-name-as-directory (expand-file-name instance-id (claude-code-ide-control--inbox-root))))
 
@@ -443,7 +454,7 @@ Line ends become LF, and white space at the start and the end goes."
                   value))))
       record)))
 
-(defun claude-code-ide-control--json-decode (text)
+(defun claude-code-ide-control-json-decode (text)
   "Parse the JSON TEXT into an alist with symbol keys.
 Use the native parser when this Emacs has one, else json.el."
   (if (and (fboundp 'json-available-p) (json-available-p))
@@ -455,11 +466,11 @@ Use the native parser when this Emacs has one, else json.el."
   "Return the record in FILE, or nil when FILE cannot be read."
   (condition-case nil
       (claude-code-ide-control--record-from-alist
-       (claude-code-ide-control--json-decode
+       (claude-code-ide-control-json-decode
         (claude-code-ide-session-registry--file-string file)))
     (error nil)))
 
-(defun claude-code-ide-control--write-json-file (file data)
+(defun claude-code-ide-control-write-json-file (file data)
   "Write DATA, a value for `json-encode', to FILE atomically.
 The text goes to a temporary file (mode 0600) in the same folder, which
 is then renamed over FILE.  The folder is private (mode 0700).  Other
@@ -478,8 +489,8 @@ files of the package, such as the review file, use it too."
           (delete-file tmp))))))
 
 (defun claude-code-ide-control--write-file (file record)
-  "Write RECORD to FILE atomically; see `claude-code-ide-control--write-json-file'."
-  (claude-code-ide-control--write-json-file
+  "Write RECORD to FILE atomically; see `claude-code-ide-control-write-json-file'."
+  (claude-code-ide-control-write-json-file
    file (claude-code-ide-control--record-to-alist record)))
 
 (defun claude-code-ide-control--pending-records (instance-id)
@@ -487,7 +498,7 @@ files of the package, such as the review file, use it too."
 The first call for an inbox folder reads its files; later calls read
 the index.  A pending file whose final copy exists in done is a
 left-over of an interrupted move, and is deleted."
-  (when (claude-code-ide-control--valid-id-p instance-id)
+  (when (claude-code-ide-control-valid-id-p instance-id)
     (let* ((dir (claude-code-ide-control-inbox-directory-of instance-id))
            (cell (gethash dir claude-code-ide-control--index 'none)))
       (if (not (eq cell 'none))
@@ -508,24 +519,30 @@ left-over of an interrupted move, and is deleted."
                                           (claude-code-ide-control--record-seq b))))
                    claude-code-ide-control--index))))))
 
-(defun claude-code-ide-control--prune-folder (dir days &optional regexp)
+(defun claude-code-ide-control-prune-folder (dir days &optional regexp)
   "Delete the files in DIR whose names match REGEXP and that are older than DAYS.
 REGEXP defaults to the names of the inbox files (hex digits and
 \".json\").  Other files of the package, such as the review file, use
 it too."
-  (let ((limit (* days 86400)))
-    (when (file-directory-p dir)
-      (dolist (file (directory-files dir t (or regexp "\\`[0-9a-f]+\\.json\\'") t))
-        (when-let* ((attributes (file-attributes file)))
-          (when (> (float-time (time-subtract nil (file-attribute-modification-time attributes)))
-                   limit)
-            (ignore-errors (delete-file file))))))))
+  (when (file-directory-p dir)
+    (dolist (file (directory-files dir t (or regexp "\\`[0-9a-f]+\\.json\\'") t))
+      (claude-code-ide-control-prune-file file days))))
+
+(defun claude-code-ide-control-prune-file (file days)
+  "Delete FILE when it is older than DAYS, and return non-nil then.
+The age is that of its last change.  A file that does not exist gives
+nil.  A delete that fails is ignored; the result is still non-nil."
+  (when-let* ((attributes (file-attributes file)))
+    (when (> (float-time (time-subtract nil (file-attribute-modification-time attributes)))
+             (* days 86400))
+      (ignore-errors (delete-file file))
+      t)))
 
 (defun claude-code-ide-control--prune-done (instance-id)
   "Delete the final records of INSTANCE-ID that are too old.
 See `claude-code-ide-control-done-days'."
-  (claude-code-ide-control--prune-folder (claude-code-ide-control--done-directory instance-id)
-                                         claude-code-ide-control-done-days))
+  (claude-code-ide-control-prune-folder (claude-code-ide-control--done-directory instance-id)
+                                        claude-code-ide-control-done-days))
 
 (defun claude-code-ide-control--write-record (record)
   "Write RECORD to its inbox file and update the index.  Return RECORD.
@@ -538,7 +555,7 @@ file is deleted, so that an interrupted move loses nothing."
          (others (cl-remove request-id pending
                             :key #'claude-code-ide-control--record-request-id :test #'equal))
          (file (claude-code-ide-control--record-file instance-id request-id)))
-    (setf (claude-code-ide-control--record-updated-at record) (claude-code-ide-control--now))
+    (setf (claude-code-ide-control--record-updated-at record) (claude-code-ide-control-now))
     (if (claude-code-ide-control--final-p record)
         (progn
           (setf (claude-code-ide-control--record-text record) nil)
@@ -589,7 +606,7 @@ DUPLICATE non-nil adds :duplicate t: the request ID was known."
                 :sent-at (claude-code-ide-control--record-sent-at record))
           (when duplicate (list :duplicate t))))
 
-(defun claude-code-ide-control--request-id-string (request-id)
+(defun claude-code-ide-control-request-id-string (request-id)
   "Return REQUEST-ID as a string: a number becomes its decimal text.
 Return nil for another value."
   (cond ((stringp request-id) request-id)
@@ -600,8 +617,8 @@ Return nil for another value."
 REQUEST-ID is a string or a number, as for `claude-code-ide-control-submit'.
 The result has the keys of `claude-code-ide-control-submit'.  An
 unknown request gives (:status error :reason unknown-request)."
-  (let ((request-id (claude-code-ide-control--request-id-string request-id)))
-    (if-let* ((record (and (claude-code-ide-control--valid-id-p instance-id)
+  (let ((request-id (claude-code-ide-control-request-id-string request-id)))
+    (if-let* ((record (and (claude-code-ide-control-valid-id-p instance-id)
                            request-id
                            (claude-code-ide-control--find-record instance-id request-id))))
         (claude-code-ide-control--result record)
@@ -649,7 +666,7 @@ The reason is `exit-code' when the CLI exited with an error code, else
                'error))
             (list :detail failure))))
 
-(defun claude-code-ide-control--state-of (instance-id)
+(defun claude-code-ide-control-state-of (instance-id)
   "Return the state of INSTANCE-ID for the state rules, or nil when unknown.
 A running instance gives its state plist.  For an instance that does
 not run, the session registry decides:
@@ -731,7 +748,7 @@ launch that got the prompt are dropped."
         (claude-code-ide-control--record-reason record) reason)
   (claude-code-ide-control--write-record record))
 
-(defun claude-code-ide-control--refresh (instance-id)
+(defun claude-code-ide-control-refresh (instance-id)
   "Make the overdue sent records of INSTANCE-ID final, and return the rest.
 An overdue record gets the result `unacknowledged'.  It is never sent
 again and no longer blocks the queue.  The result is the list of the
@@ -773,24 +790,24 @@ Return a plist with :destination (the instance that gets TEXT),
   `awaiting-acknowledgement'.
 - `unacknowledged': TEXT was sent, but no acknowledgement came in time.
 - `rejected': TEXT does not go out; :reason says why."
-  (let* ((request-id (or (claude-code-ide-control--request-id-string request-id)
+  (let* ((request-id (or (claude-code-ide-control-request-id-string request-id)
                          (claude-code-ide-instance-new-id)))
          (queue (cond ((not queue-given) 'auto)
                       ((memq queue '(auto always never)) queue)
                       (queue 'always)
                       (t 'never))))
-    (when (claude-code-ide-control--valid-id-p instance-id)
+    (when (claude-code-ide-control-valid-id-p instance-id)
       (setq instance-id (claude-code-ide-control--chain-current instance-id)))
-    (if (not (claude-code-ide-control--valid-id-p instance-id))
+    (if (not (claude-code-ide-control-valid-id-p instance-id))
         (claude-code-ide-control--rejected instance-id request-id 'invalid-instance-id)
-      (let* ((pending (claude-code-ide-control--refresh instance-id))
+      (let* ((pending (claude-code-ide-control-refresh instance-id))
              (known (claude-code-ide-control--find-record instance-id request-id pending)))
         (cond
          (known (claude-code-ide-control--result known t))
          ((not (and (stringp text) (not (string-empty-p (string-trim text)))))
           (claude-code-ide-control--rejected instance-id request-id 'empty-text))
          (t
-          (let ((state (claude-code-ide-control--state-of instance-id)))
+          (let ((state (claude-code-ide-control-state-of instance-id)))
             (if (null state)
                 (claude-code-ide-control--rejected instance-id request-id 'unknown-instance)
               (claude-code-ide-control--submit-new
@@ -804,7 +821,7 @@ new one.  Without a chain, or without the registry, it is INSTANCE-ID."
            (fboundp 'claude-code-ide-session-registry-chain-current)
            (let ((current (ignore-errors
                             (funcall 'claude-code-ide-session-registry-chain-current instance-id))))
-             (and (claude-code-ide-control--valid-id-p current) current)))
+             (and (claude-code-ide-control-valid-id-p current) current)))
       instance-id))
 
 (defun claude-code-ide-control--submit-new (instance-id text request-id queue state pending)
@@ -836,7 +853,7 @@ and PENDING the pending records of INSTANCE-ID."
                    :text (claude-code-ide-control--line-ends text)
                    :result (if (eq action 'reject) 'rejected 'queued)
                    :reason reason
-                   :created-at (claude-code-ide-control--now)
+                   :created-at (claude-code-ide-control-now)
                    :requested-by (claude-code-ide-control--requester))))
       (claude-code-ide-control--write-record record)
       (pcase action
@@ -855,7 +872,7 @@ when sent."
          (instance (claude-code-ide-instance-by-id instance-id))
          (text (claude-code-ide-control--record-text record)))
     (when (and instance (stringp text))
-      (setf (claude-code-ide-control--record-sent-at record) (claude-code-ide-control--now)
+      (setf (claude-code-ide-control--record-sent-at record) (claude-code-ide-control-now)
             (claude-code-ide-control--record-sent-generation record)
             (claude-code-ide-instance-generation instance)
             (claude-code-ide-control--record-sent-guess record) (and guess t)
@@ -893,7 +910,7 @@ waits for its acknowledgement (see
 When the provider of the instance has no submit-prompt, the queued
 prompts become final with the reason `no-submit'.  Return the request
 ID of the prompt that was sent, or nil."
-  (let* ((pending (claude-code-ide-control--refresh instance-id))
+  (let* ((pending (claude-code-ide-control-refresh instance-id))
          (instance (claude-code-ide-instance-by-id instance-id))
          (state (and instance (claude-code-ide-instance-live-p instance)
                      (claude-code-ide-instance-state instance)))
@@ -951,8 +968,8 @@ has already:
   moves too, with a note that it may have reached FROM.
 A second call moves nothing again.  Return the request IDs of the
 copies, oldest first."
-  (when (and (claude-code-ide-control--valid-id-p from)
-             (claude-code-ide-control--valid-id-p to)
+  (when (and (claude-code-ide-control-valid-id-p from)
+             (claude-code-ide-control-valid-id-p to)
              (not (equal from to)))
     (let ((moved nil))
       (dolist (record (claude-code-ide-control--pending-records from))
@@ -1025,7 +1042,7 @@ Return the request ID of that prompt, or nil."
                                  (claude-code-ide-control--pending-records instance-id))))
         (when record
           (setf (claude-code-ide-control--record-delivered-at record)
-                (claude-code-ide-control--now))
+                (claude-code-ide-control-now))
           (claude-code-ide-control--finish record 'delivered nil)
           (claude-code-ide-control--maybe-stop-timer)
           (let ((request-id (claude-code-ide-control--record-request-id record)))
@@ -1058,7 +1075,7 @@ an instance with queued prompts, such as `turn-end' or
 `session-start', starts a delivery.  The index gives the queued
 prompts, so an event reads no file."
   (let ((instance-id (plist-get event :instance-id)))
-    (when (claude-code-ide-control--valid-id-p instance-id)
+    (when (claude-code-ide-control-valid-id-p instance-id)
       (if (eq (plist-get event :event) 'prompt-submit)
           (claude-code-ide-control--acknowledge event)
         (when (claude-code-ide-control--pending-records instance-id)
@@ -1143,42 +1160,42 @@ Stop the timer when no running instance has a pending record."
    ((and value (symbolp value)) (symbol-name value))
    (t value)))
 
-(defun claude-code-ide-control--json (result)
+(defun claude-code-ide-control-json (result)
   "Return the plist RESULT as JSON text for an MCP tool."
   (json-encode (claude-code-ide-control--to-json result)))
 
-(defun claude-code-ide-control--blank-p (value)
+(defun claude-code-ide-control-blank-p (value)
   "Return non-nil when the MCP argument VALUE is missing or empty."
   (or (null value) (and (stringp value) (string-empty-p value))))
 
 (defun claude-code-ide-control--provider-arg (value)
   "Return the provider name of the MCP argument VALUE, or nil."
-  (unless (claude-code-ide-control--blank-p value) (intern value)))
+  (unless (claude-code-ide-control-blank-p value) (intern value)))
 
 (defun claude-code-ide-control--mcp-list-instances (&optional provider)
   "MCP tool: list the instances, of PROVIDER only when it is given."
-  (claude-code-ide-control--json
+  (claude-code-ide-control-json
    (claude-code-ide-control-list-instances (claude-code-ide-control--provider-arg provider))))
 
 (defun claude-code-ide-control--mcp-inspect-instance (instance-id)
   "MCP tool: describe the instance INSTANCE-ID."
-  (claude-code-ide-control--json (claude-code-ide-control-inspect-instance instance-id)))
+  (claude-code-ide-control-json (claude-code-ide-control-inspect-instance instance-id)))
 
 (defun claude-code-ide-control--mcp-launch (directory &optional provider name prompt role)
   "MCP tool: start an instance in DIRECTORY with PROVIDER, NAME, PROMPT and ROLE."
-  (claude-code-ide-control--json
+  (claude-code-ide-control-json
    (claude-code-ide-control-launch
     :directory directory
     :provider (claude-code-ide-control--provider-arg provider)
-    :name (unless (claude-code-ide-control--blank-p name) name)
-    :prompt (unless (claude-code-ide-control--blank-p prompt) prompt)
-    :role (unless (claude-code-ide-control--blank-p role) role))))
+    :name (unless (claude-code-ide-control-blank-p name) name)
+    :prompt (unless (claude-code-ide-control-blank-p prompt) prompt)
+    :role (unless (claude-code-ide-control-blank-p role) role))))
 
 (defun claude-code-ide-control--mcp-resume (instance-id &optional prompt)
   "MCP tool: start INSTANCE-ID again with the first message PROMPT."
-  (claude-code-ide-control--json
+  (claude-code-ide-control-json
    (claude-code-ide-control-resume
-    instance-id :prompt (unless (claude-code-ide-control--blank-p prompt) prompt))))
+    instance-id :prompt (unless (claude-code-ide-control-blank-p prompt) prompt))))
 
 (defun claude-code-ide-control--mcp-submit (instance-id text &optional request-id queue)
   "MCP tool: submit TEXT to INSTANCE-ID with REQUEST-ID.
@@ -1187,20 +1204,20 @@ QUEUE is \"auto\" (the default), \"always\" or \"never\"."
                 ("always" 'always)
                 ("never" 'never)
                 (_ 'auto))))
-    (claude-code-ide-control--json
+    (claude-code-ide-control-json
      (claude-code-ide-control-submit
       instance-id text
-      :request-id (unless (claude-code-ide-control--blank-p request-id) request-id)
+      :request-id (unless (claude-code-ide-control-blank-p request-id) request-id)
       :queue mode))))
 
 (defun claude-code-ide-control--mcp-request-status (instance-id request-id)
   "MCP tool: return the result of REQUEST-ID in the inbox of INSTANCE-ID."
-  (claude-code-ide-control--json
+  (claude-code-ide-control-json
    (claude-code-ide-control-request-status instance-id request-id)))
 
 (defun claude-code-ide-control--mcp-stop (instance-id)
   "MCP tool: end the instance INSTANCE-ID."
-  (claude-code-ide-control--json (claude-code-ide-control-stop instance-id)))
+  (claude-code-ide-control-json (claude-code-ide-control-stop instance-id)))
 
 (defconst claude-code-ide-control--instance-id-arg
   '(:name "instance_id" :type string
@@ -1329,6 +1346,14 @@ tool is added to the MCP tools when the control tools are set up."
 (when (and claude-code-ide-control-enable-mcp-tools
            (claude-code-ide-control-scope-enforced-p))
   (claude-code-ide-control-setup-mcp-tools))
+
+;;; Earlier internal names
+
+;; These helpers were internal before 1.2.0 and now have public names.
+;; The handover file and its tests still use these internal names.
+(defalias 'claude-code-ide-control--state-of #'claude-code-ide-control-state-of)
+(defalias 'claude-code-ide-control--json #'claude-code-ide-control-json)
+(defalias 'claude-code-ide-control--blank-p #'claude-code-ide-control-blank-p)
 
 (provide 'claude-code-ide-control)
 
