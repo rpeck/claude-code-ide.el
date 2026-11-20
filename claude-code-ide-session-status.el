@@ -672,12 +672,16 @@ main agent waits on the subagent that started them."
 (defcustom claude-code-ide-session-status-quota-regexp
   (concat "usage[_ ]?limit\\|plan[_ ]limit\\|quota"
           "\\|credits?[_ ]\\(?:depleted\\|exhausted\\)\\|out of credits\\|insufficient[_ ]credits"
-          "\\|hit your limit\\|\\(?:5-hour\\|five-hour\\|weekly\\|daily\\|monthly\\) limit")
+          "\\|hit your limit\\|\\(?:5-hour\\|five-hour\\|weekly\\|daily\\|monthly\\) limit"
+          "\\|spend[_ ]cap\\|usage[_ ]not[_ ]included\\|chatgpt plan, upgrade to"
+          "\\|included usage is exhausted")
   "Regexp for an error text that reports the usage limit of the account.
 It is matched without case.  It must not match a short rate limit,
 such as \"Rate limit reached ... tokens per min\", which ends in
 seconds.  A Claude Code rate limit or a failed Codex model request
-whose text matches it is `failed/quota-limit'."
+whose text matches it is `failed/quota-limit'.  The Codex 0.164.0
+texts that it matches are in docs/status-events.md, section \"Quota
+limits\"."
   :type 'regexp
   :group 'claude-code-ide)
 
@@ -1444,9 +1448,9 @@ See `claude-code-ide-session-status--cli-state'."
                           claude-code-ide-session-registry--start-tolerance)))
            (status (and owner (claude-code-ide-session-registry--cli-session-status cli)))
            (since (and owner (claude-code-ide-session-registry--cli-session-status-time cli)))
+           ;; No source gives the state: it has no :source
            (untracked (lambda (detail)
-                        (cons (append (claude-code-ide-instance-make-state 'disconnected 'untracked)
-                                      (list :source 'cli-file))
+                        (cons (claude-code-ide-instance-make-state 'disconnected 'untracked)
                               detail)))
            (from-cli (lambda (state reason detail)
                        (cons (append (claude-code-ide-instance-make-state state reason since)
@@ -1465,7 +1469,8 @@ See `claude-code-ide-session-status--cli-state'."
 
 (defun claude-code-ide-session-status--cli-state (session &optional now)
   "Return (STATE . DETAIL) of SESSION, without status hooks, from its CLI file.
-STATE is a common state plist with the extra key :source `cli-file'.
+STATE is a common state plist.  A state that the file gives has the
+extra key :source `cli-file'; `disconnected/untracked' has no :source.
 
 - \"busy\" is `working'; \"idle\" and \"shell\" (a background shell runs)
   are `idle', as the hooks give them.  The CLI reports them itself, so
@@ -1492,16 +1497,19 @@ result is computed once for each NOW (one refresh)."
 
 (defun claude-code-ide-session-status--session-state (session now)
   "Return (STATUS-STATE COMMON DETAIL SINCE) of the Claude Code SESSION at NOW.
-A session with a status record uses its hooks.  A session without one
-uses its CLI status file, when its CLI process is known."
+A session with a status record uses its hooks: COMMON has :source
+`hooks'.  A session without one uses its CLI status file, when its CLI
+process is known (:source `cli-file').  Else COMMON is
+`disconnected/untracked' without :source."
   (let ((status (gethash session claude-code-ide-session-status--by-session)))
     (if-let* (((null status))
               (cli (and session (claude-code-ide-session-status--cli-state session now))))
         (list (claude-code-ide-session-status--common-label-key (car cli))
               (car cli) (cdr cli) (plist-get (car cli) :since))
-      (let ((state (claude-code-ide-session-status--state status now)))
+      (let ((state (claude-code-ide-session-status--state status now))
+            (common (claude-code-ide-session-status--common-state status now)))
         (list state
-              (claude-code-ide-session-status--common-state status now)
+              (if status (append common (list :source 'hooks)) common)
               (claude-code-ide-session-status--detail status state now)
               (claude-code-ide-session-status--state-since status state))))))
 
@@ -1749,6 +1757,7 @@ this value well below 30."
       (state . ,(funcall value (plist-get state :state)))
       (reason . ,(funcall value (plist-get state :reason)))
       (guess . ,(if (plist-get state :guess) t :json-false))
+      (source . ,(funcall value (plist-get state :source)))
       (since . ,(claude-code-ide-session-status--iso-time (plist-get state :since)))
       (age_seconds . ,(let ((age (plist-get state :age))) (and age (round age))))
       (detail . ,(claude-code-ide-session-status--instance-detail instance now)))))
