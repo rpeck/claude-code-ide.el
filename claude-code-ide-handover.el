@@ -553,10 +553,12 @@ of the Codex sessions folder as its fallback."
 (defun claude-code-ide-handover--transcript-file (provider native-id &optional entry leg)
   "Return the transcript file of the conversation NATIVE-ID of PROVIDER, or nil.
 It is the :transcript of LEG, else the transcript path of the registry
-ENTRY, else for Claude Code the session file of ENTRY (its ID in its
-folder), else the file that the `transcript' operation of PROVIDER
-gives for NATIVE-ID or the native ID of ENTRY.  So the delivery check
-and the source leg read the same Claude Code file as before."
+ENTRY, else:
+- for Claude Code, the session file of ENTRY (its ID in its folder),
+  and nothing more, so that the delivery check and the source leg read
+  the same file as before;
+- for another provider, the file that its `transcript' operation gives
+  for NATIVE-ID or the native ID of ENTRY."
   (let ((candidates (list (plist-get leg :transcript)
                           (and entry (claude-code-ide-session-registry-entry-transcript-path entry))
                           ;; A Claude Code entry finds its file from its ID and folder
@@ -564,10 +566,11 @@ and the source leg read the same Claude Code file as before."
                                (ignore-errors
                                  (claude-code-ide-session-registry--transcript-file entry))))))
     (or (cl-find-if (lambda (file) (and (stringp file) (file-readable-p file))) candidates)
-        (claude-code-ide-handover--provider-transcript
-         provider
-         (list native-id (and entry (claude-code-ide-session-registry-entry-session-id entry)))
-         entry))))
+        (unless (eq provider 'claude)
+          (claude-code-ide-handover--provider-transcript
+           provider
+           (list native-id (and entry (claude-code-ide-session-registry-entry-session-id entry)))
+           entry)))))
 
 (defun claude-code-ide-handover--line-count (file)
   "Return the number of lines of FILE, or nil when it cannot be read."
@@ -2030,7 +2033,7 @@ starts the handover without that yes."
 TARGET-PROVIDER, METHOD and REASON are the tool arguments."
   (let ((instance-id (and (fboundp 'claude-code-ide-mcp-request-instance-id)
                           (claude-code-ide-mcp-request-instance-id))))
-    (claude-code-ide-control--json
+    (claude-code-ide-control-json
      (if instance-id
          (claude-code-ide-handover-request instance-id target-provider method reason)
        (claude-code-ide-handover--error 'no-instance "The request has no instance")))))
@@ -2058,18 +2061,18 @@ TARGET-PROVIDER, METHOD and REASON are the tool arguments."
                                                            interrupt force request-id)
   "MCP tool: hand INSTANCE-ID over to TARGET-PROVIDER.
 METHOD, CONTEXT, INTERRUPT, FORCE and REQUEST-ID are the tool arguments."
-  (claude-code-ide-control--json
+  (claude-code-ide-control-json
    (claude-code-ide-control-call
     'handover instance-id target-provider
     :method (if (and (stringp method) (string= method "fork")) 'fork 'fresh)
-    :context (unless (claude-code-ide-control--blank-p context) context)
+    :context (unless (claude-code-ide-control-blank-p context) context)
     :interrupt (claude-code-ide-handover--flag interrupt)
     :force (claude-code-ide-handover--flag force)
-    :request-id (unless (claude-code-ide-control--blank-p request-id) request-id))))
+    :request-id (unless (claude-code-ide-control-blank-p request-id) request-id))))
 
 (defun claude-code-ide-handover--mcp-status (handover-id)
   "MCP tool: return the result of the handover HANDOVER-ID (or request ID)."
-  (claude-code-ide-control--json (claude-code-ide-handover-status handover-id)))
+  (claude-code-ide-control-json (claude-code-ide-handover-status handover-id)))
 
 (claude-code-ide-control-define-operation 'handover #'claude-code-ide-handover-session)
 

@@ -173,15 +173,22 @@ instead of signaling an error."
 
 ;; The Codex provider and the transcript readers both need the Codex
 ;; home, and neither file loads the other, so the one rule is here.
-(defun claude-code-ide-codex-home ()
-  "Return the Codex home folder as an absolute directory name.
-It is CODEX_HOME when that is an absolute file name.  An empty or a
-relative CODEX_HOME counts as unset, so the folder is ~/.codex."
+(defun claude-code-ide-codex-home (&optional directory)
+  "Return the Codex home folder as a directory name, as Codex reads it.
+- CODEX_HOME unset or empty: ~/.codex.
+- CODEX_HOME absolute: CODEX_HOME as it is.
+- CODEX_HOME relative: relative to DIRECTORY, the working folder of the
+  Codex session (its worktree or project root) when the caller knows
+  it, else to `default-directory'.
+Codex does not expand a leading ~ in CODEX_HOME, so neither does this:
+\"~/x\" is the folder \"~/x\" in DIRECTORY."
   (let ((home (getenv "CODEX_HOME")))
     (file-name-as-directory
-     (expand-file-name (if (and home (> (length home) 0) (file-name-absolute-p home))
-                           home
-                         "~/.codex")))))
+     (cond
+      ((or (null home) (= (length home) 0)) (expand-file-name "~/.codex"))
+      ((and (not (string-prefix-p "~" home)) (file-name-absolute-p home)) home)
+      ;; "./" keeps `expand-file-name' from reading a leading ~
+      (t (expand-file-name (concat "./" home) (or directory default-directory)))))))
 
 (provide 'claude-code-ide-provider)
 

@@ -946,7 +946,7 @@ EXTRA is a plist of :target-native to set the target's native ID, and
   "A failed registry entry is `failed' with its reason; a pending one is starting."
   (claude-code-ide-handover-tests--with
     (let ((entries nil))
-      (cl-letf (((symbol-function 'claude-code-ide-control--registry-entry)
+      (cl-letf (((symbol-function 'claude-code-ide-control-registry-entry)
                  (lambda (id) (cdr (assoc id entries)))))
         (push (cons "cci-test-f1" (claude-code-ide-session-registry-entry-create
                                    :key "cci-test-f1" :state 'failed
@@ -961,17 +961,17 @@ EXTRA is a plist of :target-native to set the target's native ID, and
         (push (cons "cci-test-o" (claude-code-ide-session-registry-entry-create
                                   :key "cci-test-o" :state 'open))
               entries)
-        (let ((state (claude-code-ide-control--state-of "cci-test-f1")))
+        (let ((state (claude-code-ide-control-state-of "cci-test-f1")))
           (should (eq (plist-get state :state) 'failed))
           (should (eq (plist-get state :reason) 'exit-code))
           (should (string-prefix-p "The CLI exited" (plist-get state :detail))))
-        (let ((state (claude-code-ide-control--state-of "cci-test-f2")))
+        (let ((state (claude-code-ide-control-state-of "cci-test-f2")))
           (should (eq (plist-get state :reason) 'error))
           (should (equal (plist-get state :detail) "Directory x does not exist")))
-        (let ((state (claude-code-ide-control--state-of "cci-test-p")))
+        (let ((state (claude-code-ide-control-state-of "cci-test-p")))
           (should (eq (plist-get state :state) 'working))
           (should (eq (plist-get state :reason) 'starting)))
-        (should (eq (plist-get (claude-code-ide-control--state-of "cci-test-o") :state) 'disconnected))
+        (should (eq (plist-get (claude-code-ide-control-state-of "cci-test-o") :state) 'disconnected))
         ;; The submit rules follow: failed rejects, pending queues
         (should (eq (plist-get (claude-code-ide-control-submit "cci-test-f1" "cci-test-x") :result)
                     'rejected))
@@ -1202,12 +1202,16 @@ entry, and the key and folder of the entry."
             (should (equal (claude-code-ide-handover--transcript-file
                             'claude "cci-test-cc-live" cc-entry)
                            cc-file))
-            ;; Without an entry file, the operation finds the live one
+            ;; Claude Code has exactly the three old steps: without an
+            ;; entry file, the file of the live native ID does not count
             (delete-file cc-file)
-            (should (equal (claude-code-ide-handover--transcript-file
-                            'claude "cci-test-cc-live" cc-entry)
-                           (expand-file-name "cci-test-cc-live.jsonl"
-                                             (file-name-directory cc-file))))))
+            (let ((asked nil))
+              (cl-letf (((symbol-function 'claude-code-ide--claude-transcript)
+                         (lambda (&rest _) (setq asked t) 'unknown)))
+                (should-not (claude-code-ide-handover--transcript-file
+                             'claude "cci-test-cc-live" cc-entry))
+                (should-not (claude-code-ide-handover--transcript-file 'claude "cci-test-cc-live")))
+              (should-not asked))))
       (delete-directory dir t))))
 
 ;;; Review fixes
