@@ -41,6 +41,10 @@ echo "Running compile and test checks..." >&2
 # Find Emacs (EMACS) and the package folders
 # shellcheck source=scripts/common.sh
 source "$SCRIPT_DIR/common.sh"
+if ! find_emacs; then
+    echo "Emacs not found (set EMACS); trying emacs" >&2
+    EMACS=emacs
+fi
 
 # Mocking primitives with cl-letf makes Emacs 29+ native-compile a
 # trampoline, which fails where the C toolchain is broken; mocks work
@@ -72,7 +76,7 @@ fi
 
 # The MCP tests that use the real web-server package run when it is
 # found, and are skipped otherwise
-if WEB_SERVER_DIR=$(find_newest_elpa_package "web-server"); then
+if WEB_SERVER_DIR=$(find_emacs_package "web-server"); then
     LOAD_PATH="$LOAD_PATH -L $WEB_SERVER_DIR"
 fi
 
@@ -143,15 +147,17 @@ if [ $COMPILE_EXIT_CODE -eq 0 ] && [ $NATIVE_COMPILE_EXIT_CODE -eq 0 ]; then
         TEST_FAILED=1
     fi
 
-    # The format hook must change files of this repository only
-    echo "" >&2
-    echo "=== Running the format hook test ===" >&2
-    if "$SCRIPT_DIR/test-format-hook.sh"; then
-        echo "✓ Format hook test passed!" >&2
-    else
-        echo "✗ Format hook test failed!" >&2
-        TEST_FAILED=1
-    fi
+    # The tests of the scripts: scripts/test-*.sh
+    for script_test in "$SCRIPT_DIR"/test-*.sh; do
+        echo "" >&2
+        echo "=== Running $(basename "$script_test") ===" >&2
+        if "$script_test"; then
+            echo "✓ $(basename "$script_test") passed!" >&2
+        else
+            echo "✗ $(basename "$script_test") failed!" >&2
+            TEST_FAILED=1
+        fi
+    done
 else
     echo "" >&2
     echo "=== Skipping tests due to compilation errors ===" >&2
