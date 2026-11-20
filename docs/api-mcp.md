@@ -7,7 +7,7 @@ This document describes how a request finds its instance, how the server checks 
 - Code: `claude-code-ide-mcp-server.el` (sessions, secrets, context, scopes) and `claude-code-ide-mcp-http-server.el` (HTTP).
 - Tools: `claude-code-ide-emacs-tools.el`.
 - Tests: `claude-code-ide-mcp-routing-tests.el`.
-  - The tests mock web-server, except `claude-code-ide-mcp-routing-test-web-server-split-body`. That test runs only when the web-server package is on the `load-path`, and it is skipped otherwise. To run it, put the package folder first in `EMACSLOADPATH`, for example `EMACSLOADPATH=~/.emacs.d/elpa/web-server-20210708.2242: ./scripts/compile-and-test.sh`.
+  - The tests mock web-server, except the tests named `…-web-server-…`. Those run only when the web-server package is on the `load-path`, and they are skipped otherwise. `./scripts/compile-and-test.sh` adds the newest `~/.emacs.d/elpa/web-server-*` folder when there is one.
 - Instances and providers: [session-schema.md](session-schema.md) and [providers.md](providers.md).
 
 ## Sessions
@@ -78,14 +78,24 @@ Other rules:
 
 ### The body
 
-The handler reads a request only when its whole body has arrived (`claude-code-ide-mcp-http-server--await-body`).
+The filter of the connections (`claude-code-ide-mcp-http-server--filter`) reads each request before web-server sees it. It gives web-server the request only when the headers and `Content-Length` bytes of body are there.
 
 - **Why.** The web-server package calls the handler as soon as the headers end, with the part of the body that has arrived until then. It does not read `Content-Length`. Python's `http.client` (and so `urllib`, and the stdio bridge of `rp-emacs-mcp.el`) sends the headers and the body in two writes. When Emacs reads the headers alone, the handler sees an empty or partial body.
-  - Before this check, such a request got a JSON-RPC error with `id` null (`End of file while parsing JSON`), and its tool did not run. A client that waits for its own `id` waited until its time limit. A client that was still sending got `Connection reset by peer`.
-- **What the handler does.** When the body has fewer bytes than `Content-Length`, the handler clears the `active` slot of the request and returns `:keep-alive` to web-server. web-server then parses the request again, and calls the handler again, when the next data arrives. No timer runs and nothing waits.
-- **Advice runs again.** An advice on `claude-code-ide-mcp-http-server--handle-post` (such as the guard of `rp-emacs-mcp.el`) runs once for each part, before the body is complete. It must not read the body.
+  - Before this filter, such a request got a JSON-RPC error with `id` null (`End of file while parsing JSON`), and its tool did not run. A client that waits for its own `id` waited until its time limit. A client that was still sending got `Connection reset by peer`.
+- **One place.** The filter is the only code that depends on how web-server reads a request (tested with web-server 20210708.2242). It calls `ws-filter` once, with the whole request. Every handler and every advice on a handler sees whole requests only. The filter keeps each part of the body as it comes, and joins the parts once.
+- **Checks before the body.** For a POST to `/mcp…`, the filter runs these checks on the path and the headers, before it reads the body. A refused request gets its reply at once, and no body is kept:
+  1. `Origin` and `Content-Type` (403, 415), as in [The check](#the-check).
+  2. `claude-code-ide-mcp-server-check-request` (403), as in [The check](#the-check).
+  3. The body length:
+     - `Transfer-Encoding` (for example `chunked`): 411. The server reads only `Content-Length`.
+     - A POST without `Content-Length`: 411.
+     - A `Content-Length` that is not a plain non-negative integer, or two different values: 400.
+     - A `Content-Length` above `claude-code-ide-mcp-http-server-max-body-bytes` (default 16 MiB): 413.
+  - The reply of a refusal has a JSON-RPC error with `id` null. After the reply, the server ends its side of the connection and drops the data that still comes, so that the client does not lose the reply to a reset.
+- **Time limit.** A connection must send its whole request within `claude-code-ide-mcp-http-server-body-timeout` seconds (default 30). Then it gets 408 and is closed, and the filter forgets it. The limit also closes a connection that sends nothing.
+- **Header limit.** A header section above 64 KiB gets 431.
 - **`Expect: 100-continue`.** A request with this header and no body yet gets `HTTP/1.1 100 Continue` first. curl sends this header for a body of 1 MB or more. Without the reply, curl waits 1 s before it sends the body.
-- **No `Content-Length`.** The handler reads the body that it has.
+- **The handler.** It still makes all the checks of [The check](#the-check). A body that is shorter than its `Content-Length` (only possible when the filter is not in use) gets 400 and is never parsed.
 
 ### Replies
 
