@@ -1130,16 +1130,17 @@ EXTRA is a plist of :target-native to set the target's native ID, and
   "A Codex leg finds its rollout file by its native ID in the Codex home."
   (let* ((home (make-temp-file "cci-test-codex-home-" t))
          (dir (expand-file-name "sessions/2026/11/18" home))
-         (file (expand-file-name "rollout-2026-11-18T10-00-00-cci-test-0001.jsonl" dir))
+         (id "cc1e5000-0000-4000-8000-000000000001")
+         (file (expand-file-name (concat "rollout-2026-11-18T10-00-00-" id ".jsonl") dir))
          (process-environment (cons (concat "CODEX_HOME=" home) process-environment)))
     (unwind-protect
         (progn
           (make-directory dir t)
           (write-region "{}\n{}\n" nil file nil 'silent)
-          (should (equal (claude-code-ide-codex-rollout-file "cci-test-0001") file))
-          (should-not (claude-code-ide-codex-rollout-file "cci-test-0002"))
+          (should (equal (claude-code-ide-codex-rollout-file id) file))
+          (should-not (claude-code-ide-codex-rollout-file "cc1e5000-0000-4000-8000-000000000002"))
           (should-not (claude-code-ide-codex-rollout-file "../x"))
-          (should (equal (claude-code-ide-handover--transcript-file 'codex "cci-test-0001") file))
+          (should (equal (claude-code-ide-handover--transcript-file 'codex id) file))
           (should (= (claude-code-ide-handover--line-count file) 2)))
       (delete-directory home t))))
 
@@ -1192,7 +1193,21 @@ entry, and the key and folder of the entry."
             (make-directory (file-name-directory cc-file) t)
             (write-region "{}\n" nil cc-file nil 'silent)
             (should (equal (claude-code-ide-handover--transcript-file 'claude nil cc-entry)
-                           cc-file))))
+                           cc-file))
+            ;; The session file of the entry comes before the file of
+            ;; the live native ID, as before the provider operation
+            (write-region "{}\n" nil (expand-file-name "cci-test-cc-live.jsonl"
+                                                       (file-name-directory cc-file))
+                          nil 'silent)
+            (should (equal (claude-code-ide-handover--transcript-file
+                            'claude "cci-test-cc-live" cc-entry)
+                           cc-file))
+            ;; Without an entry file, the operation finds the live one
+            (delete-file cc-file)
+            (should (equal (claude-code-ide-handover--transcript-file
+                            'claude "cci-test-cc-live" cc-entry)
+                           (expand-file-name "cci-test-cc-live.jsonl"
+                                             (file-name-directory cc-file))))))
       (delete-directory dir t))))
 
 ;;; Review fixes

@@ -169,6 +169,20 @@ instead of signaling an error."
         (apply (cl-struct-slot-value 'claude-code-ide-provider operation provider) args)
       (claude-code-ide-provider-unavailable operation))))
 
+;;; The Codex home
+
+;; The Codex provider and the transcript readers both need the Codex
+;; home, and neither file loads the other, so the one rule is here.
+(defun claude-code-ide-codex-home ()
+  "Return the Codex home folder as an absolute directory name.
+It is CODEX_HOME when that is an absolute file name.  An empty or a
+relative CODEX_HOME counts as unset, so the folder is ~/.codex."
+  (let ((home (getenv "CODEX_HOME")))
+    (file-name-as-directory
+     (expand-file-name (if (and home (> (length home) 0) (file-name-absolute-p home))
+                           home
+                         "~/.codex")))))
+
 (provide 'claude-code-ide-provider)
 
 ;;; claude-code-ide-provider.el ends here

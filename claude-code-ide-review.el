@@ -650,11 +650,8 @@ request ID counts."
   "Delete FILE of the final RECORD when it is older than the limit.
 Return non-nil when it was deleted.  The limit is
 `claude-code-ide-review-done-days'.  A record that is not final stays."
-  (when (and (claude-code-ide-review--final-p record) (file-exists-p file))
-    (claude-code-ide-control-prune-folder
-     (file-name-directory file) claude-code-ide-review-done-days
-     (concat "\\`" (regexp-quote (file-name-nondirectory file)) "\\'"))
-    (not (file-exists-p file))))
+  (when (claude-code-ide-review--final-p record)
+    (claude-code-ide-control-prune-file file claude-code-ide-review-done-days)))
 
 (defun claude-code-ide-review--take (file record)
   "Take the RECORD of FILE into this Emacs, unless another Emacs tracks it.

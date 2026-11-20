@@ -72,14 +72,27 @@ Rules for each operation:
 | `claude` | The transcript path of the CLI report, else `<CLAUDE_CONFIG_DIR>/projects/<project slug>/<native ID>.jsonl`. | The `/rename` title, else the summary. | The model of the last assistant message. |
 | `codex` | The rollout file of the native ID: `claude-code-ide-codex-rollout-file`. | The last `thread_name` of the native ID in `<CODEX_HOME>/session_index.jsonl`. | The `model` of the last `turn_context` record of the rollout file. |
 
-**The Codex rollout file.** `(claude-code-ide-codex-rollout-file NATIVE-ID)` returns the absolute path of the rollout file of the Codex conversation NATIVE-ID, or nil. The `transcript` operation of `codex` calls it with the native ID of INSTANCE. The steps:
+**Capabilities of Codex instances.** Since 1.2.0 the `codex` provider has `transcript`. So `get_capabilities` and `inspect-instance` list `transcript` for a Codex instance. This is an intended change.
 
-1. NATIVE-ID must be letters, digits, and `-`. Another value gives nil.
-2. A cache by native ID gives the path of an earlier find, when the file still exists.
-3. A native ID that is a UUID version 7 holds its creation time. The function looks in the day folders `<CODEX_HOME>/sessions/YYYY/MM/DD/` of the day before, the day of, and the day after that time, for `rollout-*-<NATIVE-ID>.jsonl`.
-4. Else, as a fallback, it searches all of `<CODEX_HOME>/sessions/` for that name, and takes the last match by name. A miss of this search is kept for `claude-code-ide-codex-rollout-retry-seconds` (5 s), so frequent calls for a conversation without a rollout file yet do not search again each time.
+**The Codex rollout file.** `(claude-code-ide-codex-rollout-file NATIVE-ID)` returns the absolute path of the rollout file of the Codex conversation NATIVE-ID, or nil. The `transcript` operation of `codex` calls it with the native ID of INSTANCE. The rules:
 
-CODEX_HOME is the environment variable when it is set and not empty, else `~/.codex`. A compressed rollout (`.jsonl.zst`) is not found, because the transcript readers cannot read it.
+1. **Full IDs only.** NATIVE-ID must be a full UUID (8-4-4-4-12 hex digits). A part of an ID, or another value, gives nil.
+2. **The name.** A rollout file has the name `rollout-<start time>-<NATIVE-ID>.jsonl`, for example `rollout-2026-11-17T14-22-26-<NATIVE-ID>.jsonl`. Of several matching files, the newest by name wins, as Codex can write a new rollout at a resume.
+3. **The cache.** A found file comes from a cache by native ID while it is readable. After `claude-code-ide-codex-rollout-recheck-seconds` (60 s), the function checks the day folders again for a newer file.
+4. **The day folders.** These are `<CODEX_HOME>/sessions/YYYY/MM/DD/` of today, and, for a UUID version 7, of the day before, the day of, and the day after its creation time. The function always checks them, and they are cheap.
+5. **The full search.** Only when the day folders have no file, it searches all of `<CODEX_HOME>/sessions/`. A miss of this search is kept for `claude-code-ide-codex-rollout-miss-seconds` (60 s). In that time, it searches again only when the sessions folder or the day folder of today changes. So frequent calls never walk the whole folder each time.
+6. **The limit.** A newer rollout in a day folder that is not in the list above is found only by the full search, so only before the first find.
+
+**The Codex home.** `(claude-code-ide-codex-home)` (in `claude-code-ide-provider.el`) is the one rule for the rollouts, the session index, and the Codex config file of the transcript readers. It is CODEX_HOME when that is an absolute file name. An empty or a relative CODEX_HOME counts as unset, so the home is `~/.codex`.
+
+A compressed rollout (`.jsonl.zst`) is not found, because the transcript readers cannot read it.
+
+**The shared transcript helpers.** Both providers read their transcripts with the helpers of the session registry:
+
+- `claude-code-ide-session-registry-grep-lines` and `-grep-last` run grep, so that no transcript is read in full.
+- `claude-code-ide-session-registry-line-field` reads one field of a JSON line.
+- `claude-code-ide-session-registry-cached` caches a value for each kind and file, until the time or the size of the file changes. A changed file replaces its value, so the cache does not grow with each change.
+- The Codex model comes from `grep -n -o`: it reads only short matches, never a whole `turn_context` record.
 
 ### Restore flags
 
@@ -88,7 +101,7 @@ CODEX_HOME is the environment variable when it is set and not empty, else `~/.co
 - The `claude` provider gives the stored flags, the model of the transcript (else the stored model) as `--model`, and the title that the user gave as `--name`.
 - The `codex` provider sets the slot to nil: a Codex restore gets no flags. The Codex options give the Codex flags and the model.
 - A provider with nil in the slot gets no flags.
-- **Deprecated fallback.** For one release, a provider with nil in the slot that has an entry in `claude-code-ide-session-registry-restore-flags-functions` still gets the flags of that entry. Set the slot in place of the table. The table goes away in the next release.
+- **Deprecated table.** For one release, an entry of the provider in `claude-code-ide-session-registry-restore-flags-functions` still wins over the slot, as before the slot. So a user who set an entry keeps its flags. The table is nil by default. Set the slot in place of the table. The table goes away in the next release.
 
 ### Two operations that §4.1 of the plan does not list
 
