@@ -710,6 +710,51 @@ The two instances have the same display name."
         (should (eq (plist-get result :reason) 'start-failed))
         (should (equal (plist-get result :message) "CLI not available"))))))
 
+(ert-deftest claude-code-ide-test-control-public-helpers ()
+  "The helpers for other files work, and the internal names that other files use stay."
+  (should (claude-code-ide-control-valid-id-p "cci-test-a.b_c"))
+  (should-not (claude-code-ide-control-valid-id-p "../x"))
+  (should-not (claude-code-ide-control-valid-id-p 42))
+  (should (equal (claude-code-ide-control-request-id-string 42) "42"))
+  (should (equal (claude-code-ide-control-request-id-string "r") "r"))
+  (should-not (claude-code-ide-control-request-id-string '(x)))
+  (should (claude-code-ide-control-blank-p nil))
+  (should (claude-code-ide-control-blank-p ""))
+  (should-not (claude-code-ide-control-blank-p "x"))
+  (should (string-match-p "\\`[0-9-]+T[0-9:]+Z\\'" (claude-code-ide-control-now)))
+  (should (equal (claude-code-ide-control-json-decode "{\"a\":[1,null]}") '((a 1 nil))))
+  (should (equal (claude-code-ide-control-json-decode (claude-code-ide-control-json '(:status ok)))
+                 '((status . "ok"))))
+  (let* ((dir (make-temp-file "cci-test-control-helpers-" t))
+         (sub (expand-file-name "sub" dir))
+         (file (expand-file-name "cci-test.json" sub)))
+    (unwind-protect
+        (progn
+          (claude-code-ide-control-write-json-file file '((a . 1)))
+          (should (equal (claude-code-ide-control-json-decode
+                          (with-temp-buffer (insert-file-contents file) (buffer-string)))
+                         '((a . 1))))
+          (should (= (file-modes file) #o600))
+          (should (= (file-modes sub) #o700))
+          (should-not (directory-files sub nil "\\.tmp\\'"))
+          (let ((young (expand-file-name "cci-test-young.json" sub)))
+            (write-region "{}" nil young nil 'silent)
+            (set-file-times file (time-subtract nil (* 3 86400)))
+            (claude-code-ide-control-prune-folder sub 2 "\\`cci-test.*\\.json\\'")
+            (should-not (file-exists-p file))
+            (should (file-exists-p young))))
+      (delete-directory dir t)))
+  ;; Other files still call these internal names
+  (dolist (pair '((claude-code-ide-control--state-of . claude-code-ide-control-state-of)
+                  (claude-code-ide-control--json . claude-code-ide-control-json)
+                  (claude-code-ide-control--blank-p . claude-code-ide-control-blank-p)
+                  (claude-code-ide-control-registry-entry . claude-code-ide-control--registry-entry)))
+    (should (eq (indirect-function (car pair)) (indirect-function (cdr pair)))))
+  (dolist (name '(claude-code-ide-control--now claude-code-ide-control--refresh
+                                               claude-code-ide-control--valid-id-p
+                                               claude-code-ide-control--json-decode))
+    (should-not (fboundp name))))
+
 (ert-deftest claude-code-ide-test-control-operations-table ()
   "Each operation has a function; handover and track-review come later."
   (let ((claude-code-ide-control-operations (copy-tree claude-code-ide-control-operations)))

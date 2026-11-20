@@ -243,32 +243,19 @@ the review over when that Emacs is gone.")
   "Return the record in FILE, or nil when FILE cannot be read."
   (condition-case nil
       (claude-code-ide-review--from-alist
-       (claude-code-ide-control--json-decode
+       (claude-code-ide-control-json-decode
         (claude-code-ide-session-registry--file-string file)))
     (error nil)))
 
 (defun claude-code-ide-review--write (record)
   "Write RECORD to its file atomically and return RECORD.
-The text goes to a temporary file in the same folder, which is then
-renamed over the file.  The folder is private (mode 0700) and the file
-has mode 0600, because the result text can be private.  The record
-format differs from the inbox format, so the inbox writer
-`claude-code-ide-control--write-file' does not fit."
-  (setf (claude-code-ide-review--record-updated-at record) (claude-code-ide-control--now))
-  (let* ((file (claude-code-ide-review--file (claude-code-ide-review--record-review-id record)))
-         (dir (file-name-directory file)))
-    (with-file-modes #o700
-      (make-directory dir t))
-    (let ((tmp (with-file-modes #o600
-                 (make-temp-file (expand-file-name ".review-" dir) nil ".tmp"))))
-      (unwind-protect
-          (progn
-            (let ((coding-system-for-write 'utf-8-unix))
-              (write-region (json-encode (claude-code-ide-review--to-alist record))
-                            nil tmp nil 'silent))
-            (rename-file tmp file t))
-        (when (file-exists-p tmp)
-          (delete-file tmp)))))
+`claude-code-ide-control-write-json-file' writes it: the folder is
+private (mode 0700) and the file has mode 0600, because the result
+text can be private."
+  (setf (claude-code-ide-review--record-updated-at record) (claude-code-ide-control-now))
+  (claude-code-ide-control-write-json-file
+   (claude-code-ide-review--file (claude-code-ide-review--record-review-id record))
+   (claude-code-ide-review--to-alist record))
   (puthash (claude-code-ide-review--record-review-id record) record
            claude-code-ide-review--records)
   record)
@@ -325,7 +312,7 @@ This runs after the sentinel of PROCESS."
 (defun claude-code-ide-review--json-p (text)
   "Return non-nil when TEXT is valid JSON."
   (condition-case nil
-      (progn (claude-code-ide-control--json-decode text) t)
+      (progn (claude-code-ide-control-json-decode text) t)
     (error nil)))
 
 (defun claude-code-ide-review--read-result (file)
@@ -447,7 +434,7 @@ the owner.  When the result text cannot be made, RECORD stays
 `running', and a later check tries again."
   (when (eq (claude-code-ide-review--record-state record) 'running)
     (unless (claude-code-ide-review--record-ended-at record)
-      (setf (claude-code-ide-review--record-ended-at record) (claude-code-ide-control--now)
+      (setf (claude-code-ide-review--record-ended-at record) (claude-code-ide-control-now)
             (claude-code-ide-review--record-exit-status record) exit-status))
     (let ((text (condition-case err
                     (claude-code-ide-review--result-text record)
@@ -476,7 +463,7 @@ registry has it.  Otherwise it is OWNER."
   (or (and (fboundp 'claude-code-ide-session-registry-chain-current)
            (let ((current (ignore-errors
                             (funcall 'claude-code-ide-session-registry-chain-current owner))))
-             (and (claude-code-ide-control--valid-id-p current) current)))
+             (and (claude-code-ide-control-valid-id-p current) current)))
       owner))
 
 (defun claude-code-ide-review--finish (record state &optional reason)
@@ -490,7 +477,7 @@ lost without a word."
   (if (eq state 'delivered)
       (setf (claude-code-ide-review--record-text record) nil
             (claude-code-ide-review--record-delivered-at record)
-            (or (claude-code-ide-review--record-delivered-at record) (claude-code-ide-control--now)))
+            (or (claude-code-ide-review--record-delivered-at record) (claude-code-ide-control-now)))
     (display-warning
      'claude-code-ide
      (format "The result of the review \"%s\" (%s) was not delivered to %s: %s (%s).  The result file is %s; the record is %s"
@@ -512,7 +499,7 @@ lost without a word."
           (claude-code-ide-review--record-attempts record) 0
           (claude-code-ide-review--record-waiting-since record) nil
           (claude-code-ide-review--record-submitted-at record)
-          (or (claude-code-ide-review--record-submitted-at record) (claude-code-ide-control--now)))
+          (or (claude-code-ide-review--record-submitted-at record) (claude-code-ide-control-now)))
     (claude-code-ide-review--write record)))
 
 (defun claude-code-ide-review--follow (record from)
@@ -614,8 +601,8 @@ result that no inbox knows is submitted again.  Return the new state."
          (status (progn
                    ;; A sent result whose acknowledgement is overdue
                    ;; becomes unacknowledged here
-                   (when (claude-code-ide-control--valid-id-p destination)
-                     (claude-code-ide-control--refresh destination))
+                   (when (claude-code-ide-control-valid-id-p destination)
+                     (claude-code-ide-control-refresh destination))
                    (claude-code-ide-control-request-status destination request-id))))
     (if (eq (plist-get status :status) 'error)
         (let ((current (claude-code-ide-review--current-owner
@@ -661,13 +648,13 @@ request ID counts."
 
 (defun claude-code-ide-review--prune (file record)
   "Delete FILE of the final RECORD when it is older than the limit.
-Return non-nil when it was deleted."
-  (when (claude-code-ide-review--final-p record)
-    (when-let* ((attributes (file-attributes file)))
-      (when (> (float-time (time-subtract nil (file-attribute-modification-time attributes)))
-               (* claude-code-ide-review-done-days 86400))
-        (ignore-errors (delete-file file))
-        t))))
+Return non-nil when it was deleted.  The limit is
+`claude-code-ide-review-done-days'.  A record that is not final stays."
+  (when (and (claude-code-ide-review--final-p record) (file-exists-p file))
+    (claude-code-ide-control-prune-folder
+     (file-name-directory file) claude-code-ide-review-done-days
+     (concat "\\`" (regexp-quote (file-name-nondirectory file)) "\\'"))
+    (not (file-exists-p file))))
 
 (defun claude-code-ide-review--take (file record)
   "Take the RECORD of FILE into this Emacs, unless another Emacs tracks it.
@@ -822,7 +809,7 @@ their result file, or gives the owner the error result `interrupted'."
 A running instance gives the folder of its descriptor.  An instance
 that does not run gives the folder of its session registry entry."
   (let* ((instance (claude-code-ide-instance-by-id owner))
-         (entry (and (not instance) (claude-code-ide-control--registry-entry owner)))
+         (entry (and (not instance) (claude-code-ide-control-registry-entry owner)))
          (dir (cond
                (instance (or (claude-code-ide-instance-worktree instance)
                              (claude-code-ide-instance-project-root instance)))
@@ -837,7 +824,7 @@ The result is (:status ok :review-id ID :owner OWNER :label LABEL
 :exit-status N :pid PID :result-file FILE :created-at T :ended-at T
 :delivered-at T), or (:status error :reason unknown-review)."
   (claude-code-ide-review--ensure-loaded)
-  (let* ((review-id (claude-code-ide-control--request-id-string review-id))
+  (let* ((review-id (claude-code-ide-control-request-id-string review-id))
          (record (and review-id
                       (or (gethash review-id claude-code-ide-review--records)
                           (let ((file (claude-code-ide-review--file review-id)))
@@ -909,10 +896,10 @@ PID), the state of the known review with :duplicate t when REVIEW-ID
 was used before, or (:status error :reason R ...).  This never
 signals."
   (claude-code-ide-review--ensure-loaded)
-  (let ((review-id (or (claude-code-ide-control--request-id-string review-id)
+  (let ((review-id (or (claude-code-ide-control-request-id-string review-id)
                        (claude-code-ide-instance-new-id)))
         (directory (or directory
-                       (and (claude-code-ide-control--valid-id-p owner)
+                       (and (claude-code-ide-control-valid-id-p owner)
                             (claude-code-ide-review--owner-directory owner))
                        default-directory)))
     (cond
@@ -921,7 +908,7 @@ signals."
      ((or (gethash review-id claude-code-ide-review--records)
           (file-exists-p (claude-code-ide-review--file review-id)))
       (append (claude-code-ide-review-status review-id) (list :duplicate t)))
-     ((not (claude-code-ide-control--valid-id-p owner))
+     ((not (claude-code-ide-control-valid-id-p owner))
       (claude-code-ide-review--error 'invalid-instance-id review-id))
      ((and process command)
       (claude-code-ide-review--error 'process-and-command review-id
@@ -936,14 +923,14 @@ signals."
                              (not (string-empty-p (car command))))))
       (claude-code-ide-review--error 'invalid-command review-id
                                      "The command is a list of strings"))
-     ((claude-code-ide-control--blank-p result-file)
+     ((claude-code-ide-control-blank-p result-file)
       (claude-code-ide-review--error 'no-result-file review-id))
      ((not (stringp result-file))
       (claude-code-ide-review--error 'no-result-file review-id))
      ((not (and (stringp directory) (file-directory-p directory)))
       (claude-code-ide-review--error 'no-directory review-id
                                      (format "No such directory: %s" directory)))
-     ((null (claude-code-ide-control--state-of owner))
+     ((null (claude-code-ide-control-state-of owner))
       (claude-code-ide-review--error 'unknown-instance review-id
                                      (format "No instance %s is known" owner)))
      (t
@@ -956,7 +943,7 @@ signals."
            (and command (file-name-nondirectory (car command)))
            directory
            (expand-file-name result-file directory)
-           (if (claude-code-ide-control--blank-p label) "review" label))
+           (if (claude-code-ide-control-blank-p label) "review" label))
         (error
          (claude-code-ide-review--error 'start-failed review-id (error-message-string err))))))))
 
@@ -979,7 +966,7 @@ else nil.  RESULT-FILE and LABEL are those of the review."
                   :emacs-start (claude-code-ide-review--emacs-start)
                   :result-file result-file
                   :state 'running
-                  :created-at (claude-code-ide-control--now))))
+                  :created-at (claude-code-ide-control-now))))
     (claude-code-ide-review--write record)
     (when (processp process)
       (process-put process 'claude-code-ide-review-id review-id)
@@ -1001,15 +988,15 @@ else nil.  RESULT-FILE and LABEL are those of the review."
   "MCP tool: track a review of INSTANCE-ID that writes RESULT-FILE.
 LABEL, REVIEW-ID, PID (a process ID), COMMAND (an array of strings) and
 DIRECTORY are optional; give PID or COMMAND."
-  (claude-code-ide-control--json
+  (claude-code-ide-control-json
    (claude-code-ide-review-track
     instance-id
-    :process (unless (claude-code-ide-control--blank-p pid) pid)
+    :process (unless (claude-code-ide-control-blank-p pid) pid)
     :command (when (or (vectorp command) (consp command)) (append command nil))
     :result-file result-file
-    :label (unless (claude-code-ide-control--blank-p label) label)
-    :review-id (unless (claude-code-ide-control--blank-p review-id) review-id)
-    :directory (unless (claude-code-ide-control--blank-p directory) directory))))
+    :label (unless (claude-code-ide-control-blank-p label) label)
+    :review-id (unless (claude-code-ide-control-blank-p review-id) review-id)
+    :directory (unless (claude-code-ide-control-blank-p directory) directory))))
 
 (claude-code-ide-control-define-operation 'track-review #'claude-code-ide-review-track)
 
