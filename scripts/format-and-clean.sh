@@ -9,9 +9,15 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$PROJECT_ROOT" || exit 1
 
-# Find Emacs (EMACS) the same way as compile-and-test.sh
+# Find Emacs (EMACS) the same way as compile-and-test.sh.  Without
+# Emacs, Elisp files are not formatted: the script says so once and
+# exits with 0
 # shellcheck source=scripts/common.sh
 source "$SCRIPT_DIR/common.sh"
+HAVE_EMACS=true
+if ! find_emacs; then
+    HAVE_EMACS=false
+fi
 
 # transient gives the indent rules of its own macros; recent releases
 # depend on cond-let and llama
@@ -58,6 +64,13 @@ process_file() {
     # For Elisp files, format and clean whitespace in one operation
     case "$file" in
         *.el)
+            if [ "$HAVE_EMACS" != true ]; then
+                if [ -z "$NO_EMACS_REPORTED" ]; then
+                    echo "format-and-clean: Emacs not found; Elisp files are not formatted" >&2
+                    NO_EMACS_REPORTED=1
+                fi
+                return 0
+            fi
             echo "Formatting and cleaning: $file" >&2
 
             # The indent rules of the project macros come from the
