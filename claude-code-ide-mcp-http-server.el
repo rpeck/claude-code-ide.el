@@ -31,7 +31,8 @@
 ;; The session of an instance also needs the secret of the instance:
 ;; /mcp/<instance-id>/<secret>, or the header
 ;; `claude-code-ide-mcp-server-secret-header'.  A notification gets
-;; 202 Accepted with no body.
+;; 202 Accepted with no body.  The handler reads a request only when
+;; its whole body (Content-Length bytes) has arrived.
 
 ;;; Code:
 
@@ -126,6 +127,45 @@ browser, which can send a POST to 127.0.0.1:
                                 (downcase type))))
       '(415 . "Content-Type must be application/json")))))
 
+(defun claude-code-ide-mcp-http-server--content-length (headers)
+  "Return the Content-Length of the request with HEADERS as a number, or nil.
+Return nil also when the value is not a number."
+  (let ((value (claude-code-ide-mcp-http-server--header headers "Content-Length")))
+    (and (stringp value)
+         (string-match-p "\\`[ \t]*[0-9]+[ \t]*\\'" value)
+         (string-to-number value))))
+
+(defun claude-code-ide-mcp-http-server--await-body (request headers)
+  "Return non-nil when the body of REQUEST is not complete yet.
+HEADERS are the headers of REQUEST.  The body is complete when it
+has as many bytes as the Content-Length header says, or when there
+is no such header.
+
+web-server calls the handler as soon as the headers end, with the
+part of the body that has arrived until then.  A client can send the
+headers and the body in two writes; Python's http.client always does.
+When the body arrives in a later read, the handler sees a part of the
+body only.  So, for an incomplete body, this function clears the
+active slot of REQUEST: web-server then parses the request again, and
+calls the handler again, when the next data arrives.  The caller must
+then return to web-server with :keep-alive, to keep the connection.
+
+A client that sends \"Expect: 100-continue\" (curl does for a body
+of 1 MB or more) gets \"100 Continue\" before the body, so it does
+not wait before it sends the body."
+  (let ((expected (claude-code-ide-mcp-http-server--content-length headers))
+        (body (ws-body request)))
+    (when (and expected (< (string-bytes body) expected))
+      (with-slots (process active) request
+        (setq active nil)
+        (when (and (string-empty-p body)
+                   (equal (downcase (or (claude-code-ide-mcp-http-server--header
+                                         headers "Expect")
+                                        ""))
+                          "100-continue"))
+          (process-send-string process "HTTP/1.1 100 Continue\r\n\r\n")))
+      t)))
+
 ;;; Public Functions
 
 (defun claude-code-ide-mcp-http-server-start (&optional port)
@@ -183,7 +223,9 @@ in the header `claude-code-ide-mcp-server-secret-header'; else it
 gets 403.  See `claude-code-ide-mcp-server-check-request'.  A request
 with an Origin header gets 403, and one that is not application/json
 gets 415, before its body is read; see
-`claude-code-ide-mcp-http-server--transport-refusal'."
+`claude-code-ide-mcp-http-server--transport-refusal'.  A request
+whose body has not fully arrived waits for the rest; see
+`claude-code-ide-mcp-http-server--await-body'."
   (claude-code-ide-debug "MCP server received POST request")
   (let ((id nil))  ; bound outside the condition-case so error replies can carry it
     (condition-case err
@@ -202,6 +244,9 @@ gets 415, before its body is read; see
                (id . nil)
                (error . ((code . -32000)
                          (message . ,(format "Forbidden: %s" (cdr refusal))))))))
+          (when (claude-code-ide-mcp-http-server--await-body request headers)
+            (claude-code-ide-debug "MCP request body incomplete; waiting for the rest")
+            (throw 'close-connection :keep-alive))
           (let* ((body (ws-body request))
                  (check (claude-code-ide-mcp-server-check-request
                          url-session-id
