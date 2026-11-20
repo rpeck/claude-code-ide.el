@@ -406,13 +406,18 @@ nil means that no process PID runs.  CACHE is as for
       (setq claude-code-ide-session-registry--emacs-start-time
             (claude-code-ide-session-registry--process-start-time (emacs-pid)))))
 
-(defun claude-code-ide-session-registry--same-start-p (pid start &optional cache)
+(defconst claude-code-ide-session-registry--start-tolerance 1.0
+  "Seconds by which two start times of one process may differ.")
+
+(defun claude-code-ide-session-registry--same-start-p (pid start &optional cache tolerance)
   "Return non-nil when the process PID runs and started at the float time START.
 A process with a reused PID has another start time.  CACHE is as for
-`claude-code-ide-session-registry--process-attributes'."
+`claude-code-ide-session-registry--process-attributes'.  TOLERANCE is
+the difference in seconds that counts as the same start; the default
+is `claude-code-ide-session-registry--start-tolerance'."
   (when-let* (((numberp start))
               (now (claude-code-ide-session-registry--process-start-time pid cache)))
-    (< (abs (- now start)) 1.0)))
+    (< (abs (- now start)) (or tolerance claude-code-ide-session-registry--start-tolerance))))
 
 (declare-function claude-code-ide-codex-events--string "claude-code-ide-codex-events" (data field))
 
@@ -1843,12 +1848,42 @@ process with a reused ID is not the owner.  CACHE is as for
                   :documentation "Non-nil when the user or --name set the name.")
   (status nil :type (or null string)
           :documentation "What the CLI reports: \"busy\" while a turn runs, \"idle\"
-at the prompt, \"shell\" at the prompt while a background shell runs."))
+at the prompt, \"shell\" at the prompt while a background shell runs.")
+  (proc-start nil :type (or null number)
+              :documentation "Start time of the CLI process as a float time, or nil.
+It comes from `procStart' (UTC text), else from `startedAt' (ms).")
+  (status-time nil :type (or null number)
+               :documentation "Float time of the last change of `status', or nil.
+It comes from `statusUpdatedAt' (ms), else from `updatedAt' (ms)."))
+
+(defun claude-code-ide-session-registry--cli-proc-start (data)
+  "Return the start time of the CLI process in the session file DATA, or nil.
+The file has `procStart' in UTC, as \"Tue Nov 17 22:25:15 2026\".  When
+that text does not parse, `startedAt' in milliseconds stands in."
+  (or (let ((text (alist-get 'procStart data)))
+        (when (stringp text)
+          (let ((parts (ignore-errors (parse-time-string text))))
+            (when (and parts (nth 0 parts) (nth 1 parts) (nth 2 parts)
+                       (nth 3 parts) (nth 4 parts) (nth 5 parts))
+              (setf (nth 8 parts) 0)
+              (ignore-errors (float-time (encode-time parts)))))))
+      (let ((ms (alist-get 'startedAt data)))
+        (and (numberp ms) (/ ms 1000.0)))))
+
+(defun claude-code-ide-session-registry--claude-config-directory ()
+  "Return the configuration folder of Claude Code.
+That is CLAUDE_CONFIG_DIR when it is an absolute folder, else ~/.claude.
+An empty or relative value counts as unset."
+  (let ((dir (getenv "CLAUDE_CONFIG_DIR")))
+    (if (and (stringp dir) (not (string-empty-p dir))
+             (file-name-absolute-p dir) (file-directory-p dir))
+        dir
+      (expand-file-name "~/.claude"))))
 
 (defun claude-code-ide-session-registry--cli-session-file (pid)
   "Return the file that the Claude CLI process PID keeps about itself."
   (expand-file-name (format "sessions/%d.json" pid)
-                    (or (getenv "CLAUDE_CONFIG_DIR") (expand-file-name "~/.claude"))))
+                    (claude-code-ide-session-registry--claude-config-directory)))
 
 (defun claude-code-ide-session-registry--read-cli-session (file)
   "Return the CLI session in FILE when its process runs, else nil."
@@ -1863,7 +1898,10 @@ at the prompt, \"shell\" at the prompt while a background shell runs."))
        :cwd (let ((cwd (alist-get 'cwd data))) (and (stringp cwd) cwd))
        :name (let ((name (alist-get 'name data))) (and (stringp name) name))
        :name-from-user (equal (alist-get 'nameSource data) "user")
-       :status (let ((status (alist-get 'status data))) (and (stringp status) status))))))
+       :status (let ((status (alist-get 'status data))) (and (stringp status) status))
+       :proc-start (claude-code-ide-session-registry--cli-proc-start data)
+       :status-time (let ((ms (or (alist-get 'statusUpdatedAt data) (alist-get 'updatedAt data))))
+                      (and (numberp ms) (/ ms 1000.0)))))))
 
 (defun claude-code-ide-session-registry--live-cli-sessions ()
   "Return the CLI sessions that run on this host."
@@ -1873,8 +1911,10 @@ at the prompt, \"shell\" at the prompt while a background shell runs."))
                         (directory-files dir t "\\`[0-9]+\\.json\\'"))))))
 
 (defun claude-code-ide-session-registry--session-pid (session)
-  "Return the PID of SESSION's CLI process, or nil."
-  (or (claude-code-ide-mcp-session-cli-pid session)
+  "Return the PID of SESSION's CLI process, or nil.
+Only an integer that `ide_connected' gave counts; else the PID of the
+terminal process."
+  (or (let ((pid (claude-code-ide-mcp-session-cli-pid session))) (and (integerp pid) pid))
       (let ((process (claude-code-ide-mcp-session-process session)))
         (and process (process-live-p process) (process-id process)))))
 

@@ -623,7 +623,7 @@ To enable it, put this in your init file:
 (setq claude-code-ide-state-file "~/.emacs-claude-code-ide-state.json")
 #+end_src
 
-When the mode turns on, it also records the instances that already run in this Emacs. Their session id comes from the file that each CLI process keeps in =~/.claude/sessions=, and the registry reads it again every minute and at exit, because =/clear= changes it. These instances have no status hooks; they show as =UNTRACKED= in the status buffer. =M-x claude-code-ide-session-registry-track-sessions= restarts them with hooks (=T= does it for the session on a line of the status buffer): each resumes its conversation with its instance name, title and model, and a note as its first message tells it to re-arm its background tasks, which end. A session that is busy is skipped unless you give a prefix argument.
+When the mode turns on, it also records the instances that already run in this Emacs. Their session id comes from the file that each CLI process keeps in =~/.claude/sessions=, and the registry reads it again every minute and at exit, because =/clear= changes it. These instances have no status hooks. The status buffer shows their state from that file (busy is working; idle, also with a background shell, waits for you), marked "From CLI status"; a session without a matching file shows as =UNTRACKED=. =M-x claude-code-ide-session-registry-track-sessions= restarts them with hooks (=T= does it for the session on a line of the status buffer): each resumes its conversation with its instance name, title and model, and a note as its first message tells it to re-arm its background tasks, which end. A session that is busy is skipped unless you give a prefix argument.
 
 *** States
 
@@ -721,7 +721,7 @@ The status buffer, =*Coding Agents Sessions*=, shows what each running instance 
 (claude-code-ide-session-status-mode 1)   ; also turns on the session registry
 #+end_src
 
-Turn the mode off to close the buffer. =M-x claude-code-ide-show-session-status= shows it again.
+The mode keeps the buffer up to date, but it does not show it. =M-x claude-code-ide-show-session-status= shows it as a normal buffer, in the selected window (=claude-code-ide-session-status-display-action= changes that, for example to a side window). Turn the mode off to kill the buffer; each window shows again what it showed before.
 
 Codex instances are in the same buffer. Each line shows the provider, the model (=unknown= when not known), and the common state with its reason (a =?= marks a guess).
 
@@ -746,7 +746,7 @@ Each state says who waits for whom. They are listed in the order of the buffer: 
 | =WAITS ON TASKS= | The turn ended, but its subagents still run. The agent continues by itself when they finish |
 | =STARTING=       | The instance has started and has not reported yet                                             |
 | =WORKING=        | The agent works                                                                               |
-| =UNTRACKED=      | The instance started without status hooks                                                     |
+| =UNTRACKED=      | The instance started without status hooks, and its CLI status file gives no state              |
 
 The =For= column shows how long the instance has been in its state. =Detail= shows the command or question that waits for you, the first line of the last reply, or the running tasks (for example "2 agents, 1 shell: Run the tests").
 

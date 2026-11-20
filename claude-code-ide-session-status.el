@@ -111,12 +111,13 @@ time, which is true: the agent no longer waits on it."
   :group 'claude-code-ide)
 
 (defcustom claude-code-ide-session-status-display-action
-  '((display-buffer-reuse-window display-buffer-in-side-window)
-    (side . top)
-    (slot . 0)
-    (window-height . fit-window-to-buffer)
-    (preserve-size . (nil . t)))
-  "Display action for the status buffer of `claude-code-ide-session-status-mode'."
+  '((display-buffer-reuse-window display-buffer-same-window))
+  "Display action for the status buffer of `claude-code-ide-session-status-mode'.
+The default shows it as a normal buffer: in a window that shows it
+already, else in the selected window.  Only
+`claude-code-ide-show-session-status' and the paths that you start show
+it; the mode itself does not.  An action with a side window works too:
+the status then fits that window to its lines."
   :type 'sexp
   :group 'claude-code-ide)
 
@@ -1366,14 +1367,151 @@ A nil STATUS, a session without status hooks, is
       ;; No status hooks
       (_ (claude-code-ide-instance-make-state 'disconnected 'untracked since)))))
 
+;;; The CLI status file of a session without hooks
+
+;; A Claude Code CLI that started before the status tracking was on has
+;; no hooks, and it reads hooks only at its start.  But each CLI keeps
+;; ~/.claude/sessions/<pid>.json, with its `status' ("busy", "idle", or
+;; "shell" while a background shell runs) and `statusUpdatedAt'.  For a
+;; session without a status record, the status comes from that file.
+
+(defvar claude-code-ide-session-status--cli-cache (make-hash-table :test 'eq :weakness 'key)
+  "SESSION -> plist of what its CLI status file gave, weak in SESSION.
+:pid and :start are the CLI PID and the start time of that process when
+Emacs learned the PID.  :file-time and :cli are the modification time of
+the file and the `claude-code-ide-session-registry--cli-session' read
+then.  :now and :result keep the result of one refresh.  An entry goes
+with its session.")
+
+(defvar claude-code-ide-session-status--process-cache nil
+  "(NOW . TABLE): the process attributes of each PID for the refresh at NOW.")
+
+(defun claude-code-ide-session-status--process-table (now)
+  "Return the table of process attributes for the refresh at NOW.
+Each PID is asked once per refresh."
+  (unless (equal (car claude-code-ide-session-status--process-cache) now)
+    (setq claude-code-ide-session-status--process-cache
+          (cons now (make-hash-table :test 'eql))))
+  (cdr claude-code-ide-session-status--process-cache))
+
+(defun claude-code-ide-session-status--terminal-live-p (session)
+  "Return non-nil when the terminal process of SESSION runs."
+  (let* ((buffer (claude-code-ide-mcp-session-buffer session))
+         (process (or (claude-code-ide-mcp-session-process session)
+                      (and (buffer-live-p buffer) (get-buffer-process buffer)))))
+    (and process (process-live-p process))))
+
+(defun claude-code-ide-session-status--cli-entry (session pid now)
+  "Return the cache entry of SESSION for its CLI PID at NOW, made when needed.
+The entry records the start time of process PID the first time that
+Emacs sees PID for SESSION; a new PID starts a new entry."
+  (let ((entry (gethash session claude-code-ide-session-status--cli-cache)))
+    (unless (equal (plist-get entry :pid) pid)
+      (setq entry (list :pid pid
+                        :start (claude-code-ide-session-registry--process-start-time
+                                pid (claude-code-ide-session-status--process-table now))))
+      (puthash session entry claude-code-ide-session-status--cli-cache))
+    entry))
+
+(defun claude-code-ide-session-status--cli-read (entry file)
+  "Return the CLI session in FILE, read only when its time changed since ENTRY.
+The registry reads it (`claude-code-ide-session-registry--read-cli-session');
+the result goes into ENTRY.  The file is never written."
+  (let ((time (file-attribute-modification-time (file-attributes file))))
+    (unless (and time (equal (plist-get entry :file-time) time))
+      (plist-put entry :file-time time)
+      (plist-put entry :cli (and time (claude-code-ide-session-registry--read-cli-session file))))
+    (and time (plist-get entry :cli))))
+
+(defun claude-code-ide-session-status--cli-state-at (session now)
+  "Return (STATE . DETAIL) of SESSION from its CLI status file, at NOW, or nil.
+See `claude-code-ide-session-status--cli-state'."
+  (when-let* ((pid (claude-code-ide-session-registry--session-pid session))
+              ((claude-code-ide-session-status--terminal-live-p session)))
+    (let* ((entry (claude-code-ide-session-status--cli-entry session pid now))
+           (start (plist-get entry :start))
+           (table (claude-code-ide-session-status--process-table now))
+           (file (claude-code-ide-session-registry--cli-session-file pid))
+           (exists (file-exists-p file))
+           (cli (and exists (claude-code-ide-session-status--cli-read entry file)))
+           (file-start (and cli (claude-code-ide-session-registry--cli-session-proc-start cli)))
+           ;; The process that holds PID now is the one of the session, and
+           ;; the file is of that process
+           (owner (and cli start file-start
+                       (equal (claude-code-ide-session-registry--cli-session-pid cli) pid)
+                       (claude-code-ide-session-registry--same-start-p pid start table)
+                       (< (abs (- file-start start))
+                          claude-code-ide-session-registry--start-tolerance)))
+           (status (and owner (claude-code-ide-session-registry--cli-session-status cli)))
+           (since (and owner (claude-code-ide-session-registry--cli-session-status-time cli)))
+           (untracked (lambda (detail)
+                        (cons (append (claude-code-ide-instance-make-state 'disconnected 'untracked)
+                                      (list :source 'cli-file))
+                              detail)))
+           (from-cli (lambda (state reason detail)
+                       (cons (append (claude-code-ide-instance-make-state state reason since)
+                                     (list :source 'cli-file))
+                             detail))))
+      (cond
+       ((not exists) (funcall untracked "No status hooks, and no CLI status file"))
+       ((or (null cli) (null file-start)) (funcall untracked "No status hooks; CLI status file not readable"))
+       ((not owner) (funcall untracked "No status hooks; the CLI status file is of another process"))
+       ((equal status "busy") (funcall from-cli 'working nil "From CLI status: busy (no status hooks)"))
+       ((equal status "idle") (funcall from-cli 'idle nil "From CLI status: idle (no status hooks)"))
+       ;; As the hooks do: a background shell does not keep the agent from you
+       ((equal status "shell")
+        (funcall from-cli 'idle nil "From CLI status: idle, a background shell runs (no status hooks)"))
+       (t (funcall untracked (format "No status hooks; CLI status %s is not known" (or status "missing"))))))))
+
+(defun claude-code-ide-session-status--cli-state (session &optional now)
+  "Return (STATE . DETAIL) of SESSION, without status hooks, from its CLI file.
+STATE is a common state plist with the extra key :source `cli-file'.
+
+- \"busy\" is `working'; \"idle\" and \"shell\" (a background shell runs)
+  are `idle', as the hooks give them.  The CLI reports them itself, so
+  they are no guess, and they start at `statusUpdatedAt'.
+- Another value, no value, no file, a file that cannot be read, or a
+  file of another process is `disconnected/untracked'.
+- The file must name the CLI PID of SESSION, and its start time must
+  match the start of that process when Emacs learned the PID; the
+  process that holds the PID now must have that start too.  So a
+  reused PID never gives a state.
+
+Without a known CLI process, or when the terminal of SESSION has
+ended, return nil: the session then has no state from the file.  The
+result is computed once for each NOW (one refresh)."
+  (let* ((now (or now (float-time)))
+         (entry (gethash session claude-code-ide-session-status--cli-cache)))
+    (if (and entry (equal (plist-get entry :now) now))
+        (plist-get entry :result)
+      (let ((result (claude-code-ide-session-status--cli-state-at session now)))
+        (when-let* ((entry (gethash session claude-code-ide-session-status--cli-cache)))
+          (plist-put entry :now now)
+          (plist-put entry :result result))
+        result))))
+
+(defun claude-code-ide-session-status--session-state (session now)
+  "Return (STATUS-STATE COMMON DETAIL SINCE) of the Claude Code SESSION at NOW.
+A session with a status record uses its hooks.  A session without one
+uses its CLI status file, when its CLI process is known."
+  (let ((status (gethash session claude-code-ide-session-status--by-session)))
+    (if-let* (((null status))
+              (cli (and session (claude-code-ide-session-status--cli-state session now))))
+        (list (claude-code-ide-session-status--common-label-key (car cli))
+              (car cli) (cdr cli) (plist-get (car cli) :since))
+      (let ((state (claude-code-ide-session-status--state status now)))
+        (list state
+              (claude-code-ide-session-status--common-state status now)
+              (claude-code-ide-session-status--detail status state now)
+              (claude-code-ide-session-status--state-since status state))))))
+
 (defun claude-code-ide-session-status--instance-state (instance now)
   "Return the common state of the Claude Code INSTANCE at NOW, or nil.
-This is a function of `claude-code-ide-instance-state-functions'."
+A session without status hooks gets its state from its CLI status
+file.  This is a function of `claude-code-ide-instance-state-functions'."
   (when (eq (claude-code-ide-instance-provider instance) 'claude)
-    (claude-code-ide-session-status--common-state
-     (gethash (claude-code-ide-instance-session instance)
-              claude-code-ide-session-status--by-session)
-     now)))
+    (nth 1 (claude-code-ide-session-status--session-state
+            (claude-code-ide-instance-session instance) now))))
 
 (add-hook 'claude-code-ide-instance-state-functions
           #'claude-code-ide-session-status--instance-state)
@@ -1481,13 +1619,11 @@ or next message, or the agent for its own background tasks.")
   (memq state '(waiting asks quota error unobserved disconnected tasks-quiet)))
 
 (defun claude-code-ide-session-status--claude-row (session now)
-  "Return the row of the Claude Code SESSION at NOW."
-  (let* ((status (gethash session claude-code-ide-session-status--by-session))
-         (state (claude-code-ide-session-status--state status now)))
-    (list session state
-          (claude-code-ide-session-status--state-since status state)
-          (claude-code-ide-session-status--detail status state now)
-          (claude-code-ide-session-status--common-state status now))))
+  "Return the row of the Claude Code SESSION at NOW.
+A session without status hooks gets its state from its CLI status file."
+  (pcase-let ((`(,state ,common ,detail ,since)
+               (claude-code-ide-session-status--session-state session now)))
+    (list session state since detail common)))
 
 (defun claude-code-ide-session-status--other-row (item instance now)
   "Return the row of ITEM, whose descriptor INSTANCE runs another provider, at NOW."
@@ -1590,10 +1726,9 @@ this value well below 30."
   "Return the detail text of INSTANCE at NOW, of any provider."
   (if (claude-code-ide-session-status--other-provider-p instance)
       (claude-code-ide-session-status--other-detail instance now)
-    (let* ((status (gethash (claude-code-ide-instance-session instance)
-                            claude-code-ide-session-status--by-session))
-           (state (claude-code-ide-session-status--state status now)))
-      (or (claude-code-ide-session-status--detail status state now) ""))))
+    (or (nth 2 (claude-code-ide-session-status--session-state
+                (claude-code-ide-instance-session instance) now))
+        "")))
 
 (defun claude-code-ide-session-status--snapshot-instance (instance now)
   "Return the snapshot record of INSTANCE at NOW, as an alist."
@@ -2095,22 +2230,32 @@ These need an answer, failed, sent no signal, or have quiet tasks."
                   'face 'claude-code-ide-session-status-waiting)
     " Claude"))
 
-(defun claude-code-ide-session-status--display ()
-  "Create the status buffer when needed and display it."
+(defun claude-code-ide-session-status--ensure-buffer ()
+  "Create the status buffer when needed, update it, and return it.
+It does not display the buffer."
   (let ((buffer (get-buffer-create claude-code-ide-session-status--buffer-name)))
     (with-current-buffer buffer
       (unless (derived-mode-p 'claude-code-ide-session-status-list-mode)
         (claude-code-ide-session-status-list-mode)))
     (claude-code-ide-session-status--refresh)
+    buffer))
+
+(defun claude-code-ide-session-status--display ()
+  "Create the status buffer when needed and display it.
+`claude-code-ide-session-status-display-action' says where."
+  (let ((buffer (claude-code-ide-session-status--ensure-buffer)))
     (display-buffer buffer claude-code-ide-session-status-display-action)
-    (claude-code-ide-session-status--refresh)))
+    (claude-code-ide-session-status--refresh)
+    buffer))
 
 ;;;###autoload
 (define-minor-mode claude-code-ide-session-status-mode
-  "Show the live status of each Claude Code session in a buffer.
-The buffer lists the sessions of this Emacs, the ones that wait for you
-first, and updates itself.  RET goes to a session.  The mode line shows
-how many sessions wait.  Turning the mode off closes the buffer.
+  "Keep the live status of each Claude Code session in a buffer.
+The buffer *Coding Agents Sessions* lists the sessions of this Emacs,
+the ones that wait for you first, and updates itself.  Turning the mode
+on does not display it: `claude-code-ide-show-session-status' does.
+RET goes to a session.  The mode line shows how many sessions wait.
+Turning the mode off kills the buffer.
 The status comes from hooks that `claude-code-ide-session-registry-mode'
 passes to the instances it starts, so this mode turns it on."
   :global t
@@ -2121,10 +2266,12 @@ passes to the instances it starts, so this mode turns it on."
         (unless claude-code-ide-session-registry-mode
           (claude-code-ide-session-registry-mode 1))
         (claude-code-ide-session-status--ensure-timers)
-        (claude-code-ide-session-status--display))
+        (claude-code-ide-session-status--ensure-buffer))
     (when-let* ((buffer (get-buffer claude-code-ide-session-status--buffer-name)))
+      ;; Each window goes back to what it was: a window made for the
+      ;; buffer goes, a reused window shows its previous buffer again
       (dolist (window (get-buffer-window-list buffer nil t))
-        (ignore-errors (delete-window window)))
+        (ignore-errors (quit-restore-window window)))
       (kill-buffer buffer))
     (when (zerop (hash-table-count claude-code-ide-session-status--by-nonce))
       (claude-code-ide-session-status--stop-timers))
@@ -2133,11 +2280,13 @@ passes to the instances it starts, so this mode turns it on."
 ;;;###autoload
 (defun claude-code-ide-show-session-status ()
   "Show the status buffer of the Claude Code sessions.
-This turns on `claude-code-ide-session-status-mode'."
+This turns on `claude-code-ide-session-status-mode' when it is off.
+`claude-code-ide-session-status-display-action' says where the buffer
+shows; by default in the selected window, as a normal buffer."
   (interactive)
-  (if claude-code-ide-session-status-mode
-      (claude-code-ide-session-status--display)
-    (claude-code-ide-session-status-mode 1)))
+  (unless claude-code-ide-session-status-mode
+    (claude-code-ide-session-status-mode 1))
+  (claude-code-ide-session-status--display))
 
 (provide 'claude-code-ide-session-status)
 
