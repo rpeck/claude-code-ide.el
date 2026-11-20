@@ -222,10 +222,11 @@ codex queue --thread=<native-id> --message=<text>
 
 ## Capabilities
 
-`detect`, `launch`, `resume`, `fork`, `submit-prompt`, `stop`, `native-id`, `map-event`, `mcp-setup`, and `exit-message`.
+`detect`, `launch`, `resume`, `fork`, `submit-prompt`, `stop`, `native-id`, `map-event`, `mcp-setup`, `transcript`, and `exit-message`.
 
 - `stop` is `claude-code-ide--claude-stop`: it kills the terminal buffer. With `--no-daemon`, that ends Codex and its child processes.
-- No `transcript` and no `status-events` yet. The status hooks come from the `codex-status` part.
+- `transcript` gives the rollout file of the native ID (`claude-code-ide-codex-rollout-file`), the title from `session_index.jsonl`, and the model of the rollout. See [providers.md](providers.md), "The transcript operation".
+- No `status-events` yet. The status hooks come from the `codex-status` part.
 - No IDE protocol: Codex uses no WebSocket connection, no lock file, and no `openDiff`.
 
 ## Known limits
