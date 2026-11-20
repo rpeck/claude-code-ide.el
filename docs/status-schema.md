@@ -44,6 +44,7 @@ Code: `claude-code-ide-session-status.el`, section "Status snapshot". The common
       "state": "waiting-for-user",
       "reason": "approval",
       "guess": false,
+      "source": "hooks",
       "since": "2026-11-18T21:29:51.004Z",
       "age_seconds": 14,
       "detail": "Bash: make test"
@@ -82,6 +83,7 @@ Code: `claude-code-ide-session-status.el`, section "Status snapshot". The common
 | `state` | string | A common state: `working`, `idle`, `waiting-for-user`, `waiting-for-task`, `disconnected`, or `failed`. |
 | `reason` | string or null | The reason of the state, or null. See the table below. |
 | `guess` | boolean | true when Emacs infers the state and no event reports it. |
+| `source` | string or null | Optional. What gave the state; see "Sources" below. null when no source gives it: an UNTRACKED instance, or a process that is gone. A file of an older version has no such field: treat a missing field as null. |
 | `since` | string or null | The time when the state started, ISO 8601 in UTC, or null when it is not known. |
 | `age_seconds` | integer or null | The seconds from `since` to `generated_at`, or null. |
 | `detail` | string | One line for people, for example the command that waits for an approval. Do not parse it. |
@@ -102,6 +104,20 @@ Code: `claude-code-ide-session-status.el`, section "Status snapshot". The common
 - `failed/quota-limit` needs a usage limit of the account: a Claude Code `billing_error`, or an error text that says a usage or plan limit was reached. A short rate limit is `failed/error`. [status-events.md](status-events.md), section "Quota limits", has the full table.
 - A guess is not an event. Examples: a reply that ends with a question (`waiting-for-user/question`, guess), and a Codex approval after 10 seconds without a screen check.
 
+### Sources
+
+| `source` | Provider | Meaning |
+|---|---|---|
+| `"hooks"` | both | The status hooks of the launch. Also the states that Emacs infers from them, such as `working/starting` and `disconnected/no-signal`. |
+| `"cli-file"` | `claude` | The launch has no hooks. The state comes from the CLI status file of the process, `<config>/sessions/<pid>.json`. |
+| `"rollout"` | `codex` | The launch has no hooks. The state comes from the last turn record of the rollout file of the conversation. An approval or a question shows as `working`. |
+| `"screen"` | `codex` | The launch has no hooks, and its terminal shows a startup dialog: `waiting-for-user/dialog` or `waiting-for-user/approval`. |
+| null | both | No source gives the state: `disconnected/untracked`, or a process that is gone. |
+
+- A reader can trust `"hooks"` most. `"cli-file"` and `"rollout"` give fewer states: they never give `waiting-for-user` or `waiting-for-task`.
+- Later versions of v1 can add values. A reader treats an unknown value like null.
+- [status-events.md](status-events.md) describes each source.
+
 ## Freshness rules for readers
 
 A reader must check each file before it uses the data:
@@ -119,4 +135,5 @@ Several Emacs processes can write their own files in the same folder. Read each 
 ## Version rules
 
 - A new field can come in v1. A reader ignores the fields that it does not know.
+  - `source` came this way, after the first v1 files. A file without it is still v1.
 - A change of the meaning or the type of a field, or a removed field, gives a new schema name, for example `claude-code-ide-status/v2`.
