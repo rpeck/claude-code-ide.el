@@ -510,34 +510,34 @@ change nothing."
           (dolist (record claude-code-ide-codex-events-tests--t1-records)
             (pcase-let ((`(,index ,event ,id ,generation ,json ,nested) record))
               (unless (and nested (equal event "SessionStart"))
-              ;; The script drops the SessionStart of the nested session, as
-              ;; it has CODEX_THREAD_ID; the adapter would take it for /new
-              (let ((instance (claude-code-ide-instance-by-id id)))
-                (unless (and instance (= (claude-code-ide-instance-generation instance) generation))
-                  (setq instance (claude-code-ide-codex-events-tests--instance id generation))
-                  (claude-code-ide-codex-events--track instance))
-                (let ((result (claude-code-ide-codex-events--handle
-                               id generation event
-                               (json-parse-string json :object-type 'alist :array-type 'list
-                                                  :null-object nil :false-object nil)
-                               (cl-incf now))))
-                  (if result
-                      (progn
-                        (cl-incf applied)
-                        (should (equal (plist-get result :provider-event) event))
-                        (should (memq (plist-get result :event) claude-code-ide-event-names))
-                        (should-not nested))
-                    (push index dropped)))
-                ;; Each approval belongs to its tool, though the request
-                ;; input has a description that the tool input lacks
-                (when (equal event "PermissionRequest")
-                  (let* ((launch (claude-code-ide-codex-events--launch-of instance))
-                         (blocker (car (last (claude-code-ide-codex-events--launch-blockers launch)))))
-                    (should (string-prefix-p
-                             "exec-" (cdr (claude-code-ide-codex-events--blocker-tool blocker))))))
-                (when-let* ((expected (alist-get index claude-code-ide-codex-events-tests--t1-expected)))
-                  (should (equal (list index (claude-code-ide-codex-events-tests--state instance (+ now 1)))
-                                 (list index expected))))))))
+                ;; The script drops the SessionStart of the nested session, as
+                ;; it has CODEX_THREAD_ID; the adapter would take it for /new
+                (let ((instance (claude-code-ide-instance-by-id id)))
+                  (unless (and instance (= (claude-code-ide-instance-generation instance) generation))
+                    (setq instance (claude-code-ide-codex-events-tests--instance id generation))
+                    (claude-code-ide-codex-events--track instance))
+                  (let ((result (claude-code-ide-codex-events--handle
+                                 id generation event
+                                 (json-parse-string json :object-type 'alist :array-type 'list
+                                                    :null-object nil :false-object nil)
+                                 (cl-incf now))))
+                    (if result
+                        (progn
+                          (cl-incf applied)
+                          (should (equal (plist-get result :provider-event) event))
+                          (should (memq (plist-get result :event) claude-code-ide-event-names))
+                          (should-not nested))
+                      (push index dropped)))
+                  ;; Each approval belongs to its tool, though the request
+                  ;; input has a description that the tool input lacks
+                  (when (equal event "PermissionRequest")
+                    (let* ((launch (claude-code-ide-codex-events--launch-of instance))
+                           (blocker (car (last (claude-code-ide-codex-events--launch-blockers launch)))))
+                      (should (string-prefix-p
+                               "exec-" (cdr (claude-code-ide-codex-events--blocker-tool blocker))))))
+                  (when-let* ((expected (alist-get index claude-code-ide-codex-events-tests--t1-expected)))
+                    (should (equal (list index (claude-code-ide-codex-events-tests--state instance (+ now 1)))
+                                   (list index expected))))))))
           ;; The other records of the nested session have an unknown conversation ID
           (should (equal (sort dropped #'<) '(31 32 33 34)))
           (should (= applied (- (length claude-code-ide-codex-events-tests--t1-records) 5)))
@@ -1442,9 +1442,9 @@ A later trust result does not give hooks to a launch without them."
                                      '((trusted_hash . "sha256:hash0")))))))
         ;; The check after the write is cached as trusted
         (should (eq (plist-get (gethash (claude-code-ide-codex-events--trust-key)
-                                              claude-code-ide-codex-events--trust-cache)
-                                     :status)
-                          'trusted))))))
+                                        claude-code-ide-codex-events--trust-cache)
+                               :status)
+                    'trusted))))))
 
 (ert-deftest claude-code-ide-codex-events-test-trust-command-declined-and-refused ()
   "A no writes nothing; a refused write tells the user to run /hooks."
@@ -1926,34 +1926,34 @@ spec, as the Codex launch does.  Return (QUESTIONS SLOTS HOOKS) with
 the number of questions, the slot of each start, and whether each
 start got hooks."
   `(let* ((config-dir (expand-file-name "claude" registry-dir))
-         (process-environment (cons (concat "CLAUDE_CONFIG_DIR=" config-dir) process-environment))
-         (dir (claude-code-ide-tests--registry-project registry-dir "cci-test-restore-proj"))
-         (slots nil)
-         (hooks nil)
-         (timers nil))
-    (setq answer ,answer-value)
-    (claude-code-ide-session-registry--submit
-     "setup"
-     (lambda (_)
-       (list (claude-code-ide-tests--registry-entry
-              "cci-test-restore-cx1" :provider 'codex :session-id "cci-test-restore-n1"
-              :project-dir dir :emacs-pid 999999991)
-             (claude-code-ide-tests--registry-entry
-              "cci-test-restore-cx2" :provider 'codex :session-id "cci-test-restore-n2"
-              :project-dir dir :emacs-pid 999999991 :started-at "2026-11-03T10:01:00Z"))))
-    (cl-letf (((symbol-function 'run-with-timer)
-               (lambda (_secs _repeat fn &rest args) (push (cons fn args) timers)))
-              ((symbol-function 'claude-code-ide--start-session)
-               (lambda (_continue _resume spec &optional _interactive)
-                 (let* ((slot (claude-code-ide-start-spec-interactive spec))
-                        (instance (claude-code-ide-codex-events-tests--instance
-                                   (claude-code-ide-start-spec-instance-id spec) 1)))
-                   (setf (claude-code-ide-instance-project-root instance) dir)
-                   (push slot slots)
-                   (push (and (claude-code-ide-codex-status-hook-args instance slot) t) hooks)))))
-      (call-interactively #'claude-code-ide-restore-sessions)
-      (claude-code-ide-tests--run-restore-timers timers))
-    (list asked (reverse slots) (reverse hooks))))
+          (process-environment (cons (concat "CLAUDE_CONFIG_DIR=" config-dir) process-environment))
+          (dir (claude-code-ide-tests--registry-project registry-dir "cci-test-restore-proj"))
+          (slots nil)
+          (hooks nil)
+          (timers nil))
+     (setq answer ,answer-value)
+     (claude-code-ide-session-registry--submit
+      "setup"
+      (lambda (_)
+        (list (claude-code-ide-tests--registry-entry
+               "cci-test-restore-cx1" :provider 'codex :session-id "cci-test-restore-n1"
+               :project-dir dir :emacs-pid 999999991)
+              (claude-code-ide-tests--registry-entry
+               "cci-test-restore-cx2" :provider 'codex :session-id "cci-test-restore-n2"
+               :project-dir dir :emacs-pid 999999991 :started-at "2026-11-03T10:01:00Z"))))
+     (cl-letf (((symbol-function 'run-with-timer)
+                (lambda (_secs _repeat fn &rest args) (push (cons fn args) timers)))
+               ((symbol-function 'claude-code-ide--start-session)
+                (lambda (_continue _resume spec &optional _interactive)
+                  (let* ((slot (claude-code-ide-start-spec-interactive spec))
+                         (instance (claude-code-ide-codex-events-tests--instance
+                                    (claude-code-ide-start-spec-instance-id spec) 1)))
+                    (setf (claude-code-ide-instance-project-root instance) dir)
+                    (push slot slots)
+                    (push (and (claude-code-ide-codex-status-hook-args instance slot) t) hooks)))))
+       (call-interactively #'claude-code-ide-restore-sessions)
+       (claude-code-ide-tests--run-restore-timers timers))
+     (list asked (reverse slots) (reverse hooks))))
 
 (ert-deftest claude-code-ide-codex-events-test-restore-asks-once ()
   "M-x claude-code-ide-restore-sessions asks the hook trust one time, before its starts.

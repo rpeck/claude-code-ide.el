@@ -492,7 +492,7 @@ The default is provider `claude', pid 100 and ID cci-test-process."
                         :worktree worktree :project-root worktree))
                 (second (claude-code-ide-instance-create
                          :id "cci-test-process-2" :provider 'codex :pid 400
-                   :process-start-time claude-code-ide-process-tests--start
+                         :process-start-time claude-code-ide-process-tests--start
                          :worktree worktree)))
             (claude-code-ide-process-track first nil)
             (claude-code-ide-process-track second nil)

@@ -1182,10 +1182,10 @@ full, right before the SIGKILL; only groups that pass get it."
                       (when scan-failed
                         (list :reason "the scan of working folders failed (lsof)"))
                       (list
-                           :ended (cl-remove-if-not
-                                   (lambda (pgid) (gethash pgid own-groups))
-                                   (reverse (claude-code-ide-process--job-ended job)))
-                           :escalated (gethash track (claude-code-ide-process--job-escalated job)))))))
+                       :ended (cl-remove-if-not
+                               (lambda (pgid) (gethash pgid own-groups))
+                               (reverse (claude-code-ide-process--job-ended job)))
+                       :escalated (gethash track (claude-code-ide-process--job-escalated job)))))))
            items))
          ;; The working folders of the strays that the records found: one
          ;; lsof call for all of them
