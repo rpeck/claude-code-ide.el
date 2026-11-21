@@ -119,25 +119,37 @@ non-nil when FILE changed."
             (write-region nil nil file nil 'silent))
           t)))))
 
-(defun format-elisp-batch ()
-  "Format the files of `command-line-args-left'.
+(defun format-elisp-run (files)
+  "Format FILES, and return the files that could not be formatted.
 The indent rules come from the Elisp files in `default-directory' (the
-project root) and from the files to format.  A file that cannot be
-read or formatted gets a message; the others are still formatted."
-  (let ((files command-line-args-left))
-    (setq command-line-args-left nil)
-    ;; A transient whose dependencies are missing signals an error
-    (ignore-errors (require 'transient nil t))
-    (format-elisp-set-rules
-     (delete-dups (append (directory-files default-directory t "\\.el\\'")
-                          (mapcar #'expand-file-name files))))
+project root) and from FILES.  A file that cannot be read or formatted
+gets a message, and the other files are still formatted.  A file that
+is not a regular readable file (such as a lock file) is skipped, and
+is no failure."
+  ;; A transient whose dependencies are missing signals an error
+  (ignore-errors (require 'transient nil t))
+  (format-elisp-set-rules
+   (delete-dups (append (directory-files default-directory t "\\.el\\'")
+                        (mapcar #'expand-file-name files))))
+  (let ((failed nil))
     (dolist (file files)
       (if (not (format-elisp--file-p file))
           (message "format-elisp: skipping %s: not a regular readable file" file)
         (condition-case err
             (format-elisp-file file)
           (error (message "format-elisp: cannot format %s: %s"
-                          file (error-message-string err))))))))
+                          file (error-message-string err))
+                 (push file failed)))))
+    (nreverse failed)))
+
+(defun format-elisp-batch ()
+  "Format the files of `command-line-args-left', for a batch Emacs.
+See `format-elisp-run'.  Emacs exits with status 1 when a file could
+not be formatted, after all the files are done."
+  (let ((files command-line-args-left))
+    (setq command-line-args-left nil)
+    (when (format-elisp-run files)
+      (kill-emacs 1))))
 
 (provide 'format-elisp)
 ;;; format-elisp.el ends here

@@ -60,6 +60,17 @@ find_emacs_package() {
     return 1
 }
 
+# Add "-L DIR" to the array LOAD_PATH for each PACKAGE that
+# find_emacs_package finds.  A folder with a space stays one element.
+add_emacs_packages() {
+    local package dir
+    for package in "$@"; do
+        if dir=$(find_emacs_package "$package"); then
+            LOAD_PATH+=(-L "$dir")
+        fi
+    done
+}
+
 # Print the absolute path of FILE with all symbolic links resolved
 resolve_path() {
     local file="$1"

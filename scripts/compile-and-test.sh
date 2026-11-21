@@ -51,38 +51,18 @@ fi
 # without trampolines in batch mode.
 NO_TRAMPOLINES="(setq native-comp-enable-subr-trampolines nil)"
 
-# Build load path for dependencies
-LOAD_PATH="-L ."
-
-# Try to find optional dependencies
-if WEBSOCKET_DIR=$(find_emacs_package "emacs-websocket"); then
-    LOAD_PATH="$LOAD_PATH -L $WEBSOCKET_DIR"
-fi
-
-if TRANSIENT_DIR=$(find_emacs_package "transient"); then
-    LOAD_PATH="$LOAD_PATH -L $TRANSIENT_DIR"
-fi
-
-# Recent transient releases depend on cond-let and llama
-for package in cond-let llama; do
-    if PACKAGE_DIR=$(find_emacs_package "$package"); then
-        LOAD_PATH="$LOAD_PATH -L $PACKAGE_DIR"
-    fi
-done
-
-if VTERM_DIR=$(find_emacs_package "emacs-libvterm"); then
-    LOAD_PATH="$LOAD_PATH -L $VTERM_DIR"
-fi
-
-# The MCP tests that use the real web-server package run when it is
-# found, and are skipped otherwise
-if WEB_SERVER_DIR=$(find_emacs_package "web-server"); then
-    LOAD_PATH="$LOAD_PATH -L $WEB_SERVER_DIR"
-fi
+# Build load path for dependencies.  LOAD_PATH is an array, so a
+# package folder with a space stays one argument.  The optional
+# dependencies: websocket, transient (recent releases depend on
+# cond-let and llama), vterm, and web-server (the MCP tests that use the
+# real web-server package run when it is found, and are skipped
+# otherwise)
+LOAD_PATH=(-L .)
+add_emacs_packages emacs-websocket transient cond-let llama emacs-libvterm web-server
 
 # STEP 1: Compile all elisp files
 echo "=== Running byte-compilation check ===" >&2
-"$EMACS" -batch $LOAD_PATH \
+"$EMACS" -batch "${LOAD_PATH[@]}" \
     --eval "(setq byte-compile-warnings '(not free-vars unresolved))" \
     -f batch-byte-compile *.el
 COMPILE_EXIT_CODE=$?
@@ -106,7 +86,7 @@ if [ $COMPILE_EXIT_CODE -eq 0 ] && [ "$WITH_NATIVE_COMPILE" = true ]; then
     if [ "$NATIVE_COMPILE_AVAILABLE" = true ]; then
         echo "" >&2
         echo "=== Running native-compilation check ===" >&2
-        "$EMACS" -batch $LOAD_PATH -f batch-native-compile *.el
+        "$EMACS" -batch "${LOAD_PATH[@]}" -f batch-native-compile *.el
         NATIVE_COMPILE_EXIT_CODE=$?
 
         if [ $NATIVE_COMPILE_EXIT_CODE -eq 0 ]; then
@@ -137,7 +117,7 @@ TEST_FAILED=0
 if [ $COMPILE_EXIT_CODE -eq 0 ] && [ $NATIVE_COMPILE_EXIT_CODE -eq 0 ]; then
     echo "" >&2
     echo "=== Running tests ===" >&2
-    "$EMACS" -batch $LOAD_PATH --eval "$NO_TRAMPOLINES" -l ert -l claude-code-ide-tests.el -f ert-run-tests-batch-and-exit >&2
+    "$EMACS" -batch "${LOAD_PATH[@]}" --eval "$NO_TRAMPOLINES" -l ert -l claude-code-ide-tests.el -f ert-run-tests-batch-and-exit >&2
     TEST_EXIT_CODE=$?
 
     if [ $TEST_EXIT_CODE -eq 0 ]; then
