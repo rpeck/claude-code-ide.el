@@ -204,10 +204,12 @@ codex queue --thread=<native-id> --message=<text>
 | `folder-trust` | "Trust this folder?", "Trust and continue", "Your trust decision will be saved" |
 | `hooks-review` | "Hooks need review", "Trust all and continue", "Continue without trusting" |
 | `update` | "Update now", "Skip until next version" |
-| `approval` | "Allow the ... MCP server to run tool", "Yes, proceed", "Yes, just this once", "No, and tell Codex what to do differently" |
+| `approval` | "Allow the ... MCP server to run tool", "Yes, proceed", "Yes, just this once", "No, and tell Codex what to do differently", or the tail of the MCP dialog: the selected choice "› N. Allow  Run the tool", then the control line "option N/M \| enter to submit" within 300 characters |
 | `other` | A line "› 1. ..." and another numbered line |
 
-- The screen is the last lines of the buffer: as many lines as the window that shows the buffer has, else 50.
+- The screen is the last lines of the buffer: as many lines as the terminal has. That is the size from eat or ghostel when the backend gives it, else the height that the windows of a display give the terminal (the smallest by default, after `window-adjust-process-window-size-function`), else 50. Only a window of a frame on a display counts, visible or not (`claude-code-ide-codex-screen-window`); a window of the initial frame of a daemon does not.
+- A reply that lists "1. Allow Run the tool" is no dialog: it has neither the marker "›" nor the control line.
+- An eat buffer that no window shows keeps only the tail of the MCP approval dialog. The tail pattern finds it. See docs/status-events.md, "A screen read without the dialog".
 - The text is matched with the line breaks removed, because a narrow terminal wraps the dialog.
 - The function reads text only. It never sends keys. You answer each dialog yourself.
 - Text of the model that quotes a dialog option can give a false match.

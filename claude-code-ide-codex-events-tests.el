@@ -658,7 +658,8 @@ dispatches nothing (acceptance check 4)."
       (claude-code-ide-codex-events-tests--kill-instances))))
 
 (ert-deftest claude-code-ide-codex-events-test-screen-dialogs ()
-  "The screen read sets the startup dialog and confirms or ends an approval."
+  "The screen read sets the startup dialog and confirms or ends an approval.
+A window shows the terminal, so a read without a dialog ends the wait."
   (claude-code-ide-codex-events-tests--with-codex
     (let ((screen 'folder-trust)
           (reads 0))
@@ -666,7 +667,8 @@ dispatches nothing (acceptance check 4)."
                  (lambda (buffer)
                    (should (bufferp buffer))
                    (cl-incf reads)
-                   screen)))
+                   screen))
+                ((symbol-function 'claude-code-ide-codex-screen-whole-p) (lambda (_buffer) t)))
         (unwind-protect
             (let* ((instance (claude-code-ide-codex-events-tests--instance "cci-test-dialog" 1))
                    (launch (claude-code-ide-codex-events--track instance))
@@ -719,6 +721,119 @@ dispatches nothing (acceptance check 4)."
               (should-not (claude-code-ide-codex-events--read-screen launch instance (+ start 60)))
               (should (= reads 0)))
           (claude-code-ide-codex-events-tests--kill-instances))))))
+
+(defvar claude-code-ide-codex-events-approval-end)
+
+(defun claude-code-ide-codex-events-tests--approval-read (rule window &optional events)
+  "Return the state after an approval and a screen read without a dialog.
+RULE is the value of `claude-code-ide-codex-events-approval-end';
+WINDOW non-nil means that a window of a display shows the terminal.
+EVENTS, each (EVENT JSON), come after the read.  The result is
+\(STATE REASON GUESS) 3 seconds after the read, before the approval
+is a guess by time."
+  (claude-code-ide-codex-events-tests--with-codex
+    (let ((claude-code-ide-codex-events-approval-end rule))
+      (cl-letf (((symbol-function 'claude-code-ide-codex-screen-dialog) (lambda (_buffer) nil))
+                ((symbol-function 'claude-code-ide-codex-screen-whole-p)
+                 (lambda (_buffer) (and window t))))
+        (unwind-protect
+            (let* ((instance (claude-code-ide-codex-events-tests--instance "cci-test-end" 1))
+                   (launch (claude-code-ide-codex-events--track instance))
+                   (start (claude-code-ide-codex-events--launch-registered launch)))
+              (claude-code-ide-codex-events-tests--feed
+               "cci-test-end" 1
+               '(("SessionStart" "{}") ("UserPromptSubmit" "{}")
+                 ("PreToolUse" "{\"tool_name\":\"mcp__emacs_tools__claude_code_ide_mcp_project_info\",\"tool_use_id\":\"t1\",\"tool_input\":{}}")
+                 ("PermissionRequest" "{\"tool_name\":\"mcp__emacs_tools__claude_code_ide_mcp_project_info\",\"tool_input\":{}}"))
+               (+ start 10))
+              ;; The request came at start + 14; the read is 2 s later
+              (claude-code-ide-codex-events--read-screen launch instance (+ start 16))
+              (when events
+                (claude-code-ide-codex-events-tests--feed "cci-test-end" 1 events (+ start 16)))
+              (claude-code-ide-codex-events-tests--state instance (+ start 19)))
+          (claude-code-ide-codex-events-tests--kill-instances))))))
+
+(ert-deftest claude-code-ide-codex-events-test-approval-end-window ()
+  "The default rule: a read without a dialog ends the wait only with a window."
+  (should (eq (default-value 'claude-code-ide-codex-events-approval-end) 'window))
+  ;; No window (an eat buffer in a daemon): the read cannot see the whole dialog
+  (should (equal (claude-code-ide-codex-events-tests--approval-read 'window nil)
+                 '(waiting-for-user approval nil)))
+  ;; A window shows the whole screen: no dialog means that the user answered
+  (should (equal (claude-code-ide-codex-events-tests--approval-read 'window t)
+                 '(working nil t))))
+
+(ert-deftest claude-code-ide-codex-events-test-approval-end-unsure-screen ()
+  "A window, but a screen of an unsure size (two windows of other heights): the wait stays."
+  (claude-code-ide-codex-events-tests--with-codex
+    (cl-letf (((symbol-function 'claude-code-ide-codex-screen-dialog) (lambda (_buffer) nil))
+              ((symbol-function 'claude-code-ide-codex-screen-window)
+               (lambda (_buffer) (selected-window)))
+              ((symbol-function 'claude-code-ide-codex-screen-whole-p) (lambda (_buffer) nil)))
+      (unwind-protect
+          (let* ((instance (claude-code-ide-codex-events-tests--instance "cci-test-unsure" 1))
+                 (launch (claude-code-ide-codex-events--track instance))
+                 (start (claude-code-ide-codex-events--launch-registered launch)))
+            (claude-code-ide-codex-events-tests--feed
+             "cci-test-unsure" 1
+             '(("SessionStart" "{}") ("UserPromptSubmit" "{}")
+               ("PreToolUse" "{\"tool_name\":\"Bash\",\"tool_use_id\":\"t1\",\"tool_input\":{\"command\":\"make\"}}")
+               ("PermissionRequest" "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"make\"}}"))
+             (+ start 10))
+            (claude-code-ide-codex-events--read-screen launch instance (+ start 16))
+            (should (equal (claude-code-ide-codex-events-tests--state instance (+ start 19))
+                           '(waiting-for-user approval nil))))
+        (claude-code-ide-codex-events-tests--kill-instances)))))
+
+(ert-deftest claude-code-ide-codex-events-test-approval-end-event ()
+  "The rule `event': only an event ends the wait, also with a window."
+  (should (equal (claude-code-ide-codex-events-tests--approval-read 'event t)
+                 '(waiting-for-user approval nil)))
+  (should (equal (claude-code-ide-codex-events-tests--approval-read 'event nil)
+                 '(waiting-for-user approval nil))))
+
+(ert-deftest claude-code-ide-codex-events-test-approval-end-screen ()
+  "The rule `screen' (the old rule): any read without a dialog ends the wait."
+  (should (equal (claude-code-ide-codex-events-tests--approval-read 'screen nil)
+                 '(working nil t)))
+  (should (equal (claude-code-ide-codex-events-tests--approval-read 'screen t)
+                 '(working nil t))))
+
+(ert-deftest claude-code-ide-codex-events-test-approval-end-events-without-window ()
+  "Without a window, PostToolUse, Stop or Interrupt ends the wait."
+  (should (equal (claude-code-ide-codex-events-tests--approval-read
+                  'window nil
+                  '(("PostToolUse" "{\"tool_name\":\"mcp__emacs_tools__claude_code_ide_mcp_project_info\",\"tool_use_id\":\"t1\",\"tool_input\":{},\"tool_response\":\"ok\"}")))
+                 '(working nil nil)))
+  (should (equal (car (claude-code-ide-codex-events-tests--approval-read
+                       'window nil '(("Stop" "{\"last_assistant_message\":\"done\"}"))))
+                 'idle))
+  (should (equal (car (claude-code-ide-codex-events-tests--approval-read
+                       'window nil '(("Interrupt" "{}"))))
+                 'idle)))
+
+(ert-deftest claude-code-ide-codex-events-test-approval-tail-in-eat-without-window ()
+  "The tail of the MCP approval dialog, in a buffer without a window, is a sure approval."
+  (claude-code-ide-codex-events-tests--with-codex
+    (unwind-protect
+        (let* ((instance (claude-code-ide-codex-events-tests--instance "cci-test-tail" 1))
+               (launch (claude-code-ide-codex-events--track instance))
+               (start (claude-code-ide-codex-events--launch-registered launch)))
+          (with-current-buffer (claude-code-ide-instance-buffer instance)
+            (insert "\n  Field 1/1\n  › 1. Allow  Run the tool and\n"
+                    "  option 1/2 | enter to submit | esc\n\n"))
+          (should-not (claude-code-ide-codex-screen-window (claude-code-ide-instance-buffer instance)))
+          (claude-code-ide-codex-events-tests--feed
+           "cci-test-tail" 1
+           '(("SessionStart" "{}") ("UserPromptSubmit" "{}")
+             ("PreToolUse" "{\"tool_name\":\"mcp__emacs_tools__claude_code_ide_mcp_project_info\",\"tool_use_id\":\"t1\",\"tool_input\":{}}")
+             ("PermissionRequest" "{\"tool_name\":\"mcp__emacs_tools__claude_code_ide_mcp_project_info\",\"tool_input\":{}}"))
+           (+ start 10))
+          (claude-code-ide-codex-events--read-screen launch instance (+ start 16))
+          ;; Sure, also after the guess time
+          (should (equal (claude-code-ide-codex-events-tests--state instance (+ start 60))
+                         '(waiting-for-user approval nil))))
+      (claude-code-ide-codex-events-tests--kill-instances))))
 
 (ert-deftest claude-code-ide-codex-events-test-subagent-approval ()
   "A subagent's approval waits for the user; its other events leave the main turn."
@@ -1710,9 +1825,11 @@ other events with an unknown conversation ID still drop."
                        '((event . "Stop") (input (x)))))))))
 
 (ert-deftest claude-code-ide-codex-events-test-answered-per-blocker ()
-  "The end of a subagent leaves the screen check of the main approval."
+  "The end of a subagent leaves the screen check of the main approval.
+A window shows the terminal, so a read without a dialog ends the wait."
   (claude-code-ide-codex-events-tests--with-codex
-    (cl-letf (((symbol-function 'claude-code-ide-codex-screen-dialog) (lambda (_buffer) nil)))
+    (cl-letf (((symbol-function 'claude-code-ide-codex-screen-dialog) (lambda (_buffer) nil))
+              ((symbol-function 'claude-code-ide-codex-screen-whole-p) (lambda (_buffer) t)))
       (unwind-protect
           (let* ((instance (claude-code-ide-codex-events-tests--instance "cci-test-ans" 1))
                  (launch (claude-code-ide-codex-events--track instance)))

@@ -167,10 +167,18 @@ The other events are `other'.")
                   "Continue without trusting")
     (update "Update now" "Skip until next version")
     (approval "Allow the [^ ]+ MCP server to run tool" "Yes, proceed"
-              "Yes, just this once" "No, and tell Codex what to do differently"))
+              "Yes, just this once" "No, and tell Codex what to do differently"
+              ;; The tail of the MCP approval dialog, which is all that an
+              ;; eat buffer without a window keeps: the selected choice
+              ;; "› 1. Allow  Run the tool and" and, below it, the control
+              ;; line "option 1/2 | enter to submit | esc" (white space is
+              ;; one space here).  A reply that lists such a choice has
+              ;; neither the marker nor the control line.
+              "› [0-9]+\\. Allow Run the tool.\\{0,300\\}option [0-9]+/[0-9]+ | enter to submit"))
   "Text patterns of the Codex dialogs, as (KIND REGEXP...).
-The first kind with a matching regexp wins.  The texts are those of
-Codex 0.164.0.")
+The first kind with a matching regexp wins.  The regexps match the
+screen text with each run of white space as one space.  The texts are
+those of Codex 0.164.0.")
 
 (defvar claude-code-ide-codex--screen-lines 50
   "Lines of a terminal screen when no window shows the terminal buffer.")
@@ -1084,13 +1092,96 @@ native ID: a new conversation gets it only at its first prompt."
 
 ;;; Dialogs on the screen
 
+(defun claude-code-ide-codex--display-frame-p (frame)
+  "Return non-nil when FRAME is on a display, visible or not.
+The initial frame of a daemon, and the frame of batch Emacs, are on the
+terminal \"initial_terminal\": they show nothing to anybody.  That
+frame says that it is visible, so `frame-visible-p' cannot tell."
+  (and (frame-live-p frame)
+       (not (equal (terminal-name (frame-terminal frame)) "initial_terminal"))))
+
+(defun claude-code-ide-codex--display-windows (buffer)
+  "Return the windows of BUFFER on frames of a display, visible or not.
+See `claude-code-ide-codex--display-frame-p'."
+  (and (buffer-live-p buffer)
+       (cl-remove-if-not (lambda (window)
+                           (claude-code-ide-codex--display-frame-p (window-frame window)))
+                         (get-buffer-window-list buffer nil t))))
+
+(defun claude-code-ide-codex-screen-window (buffer)
+  "Return a window of BUFFER on a frame of a display, or nil.
+A frame that is not visible counts: the terminal keeps the size of its
+window.  See `claude-code-ide-codex-screen-whole-p' for when a read of
+the screen sees all of it."
+  (car (claude-code-ide-codex--display-windows buffer)))
+
+(defun claude-code-ide-codex--terminal-lines (buffer)
+  "Return the number of lines of the terminal screen of BUFFER, or nil.
+eat gives its terminal size (`eat-term-size' of `eat-terminal'), and
+ghostel its rows (`ghostel--term-rows').  vterm keeps its size in its
+module, so it gives nil."
+  (with-current-buffer buffer
+    (let ((lines (cond
+                  ((and (local-variable-p 'eat-terminal) (fboundp 'eat-term-size))
+                   (cdr-safe (ignore-errors
+                               (funcall 'eat-term-size (buffer-local-value 'eat-terminal buffer)))))
+                  ((local-variable-p 'ghostel--term-rows)
+                   (buffer-local-value 'ghostel--term-rows buffer)))))
+      (and (integerp lines) (> lines 0) lines))))
+
+(defun claude-code-ide-codex--size-function (buffer)
+  "Return the value of `window-adjust-process-window-size-function' in BUFFER."
+  (buffer-local-value 'window-adjust-process-window-size-function buffer))
+
+(defun claude-code-ide-codex--known-size-function-p (buffer)
+  "Return non-nil when BUFFER sizes its terminal by the smallest or largest window."
+  (memq (claude-code-ide-codex--size-function buffer)
+        '(window-adjust-process-window-size-smallest
+          window-adjust-process-window-size-largest)))
+
+(defun claude-code-ide-codex--window-lines (windows)
+  "Return the terminal height that the WINDOWS of a terminal give it, or nil.
+Emacs sizes the terminal with `window-adjust-process-window-size-function'
+of the buffer: the smallest window by default, the largest with
+`window-adjust-process-window-size-largest'.  Another function counts
+as the smallest."
+  (when windows
+    (let ((heights (mapcar #'window-body-height windows)))
+      (apply (if (eq (claude-code-ide-codex--size-function (window-buffer (car windows)))
+                     #'window-adjust-process-window-size-largest)
+                 #'max
+               #'min)
+             heights))))
+
+(defun claude-code-ide-codex-screen-whole-p (buffer)
+  "Return non-nil when a read of BUFFER sees the whole terminal screen.
+That needs a window of a display (`claude-code-ide-codex-screen-window'),
+and a sure size of the screen: the size that the backend gives
+\(`claude-code-ide-codex--terminal-lines'), else one height of all the
+windows of a display.  Windows of other heights, without a size of the
+backend, make the size unsure: the read can cover another part than
+the terminal screen.  So does a `window-adjust-process-window-size-function'
+other than the smallest or the largest: it can give the terminal more
+lines than the windows have."
+  (let ((windows (claude-code-ide-codex--display-windows buffer)))
+    (and windows
+         (or (claude-code-ide-codex--terminal-lines buffer)
+             (and (claude-code-ide-codex--known-size-function-p buffer)
+                  (null (cdr (delete-dups (mapcar #'window-body-height windows))))))
+         t)))
+
 (defun claude-code-ide-codex--screen-text (buffer)
   "Return the text of the terminal screen of BUFFER.
-The screen is the last lines of the buffer, as many as the window that
-shows BUFFER has, else `claude-code-ide-codex--screen-lines'."
+The screen is the last lines of the buffer: as many as the terminal has
+when the backend says it (`claude-code-ide-codex--terminal-lines'),
+else as many as the windows of a display give the terminal
+\(`claude-code-ide-codex--window-lines'), else
+`claude-code-ide-codex--screen-lines'."
   (with-current-buffer buffer
-    (let* ((window (get-buffer-window buffer t))
-           (lines (if window (window-body-height window) claude-code-ide-codex--screen-lines)))
+    (let ((lines (or (claude-code-ide-codex--terminal-lines buffer)
+                     (claude-code-ide-codex--window-lines
+                      (claude-code-ide-codex--display-windows buffer))
+                     claude-code-ide-codex--screen-lines)))
       (save-excursion
         (goto-char (point-max))
         ;; Trailing empty lines of the buffer are part of the screen

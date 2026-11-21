@@ -84,6 +84,29 @@ the check goes on in the background."
   :type 'number
   :group 'claude-code-ide)
 
+(defcustom claude-code-ide-codex-events-approval-end 'window
+  "What ends the wait for an approval of the main agent of a Codex launch.
+The wait starts with the event PermissionRequest.  An event always ends
+it: PostToolUse of the tool, Stop, Interrupt, or the end of the
+session.  No event shows that the user allowed the tool, so a screen
+read that finds no dialog can end the wait too:
+
+- `window' (the default): only when the read sees the whole screen
+  (`claude-code-ide-codex-screen-whole-p'): a window of a display shows
+  the terminal, and the size of the screen is sure.  An eat buffer
+  without a window keeps only the last lines of a dialog, and the read
+  can miss the dialog.  Two windows of other heights, without a size
+  of the terminal from the backend, make the size unsure.
+- `event': never; only an event ends the wait.  A long tool run after
+  an allow shows as waiting.
+- `screen': always, also without a window (the rule before 1.2.0).
+
+A screen read that finds the dialog confirms the wait in each case."
+  :type '(choice (const :tag "A screen read with a window, or an event" window)
+                 (const :tag "Only an event" event)
+                 (const :tag "Any screen read, or an event" screen))
+  :group 'claude-code-ide)
+
 (defcustom claude-code-ide-codex-events-approval-guess-time 10
   "Seconds after which an approval that no screen read confirms is a guess.
 No hook event shows that the user allowed a command; the next event
@@ -1403,17 +1426,35 @@ because Codex draws the dialog after the event."
                       (>= (- now (claude-code-ide-codex-events--blocker-since blocker)) 1.5)))
                (claude-code-ide-codex-events--launch-blockers launch))))
 
+(defun claude-code-ide-codex-events--read-ends-approval-p (buffer)
+  "Return non-nil when a read of BUFFER without a dialog ends an approval.
+See `claude-code-ide-codex-events-approval-end'.  For `window', the
+read must see the whole screen: a window of a display shows BUFFER,
+and the size of the screen is sure.  The check
+`claude-code-ide-codex-screen-whole-p' belongs to the Codex launch;
+without it, no read sees the whole screen."
+  (pcase claude-code-ide-codex-events-approval-end
+    ('screen t)
+    ('event nil)
+    (_ (and (fboundp 'claude-code-ide-codex-screen-whole-p)
+            (funcall 'claude-code-ide-codex-screen-whole-p buffer)
+            t))))
+
 (defun claude-code-ide-codex-events--read-screen (launch instance now)
   "Read the terminal of INSTANCE for a dialog and note it in LAUNCH at NOW.
 The reader `claude-code-ide-codex-screen-dialog' belongs to the Codex
-launch; without it nothing happens.  It never sends keys.  Return
-non-nil when the state of LAUNCH changed."
+launch; without it nothing happens.  It never sends keys.  A read
+without a dialog ends the wait for an approval only as
+`claude-code-ide-codex-events-approval-end' says.  Return non-nil when
+the state of LAUNCH changed."
   (let ((buffer (claude-code-ide-instance-buffer instance)))
     (when (and (fboundp 'claude-code-ide-codex-screen-dialog)
                (buffer-live-p buffer)
                (claude-code-ide-codex-events--needs-screen-p launch now))
       (let* ((before (claude-code-ide-codex-events--state launch now))
-             (dialog (funcall 'claude-code-ide-codex-screen-dialog buffer)))
+             (dialog (funcall 'claude-code-ide-codex-screen-dialog buffer))
+             (ends (and (not dialog)
+                        (claude-code-ide-codex-events--read-ends-approval-p buffer))))
         (setf (claude-code-ide-codex-events--launch-dialog launch) dialog
               (claude-code-ide-codex-events--launch-dialog-checked launch) now)
         ;; The screen shows the dialogs of the main agent only
@@ -1421,9 +1462,10 @@ non-nil when the state of LAUNCH changed."
           (when (and (eq (claude-code-ide-codex-events--blocker-kind blocker) 'approval)
                      (null (car-safe (claude-code-ide-codex-events--blocker-tool blocker))))
             (setf (claude-code-ide-codex-events--blocker-answered blocker)
-                  (if dialog
-                      nil
-                    (or (claude-code-ide-codex-events--blocker-answered blocker) now)))))
+                  (cond
+                   (dialog nil)
+                   (ends (or (claude-code-ide-codex-events--blocker-answered blocker) now))
+                   (t (claude-code-ide-codex-events--blocker-answered blocker))))))
         (not (equal (butlast (claude-code-ide-codex-events--state launch now) 3)
                     (butlast before 3)))))))
 
