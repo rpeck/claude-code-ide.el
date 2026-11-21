@@ -872,6 +872,91 @@ the size of that window."
                                          (claude-code-ide-codex--screen-text buffer)))))))
       (kill-buffer buffer))))
 
+(ert-deftest claude-code-ide-test-codex-screen-dialog-approval-tail-structure ()
+  "Only the structure of the dialog tail is an approval: the marker and the control line."
+  (dolist (text '(;; A reply that lists the choices
+                  "• The choices were:\n  1. Allow Run the tool and continue.\n  2. Deny.\n\n› Ask Codex to do anything\n"
+                  ;; The selection marker, but no control line
+                  "  › 1. Allow  Run the tool and\n\n› Ask Codex to do anything\n"
+                  ;; The control line, but no marker before the choice
+                  "  1. Allow  Run the tool and\n  option 1/2 | enter to submit | esc\n"))
+    (with-temp-buffer
+      (insert text)
+      (should-not (eq (claude-code-ide-codex-screen-dialog (current-buffer)) 'approval)))))
+
+(defmacro claude-code-ide-codex-tests--with-two-windows (top &rest body)
+  "Run BODY with `buffer' in two windows, the upper one with TOP body lines.
+The frame of batch Emacs counts as a frame of a display here."
+  (declare (indent 1))
+  `(let ((buffer (generate-new-buffer " *cci-test-two-windows*")))
+     (unwind-protect
+         (save-window-excursion
+           (delete-other-windows)
+           (with-current-buffer buffer
+             (dotimes (i 100) (insert (format "line %d\n" (1+ i)))))
+           (set-window-buffer (selected-window) buffer)
+           (let ((other (split-window (selected-window) (+ ,top 1))))
+             (set-window-buffer other buffer)
+             (cl-letf (((symbol-function 'claude-code-ide-codex--display-frame-p) #'always))
+               ,@body)))
+       (kill-buffer buffer))))
+
+(ert-deftest claude-code-ide-test-codex-screen-two-windows ()
+  "Two windows of different heights: the screen size is not sure, so no read is whole."
+  (claude-code-ide-codex-tests--with-two-windows 6
+    (let ((heights (sort (mapcar #'window-body-height (get-buffer-window-list buffer nil t)) #'<)))
+      (should (= (length heights) 2))
+      (should (/= (car heights) (cadr heights)))
+      ;; The terminal gets the smallest window by default
+      (let ((window-adjust-process-window-size-function #'window-adjust-process-window-size-smallest))
+        (should (string-prefix-p (format "line %d\n" (- 102 (car heights)))
+                                 (claude-code-ide-codex--screen-text buffer)))
+        (should-not (claude-code-ide-codex-screen-whole-p buffer)))
+      ;; Or the largest
+      (let ((window-adjust-process-window-size-function #'window-adjust-process-window-size-largest))
+        (should (string-prefix-p (format "line %d\n" (- 102 (cadr heights)))
+                                 (claude-code-ide-codex--screen-text buffer)))
+        (should-not (claude-code-ide-codex-screen-whole-p buffer))))))
+
+(ert-deftest claude-code-ide-test-codex-screen-size-of-the-backend ()
+  "The terminal size of eat or ghostel sets the screen, and makes a read whole."
+  (claude-code-ide-codex-tests--with-two-windows 6
+    ;; eat keeps the size of its terminal
+    (with-current-buffer buffer
+      (setq-local eat-terminal 'cci-test-terminal))
+    (cl-letf (((symbol-function 'eat-term-size)
+               (lambda (terminal) (should (eq terminal 'cci-test-terminal)) '(80 . 33))))
+      (should (= (claude-code-ide-codex--terminal-lines buffer) 33))
+      (should (string-prefix-p "line 69\n" (claude-code-ide-codex--screen-text buffer)))
+      (should (claude-code-ide-codex-screen-whole-p buffer)))
+    (with-current-buffer buffer
+      (kill-local-variable 'eat-terminal)
+      ;; ghostel keeps its rows
+      (setq-local ghostel--term-rows 20))
+    (should (= (claude-code-ide-codex--terminal-lines buffer) 20))
+    (should (string-prefix-p "line 82\n" (claude-code-ide-codex--screen-text buffer)))
+    (should (claude-code-ide-codex-screen-whole-p buffer)))
+  ;; A size of the backend without a window of a display: no read is whole
+  (let ((buffer (generate-new-buffer " *cci-test-no-window*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer (setq-local ghostel--term-rows 20))
+          (should-not (claude-code-ide-codex-screen-whole-p buffer)))
+      (kill-buffer buffer))))
+
+(ert-deftest claude-code-ide-test-codex-screen-one-window-is-whole ()
+  "One window of a display without a backend size: its height is the screen, and a read is whole."
+  (let ((buffer (generate-new-buffer " *cci-test-one-window*")))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (set-window-buffer (selected-window) buffer)
+          (should-not (claude-code-ide-codex-screen-whole-p buffer))
+          (cl-letf (((symbol-function 'claude-code-ide-codex--display-frame-p) #'always))
+            (should-not (claude-code-ide-codex--terminal-lines buffer))
+            (should (claude-code-ide-codex-screen-whole-p buffer))))
+      (kill-buffer buffer))))
+
 ;;; Commands
 
 (ert-deftest claude-code-ide-test-codex-command-starts-codex ()

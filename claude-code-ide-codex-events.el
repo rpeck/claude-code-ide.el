@@ -91,10 +91,12 @@ it: PostToolUse of the tool, Stop, Interrupt, or the end of the
 session.  No event shows that the user allowed the tool, so a screen
 read that finds no dialog can end the wait too:
 
-- `window' (the default): only when a window of a display shows the
-  terminal (`claude-code-ide-codex-screen-window'), so that the read
-  sees the whole screen.  An eat buffer without a window keeps only
-  the last lines of a dialog, and the read can miss the dialog.
+- `window' (the default): only when the read sees the whole screen
+  (`claude-code-ide-codex-screen-whole-p'): a window of a display shows
+  the terminal, and the size of the screen is sure.  An eat buffer
+  without a window keeps only the last lines of a dialog, and the read
+  can miss the dialog.  Two windows of other heights, without a size
+  of the terminal from the backend, make the size unsure.
 - `event': never; only an event ends the wait.  A long tool run after
   an allow shows as waiting.
 - `screen': always, also without a window (the rule before 1.2.0).
@@ -1426,14 +1428,16 @@ because Codex draws the dialog after the event."
 
 (defun claude-code-ide-codex-events--read-ends-approval-p (buffer)
   "Return non-nil when a read of BUFFER without a dialog ends an approval.
-See `claude-code-ide-codex-events-approval-end'.  The window check
-`claude-code-ide-codex-screen-window' belongs to the Codex launch;
-without it, no window counts."
+See `claude-code-ide-codex-events-approval-end'.  For `window', the
+read must see the whole screen: a window of a display shows BUFFER,
+and the size of the screen is sure.  The check
+`claude-code-ide-codex-screen-whole-p' belongs to the Codex launch;
+without it, no read sees the whole screen."
   (pcase claude-code-ide-codex-events-approval-end
     ('screen t)
     ('event nil)
-    (_ (and (fboundp 'claude-code-ide-codex-screen-window)
-            (funcall 'claude-code-ide-codex-screen-window buffer)
+    (_ (and (fboundp 'claude-code-ide-codex-screen-whole-p)
+            (funcall 'claude-code-ide-codex-screen-whole-p buffer)
             t))))
 
 (defun claude-code-ide-codex-events--read-screen (launch instance now)
