@@ -210,10 +210,15 @@ Rules:
 
 | Value | A read without the dialog ends the wait | Use |
 |---|---|---|
-| `window` (default) | Only when a window of a display shows the terminal | An eat buffer without a window keeps only the last lines of a dialog, so the read can miss it. Then only an event ends the wait. |
+| `window` (default) | Only when the read sees the whole screen: a window of a display shows the terminal, and the size of the screen is sure | An eat buffer without a window keeps only the last lines of a dialog, so the read can miss it. Then only an event ends the wait. |
 | `event` | Never | A long tool run after an allow shows as `waiting-for-user/approval` (a guess after 10 s) until its `PostToolUse`. |
 | `screen` | Always | The rule before 1.2.0. In an eat buffer without a window, an open dialog can show as `working`. |
 
+- **The size of the screen.** The read covers the last lines of the buffer, as many as the terminal has:
+  - The size from the backend, when it gives one: eat (`eat-term-size` of `eat-terminal`) and ghostel (`ghostel--term-rows`). vterm keeps its size in its module, so it gives none.
+  - Else the height that the windows of a display give the terminal. Emacs uses `window-adjust-process-window-size-function`: the smallest window by default (eat and vterm resize with it), the largest with `window-adjust-process-window-size-largest`.
+  - Else 50 lines.
+- **A whole screen.** `claude-code-ide-codex-screen-whole-p` says whether a read sees the whole screen. That needs a window of a display, and a sure size: the size from the backend, or one height of all the windows of a display. With two windows of other heights and no size from the backend, the read can cover another part than the terminal screen, so a read without the dialog does not end the wait.
 - **Which window counts.** `claude-code-ide-codex-screen-window` gives a window of the terminal buffer on a frame of a display, visible or not. VERIFIED in an `emacs -Q` daemon:
   - The initial frame of a daemon (and the frame of batch Emacs) is on the terminal `initial_terminal`. It says that it is visible (`frame-visible-p` is t), but nobody sees it. Its window does not count.
   - A frame that is not visible, on a display (`(make-frame '((window-system . ns) (visibility . nil)))`), counts. `get-buffer-window` with ALL-FRAMES t finds its window; `visible` and 0 do not. L's live test showed that the terminal in such a window keeps the whole dialog.
@@ -290,7 +295,7 @@ The tests use these texts as fixtures (`claude-code-ide-codex-events-tests--quot
 3. An open question: `waiting-for-user/question`.
 4. An open approval:
    - The screen shows the approval dialog, also only its tail: `waiting-for-user/approval`, not a guess.
-   - A read found no dialog, and the rule of `claude-code-ide-codex-events-approval-end` lets that end the wait (by default: a window of a display shows the terminal): `working`, a guess ("Approved, runs?").
+   - A read found no dialog, and the rule of `claude-code-ide-codex-events-approval-end` lets that end the wait (by default: the read sees the whole screen): `working`, a guess ("Approved, runs?").
    - Else: `waiting-for-user/approval`, a guess after 10 seconds.
 5. A startup dialog on the screen: `waiting-for-user/dialog`.
 6. A subagent runs: `waiting-for-task/subagent`.

@@ -668,8 +668,7 @@ A window shows the terminal, so a read without a dialog ends the wait."
                    (should (bufferp buffer))
                    (cl-incf reads)
                    screen))
-                ((symbol-function 'claude-code-ide-codex-screen-window)
-                 (lambda (_buffer) (selected-window))))
+                ((symbol-function 'claude-code-ide-codex-screen-whole-p) (lambda (_buffer) t)))
         (unwind-protect
             (let* ((instance (claude-code-ide-codex-events-tests--instance "cci-test-dialog" 1))
                    (launch (claude-code-ide-codex-events--track instance))
@@ -735,8 +734,8 @@ is a guess by time."
   (claude-code-ide-codex-events-tests--with-codex
     (let ((claude-code-ide-codex-events-approval-end rule))
       (cl-letf (((symbol-function 'claude-code-ide-codex-screen-dialog) (lambda (_buffer) nil))
-                ((symbol-function 'claude-code-ide-codex-screen-window)
-                 (lambda (_buffer) (and window (selected-window)))))
+                ((symbol-function 'claude-code-ide-codex-screen-whole-p)
+                 (lambda (_buffer) (and window t))))
         (unwind-protect
             (let* ((instance (claude-code-ide-codex-events-tests--instance "cci-test-end" 1))
                    (launch (claude-code-ide-codex-events--track instance))
@@ -763,6 +762,28 @@ is a guess by time."
   ;; A window shows the whole screen: no dialog means that the user answered
   (should (equal (claude-code-ide-codex-events-tests--approval-read 'window t)
                  '(working nil t))))
+
+(ert-deftest claude-code-ide-codex-events-test-approval-end-unsure-screen ()
+  "A window, but a screen of an unsure size (two windows of other heights): the wait stays."
+  (claude-code-ide-codex-events-tests--with-codex
+    (cl-letf (((symbol-function 'claude-code-ide-codex-screen-dialog) (lambda (_buffer) nil))
+              ((symbol-function 'claude-code-ide-codex-screen-window)
+               (lambda (_buffer) (selected-window)))
+              ((symbol-function 'claude-code-ide-codex-screen-whole-p) (lambda (_buffer) nil)))
+      (unwind-protect
+          (let* ((instance (claude-code-ide-codex-events-tests--instance "cci-test-unsure" 1))
+                 (launch (claude-code-ide-codex-events--track instance))
+                 (start (claude-code-ide-codex-events--launch-registered launch)))
+            (claude-code-ide-codex-events-tests--feed
+             "cci-test-unsure" 1
+             '(("SessionStart" "{}") ("UserPromptSubmit" "{}")
+               ("PreToolUse" "{\"tool_name\":\"Bash\",\"tool_use_id\":\"t1\",\"tool_input\":{\"command\":\"make\"}}")
+               ("PermissionRequest" "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"make\"}}"))
+             (+ start 10))
+            (claude-code-ide-codex-events--read-screen launch instance (+ start 16))
+            (should (equal (claude-code-ide-codex-events-tests--state instance (+ start 19))
+                           '(waiting-for-user approval nil))))
+        (claude-code-ide-codex-events-tests--kill-instances)))))
 
 (ert-deftest claude-code-ide-codex-events-test-approval-end-event ()
   "The rule `event': only an event ends the wait, also with a window."
@@ -1808,8 +1829,7 @@ other events with an unknown conversation ID still drop."
 A window shows the terminal, so a read without a dialog ends the wait."
   (claude-code-ide-codex-events-tests--with-codex
     (cl-letf (((symbol-function 'claude-code-ide-codex-screen-dialog) (lambda (_buffer) nil))
-              ((symbol-function 'claude-code-ide-codex-screen-window)
-               (lambda (_buffer) (selected-window))))
+              ((symbol-function 'claude-code-ide-codex-screen-whole-p) (lambda (_buffer) t)))
       (unwind-protect
           (let* ((instance (claude-code-ide-codex-events-tests--instance "cci-test-ans" 1))
                  (launch (claude-code-ide-codex-events--track instance)))
