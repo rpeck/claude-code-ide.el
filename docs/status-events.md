@@ -8,6 +8,7 @@ This document describes how Emacs gets the status of a Codex instance:
 - The event files.
 - The mapping of each Codex event to the common events and the common states.
 - The startup dialogs.
+- The states of Claude Code and Codex sessions without status hooks.
 
 Code: `claude-code-ide-codex-events.el`. The common events and states are in [session-schema.md](session-schema.md). The status snapshot is in [status-schema.md](status-schema.md).
 
@@ -217,18 +218,56 @@ Rules:
 
 ### Quota limits
 
-`claude-code-ide-session-status-quota-regexp` decides whether an error text reports the usage limit of the account. It is matched without case. It matches texts such as "usage limit", "plan limit", "quota", "credits depleted", "out of credits", "hit your limit", and "5-hour limit" or "weekly limit". It does not match a short rate limit such as "Rate limit reached ... tokens per min ... try again in 1.2s".
+Two regexps decide whether an error text reports the usage limit of the account. Both are matched without case.
+
+- `claude-code-ide-session-status-quota-regexp` matches texts such as "usage limit", "plan limit", "quota", "credits depleted", "out of credits", "hit your limit", "spend cap", "usage not included", and "5-hour limit" or "weekly limit".
+- `claude-code-ide-session-status-transient-regexp` matches the texts of short limits: "per minute", "tokens per min", RPM or TPM, "retry after", and "try again in" a number of seconds. A text that matches it is never a usage limit, also when it says "quota". Examples: the Gemini text "Quota exceeded for quota metric '... requests per minute'", and the Azure text "... Please retry after 6 seconds".
+- "Try again at" a time does not match the second regexp. Codex says so at a usage limit.
+
+For Codex, the error kind decides first:
+
+- `claude-code-ide-codex-events-error-kind-states` maps each kind (`codex_error_info` of the rollout, in snake case) to `quota-limit` or `error`.
+  - The defaults: `usage_limit_exceeded`, `session_budget_exceeded`, and `usage_not_included` give `quota-limit`.
+  - `rate_limit_exceeded`, `server_overloaded`, `response_too_many_failed_attempts`, the connection kinds, and the other kinds of the schema give `error`.
+- A kind that is not in the list, such as `other`, and no kind leave it to the text. The hooks give no kind, only the text.
+- **A plan without Codex.** The kind `usage_not_included`, or a text that matches `claude-code-ide-codex-events-not-included-regexp` ("usage not included", "with your ChatGPT plan, upgrade to"), is `failed/quota-limit` with the detail "Not included in the plan: ...". The state plist has `:not-included t`. See "A plan without Codex".
 
 | Provider | Event | State | Detail |
 |---|---|---|---|
 | Claude Code | `StopFailure`, `error: "billing_error"` | `failed/quota-limit` | "Quota limit: <text>" |
-| Claude Code | `StopFailure`, `error: "rate_limit"`, and `error_details` or `last_assistant_message` matches the regexp | `failed/quota-limit` | "Quota limit: <text>" |
+| Claude Code | `StopFailure`, `error: "rate_limit"`, and `error_details` matches the regexp | `failed/quota-limit` | "Quota limit: <text>" |
+| Claude Code | `StopFailure`, `error: "rate_limit"`, a blank `error_details`, and `last_assistant_message` matches the regexp (the limit message of the CLI) | `failed/quota-limit` | "Quota limit: <text>" |
 | Claude Code | `StopFailure`, `error: "rate_limit"`, other | `failed/error` | "Error: rate limit", plus `error_details` when it has text |
 | Claude Code | `StopFailure`, other | `failed/error` | "Error: <error>" |
-| Codex | `PostModelRequest`, `status: "failed"`, and `error` matches the regexp | `failed/quota-limit` | "Quota limit: <error>" |
+| Codex | `PostModelRequest`, `status: "failed"`, and `error` says that the plan does not include Codex | `failed/quota-limit` | "Not included in the plan: <error>" |
+| Codex | `PostModelRequest`, `status: "failed"`, and `error` is a usage limit by the regexps | `failed/quota-limit` | "Quota limit: <error>" |
 | Codex | `PostModelRequest`, `status: "failed"`, other | `failed/error` | "Error: <error>" |
+| Codex, without hooks | rollout `task_complete` with a kind of `quota-limit` in the alist | `failed/quota-limit` | "From rollout: Quota limit: <message>" |
+| Codex, without hooks | rollout `task_complete` with a kind of `error` in the alist | `failed/error` | "From rollout: Error: <message>" |
+| Codex, without hooks | rollout `task_complete` with another kind, or none | by the text, as for the hooks | "From rollout: ..." |
 
-The real Codex usage-limit text is not yet known (T1). `<text>` is `error_details`, else `last_assistant_message`, else `error`.
+- `<text>` is `error_details`, else `last_assistant_message`, else `error`.
+- `<message>` is `error.message`, else the kind, else "unknown error".
+
+#### The Codex 0.164.0 usage limit
+
+No usage-limit record exists on this machine, so no live run shows one. These facts come from the binary (`strings`) and from `codex app-server generate-json-schema`:
+
+- **VERIFIED: the hook has only a text.** A failed `PostModelRequest` has `status`, `error` (a string), and `token_usage` (null). It has no error kind. Its `status` is `completed`, `failed`, or `cancelled`.
+- **VERIFIED: the rollout has the kind.** A failed turn ends with `task_complete`, whose `error` is `{message, codex_error_info}`. In a real run (an unknown model), `error.message` was the same text as the hook `error`, and `codex_error_info` was `other`.
+- **VERIFIED: the error kinds.** `CodexErrorInfo` of the app-server schema: `contextWindowExceeded`, `sessionBudgetExceeded`, `usageLimitExceeded`, `rateLimitExceeded`, `flexUnavailable`, `serverOverloaded`, `cyberPolicy`, `misalignmentPolicyViolation`, `tooManyDenials`, `internalServerError`, `unauthorized`, `badRequest`, `threadRollbackFailed`, `sandboxError`, `other`. With an HTTP status: `httpConnectionFailed`, `responseStreamConnectionFailed`, `responseStreamDisconnected`, `responseTooManyFailedAttempts`. The rollout writes them in snake case (`usage_limit_exceeded`), and an object kind as `{"http_connection_failed": {"http_status_code": 429}}`.
+- **VERIFIED: the texts in the binary.** Each of these is `failed/quota-limit`:
+  - "You’ve hit your usage limit." with a hint, for example "Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus)," and " or try again at ". The apostrophe is U+2019.
+  - "Quota exceeded. Check your plan and billing details."
+  - "To use Codex with your ChatGPT plan, upgrade to Plus: https://chatgpt.com/explore/plus." (the kind `usage_not_included`).
+  - "Your workspace is out of credits. ..." and "You hit your spend cap ...".
+  - "Usage limit reached. ..." and "Your included usage is exhausted. ..." (texts of the terminal UI).
+- **VERIFIED: the texts of short limits.** Each of these is `failed/error`: "exceeded retry limit, last status: ...", "Selected model is at capacity. Please try a different model.", and "We’re currently experiencing high demand, which may cause temporary errors.".
+- **NOT VERIFIED: a per-minute rate limit.** The text "exceeded retry limit" shows that Codex retries a failed request. So a short rate limit probably fails the turn only after the retries, with that text or the kind `rate_limit_exceeded`. Both are `failed/error`.
+- **NOT VERIFIED: which text a usage limit gives in the hook.** The display text ("You’ve hit your usage limit ...") is the most likely, because Codex turns the server answer `usage_limit_reached` into its own error. A raw server body with `usage_limit_reached`, `usage_not_included`, or `insufficient_quota` also matches the regexp.
+- **NOT VERIFIED: the kind of `Quota exceeded` and `usage not included`.** `CodexErrorInfo` has no own value for them. Emacs uses the text for them, and the kind `usage_not_included` in case a rollout has it.
+
+The tests use these texts as fixtures (`claude-code-ide-codex-events-tests--quota-texts` and `--transient-texts`).
 
 ### The order of the states
 
@@ -287,11 +326,68 @@ A Claude Code CLI reads its hooks only at its start. A session that started befo
 
 - A background shell is `idle`, as with the hooks: the agent waits for you while the shell runs. So `w` visits such a session, and a handover needs no force.
 - UNTRACKED is not urgent. NO SIGNAL is only for a session with hooks that sent no event.
-- The CLI reports `busy` and `idle` itself, so `:guess` is nil. The state plist has the extra key `:source` with the value `cli-file`.
+- The CLI reports `busy` and `idle` itself, so `:guess` is nil. The state plist has the extra key `:source` with the value `cli-file`. An UNTRACKED state has no `:source`.
 - The state starts at `statusUpdatedAt` (milliseconds), else at `updatedAt`. So the status buffer shows its age.
 - `claude-code-ide-instance-state`, the status snapshot, and the control operations use the same state.
 - **Cheap polling.** The state of a session is computed once for each refresh (one NOW), and the start of each process is asked once for each refresh. The file is read only when its modification time changed. The cache is keyed by session and weak, so it goes with the session. Emacs never writes the file.
 - `T` in the status buffer still restarts such a session with hooks.
+
+## Codex sessions without status hooks
+
+Codex keeps no status file for each process. But it appends each turn to the rollout file of the conversation, `<CODEX_HOME>/sessions/YYYY/MM/DD/rollout-<time>-<native id>.jsonl`. For a Codex instance without status hooks, the last turn record of that file gives the state, as a guess.
+
+- **Which instances.** A Codex instance without a launch record, or whose launch has no hooks (the hooks were not trusted at the launch). A launch with hooks always uses its hooks. A launch without hooks whose screen shows a startup dialog shows the dialog (`:source` `screen`).
+- **Which file.** The `transcript` operation of the Codex provider finds it: `(claude-code-ide-provider-call 'codex 'transcript INSTANCE 'file)`. See [providers.md](providers.md), section "The transcript operation".
+  - Without a known native ID, the provider is not asked. A new Codex session has no native ID until its first prompt, so it stays UNTRACKED. A resumed session has its native ID.
+  - Without the `codex` provider, without its `transcript` operation, or on an error, no file is known. The release without that operation gives no rollout state.
+- **Which conversation.** The session record of the file (`session_meta`, read by `claude-code-ide-transcript-codex-meta`) must have the native ID of the instance as its `payload.id`.
+  - Another ID: UNTRACKED, detail "the rollout file is of another conversation".
+  - No whole session record yet: UNTRACKED, detail "rollout file not readable yet". Emacs checks again at the next change of the file. The first line must be the `session_meta` record and end with its newline; a line without its newline is still being written, also when it is valid JSON already. (All 55 local rollouts start with `session_meta`.)
+- **The turn records.** Each is an `event_msg` record, parsed by `claude-code-ide-transcript--parse-line`. Only lines that end with a newline count, because Codex can be in the middle of a line.
+
+| The last turn record | Common state | Detail |
+|---|---|---|
+| `task_started` | `working`, since `started_at` | "From rollout: a turn runs" |
+| `task_started` before the start of the launch | `idle` | "From rollout: a turn of an earlier run did not end" |
+| `task_complete` without `error` | `idle`, since `completed_at` | "From rollout: turn ended" |
+| `task_complete` with `error` | `failed/quota-limit` or `failed/error` (see "Quota limits") | "From rollout: Quota limit: ...", "From rollout: Not included in the plan: ...", or "From rollout: Error: ..." |
+| `turn_aborted` | `idle` | "From rollout: interrupted" |
+| none | `idle` | "From rollout: no turn yet" |
+| a file that is not there or cannot be read | `disconnected/untracked` | "rollout file not readable" |
+| a file without a whole session record | `disconnected/untracked` | "rollout file not readable yet" |
+| a file of another conversation | `disconnected/untracked` | "the rollout file is of another conversation" |
+
+- **Each rollout state is a guess** (`:guess t`, a `?` in the status buffer). The state plist has `:source` `rollout`. An UNTRACKED state has no `:source`.
+- **The detail** says once that the hooks are missing: the trust problem of the launch, else "No status hooks". A state from the rollout ends with " · <problem>"; an UNTRACKED state starts with "<problem>; ".
+- **The start of the launch.** The time when Emacs tracked the launch, else the start of the terminal process. A `task_started` more than 1 second before it is of a process that was killed in a turn (`started_at` has whole seconds).
+- **The keys of the terminal do not count.** Emacs does not watch the terminal. A RET, an empty prompt, a slash command such as `/status`, or the answer to an approval changes no state; only the rollout file does.
+- **Limits.**
+  - **After `/new` or a fork in a terminal without hooks, the status follows the old conversation until Emacs learns the new native ID.** The instance keeps its old native ID, and Codex writes the new conversation to another rollout file. So the state is a guess of the old conversation: it is often `idle` while the new conversation works. A restart of the instance with hooks ends this: the hook `SessionStart` of the new conversation moves the launch (see "Event files").
+  - An approval or a question waits inside a running turn. The rollout has no record of them, so they show as `working`.
+- **Later work.** A better signal of a switch: for example the session ID that the Codex `/status` screen shows, read from the terminal. Release 1.2.0 has no detection of `/new`: a detection from new rollout files in the day folders gave false UNTRACKED states (a later session in the same folder, a scan before the session record was written), so the user dropped it (2026-11-21).
+- **Cheap polling.** The state of an instance is computed once for each refresh (one NOW), by the helper `claude-code-ide-session-status--once-per-refresh`, which the CLI file of Claude Code uses too. A change of the launch record or the native ID counts as a new refresh. The provider caches the path. Emacs reads the file only when its modification time, size, inode, or device changed:
+  - The first read goes backward from the end, 64 KiB at a time, until it finds a turn record. A line longer than 8 MiB is skipped.
+  - A file of the conversation that grew, with the same inode, is read only from the end of the last read on.
+  - Any other change checks the session record again and reads the file again from the end backward: a new time with the same or a smaller size (a rewrite in place), a new inode or device (a rename over the file), or a file whose session record did not match or was not whole.
+- The cache is keyed by instance and weak. Emacs never writes the file.
+- Facts of Codex 0.164.0, from 43 local rollout files (record types only): each turn has one `task_started` and then one `task_complete` or `turn_aborted` (`reason` `interrupted`). No turn starts inside another one.
+- **Why not the app-server.** Its thread status (`ThreadStatus` in the schema) has the value `notLoaded` for a thread that the app-server did not load itself. So a second app-server cannot see the turn of the terminal (from the schema; not tried live).
+
+## A plan without Codex
+
+A failure whose plan does not include Codex (see "Quota limits") is `failed/quota-limit` with the detail "Not included in the plan: ...". A handover is one way out; a wait does not help.
+
+- When you act on such a session, `claude-code-ide-codex-events-not-included-action` decides what Emacs does. The actions: RET or a click on its row, `w` or `M-x claude-code-ide-visit-waiting-session`, and the handover key `H` of the status buffer.
+
+| Value | What Emacs does |
+|---|---|
+| `ask` (default) | It asks with `read-multiple-choice`: c (continue), h (hand over), s (stop). |
+| `continue` | It keeps the session and sends nothing. A visit shows the terminal; the handover key does nothing. |
+| `handover` | It starts `claude-code-ide-handover` for the instance. The handover asks for the target. |
+| `stop` | It ends the session with `claude-code-ide-control-stop`, and says the result. |
+
+- A coordinator never gets the question. It reads the state, the reason (`quota-limit`), and the detail of the snapshot.
+- Another file can take over such actions too: `claude-code-ide-session-status-act-functions` gets the instance and `visit` or `handover`.
 
 ## Tracking
 
@@ -299,7 +395,8 @@ A Claude Code CLI reads its hooks only at its start. A session that started befo
 - A new launch of the same instance ID replaces the record and deletes the files of the old launch.
 - Every 2 seconds, Emacs deletes the records whose instance does not run that launch any more, and their files.
 - The timers stop when no record is left.
-- `claude-code-ide-codex-events--instance-state` is a function of `claude-code-ide-instance-state-functions` for the provider `codex`. An instance without a record has the state `disconnected/untracked`, detail "No status hooks".
+- `claude-code-ide-codex-events--instance-state` is a function of `claude-code-ide-instance-state-functions` for the provider `codex`. An instance without a record gets its state from its rollout file (see "Codex sessions without status hooks"), else it has the state `disconnected/untracked`, detail "No status hooks".
+- The state plist has `:source`: `hooks` for a launch with hooks, `screen` for a dialog of a launch without hooks, `rollout` for the rollout file. An UNTRACKED state has none. The status snapshot shows it as `source`.
 - `claude-code-ide-codex-events-map-event` maps the events. The Codex provider can use it as its `map-event` operation.
 
 ## Options
@@ -311,4 +408,8 @@ A Claude Code CLI reads its hooks only at its start. A session that started befo
 | `claude-code-ide-codex-events-trust-timeout` | 5 | Seconds that a start waits for the trust check. |
 | `claude-code-ide-codex-events-startup-grace` | 3 | Seconds before the first screen read of a launch. |
 | `claude-code-ide-codex-events-approval-guess-time` | 10 | Seconds after which an unconfirmed approval is a guess. |
-| `claude-code-ide-session-status-quota-regexp` | see above | The usage-limit pattern of both providers. |
+| `claude-code-ide-session-status-quota-regexp` | see "Quota limits" | The usage-limit pattern of both providers. |
+| `claude-code-ide-session-status-transient-regexp` | see "Quota limits" | Texts of short limits, which are never a usage limit (both providers). |
+| `claude-code-ide-codex-events-error-kind-states` | see "Quota limits" | The state of each Codex error kind: `quota-limit` or `error`. |
+| `claude-code-ide-codex-events-not-included-regexp` | see "Quota limits" | Texts that say that the plan does not include Codex. |
+| `claude-code-ide-codex-events-not-included-action` | `ask` | What a visit or the handover key does on a session whose plan lacks Codex. |

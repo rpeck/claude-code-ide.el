@@ -672,32 +672,55 @@ main agent waits on the subagent that started them."
 (defcustom claude-code-ide-session-status-quota-regexp
   (concat "usage[_ ]?limit\\|plan[_ ]limit\\|quota"
           "\\|credits?[_ ]\\(?:depleted\\|exhausted\\)\\|out of credits\\|insufficient[_ ]credits"
-          "\\|hit your limit\\|\\(?:5-hour\\|five-hour\\|weekly\\|daily\\|monthly\\) limit")
+          "\\|hit your limit\\|\\(?:5-hour\\|five-hour\\|weekly\\|daily\\|monthly\\) limit"
+          "\\|spend[_ ]cap\\|usage[_ ]not[_ ]included\\|chatgpt plan, upgrade to"
+          "\\|included usage is exhausted")
   "Regexp for an error text that reports the usage limit of the account.
-It is matched without case.  It must not match a short rate limit,
-such as \"Rate limit reached ... tokens per min\", which ends in
-seconds.  A Claude Code rate limit or a failed Codex model request
-whose text matches it is `failed/quota-limit'."
+It is matched without case.  A text that matches
+`claude-code-ide-session-status-transient-regexp' is never a usage
+limit, so a short limit such as \"Quota exceeded ... requests per
+minute\" does not count.  A Claude Code rate limit or a failed Codex
+model request whose text matches it is `failed/quota-limit'.  The
+Codex 0.164.0 texts that it matches are in docs/status-events.md,
+section \"Quota limits\"."
+  :type 'regexp
+  :group 'claude-code-ide)
+
+(defcustom claude-code-ide-session-status-transient-regexp
+  (concat "per[ _-]?min\\(?:ute\\)?\\b\\|\\b[RT]PM\\b\\|retry[ _-]after"
+          "\\|\\(?:try again\\|retry\\) in [0-9.]+ ?\\(?:ms\\|s\\|secs?\\|seconds?\\)\\b")
+  "Regexp for an error text of a short limit, which is never a usage limit.
+It is matched without case.  It matches texts with \"per minute\",
+\"tokens per min\", RPM or TPM, \"retry after\", and \"try again in\" a
+number of seconds.  \"Try again at\" a time does not match: Codex says
+so at a usage limit."
   :type 'regexp
   :group 'claude-code-ide)
 
 (defun claude-code-ide-session-status--quota-text-p (text)
-  "Return non-nil when TEXT reports the usage limit of the account."
+  "Return non-nil when TEXT reports the usage limit of the account.
+See `claude-code-ide-session-status-quota-regexp' and
+`claude-code-ide-session-status-transient-regexp'."
   (and (stringp text)
        (let ((case-fold-search t))
-         (string-match-p claude-code-ide-session-status-quota-regexp text))))
+         (and (string-match-p claude-code-ide-session-status-quota-regexp text)
+              (not (string-match-p claude-code-ide-session-status-transient-regexp text))))))
 
 (defun claude-code-ide-session-status--quota-failure-p (data)
   "Return non-nil when the StopFailure input DATA reports a quota limit.
 `billing_error' means that the account has no credits.  `rate_limit'
 covers also short limits of a few seconds, so it counts only when
-`error_details' or the last message says that a usage or plan limit
-was reached; see `claude-code-ide-session-status-quota-regexp'."
+`error_details' says that a usage or plan limit was reached; see
+`claude-code-ide-session-status-quota-regexp'.  The last message can
+be text of the model, so it counts only when `error_details' is blank:
+then it is the limit message of the CLI."
   (pcase (alist-get 'error data)
     ("billing_error" t)
     ("rate_limit"
-     (or (claude-code-ide-session-status--quota-text-p (alist-get 'error_details data))
-         (claude-code-ide-session-status--quota-text-p (alist-get 'last_assistant_message data))))))
+     (let ((details (alist-get 'error_details data)))
+       (if (and (stringp details) (not (string-blank-p details)))
+           (claude-code-ide-session-status--quota-text-p details)
+         (claude-code-ide-session-status--quota-text-p (alist-get 'last_assistant_message data)))))))
 
 (defun claude-code-ide-session-status--failure-text (data)
   "Return the text that explains the StopFailure input DATA."
@@ -1380,8 +1403,28 @@ A nil STATUS, a session without status hooks, is
 :pid and :start are the CLI PID and the start time of that process when
 Emacs learned the PID.  :file-time and :cli are the modification time of
 the file and the `claude-code-ide-session-registry--cli-session' read
-then.  :now and :result keep the result of one refresh.  An entry goes
-with its session.")
+then.  `claude-code-ide-session-status--once-per-refresh' keeps the
+result of one refresh in it.  An entry goes with its session.")
+
+(defun claude-code-ide-session-status--once-per-refresh (table key now compute &optional stamp)
+  "Return the result of COMPUTE for KEY, computed once for each NOW.
+TABLE maps KEY to a plist entry; the result of the refresh at NOW goes
+into the keys :memo-now, :memo-stamp and :memo-result of that entry.
+An entry with the same NOW and STAMP gives its result without a call.
+STAMP is any value; a change of it counts as a new refresh.  COMPUTE
+can make or replace the entry of KEY; without one, a new entry is made."
+  (let ((entry (gethash key table)))
+    (if (and entry
+             (plist-member entry :memo-now)
+             (equal (plist-get entry :memo-now) now)
+             (equal (plist-get entry :memo-stamp) stamp))
+        (plist-get entry :memo-result)
+      (let ((result (funcall compute))
+            (entry (or (gethash key table) (puthash key (list :memo-now nil) table))))
+        (plist-put entry :memo-now now)
+        (plist-put entry :memo-stamp stamp)
+        (plist-put entry :memo-result result)
+        result))))
 
 (defvar claude-code-ide-session-status--process-cache nil
   "(NOW . TABLE): the process attributes of each PID for the refresh at NOW.")
@@ -1444,9 +1487,9 @@ See `claude-code-ide-session-status--cli-state'."
                           claude-code-ide-session-registry--start-tolerance)))
            (status (and owner (claude-code-ide-session-registry--cli-session-status cli)))
            (since (and owner (claude-code-ide-session-registry--cli-session-status-time cli)))
+           ;; No source gives the state: it has no :source
            (untracked (lambda (detail)
-                        (cons (append (claude-code-ide-instance-make-state 'disconnected 'untracked)
-                                      (list :source 'cli-file))
+                        (cons (claude-code-ide-instance-make-state 'disconnected 'untracked)
                               detail)))
            (from-cli (lambda (state reason detail)
                        (cons (append (claude-code-ide-instance-make-state state reason since)
@@ -1465,7 +1508,8 @@ See `claude-code-ide-session-status--cli-state'."
 
 (defun claude-code-ide-session-status--cli-state (session &optional now)
   "Return (STATE . DETAIL) of SESSION, without status hooks, from its CLI file.
-STATE is a common state plist with the extra key :source `cli-file'.
+STATE is a common state plist.  A state that the file gives has the
+extra key :source `cli-file'; `disconnected/untracked' has no :source.
 
 - \"busy\" is `working'; \"idle\" and \"shell\" (a background shell runs)
   are `idle', as the hooks give them.  The CLI reports them itself, so
@@ -1480,28 +1524,26 @@ STATE is a common state plist with the extra key :source `cli-file'.
 Without a known CLI process, or when the terminal of SESSION has
 ended, return nil: the session then has no state from the file.  The
 result is computed once for each NOW (one refresh)."
-  (let* ((now (or now (float-time)))
-         (entry (gethash session claude-code-ide-session-status--cli-cache)))
-    (if (and entry (equal (plist-get entry :now) now))
-        (plist-get entry :result)
-      (let ((result (claude-code-ide-session-status--cli-state-at session now)))
-        (when-let* ((entry (gethash session claude-code-ide-session-status--cli-cache)))
-          (plist-put entry :now now)
-          (plist-put entry :result result))
-        result))))
+  (let ((now (or now (float-time))))
+    (claude-code-ide-session-status--once-per-refresh
+     claude-code-ide-session-status--cli-cache session now
+     (lambda () (claude-code-ide-session-status--cli-state-at session now)))))
 
 (defun claude-code-ide-session-status--session-state (session now)
   "Return (STATUS-STATE COMMON DETAIL SINCE) of the Claude Code SESSION at NOW.
-A session with a status record uses its hooks.  A session without one
-uses its CLI status file, when its CLI process is known."
+A session with a status record uses its hooks: COMMON has :source
+`hooks'.  A session without one uses its CLI status file, when its CLI
+process is known (:source `cli-file').  Else COMMON is
+`disconnected/untracked' without :source."
   (let ((status (gethash session claude-code-ide-session-status--by-session)))
     (if-let* (((null status))
               (cli (and session (claude-code-ide-session-status--cli-state session now))))
         (list (claude-code-ide-session-status--common-label-key (car cli))
               (car cli) (cdr cli) (plist-get (car cli) :since))
-      (let ((state (claude-code-ide-session-status--state status now)))
+      (let ((state (claude-code-ide-session-status--state status now))
+            (common (claude-code-ide-session-status--common-state status now)))
         (list state
-              (claude-code-ide-session-status--common-state status now)
+              (if status (append common (list :source 'hooks)) common)
               (claude-code-ide-session-status--detail status state now)
               (claude-code-ide-session-status--state-since status state))))))
 
@@ -1749,6 +1791,7 @@ this value well below 30."
       (state . ,(funcall value (plist-get state :state)))
       (reason . ,(funcall value (plist-get state :reason)))
       (guess . ,(if (plist-get state :guess) t :json-false))
+      (source . ,(funcall value (plist-get state :source)))
       (since . ,(claude-code-ide-session-status--iso-time (plist-get state :since)))
       (age_seconds . ,(let ((age (plist-get state :age))) (and age (round age))))
       (detail . ,(claude-code-ide-session-status--instance-detail instance now)))))
@@ -2161,13 +2204,35 @@ With a prefix argument FORCE, restart it also while it is busy."
       (claude-code-ide-session-registry--track-session
        session claude-code-ide-session-registry-track-note force))))
 
+(defvar claude-code-ide-session-status-act-functions nil
+  "Functions that can take over a command of the user on a row.
+Each function is called with INSTANCE (a descriptor) and COMMAND:
+`visit' for RET, a click or `claude-code-ide-visit-waiting-session',
+or `handover' for the handover key.  A function that returns non-nil
+did the action itself, and the command does nothing more.  Only these
+interactive commands run the functions; the control operations of a
+coordinator never do.")
+
+(defun claude-code-ide-session-status--act (item command)
+  "Run `claude-code-ide-session-status-act-functions' for the row ITEM.
+COMMAND is `visit' or `handover'.  Return non-nil when a function did
+the action."
+  (when-let* ((instance (and item (claude-code-ide-session-status--row-instance item))))
+    (run-hook-with-args-until-success 'claude-code-ide-session-status-act-functions
+                                      instance command)))
+
+(defun claude-code-ide-session-status--visit-item (item)
+  "Visit the row ITEM, unless an act function takes over; see `--act'."
+  (unless (claude-code-ide-session-status--act item 'visit)
+    (claude-code-ide-session-status--visit-session item)))
+
 (defun claude-code-ide-session-status-visit ()
   "Go to the session on this line, or the first session of a project line."
   (interactive)
   (let ((id (or (tabulated-list-get-id) (user-error "No session on this line"))))
     (if (eq id claude-code-ide-session-status--dropped-id)
         (claude-code-ide-session-status-show-dropped)
-      (claude-code-ide-session-status--visit-session
+      (claude-code-ide-session-status--visit-item
        (if (claude-code-ide-session-status--group-p id)
            (car (car (claude-code-ide-session-status--group-rows id)))
          id)))))
@@ -2204,8 +2269,9 @@ nothing without your answers; see `claude-code-ide-handover'."
     (user-error "The handover file is not available"))
   (let ((instance (or (claude-code-ide-session-status--handover-instance)
                       (user-error "No session on this line, and none at a quota limit"))))
-    (apply #'claude-code-ide-handover
-           (claude-code-ide-handover--read-args (claude-code-ide-instance-id instance)))))
+    (unless (claude-code-ide-session-status--act instance 'handover)
+      (apply #'claude-code-ide-handover
+             (claude-code-ide-handover--read-args (claude-code-ide-instance-id instance))))))
 
 ;;;###autoload
 (defun claude-code-ide-visit-waiting-session ()
@@ -2219,7 +2285,7 @@ next message; the longest wait first within each state."
                                                        tasks-quiet idle)))
                          (claude-code-ide-session-status--rows))))
     (if row
-        (claude-code-ide-session-status--visit-session (car row))
+        (claude-code-ide-session-status--visit-item (car row))
       (message "No Claude Code session waits for you"))))
 
 (defun claude-code-ide-session-status--lighter ()
