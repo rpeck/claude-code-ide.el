@@ -1406,6 +1406,66 @@ A clean exit, or an exit after the grace time, closes it as before."
                        :extra-flags "--model x --name y"))
                      "")))))
 
+(ert-deftest claude-code-ide-test-registry-restore-flags-slot ()
+  "The deprecated table means what it meant before; the slot serves a provider without an entry.
+The table has its old default, the claude entry.  An entry is used even
+when its value is nil, and a table set to nil gives no flags."
+  (claude-code-ide-tests--with-registry
+    (with-suppressed-warnings ((obsolete claude-code-ide-session-registry-restore-flags-functions))
+      (should (equal (default-value 'claude-code-ide-session-registry-restore-flags-functions)
+                     '((claude . claude-code-ide-session-registry--claude-restore-flags))))
+      (let ((claude-code-ide-provider--registry (copy-alist claude-code-ide-provider--registry))
+            (claude-code-ide-session-registry-restore-flags-functions
+             (default-value 'claude-code-ide-session-registry-restore-flags-functions))
+            (seen nil)
+            (config-dir (expand-file-name "claude" registry-dir)))
+        (let ((process-environment (cons (concat "CLAUDE_CONFIG_DIR=" config-dir) process-environment)))
+          (should (eq (claude-code-ide-provider-restore-flags (claude-code-ide-get-provider 'claude))
+                      #'claude-code-ide-session-registry--claude-restore-flags))
+          (claude-code-ide-register-provider
+           (claude-code-ide-provider-create
+            :name 'cci-test-slot
+            :restore-flags (lambda (entry)
+                             (setq seen (claude-code-ide-session-registry-entry-key entry))
+                             "--cci-test-slot")))
+          (claude-code-ide-register-provider (claude-code-ide-provider-create :name 'cci-test-plain))
+          ;; The default table: claude by its entry, the others by their slot
+          (should (equal (claude-code-ide-session-registry--restore-flags
+                          (claude-code-ide-tests--registry-entry "cci-test-s0" :model "opus"))
+                         "--model opus"))
+          (should (equal (claude-code-ide-session-registry--restore-flags
+                          (claude-code-ide-tests--registry-entry "cci-test-s1" :provider 'cci-test-slot))
+                         "--cci-test-slot"))
+          (should (equal seen "cci-test-s1"))
+          (should (equal (claude-code-ide-session-registry--restore-flags
+                          (claude-code-ide-tests--registry-entry "cci-test-s2" :provider 'cci-test-plain))
+                         ""))
+          (should (equal (claude-code-ide-session-registry--restore-flags
+                          (claude-code-ide-tests--registry-entry "cci-test-s3" :provider 'codex
+                                                                 :extra-flags "--model x"))
+                         ""))
+          ;; An entry wins over the slot, also an entry whose value is nil
+          (setq claude-code-ide-session-registry-restore-flags-functions
+                `((cci-test-slot . ,(lambda (_entry) "--cci-test-table-wins"))
+                  (claude . nil)
+                  (cci-test-gone . ,(lambda (_entry) "--cci-test-gone"))))
+          (should (equal (claude-code-ide-session-registry--restore-flags
+                          (claude-code-ide-tests--registry-entry "cci-test-s4" :provider 'cci-test-slot))
+                         "--cci-test-table-wins"))
+          (should (equal (claude-code-ide-session-registry--restore-flags
+                          (claude-code-ide-tests--registry-entry "cci-test-s5" :model "opus"))
+                         ""))
+          (should (equal (claude-code-ide-session-registry--restore-flags
+                          (claude-code-ide-tests--registry-entry "cci-test-s6" :provider 'cci-test-gone))
+                         "--cci-test-gone"))
+          ;; A table set to nil gives no flags, as before
+          (setq claude-code-ide-session-registry-restore-flags-functions nil)
+          (dolist (provider '(claude cci-test-slot))
+            (should (equal (claude-code-ide-session-registry--restore-flags
+                            (claude-code-ide-tests--registry-entry
+                             "cci-test-s7" :provider provider :model "opus"))
+                           ""))))))))
+
 (ert-deftest claude-code-ide-test-registry-older-v2-records ()
   "A version 2 record of an earlier release, without the new fields, reads.
 The new fields are nil, and a field with a wrong type is dropped."

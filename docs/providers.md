@@ -20,6 +20,7 @@ Make one with `claude-code-ide-provider-create` and keyword arguments.
 | `capabilities` | A list of symbols: exactly the operations that have a function. Leave it nil; registration fills it in. A list that names other operations is refused. |
 | One slot for each operation | A function, or nil when the provider does not support the operation. |
 | `ide-protocol` | Non-nil when the CLI speaks the IDE WebSocket protocol and reads the lock files in `~/.claude/ide/`. The default is nil. The `claude` provider sets it to t. It is not an operation, so it is not in `capabilities`. |
+| `restore-flags` | A function `(ENTRY)` of a session registry record that returns the flag string of the restore start spec, or nil. nil (the default) means no extra flags: the options of the provider give its flags and its model. It is the last slot. It is not an operation, so it is not in `capabilities`. See "Restore flags" below. |
 
 The accessors are `claude-code-ide-provider-<slot>`, for example `claude-code-ide-provider-launch`.
 
@@ -46,7 +47,7 @@ In this table:
 | `status-events` | `(INSTANCE)` | An alist `((EVENT-NAME COMMAND ...) ...)`: the status hooks that the launch gives the CLI. nil means none. |
 | `map-event` | `(PROVIDER-EVENT DATA)` | A symbol of `claude-code-ide-event-names`: the common event of a provider event. |
 | `mcp-setup` | `(INSTANCE)` | The MCP configuration in the format of the provider, or nil. |
-| `transcript` | `(INSTANCE WHAT)` | WHAT is `file`, `title`, or `model`. The result is the value, or `unknown`. |
+| `transcript` | `(INSTANCE WHAT)` | WHAT is `file`, `title`, or `model`. The result is a string, or `unknown`. A `file` is an absolute path of a readable file. See "The transcript operation" below. |
 | `exit-message` | `(EXIT-CODE SPEC PROGRAM)` | A message for a CLI that ended with EXIT-CODE, or nil. PROGRAM is the CLI that ran. |
 
 Rules for each operation:
@@ -55,6 +56,65 @@ Rules for each operation:
 - **The environment** is a list of strings. `"NAME=VALUE"` sets a variable. `"NAME"` without `=` removes a variable. The entries go in front of the environment of Emacs.
 - **An unknown value** is the symbol `unknown`. An operation never guesses a value.
 - **Credentials.** An operation does not copy, print, or store login files, tokens, or API keys.
+
+### The transcript operation
+
+- **The arguments.** `(INSTANCE WHAT)`. INSTANCE is an instance descriptor. It need not be live or registered: a caller that has only a native ID makes a detached descriptor, for example `(claude-code-ide-instance-create :id ID :provider 'codex :native-id NATIVE-ID :project-root DIR)`. WHAT is one of these symbols:
+  - `file`: the absolute path of the transcript file of the current native conversation of INSTANCE.
+  - `title`: the title of that conversation.
+  - `model`: the model of the last turn of that conversation.
+- **The result.** A string, or the symbol `unknown` when the value cannot be found (for example, before the CLI writes the file). Use `claude-code-ide-known-or-nil` to get nil in place of `unknown`. Another WHAT signals an error.
+- **The cost.** The operation never reads a whole large transcript. Callers can call it often, for example from a status refresh.
+- **Through `claude-code-ide-provider-call`.** A provider without the operation gives the unavailable result `(:status unavailable :capability transcript)`. A provider that is not registered (its file is not loaded) signals `user-error`, so check `claude-code-ide-get-provider` first.
+
+| Provider | `file` | `title` | `model` |
+|---|---|---|---|
+| `claude` | The transcript path of the CLI report, else `<CLAUDE_CONFIG_DIR>/projects/<project slug>/<native ID>.jsonl`. | The `/rename` title, else the summary. | The model of the last assistant message. |
+| `codex` | The rollout file of the native ID: `claude-code-ide-codex-rollout-file`. | The last `thread_name` of the native ID in `<CODEX_HOME>/session_index.jsonl`. | The `model` of the last `turn_context` record of the rollout file. |
+
+**Capabilities of Codex instances.** Since 1.2.0 the `codex` provider has `transcript`. So `get_capabilities` and `inspect-instance` list `transcript` for a Codex instance. This is an intended change.
+
+**The Codex rollout file.** `(claude-code-ide-codex-rollout-file NATIVE-ID &optional DIRECTORY)` returns the absolute path of the rollout file of the Codex conversation NATIVE-ID, or nil. DIRECTORY is the working folder of the session, for a relative CODEX_HOME (see "The Codex home"). The `transcript` operation of `codex` calls it with the native ID of INSTANCE and its worktree (else its project root). The rules:
+
+1. **Full IDs only.** NATIVE-ID must be a full UUID (8-4-4-4-12 hex digits). A part of an ID, or another value, gives nil. Codex writes the ID in lower case, so the function uses the ID in lower case: an ID in upper case finds the same file in the day folders and in the full search.
+2. **The name.** A rollout file has the name `rollout-<start time>-<NATIVE-ID>.jsonl`, for example `rollout-2026-11-17T14-22-26-<NATIVE-ID>.jsonl`. Of several matching files, the newest by name wins, as Codex can write a new rollout at a resume.
+3. **The first lookup.** A lookup of NATIVE-ID without a cache entry searches all of `<CODEX_HOME>/sessions/` one time, and takes the newest match by name. So an older rollout in a day folder never hides a newer one in another folder. Each lookup without a cache entry runs the full search: the first one, and the next one after the entry goes (rule 6). Later full searches follow the recheck rule (rule 4) and the miss rule (rule 5).
+4. **The cache and the recheck.** After that, a found file comes from a cache by native ID while it is readable. The entry keeps the time of its last check. After `claude-code-ide-codex-rollout-recheck-seconds` (60 s), a recheck reads these day folders `<CODEX_HOME>/sessions/YYYY/MM/DD/` for a newer file:
+   - each day from the day before the last check to today, so that a rollout written just before midnight, or on a day without a lookup, counts;
+   - for a UUID version 7, the day before, the day of, and the day after its creation time.
+
+   When more than `claude-code-ide-codex-rollout-recheck-max-days` (7; a value above 366 counts as 366) days passed since the last check, the recheck runs the full search one time instead. The cached file stays a candidate in both cases.
+5. **A miss.** A miss of the full search is kept for `claude-code-ide-codex-rollout-miss-seconds` (60 s). In that time, the function checks only the day folders of today and of the creation time. It searches all of `sessions/` again only when the sessions folder or the day folder of today changes. So frequent calls never walk the whole folder each time.
+6. **The size of the cache.** Each new entry first removes the misses that expired. Then the oldest entries go, a found file or a miss, until there is room under `claude-code-ide-codex-rollout-cache-limit` (1000). This holds also after the limit went down, or for a cache that was too large before. A limit of 0 or less keeps no entries. So many IDs without a rollout do not grow the cache.
+
+**The Codex home.** `(claude-code-ide-codex-home &optional DIRECTORY)` (in `claude-code-ide-provider.el`) is the one rule for the rollouts, the session index, and the Codex config file of the transcript readers. It reads CODEX_HOME as Codex does:
+
+- Unset or empty: `~/.codex`.
+- Absolute: CODEX_HOME as it is.
+- Relative: relative to DIRECTORY, the working folder of the Codex session (its worktree or project root), when the caller knows it. Else relative to `default-directory`. The Codex config file of the transcript readers has no session, so it uses `default-directory`.
+- A leading `~` is not expanded, because Codex does not expand it: `~/x` is the folder `~/x` in DIRECTORY.
+
+A compressed rollout (`.jsonl.zst`) is not found, because the transcript readers cannot read it.
+
+**The shared transcript helpers.** Both providers read their transcripts with the helpers of the session registry:
+
+- `claude-code-ide-session-registry-grep-lines` and `-grep-last` run grep, so that no transcript is read in full.
+- `claude-code-ide-session-registry-line-field` reads one field of a JSON line.
+- `claude-code-ide-session-registry-cached` caches a value for each kind and file, until the time or the size of the file changes. A changed file replaces its value, so the cache does not grow with each change.
+- The Codex model comes from `grep -n -o`: it reads only short matches, never a whole `turn_context` record.
+
+### Restore flags
+
+`claude-code-ide-restore-sessions` restores a session registry record with a start spec. The flag string of the spec comes from the `restore-flags` slot of the provider of the record:
+
+- The `claude` provider gives the stored flags, the model of the transcript (else the stored model) as `--model`, and the title that the user gave as `--name`.
+- The `codex` provider sets the slot to nil: a Codex restore gets no flags. The Codex options give the Codex flags and the model.
+- A provider with nil in the slot gets no flags.
+- **Deprecated table.** For one release, `claude-code-ide-session-registry-restore-flags-functions` keeps its old default (the `claude` entry) and its old meaning, so a user who changed it gets the same flags as before:
+  - An entry of the provider gives its flags, also an entry whose value is nil (no flags).
+  - A table set to nil gives no flags to any provider.
+  - Only a provider without an entry, in a table that is not nil, gets the flags of its `restore-flags` slot. This is `codex` and each new provider.
+  - Set the slot in place of the table. The table goes away in the next release.
 
 ### Two operations that §4.1 of the plan does not list
 

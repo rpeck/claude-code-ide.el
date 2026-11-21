@@ -87,7 +87,7 @@ are those of the test."
           (claude-code-ide-tests--control-buffers nil))
      (claude-code-ide-register-provider (claude-code-ide-tests--control-provider))
      (unwind-protect
-         (cl-letf (((symbol-function 'claude-code-ide-control--registry-entry)
+         (cl-letf (((symbol-function 'claude-code-ide-control-registry-entry)
                     (lambda (id)
                       (cdr (assoc id claude-code-ide-tests--control-registry))))
                    ((symbol-function 'run-at-time)
@@ -709,6 +709,67 @@ The two instances have the same display name."
       (let ((result (claude-code-ide-control-launch :directory temporary-file-directory)))
         (should (eq (plist-get result :reason) 'start-failed))
         (should (equal (plist-get result :message) "CLI not available"))))))
+
+(ert-deftest claude-code-ide-test-control-public-helpers ()
+  "The helpers for other files work, and the internal names that other files use stay."
+  (should (claude-code-ide-control-valid-id-p "cci-test-a.b_c"))
+  (should-not (claude-code-ide-control-valid-id-p "../x"))
+  (should-not (claude-code-ide-control-valid-id-p 42))
+  (should (equal (claude-code-ide-control-request-id-string 42) "42"))
+  (should (equal (claude-code-ide-control-request-id-string "r") "r"))
+  (should-not (claude-code-ide-control-request-id-string '(x)))
+  (should (claude-code-ide-control-blank-p nil))
+  (should (claude-code-ide-control-blank-p ""))
+  (should-not (claude-code-ide-control-blank-p "x"))
+  (should (string-match-p "\\`[0-9-]+T[0-9:]+Z\\'" (claude-code-ide-control-now)))
+  (should (equal (claude-code-ide-control-json-decode "{\"a\":[1,null]}") '((a 1 nil))))
+  (should (equal (claude-code-ide-control-json-decode (claude-code-ide-control-json '(:status ok)))
+                 '((status . "ok"))))
+  (let* ((dir (make-temp-file "cci-test-control-helpers-" t))
+         (sub (expand-file-name "sub" dir))
+         (file (expand-file-name "cci-test.json" sub)))
+    (unwind-protect
+        (progn
+          (claude-code-ide-control-write-json-file file '((a . 1)))
+          (should (equal (claude-code-ide-control-json-decode
+                          (with-temp-buffer (insert-file-contents file) (buffer-string)))
+                         '((a . 1))))
+          (should (= (file-modes file) #o600))
+          (should (= (file-modes sub) #o700))
+          (should-not (directory-files sub nil "\\.tmp\\'"))
+          (let ((young (expand-file-name "cci-test-young.json" sub)))
+            (write-region "{}" nil young nil 'silent)
+            (set-file-times file (time-subtract nil (* 3 86400)))
+            (claude-code-ide-control-prune-folder sub 2 "\\`cci-test.*\\.json\\'")
+            (should-not (file-exists-p file))
+            (should (file-exists-p young))))
+      (delete-directory dir t)))
+  ;; The internal names are gone: every file calls the public ones
+  (dolist (name '(claude-code-ide-control--now claude-code-ide-control--refresh
+                                               claude-code-ide-control--valid-id-p
+                                               claude-code-ide-control--json-decode
+                                               claude-code-ide-control--state-of
+                                               claude-code-ide-control--json
+                                               claude-code-ide-control--blank-p
+                                               claude-code-ide-control--registry-entry))
+    (should-not (fboundp name)))
+  (should (functionp (indirect-function 'claude-code-ide-control-registry-entry))))
+
+(ert-deftest claude-code-ide-test-control-no-internal-calls-in-other-files ()
+  "The handover file and its tests call no removed internal control name."
+  (dolist (base '("claude-code-ide-handover" "claude-code-ide-handover-tests"))
+    (let ((file (expand-file-name (concat base ".el")
+                                  (file-name-directory (locate-library base))))
+          (found nil))
+      (with-temp-buffer
+        (insert-file-contents file)
+        (emacs-lisp-mode)
+        (goto-char (point-min))
+        (while (re-search-forward
+                "claude-code-ide-control--\\(state-of\\|json\\|blank-p\\|registry-entry\\)\\_>" nil t)
+          (unless (nth 8 (syntax-ppss))
+            (push (match-string 0) found))))
+      (should-not found))))
 
 (ert-deftest claude-code-ide-test-control-operations-table ()
   "Each operation has a function; handover and track-review come later."

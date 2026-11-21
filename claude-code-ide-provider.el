@@ -72,7 +72,11 @@ function.")
                 :documentation "Non-nil when the CLI speaks the IDE WebSocket protocol and
 reads the lock files in ~/.claude/ide/.  A start makes a WebSocket
 server and a lock file only for such a provider.  It is not an
-operation, so it is not in the capabilities."))
+operation, so it is not in the capabilities.")
+  (restore-flags nil :documentation "(ENTRY) -> flag string of a restore, or nil.
+ENTRY is a session registry record.  nil means no extra flags: the
+options of the provider give its flags.  It is not an operation, so it
+is not in the capabilities."))
 
 (defconst claude-code-ide-provider-operations
   '(detect launch resume fork submit-prompt stop native-id status-events
@@ -164,6 +168,27 @@ instead of signaling an error."
     (if (claude-code-ide-provider-supports-p provider operation)
         (apply (cl-struct-slot-value 'claude-code-ide-provider operation provider) args)
       (claude-code-ide-provider-unavailable operation))))
+
+;;; The Codex home
+
+;; The Codex provider and the transcript readers both need the Codex
+;; home, and neither file loads the other, so the one rule is here.
+(defun claude-code-ide-codex-home (&optional directory)
+  "Return the Codex home folder as a directory name, as Codex reads it.
+- CODEX_HOME unset or empty: ~/.codex.
+- CODEX_HOME absolute: CODEX_HOME as it is.
+- CODEX_HOME relative: relative to DIRECTORY, the working folder of the
+  Codex session (its worktree or project root) when the caller knows
+  it, else to `default-directory'.
+Codex does not expand a leading ~ in CODEX_HOME, so neither does this:
+\"~/x\" is the folder \"~/x\" in DIRECTORY."
+  (let ((home (getenv "CODEX_HOME")))
+    (file-name-as-directory
+     (cond
+      ((or (null home) (= (length home) 0)) (expand-file-name "~/.codex"))
+      ((and (not (string-prefix-p "~" home)) (file-name-absolute-p home)) home)
+      ;; "./" keeps `expand-file-name' from reading a leading ~
+      (t (expand-file-name (concat "./" home) (or directory default-directory)))))))
 
 (provide 'claude-code-ide-provider)
 

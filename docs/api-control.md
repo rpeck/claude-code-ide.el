@@ -205,7 +205,7 @@ The state comes from `claude-code-ide-instance-state`.
 - `(claude-code-ide-control-move-inbox FROM TO &optional HANDOVER-ID)` moves the pending prompts of FROM to TO at a handover (plan §4.8). Each keeps its request ID; see the reason `handed-over`. When TO has another record with that ID, the copy gets the ID `handover:HANDOVER-ID:ID`. The fields `moved_from` and `moved_to` record the mapping, and `note` says when a moved prompt may have reached FROM.
 - After a committed handover, a submit to the old instance goes to the current instance of its chain (`claude-code-ide-session-registry-chain-current`), and `:destination` names it.
 - `(claude-code-ide-control-hold INSTANCE-ID)` and `(claude-code-ide-control-release INSTANCE-ID)` hold and release the delivery to an instance; `claude-code-ide-control-held-p` tells. A held instance gets no prompt, also when it is idle. The release delivers the queued prompts.
-- Two helpers for other files of the package: `(claude-code-ide-control--write-json-file FILE DATA)` writes any JSON value atomically (file 0600, folder 0700), and `(claude-code-ide-control--prune-folder DIR DAYS &optional REGEXP)` deletes the old files of a folder. The inbox uses both.
+- The inbox writes its files with `claude-code-ide-control-write-json-file` and cleans `done/` with `claude-code-ide-control-prune-folder`. See "Helpers for other files".
 
 ### The file
 
@@ -275,6 +275,27 @@ Each operation is also an MCP tool with `:scope coordinator`. Only a request wit
 - `(claude-code-ide-control-call OPERATION &rest ARGS)` calls the operation, or returns the unavailable result.
 - `(claude-code-ide-control-define-tool &rest SPEC)` adds a coordinator tool. SPEC has the arguments of `claude-code-ide-make-tool`. The tool gets `:scope coordinator`.
 - A review result goes into the owner's inbox with `claude-code-ide-control-submit`, with the review ID as the request ID (plan §4.8). So the owner gets it one time, and only when it can take it.
+
+## Helpers for other files
+
+Other files of the package, such as `claude-code-ide-review.el`, use these public functions. Before 1.2.0 they were internal (`claude-code-ide-control--NAME`).
+
+| Function | Arguments | Result |
+|---|---|---|
+| `claude-code-ide-control-valid-id-p` | `(ID)` | Non-nil when ID can name an instance or an inbox folder: 1 to 128 letters, digits, `.`, `_`, `-`, starting with a letter or a digit. |
+| `claude-code-ide-control-state-of` | `(INSTANCE-ID)` | The state of INSTANCE-ID for the state rules, or nil when no instance and no registry entry knows it. A running instance gives its state plist. For one that does not run, the registry decides: `stopped`, `failed`, `working` (starting), or `disconnected`. |
+| `claude-code-ide-control-refresh` | `(INSTANCE-ID)` | Makes the overdue sent records of INSTANCE-ID final (`unacknowledged`), and returns its pending records, oldest first. |
+| `claude-code-ide-control-registry-entry` | `(INSTANCE-ID)` | The session registry entry of INSTANCE-ID, or nil. Only while `claude-code-ide-session-registry-mode` is on. |
+| `claude-code-ide-control-request-id-string` | `(REQUEST-ID)` | REQUEST-ID as a string. A number becomes its decimal text. Another value gives nil. |
+| `claude-code-ide-control-now` | `()` | The current time as an ISO 8601 string in UTC. |
+| `claude-code-ide-control-json` | `(RESULT)` | The result plist RESULT as the JSON text of an MCP tool. |
+| `claude-code-ide-control-json-decode` | `(TEXT)` | The JSON TEXT as an alist with symbol keys. |
+| `claude-code-ide-control-blank-p` | `(VALUE)` | Non-nil when the MCP argument VALUE is nil or an empty string. |
+| `claude-code-ide-control-write-json-file` | `(FILE DATA)` | Writes DATA, a value for `json-encode`, to FILE atomically: a temporary file (mode 0600) in the same folder (mode 0700), renamed over FILE. |
+| `claude-code-ide-control-prune-folder` | `(DIR DAYS &optional REGEXP)` | Deletes the files of DIR whose names match REGEXP (default: the inbox file names) and that are older than DAYS. |
+| `claude-code-ide-control-prune-file` | `(FILE DAYS)` | Deletes FILE when it is older than DAYS, and returns non-nil then. A missing file gives nil. `prune-folder` uses it for each file. |
+
+All the internal names (`claude-code-ide-control--NAME`) of these helpers are gone. Every file and test calls the public names.
 
 ## Options
 
