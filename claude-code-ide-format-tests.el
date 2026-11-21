@@ -16,7 +16,7 @@
 (require 'ert)
 (require 'cl-lib)
 
-(declare-function format-elisp-batch "format-elisp" ())
+(declare-function format-elisp-run "format-elisp" (files))
 
 (defconst claude-code-ide-format-tests--script
   (expand-file-name "scripts/format-elisp.el"
@@ -78,11 +78,11 @@ Elisp file, and writes no backup file even where backups are on."
           (make-symbolic-link "cci-test@host.1234:5678" lock)
           (make-directory (expand-file-name "dir.el" dir))
           (let ((default-directory dir)
-                (command-line-args-left (list file lock))
+                (cci-test-files (list file lock))
                 (make-backup-files t)
                 (backup-inhibited nil)
                 (backup-enable-predicate #'always))
-            (format-elisp-batch))
+            (format-elisp-run cci-test-files))
           (should (equal (with-temp-buffer
                            (insert-file-contents file)
                            (buffer-string))
@@ -117,8 +117,9 @@ The other files of the run are still formatted."
           (claude-code-ide-format-tests--write free text)
           (make-symbolic-link "cci-test@host.1234:5678" (expand-file-name ".#a.el" dir))
           (let ((default-directory dir)
-                (command-line-args-left (list locked free)))
-            (format-elisp-batch))
+                (cci-test-files (list locked free)))
+            ;; The run goes on, and gives the files that failed
+            (should (equal (list locked) (format-elisp-run cci-test-files))))
           (should (equal text (with-temp-buffer
                                 (insert-file-contents locked)
                                 (buffer-string))))
@@ -135,11 +136,11 @@ The other files of the run are still formatted."
         (let ((file (expand-file-name "d.el" dir)))
           (claude-code-ide-format-tests--write file "(progn\n1)\n")
           (let ((default-directory dir)
-                (command-line-args-left (list file))
+                (cci-test-files (list file))
                 (make-backup-files t)
                 (backup-inhibited nil)
                 (backup-enable-predicate #'always))
-            (format-elisp-batch))
+            (format-elisp-run cci-test-files))
           (should (equal "(progn\n  1)\n" (with-temp-buffer
                                             (insert-file-contents file)
                                             (buffer-string))))
@@ -156,8 +157,8 @@ The other files of the run are still formatted."
           (claude-code-ide-format-tests--write file text)
           (set-file-times file '(0 0))
           (let ((default-directory dir)
-                (command-line-args-left (list file)))
-            (format-elisp-batch))
+                (cci-test-files (list file)))
+            (format-elisp-run cci-test-files))
           (should (equal text (with-temp-buffer
                                 (insert-file-contents file)
                                 (buffer-string))))
