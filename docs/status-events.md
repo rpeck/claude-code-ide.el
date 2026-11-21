@@ -356,24 +356,16 @@ Codex keeps no status file for each process. But it appends each turn to the rol
 | a file that is not there or cannot be read | `disconnected/untracked` | "rollout file not readable" |
 | a file without a whole session record | `disconnected/untracked` | "rollout file not readable yet" |
 | a file of another conversation | `disconnected/untracked` | "the rollout file is of another conversation" |
-| a terminal that shows another conversation (see "Another conversation in the terminal") | `disconnected/untracked` | "the terminal shows another conversation (/new or a fork)" |
 
 - **Each rollout state is a guess** (`:guess t`, a `?` in the status buffer). The state plist has `:source` `rollout`. An UNTRACKED state has no `:source`.
 - **The detail** says once that the hooks are missing: the trust problem of the launch, else "No status hooks". A state from the rollout ends with " · <problem>"; an UNTRACKED state starts with "<problem>; ".
 - **The start of the launch.** The time when Emacs tracked the launch, else the start of the terminal process. A `task_started` more than 1 second before it is of a process that was killed in a turn (`started_at` has whole seconds).
-- **Another conversation in the terminal.** After `/new` or a fork, the instance keeps its old native ID, but Codex makes a new rollout file. Emacs notes each RET in the terminal buffer (a local `post-command-hook`, added at the first state read; the last 32 RETs). The state is UNTRACKED when all of these are true:
-  - A RET came after the last write of the rollout of the instance (its modification time).
-  - A rollout file of another conversation is in the day folder of that rollout, or in the day folder of today.
-  - Codex made that file (the time in its name, local time, whole seconds) at most 1 second before such a RET, or after it.
-  - Its conversation is of no Codex instance of this Emacs.
-  - Its `session_meta` has the folder of the instance (its worktree, else its project root) as `cwd`.
-- A RET without such a file changes nothing: a RET on an empty prompt, a slash command such as `/status` or `/model`, a menu choice, or the answer to an approval while the tool runs. A write of the old rollout after the RET (a resume in the terminal) makes the rollout count again. The search runs again only when the RETs, the day folders, or the other conversations change.
-- **Limits.** The rollout can show another conversation than the one in the terminal:
-  - After `/new` or a fork, the state is of the old conversation until Codex makes the new rollout file (at the first prompt of the new conversation, NOT VERIFIED live).
-  - Another Codex outside Emacs, in the same folder, that starts a conversation right after a RET looks like `/new`.
+- **The keys of the terminal do not count.** Emacs does not watch the terminal. A RET, an empty prompt, a slash command such as `/status`, or the answer to an approval changes no state; only the rollout file does.
+- **Limits.**
+  - **After `/new` or a fork in a terminal without hooks, the status follows the old conversation until Emacs learns the new native ID.** The instance keeps its old native ID, and Codex writes the new conversation to another rollout file. So the state is a guess of the old conversation: it is often `idle` while the new conversation works. A restart of the instance with hooks ends this: the hook `SessionStart` of the new conversation moves the launch (see "Event files").
   - An approval or a question waits inside a running turn. The rollout has no record of them, so they show as `working`.
-  - Input that does not come from a key in the terminal buffer (for example a prompt that a coordinator sends) is not noted.
-- **Cheap polling.** The state of an instance is computed once for each refresh (one NOW), by the helper `claude-code-ide-session-status--once-per-refresh`, which the CLI file of Claude Code uses too. A change of the launch record, the native ID, or the last RET counts as a new refresh. The provider caches the path. Emacs reads the file only when its modification time, size, inode, or device changed:
+- **Later work.** A better signal of a switch: for example the session ID that the Codex `/status` screen shows, read from the terminal. Release 1.2.0 has no detection of `/new`: a detection from new rollout files in the day folders gave false UNTRACKED states (a later session in the same folder, a scan before the session record was written), so the user dropped it (2026-11-21).
+- **Cheap polling.** The state of an instance is computed once for each refresh (one NOW), by the helper `claude-code-ide-session-status--once-per-refresh`, which the CLI file of Claude Code uses too. A change of the launch record or the native ID counts as a new refresh. The provider caches the path. Emacs reads the file only when its modification time, size, inode, or device changed:
   - The first read goes backward from the end, 64 KiB at a time, until it finds a turn record. A line longer than 8 MiB is skipped.
   - A file of the conversation that grew, with the same inode, is read only from the end of the last read on.
   - Any other change checks the session record again and reads the file again from the end backward: a new time with the same or a smaller size (a rewrite in place), a new inode or device (a rename over the file), or a file whose session record did not match or was not whole.
