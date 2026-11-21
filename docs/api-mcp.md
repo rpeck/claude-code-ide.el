@@ -91,7 +91,7 @@ The filter of the connections (`claude-code-ide-mcp-http-server--filter`) reads 
   - A header section above 64 KiB, or more than 100 header lines, gets 431, also when the head comes in one read.
   - **No interning.** The filter interns no header name of the input, so a client cannot fill the obarray. A name whose keyword exists (the server uses it, or loaded code names it) becomes that keyword; any other name stays an upper case string. The keywords that the server uses are in `claude-code-ide-mcp-http-server--known-headers`.
 - **Checks before the body.** The filter runs these checks on the head, in this order. A refused request gets its reply at once, and no body is kept:
-  0. The route. A path that is not `/mcp` or `/mcp/…` gets 404. A method other than POST gets 405. So no request without a session check collects a body or reaches web-server (web-server would intern its header names).
+  0. The route. A path that is not `/mcp` or `/mcp/…` gets 404. A method other than POST gets 405, with the header `Allow: POST`. So no request without a session check collects a body or reaches web-server (web-server would intern its header names).
   1. A multipart or form `Content-Type` (`multipart/…`, `application/x-www-form-urlencoded`): 415. Two `Content-Type` headers: 400. web-server parses such bodies itself, and it uses the last `Content-Type`.
   2. For a POST to `/mcp…`: `Origin` and `Content-Type` (403, 415), and `claude-code-ide-mcp-server-check-request` (403), as in [The check](#the-check).
   3. The body length (`claude-code-ide-mcp-http-server--body-length`, the one parser of `Content-Length`):

@@ -1791,6 +1791,16 @@ body and never reaches web-server."
          status)
         (should-not (claude-code-ide-mcp-routing-tests--connection-in 'body))))))
 
+(ert-deftest claude-code-ide-mcp-routing-test-reader-405-allow ()
+  "A 405 reply names the method that the server serves; other replies do not."
+  (let ((sent nil))
+    (cl-letf (((symbol-function 'process-send-string)
+               (lambda (_process string) (push string sent))))
+      (claude-code-ide-mcp-http-server--send-status 'cci-test-process 405 "Method not allowed")
+      (claude-code-ide-mcp-http-server--send-status 'cci-test-process 404 "Not found"))
+    (should (string-match-p "\\`HTTP/1.1 405 [^\r]*\r\n\\(?:[^\r]+\r\n\\)*Allow: POST\r\n" (cadr sent)))
+    (should-not (string-match-p "^Allow:" (car sent)))))
+
 (ert-deftest claude-code-ide-mcp-routing-test-reader-max-connections ()
   "Connections above the limit get 503 at once and are closed.
 After the open connections close, new ones are served again."
