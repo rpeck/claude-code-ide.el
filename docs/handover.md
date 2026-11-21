@@ -147,7 +147,6 @@ Emacs saves each stage in the registry entry of the source **before** the step o
 | `scan-failed` | `wait` (scan again), `go` (go on without the check), `cancel`. |
 | `no-delivery` | `wait` (look at the transcript, then wait again for the delivery), `cancel` (stop the target). |
 | `target-exited` | `retry` (scan the worktree, then start the target again, with the same instance ID and document), `cancel`. |
-| `unsaved-target` | `retry` (scan the worktree, then start the target fresh, with the same instance ID, the same CC session ID, and the same document), `cancel`. Only with `claude-code-ide-handover-unsaved-target` set to `ask`. |
 | `start-failed`, `step-failed` | `retry` (run the stage again; a target that runs is taken up again, never started twice), `cancel`. |
 | `registry-entry-missing` | `cancel`. |
 
@@ -208,10 +207,10 @@ When the registry mode turns on (for example at the start of Emacs), the interru
 
 **An unsaved target.** A crash right after `target-identified` can end a CC target before it saves its first turn. Emacs chose its session ID (`--session-id`), so the ID is known, but `claude --resume ID` fails with "No conversation found with session ID".
 
-- **The check.** Before the stage `delivered`, an identified target that does not run counts as unsaved when its provider finds no transcript file for its native ID. For CC that is the session file of the registry entry (the transcript path of its report, else `<CLAUDE_CONFIG_DIR>/projects/<project slug>/<ID>.jsonl`). For Codex it is the rollout file (the `transcript` operation). A target with a saved conversation is resumed as before.
+- **The check.** It runs after the worktree scan is clean, just before the start. So a target CLI that survived the crash and saves its transcript while the recovery waits for strays is resumed. The scan keeps the stage and the native ID. An identified target before the stage `delivered` that does not run counts as unsaved when its provider finds no transcript file for its native ID. For CC that is the session file of the registry entry (the transcript path of its report, else `<CLAUDE_CONFIG_DIR>/projects/<project slug>/<ID>.jsonl`). For Codex it is the rollout file (the `transcript` operation). A target with a saved conversation is resumed as before.
 - **The rule** is the option `claude-code-ide-handover-unsaved-target`:
-  - `fresh` (the default): start the target fresh, after the worktree scan, with the same instance ID and the same document as its first prompt. No person is asked. A CC target gets its session ID again (`--session-id ID`, after the flags of `claude-code-ide-cli-extra-flags`). A fork, and a Codex target, get the new ID that the CLI chooses.
-  - `ask`: the handover gives `needs-user` with the reason `unsaved-target`, at the stage `target-identified`. The choice `retry` starts the target fresh, as `fresh` does.
+  - `fresh` (the default): start the target fresh, right after the clean scan, with the same instance ID and the same document as its first prompt. No person is asked. A CC target gets its session ID again (`--session-id ID`, after the flags of `claude-code-ide-cli-extra-flags`). A fork, and a Codex target, get the new ID that the CLI chooses.
+  - `ask`: the old order. The recovery resumes the target; the resume fails, and the handover gives `needs-user` with the reason `target-exited`. The choice `retry` starts the target again with the same document.
 - **Codex.** Codex chooses its own ID and reports it with the first `SessionStart`, at the first prompt. So a Codex target reaches `target-identified` only after its first prompt, and usually has its rollout file then. Only a Codex target without a rollout file starts fresh.
 
 - The plain restore and the reopen leave out the entries that a handover holds (`claude-code-ide-session-registry--handover-blocks-p`):
@@ -278,7 +277,7 @@ The handover fields are in schema version 4, in its own file (`claude-code-ide-s
 | `claude-code-ide-handover-session-server-detection` | `auto` | The `:session-server` of the document. |
 | `claude-code-ide-handover-budget` | nil | The size budget of the document. |
 | `claude-code-ide-handover-recover-at-start` | t | Continue the interrupted handovers when the registry mode turns on. With nil, only the early ones are cancelled then. |
-| `claude-code-ide-handover-unsaved-target` | `fresh` | What the recovery does with an identified target that never saved its conversation: `fresh` starts it fresh with the same IDs and document, `ask` asks a person. See "An unsaved target". |
+| `claude-code-ide-handover-unsaved-target` | `fresh` | What the recovery does with an identified target that never saved its conversation: `fresh` starts it fresh with the same IDs and document, `ask` resumes it as before and then asks a person (`target-exited`). See "An unsaved target". |
 | `claude-code-ide-handover-enable-request-tool` | t | Give the agents the tool `request_handover`. |
 
 ## Limits
