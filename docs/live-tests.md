@@ -14,13 +14,18 @@ They check what the unit tests cannot: the handover between real conversations, 
   - Emacs is a daemon (`daemonp`), not in batch mode. The CLIs need real terminals, and a person's Emacs must never run them.
   - The mocks of `claude-code-ide-tests.el` are not loaded.
 - The gate is part of the macro `claude-code-ide-live-tests--live`, which holds the body of each live test. So a live test cannot leave it out.
-- `./scripts/compile-and-test.sh` loads the file. Its live tests skip, and the unit tests of its helpers (`claude-code-ide-live-tests-test-…`) run. One of them runs each live test and checks that it skips.
+- `./scripts/compile-and-test.sh` loads the file. Its live tests skip, and the unit tests of its helpers (`claude-code-ide-live-tests-test-…`) run. One of them runs each live test with the gate closed (also in a live daemon), and checks that it skips and that no setup, stop, cleanup, or launch runs.
 - The tests cost quota: each one runs one or more turns of each CLI. Keep the selector small, and run one CC and one Codex conversation at a time.
 
 ## Before you start
 
 - **Codex needs the `claude-sessions` MCP server** for the test `handover-chain`. It reads past Claude Code sessions. The user's Codex config must have a `[mcp_servers.claude-sessions]` table. Without it, the document has no session tools, and the test fails.
-- **One live folder for each daemon.** Two daemons must not share one live folder: they would share the registry, the inbox, and the hooks. The setup claims the folder in the file `owner` (the process ID and the start time of the Emacs). It refuses a folder that a live Emacs holds; use `CLAUDE_CODE_IDE_LIVE_DIR` for a second daemon. A claim of an Emacs that ended counts as old, so the recovery test can start its second daemon.
+- **One live folder for each daemon.** Two daemons must not share one live folder: they would share the registry, the inbox, and the hooks.
+  - The setup claims the folder in the file `owner` (the process ID and the start time of the Emacs). It refuses a folder that a live Emacs holds; use `CLAUDE_CODE_IDE_LIVE_DIR` for a second daemon.
+  - The claim runs under a lock: the folder `owner.lock`, made with `make-directory` without parents, which fails when the folder exists. So two daemons that start at the same time cannot both claim. A lock older than 10 seconds comes from an Emacs that died while it held the lock, and is removed.
+  - A claim of an Emacs that ended counts as old, so the recovery test can start its second daemon.
+  - A folder that has files but no `owner` file is no live folder, for example a folder of yours that `CLAUDE_CODE_IDE_LIVE_DIR` names by mistake. The setup refuses it.
+- **The setup runs only in a live daemon.** Where the gate is closed (batch Emacs, your own Emacs), `claude-code-ide-live-tests-setup` signals an error before it changes anything. It changes package options, adds advice, and turns on the session registry, whose recovery can start CLIs.
 
 ## Start a daemon of your own
 
@@ -55,7 +60,8 @@ emacsclient -s cci-live -e '(claude-code-ide-live-tests-run "handover-chain" "/a
 
 - The file gets one line for each test (`PASSED`, `FAILED` with the condition, or `SKIPPED`), and `done` at the end.
 - The live folder gets `log.txt`, with each step of each test.
-- Each test stops all instances before and after its body, also after a failure, and deletes its codeword files (`note-*.txt`).
+- Each test stops all instances before and after its body, also after a failure. `recovery-2-after-kill` does not stop them before its body: it checks the target that the recovery started.
+- A test writes a codeword file only when the file does not exist yet (the `excl` flag of `write-region`), and records it. The test and the cleanup delete only the recorded files, and only while they are regular files, not links.
 - Stop the daemon at the end: `emacsclient -s cci-live -e '(kill-emacs)'`.
 
 ## The live folder
@@ -132,7 +138,7 @@ emacsclient -s cci-live -e '(claude-code-ide-live-tests-run "handover-chain" "/a
 ### The chain
 
 1. Leg 1 (CC) reads codeword 1. The handover to Codex commits.
-2. The document has the `claude-sessions` tool names. The question asks leg 2 to use them, because the document offers the tools or the file, and Codex chose the file without the hint. Leg 2 answers codeword 1. Its rollout exists and has calls of `mcp__claude_sessions__get_session_outline` or `get_messages` (tool call records only, not the text of the document).
+2. The document has the `claude-sessions` tool names. The question asks leg 2 to use them, because the document offers the tools or the file, and Codex chose the file without the hint. Leg 2 answers codeword 1. Its rollout exists and has calls of `mcp__claude_sessions__get_session_outline` or `get_messages` (read from the fields of the records: an `item_completed` event with an `McpToolCall` item of the server `claude-sessions` and the status `completed`, or a `function_call` named `mcp__claude_sessions__<tool>`; a text that only names a tool does not count).
 3. Leg 2 reads codeword 2. The handover to CC commits.
 4. The document of leg 3 has the first prompt of leg 1 one time, its own marker one time, and not codeword 2. (Codeword 1 is in it: leg 2 said it in its answer.) The registry chain of leg 3 is `claude, codex, claude`, with no pending leg. `chain-current` of legs 1 and 2 gives leg 3.
 5. Leg 3 answers codeword 2 from the Codex rollout (file reference).
@@ -157,7 +163,7 @@ For each backend:
 
 1. **Folder trust:** Codex in a new repository. The state is `waiting-for-user/dialog`. Nobody answers, so no trust is saved.
 2. **Hooks review:** Codex with the hooks and without the bypass flag. The state is `waiting-for-user/dialog`. Nobody answers.
-3. **Approval:** Codex calls an MCP tool of `emacs_tools` that needs an approval (`claude-code-ide-mcp-allowed-tools` nil). The state is `waiting-for-user/approval`. Then the test answers Return (allow), as a person.
+3. **Approval:** Codex calls an MCP tool of `emacs_tools` that needs an approval (`claude-code-ide-mcp-allowed-tools` nil). The state is `waiting-for-user/approval`. Before it answers, the test checks that the pending `PermissionRequest` names exactly `mcp__emacs_tools__claude_code_ide_mcp_project_info`; any other tool fails the test. Then the test answers Return (allow), as a person.
 
 In each dialog, the test submits a prompt with `claude-code-ide-control-submit`:
 
