@@ -88,9 +88,11 @@ The filter of the connections (`claude-code-ide-mcp-http-server--filter`) reads 
   - A request line that is not `METHOD PATH HTTP/x.y`, or a method that is not one of web-server's methods in upper case. web-server matches the method without case, so `post` would be a POST to web-server.
   - A header line that is not `NAME: VALUE` with one colon and one space. The value is all the text after `": "`, as web-server takes it, so `Content-Length:  5` (two spaces) is not a plain integer.
   - An `Authorization` header: web-server parses its value in its own way.
-  - A header section above 64 KiB gets 431, also when it comes in one read.
+  - A header section above 64 KiB, or more than 100 header lines, gets 431, also when the head comes in one read.
+  - **No interning.** The filter interns no header name of the input, so a client cannot fill the obarray. A name whose keyword exists (the server uses it, or loaded code names it) becomes that keyword; any other name stays an upper case string. The keywords that the server uses are in `claude-code-ide-mcp-http-server--known-headers`.
 - **Checks before the body.** The filter runs these checks on the head, in this order. A refused request gets its reply at once, and no body is kept:
-  1. A multipart or form `Content-Type` (`multipart/…`, `application/x-www-form-urlencoded`), on every path: 415. Two `Content-Type` headers: 400. web-server parses such bodies itself, and it uses the last `Content-Type`.
+  0. The route. A path that is not `/mcp` or `/mcp/…` gets 404. A method other than POST gets 405. So no request without a session check collects a body or reaches web-server (web-server would intern its header names).
+  1. A multipart or form `Content-Type` (`multipart/…`, `application/x-www-form-urlencoded`): 415. Two `Content-Type` headers: 400. web-server parses such bodies itself, and it uses the last `Content-Type`.
   2. For a POST to `/mcp…`: `Origin` and `Content-Type` (403, 415), and `claude-code-ide-mcp-server-check-request` (403), as in [The check](#the-check).
   3. The body length (`claude-code-ide-mcp-http-server--body-length`, the one parser of `Content-Length`):
      - `Transfer-Encoding` (for example `chunked`): 411. The server reads only `Content-Length`.
@@ -100,6 +102,7 @@ The filter of the connections (`claude-code-ide-mcp-http-server--filter`) reads 
   4. The functions of `claude-code-ide-mcp-http-server-head-functions` (see below).
   - The reply of a refusal has a JSON-RPC error with `id` null. After the reply, the server ends its side of the connection and drops the data that still comes, so that the client does not lose the reply to a reset.
 - **After the body.** Bytes after `Content-Length` bytes of body (for example a pipelined request) are dropped. If web-server leaves the connection open after it has the request, the filter answers 400 and closes it.
+- **Connection limit.** At most `claude-code-ide-mcp-http-server-max-connections` connections (default 32) are open at once. A connection above the limit gets 503 at once and is closed. When connections close, new ones are served again.
 - **Time limit.** A connection must send its whole request within `claude-code-ide-mcp-http-server-body-timeout` seconds (default 30). Then it gets 408 and is closed, and the filter forgets it. The limit also closes a connection that sends nothing.
 - **`Expect: 100-continue`.** A request with this header and no body yet gets `HTTP/1.1 100 Continue` first. curl sends this header for a body of 1 MB or more. Without the reply, curl waits 1 s before it sends the body.
 - **The handler.**
@@ -109,8 +112,8 @@ The filter of the connections (`claude-code-ide-mcp-http-server--filter`) reads 
 
 ### Checks of a user configuration: `claude-code-ide-mcp-http-server-head-functions`
 
-- **What it is.** An abnormal hook. Each function gets `METHOD` (upper case), `PATH` (without the query), and `HEADERS` (an alist from a keyword such as `:X-EMACS-MCP-TOKEN` to the value). It returns nil to let the request pass, or `(STATUS . REASON)` (or a `STATUS` alone) to refuse it.
-- **When it runs.** In the filter, for every request, after the built-in checks and before any body is read. The functions run until one refuses. A function that signals an error refuses with 500.
+- **What it is.** An abnormal hook. Each function gets `METHOD` (upper case), `PATH` (without the query), and `HEADERS` (an alist from a keyword such as `:X-EMACS-MCP-TOKEN` to the value; a name whose keyword does not exist is an upper case string). It returns nil to let the request pass, or `(STATUS . REASON)` (or a `STATUS` alone) to refuse it.
+- **When it runs.** In the filter, for every request that passes the built-in checks, before any body is read. The functions run until one refuses. A function that signals an error refuses with 500.
 - **Why.** An advice on `claude-code-ide-mcp-http-server--handle-post` runs only after the whole body has arrived. A check that needs only the head (a global token, the `Host`) belongs in this hook: a refused client then sends no body.
 - **Example** (a token check like the guard of `rp-emacs-mcp.el`):
 
