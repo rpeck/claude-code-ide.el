@@ -401,7 +401,7 @@ Return nil when the server may read the body."
 (defun claude-code-ide-mcp-http-server--send-status (process status reason)
   "Send STATUS with a JSON-RPC error that gives REASON to PROCESS.
 The id of the error is null: the reader sends this before it has the
-request."
+request.  A 405 reply has the header Allow: POST, as HTTP requires."
   (let ((body (json-encode
                `((jsonrpc . "2.0") (id . nil)
                  (error . ((code . -32000)
@@ -410,9 +410,10 @@ request."
                                          reason))))))))
     (process-send-string
      process
-     (format (concat "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\n"
+     (format (concat "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\n%s"
                      "Content-Length: %d\r\nConnection: close\r\n\r\n%s")
              status (alist-get status claude-code-ide-mcp-http-server--reasons "Error")
+             (if (eq status 405) "Allow: POST\r\n" "")
              (string-bytes body) body))))
 
 (defun claude-code-ide-mcp-http-server--close (process)
