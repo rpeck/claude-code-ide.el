@@ -1196,6 +1196,11 @@ The state of the test goes to the recovery file first."
                      :source-id (claude-code-ide-handover--run-source-id run)
                      :target-id (claude-code-ide-handover--run-target-id run)
                      :target-native-id (claude-code-ide-handover--run-target-native-id run)
+                     ;; Did the target save its conversation before the crash?
+                     :target-saved (let ((file (and (claude-code-ide-handover--run-target-id run)
+                                                    (claude-code-ide-live-tests--transcript
+                                                     (claude-code-ide-handover--run-target-id run)))))
+                                     (and file (file-readable-p file) t))
                      :stage stage
                      :codeword (get 'claude-code-ide-live-tests--kill-stage 'codeword)
                      :emacs-pid (emacs-pid))
@@ -1280,7 +1285,17 @@ ID, that the handover commits, and that the target has the work."
                                       (claude-code-ide-live-tests--starts-on-disk))))
         (claude-code-ide-live-tests--log "starts in this Emacs: %S" starts)
         (should (cl-every (lambda (record) (equal (car (nth 2 record)) target)) starts))
-        (should starts))
+        (should starts)
+        ;; A target whose conversation was never saved cannot be resumed:
+        ;; it starts fresh with its own session ID, and no resume ID
+        (when (and (plist-get state :target-native-id) (not (plist-get state :target-saved)))
+          (should (cl-every (lambda (record) (null (nth 2 (nth 2 record)))) starts))
+          (let ((native (plist-get state :target-native-id)))
+            (should (cl-some (lambda (pid)
+                               (string-search (concat "--session-id " native)
+                                              (alist-get 'args (process-attributes pid))))
+                             (claude-code-ide-live-tests--cli-processes native)))
+            (claude-code-ide-live-tests--log "the target started fresh with --session-id %s" native))))
       (should-not (claude-code-ide-instance-by-id source))
       (should (claude-code-ide-live-tests--running-p target))
       (should-not (claude-code-ide-live-tests--cli-processes
