@@ -790,10 +790,13 @@ EXTRA is a plist of :target-native to set the target's native ID, and
         (should-not (claude-code-ide-start-spec-resume-id spec))
         (should (string-match-p (regexp-quote document) (claude-code-ide-start-spec-prompt spec)))
         (should (equal (plist-get (claude-code-ide-handover-status id) :document) document)))))
-  ;; target-identified: resume the target, then give it the document
+  ;; target-identified with a saved conversation: resume the target,
+  ;; then give it the document.  (A target whose conversation was never
+  ;; saved starts fresh: see -recovery-unsaved-target.)
   (claude-code-ide-handover-tests--with
     (let ((id (claude-code-ide-handover-tests--interrupted 'target-identified
                                                            :target-native "cci-test-tgt-native")))
+      (claude-code-ide-handover-tests--saved-transcript "cci-test-tgt" "cci-test-tgt-native" worktree)
       (claude-code-ide-handover-recover)
       (should (= (length claude-code-ide-handover-tests--starts) 1))
       ;; The transcript has no document, so the resume gets the pointer
@@ -823,6 +826,176 @@ EXTRA is a plist of :target-native to set the target's native ID, and
     (claude-code-ide-handover-recover)
     (should-not (cl-find "cci-test-src" claude-code-ide-handover-tests--starts
                          :key #'claude-code-ide-start-spec-instance-id :test #'equal))))
+
+(defun claude-code-ide-handover-tests--saved-transcript (key native directory)
+  "Save a transcript of the conversation NATIVE of the entry KEY in DIRECTORY.
+It has one earlier user turn and no handover document.  The registry
+gets its path from a SessionStart report, as for a real CLI.  Return
+the file."
+  (let ((file (expand-file-name (concat key "-saved.jsonl") directory)))
+    (with-temp-file file
+      (insert (json-encode `((type . "user") (sessionId . ,native)
+                             (message . ((role . "user") (content . "cci-test earlier turn"))))))
+      (insert "\n"))
+    (claude-code-ide-session-registry--submit
+     "report" (claude-code-ide-session-registry--change-reported key native file nil 3))
+    file))
+
+(ert-deftest claude-code-ide-test-handover-recovery-unsaved-target ()
+  "Recovery does not resume a target whose conversation was never saved.
+`claude --resume ID' of such an ID exits with \"No conversation found
+with session ID\", so the recovery must start the target fresh, with
+the same instance ID and the same document."
+  (claude-code-ide-handover-tests--with
+    (let ((id (claude-code-ide-handover-tests--interrupted 'target-identified
+                                                           :target-native "cci-test-tgt-native")))
+      (should-not (claude-code-ide-session-registry-entry-transcript-path
+                   (claude-code-ide-session-registry-entry-of "cci-test-tgt")))
+      (claude-code-ide-handover-recover)
+      (should (= (length claude-code-ide-handover-tests--starts) 1))
+      (let ((spec (car claude-code-ide-handover-tests--starts)))
+        (should (equal (claude-code-ide-start-spec-instance-id spec) "cci-test-tgt"))
+        (should-not (claude-code-ide-start-spec-resume-id spec))
+        (should (equal (claude-code-ide-transcript-document-id (claude-code-ide-start-spec-prompt spec))
+                       id))))))
+
+(ert-deftest claude-code-ide-test-handover-recovery-unsaved-target-commits ()
+  "The fresh start of an unsaved target goes on to the commit, with no person."
+  (claude-code-ide-handover-tests--with
+    (let ((id (claude-code-ide-handover-tests--interrupted 'target-identified
+                                                           :target-native "cci-test-tgt-native")))
+      (claude-code-ide-handover-recover)
+      (should (eq (plist-get (claude-code-ide-handover-status id) :status) 'running))
+      (let ((spec (car claude-code-ide-handover-tests--starts)))
+        ;; The fresh target reports its ID and gets the document
+        (setf (claude-code-ide-instance-native-id (claude-code-ide-instance-by-id "cci-test-tgt"))
+              "cci-test-tgt-native")
+        (claude-code-ide-handover-tests--event
+         "cci-test-tgt" 'prompt-submit (list (cons 'prompt (claude-code-ide-start-spec-prompt spec))))
+        (claude-code-ide-handover-tests--run-timers 3)
+        (should (eq (plist-get (claude-code-ide-handover-status id) :status) 'committed))
+        (should (equal (claude-code-ide-session-registry-chain-current "cci-test-src") "cci-test-tgt"))
+        (should-not (cl-find "cci-test-src" claude-code-ide-handover-tests--starts
+                             :key #'claude-code-ide-start-spec-instance-id :test #'equal))))))
+
+(ert-deftest claude-code-ide-test-handover-recovery-unsaved-target-ask ()
+  "With the option `ask', an unsaved target waits for a person; retry starts it fresh."
+  (claude-code-ide-handover-tests--with
+    (let* ((claude-code-ide-handover-unsaved-target 'ask)
+           (id (claude-code-ide-handover-tests--interrupted 'target-identified
+                                                            :target-native "cci-test-tgt-native")))
+      (claude-code-ide-handover-recover)
+      (should-not claude-code-ide-handover-tests--starts)
+      (let ((status (claude-code-ide-handover-status id)))
+        (should (eq (plist-get status :status) 'needs-user))
+        (should (eq (plist-get status :reason) 'unsaved-target))
+        (should (eq (plist-get status :stage) 'target-identified)))
+      (claude-code-ide-handover-resolve id 'retry)
+      (should (= (length claude-code-ide-handover-tests--starts) 1))
+      (let ((spec (car claude-code-ide-handover-tests--starts)))
+        (should (equal (claude-code-ide-start-spec-instance-id spec) "cci-test-tgt"))
+        (should-not (claude-code-ide-start-spec-resume-id spec))
+        (should (equal (claude-code-ide-transcript-document-id (claude-code-ide-start-spec-prompt spec))
+                       id))))))
+
+(ert-deftest claude-code-ide-test-handover-unsaved-target-p-by-provider ()
+  "A target is unsaved when its provider finds no transcript file for its native ID.
+Claude Code: the session file of the registry entry.  Codex: the rollout
+file, which the transcript operation finds."
+  (claude-code-ide-handover-tests--with
+    (let* ((config (expand-file-name "claude" root))
+           (codex-home (expand-file-name "codex" root))
+           (process-environment (append (list (concat "CLAUDE_CONFIG_DIR=" config)
+                                              (concat "CODEX_HOME=" codex-home))
+                                        process-environment))
+           (cc-id "cc1e5000-0000-4000-8000-0000000000cc")
+           (cx-id "cc1e5000-0000-4000-8000-0000000000cd")
+           (run (lambda (key provider native)
+                  (claude-code-ide-handover--run-create
+                   :id "cci-test-run" :target-id key :target-provider provider
+                   :target-native-id native :stage 'target-identified))))
+      (claude-code-ide-handover-tests--registry-add "cci-test-cc" 'claude worktree :session-id cc-id)
+      (claude-code-ide-handover-tests--registry-add "cci-test-cx" 'codex worktree :session-id cx-id)
+      (should (claude-code-ide-handover--unsaved-target-p (funcall run "cci-test-cc" 'claude cc-id)))
+      (should (claude-code-ide-handover--unsaved-target-p (funcall run "cci-test-cx" 'codex cx-id)))
+      ;; The Claude Code session file, in the folder of the project
+      (let ((file (expand-file-name
+                   (concat cc-id ".jsonl")
+                   (expand-file-name (claude-code-ide-session-registry--project-slug worktree)
+                                     (expand-file-name "projects" config)))))
+        (make-directory (file-name-directory file) t)
+        (write-region "{}\n" nil file nil 'silent)
+        (should-not (claude-code-ide-handover--unsaved-target-p (funcall run "cci-test-cc" 'claude cc-id))))
+      ;; The Codex rollout file
+      (let ((file (expand-file-name (concat "sessions/2026/11/20/rollout-2026-11-20T10-00-00-" cx-id ".jsonl")
+                                    codex-home)))
+        (make-directory (file-name-directory file) t)
+        (write-region "{}\n" nil file nil 'silent)
+        (should-not (claude-code-ide-handover--unsaved-target-p (funcall run "cci-test-cx" 'codex cx-id)))))))
+
+(ert-deftest claude-code-ide-test-handover-recovery-codex-target ()
+  "A Codex target at target-identified resumes when its rollout exists.
+Without a rollout it starts fresh, with no native ID of its own: Codex
+chooses a new one.  A Claude Code target keeps its ID for --session-id."
+  (claude-code-ide-handover-tests--with
+    (let* ((codex-home (expand-file-name "codex" root))
+           (process-environment (cons (concat "CODEX_HOME=" codex-home) process-environment))
+           (cx-id "cc1e5000-0000-4000-8000-0000000000cd")
+           (next nil)
+           (run (lambda (provider native)
+                  (claude-code-ide-handover--run-create
+                   :id "cci-test-run" :target-id "cci-test-cx" :target-provider provider
+                   :target-native-id native :stage 'target-identified :status 'running
+                   :directory worktree :worktree worktree))))
+      (claude-code-ide-handover-tests--registry-add "cci-test-cx" 'codex worktree :session-id cx-id)
+      (cl-letf (((symbol-function 'claude-code-ide-handover--scan-then)
+                 (lambda (_run continuation) (setq next continuation)))
+                ((symbol-function 'claude-code-ide-handover--result) #'ignore))
+        ;; No rollout: a fresh start, and Codex chooses the new ID
+        (let ((codex (funcall run 'codex cx-id)))
+          (claude-code-ide-handover--recover-claimed codex nil)
+          (should (eq next 'start-target))
+          (should (eq (claude-code-ide-handover--run-stage codex) 'target-started))
+          (should-not (claude-code-ide-handover--run-target-native-id codex)))
+        ;; A Claude Code target keeps its ID
+        (let ((claude (funcall run 'claude cx-id)))
+          (setq next nil)
+          (claude-code-ide-handover--recover-claimed claude nil)
+          (should (eq next 'start-target))
+          (should (equal (claude-code-ide-handover--run-target-native-id claude) cx-id)))
+        ;; With its rollout: the resume, as before
+        (let ((file (expand-file-name (concat "sessions/2026/11/20/rollout-2026-11-20T10-00-00-" cx-id ".jsonl")
+                                      codex-home))
+              (codex (funcall run 'codex cx-id)))
+          (make-directory (file-name-directory file) t)
+          (write-region "{}\n" nil file nil 'silent)
+          (setq next nil)
+          (claude-code-ide-handover--recover-claimed codex nil)
+          (should (eq next 'resume-target))
+          (should (eq (claude-code-ide-handover--run-stage codex) 'target-identified))
+          (should (equal (claude-code-ide-handover--run-target-native-id codex) cx-id)))))))
+
+(ert-deftest claude-code-ide-test-handover-fresh-start-spec ()
+  "The fresh start of an unsaved Claude Code target names its session ID.
+The --session-id flag comes after the user's flags.  Codex chooses its
+own ID, so a Codex target gets no such flag."
+  (let ((claude-code-ide-cli-extra-flags "--model opus")
+        (run (lambda (provider)
+               (claude-code-ide-handover--run-create
+                :id "cci-test-run" :target-id "cci-test-tgt" :target-provider provider
+                :target-native-id "cc1e5000-0000-4000-8000-0000000000cc"
+                :directory "/tmp/cci-test-proj/" :stage 'target-started))))
+    (cl-letf (((symbol-function 'claude-code-ide-session-registry-entry-of) #'ignore))
+      (should (equal (claude-code-ide-start-spec-extra-flags
+                      (claude-code-ide-handover--start-spec (funcall run 'claude) "cci-test prompt"))
+                     "--model opus --session-id cc1e5000-0000-4000-8000-0000000000cc"))
+      (should-not (claude-code-ide-start-spec-extra-flags
+                   (claude-code-ide-handover--start-spec (funcall run 'codex) "cci-test prompt")))
+      ;; A first start has no native ID yet: the registry chooses one
+      (let ((first (funcall run 'claude)))
+        (setf (claude-code-ide-handover--run-target-native-id first) nil)
+        (should-not (claude-code-ide-start-spec-extra-flags
+                     (claude-code-ide-handover--start-spec first "cci-test prompt")))))))
 
 (ert-deftest claude-code-ide-test-handover-recovery-transcript-check ()
   "A resumed target whose transcript holds the document gets it no second time."
