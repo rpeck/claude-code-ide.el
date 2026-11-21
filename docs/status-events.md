@@ -235,7 +235,8 @@ For Codex, the error kind decides first:
 | Provider | Event | State | Detail |
 |---|---|---|---|
 | Claude Code | `StopFailure`, `error: "billing_error"` | `failed/quota-limit` | "Quota limit: <text>" |
-| Claude Code | `StopFailure`, `error: "rate_limit"`, and `error_details` or `last_assistant_message` matches the regexp | `failed/quota-limit` | "Quota limit: <text>" |
+| Claude Code | `StopFailure`, `error: "rate_limit"`, and `error_details` matches the regexp | `failed/quota-limit` | "Quota limit: <text>" |
+| Claude Code | `StopFailure`, `error: "rate_limit"`, a blank `error_details`, and `last_assistant_message` matches the regexp (the limit message of the CLI) | `failed/quota-limit` | "Quota limit: <text>" |
 | Claude Code | `StopFailure`, `error: "rate_limit"`, other | `failed/error` | "Error: rate limit", plus `error_details` when it has text |
 | Claude Code | `StopFailure`, other | `failed/error` | "Error: <error>" |
 | Codex | `PostModelRequest`, `status: "failed"`, and `error` says that the plan does not include Codex | `failed/quota-limit` | "Not included in the plan: <error>" |
@@ -341,7 +342,7 @@ Codex keeps no status file for each process. But it appends each turn to the rol
   - Without the `codex` provider, without its `transcript` operation, or on an error, no file is known. The release without that operation gives no rollout state.
 - **Which conversation.** The session record of the file (`session_meta`, read by `claude-code-ide-transcript-codex-meta`) must have the native ID of the instance as its `payload.id`.
   - Another ID: UNTRACKED, detail "the rollout file is of another conversation".
-  - No whole session record yet (Codex writes its first line, and the line has no newline yet): UNTRACKED, detail "rollout file not readable yet". Emacs checks again at the next change of the file.
+  - No whole session record yet: UNTRACKED, detail "rollout file not readable yet". Emacs checks again at the next change of the file. The first line must be the `session_meta` record and end with its newline; a line without its newline is still being written, also when it is valid JSON already. (All 55 local rollouts start with `session_meta`.)
 - **The turn records.** Each is an `event_msg` record, parsed by `claude-code-ide-transcript--parse-line`. Only lines that end with a newline count, because Codex can be in the middle of a line.
 
 | The last turn record | Common state | Detail |
@@ -355,18 +356,24 @@ Codex keeps no status file for each process. But it appends each turn to the rol
 | a file that is not there or cannot be read | `disconnected/untracked` | "rollout file not readable" |
 | a file without a whole session record | `disconnected/untracked` | "rollout file not readable yet" |
 | a file of another conversation | `disconnected/untracked` | "the rollout file is of another conversation" |
-| a RET in the terminal, and no record for `claude-code-ide-codex-events-rollout-input-grace` seconds (5) after it | `disconnected/untracked` | "no rollout record since the last input in the terminal" |
+| a terminal that shows another conversation (see "Another conversation in the terminal") | `disconnected/untracked` | "the terminal shows another conversation (/new or a fork)" |
 
 - **Each rollout state is a guess** (`:guess t`, a `?` in the status buffer). The state plist has `:source` `rollout`. An UNTRACKED state has no `:source`.
 - **The detail** says once that the hooks are missing: the trust problem of the launch, else "No status hooks". A state from the rollout ends with " · <problem>"; an UNTRACKED state starts with "<problem>; ".
 - **The start of the launch.** The time when Emacs tracked the launch, else the start of the terminal process. A `task_started` more than 1 second before it is of a process that was killed in a turn (`started_at` has whole seconds).
-- **The last input.** Emacs notes each RET in the terminal buffer (a local `post-command-hook`, added at the first state read). A RET that the rollout file does not follow with a write (its modification time) within the grace time makes the state UNTRACKED. A prompt makes Codex write `task_started` at once; `/new` or a fork in the terminal does not write the old rollout.
+- **Another conversation in the terminal.** After `/new` or a fork, the instance keeps its old native ID, but Codex makes a new rollout file. Emacs notes each RET in the terminal buffer (a local `post-command-hook`, added at the first state read; the last 32 RETs). The state is UNTRACKED when all of these are true:
+  - A RET came after the last write of the rollout of the instance (its modification time).
+  - A rollout file of another conversation is in the day folder of that rollout, or in the day folder of today.
+  - Codex made that file (the time in its name, local time, whole seconds) at most 1 second before such a RET, or after it.
+  - Its conversation is of no Codex instance of this Emacs.
+  - Its `session_meta` has the folder of the instance (its worktree, else its project root) as `cwd`.
+- A RET without such a file changes nothing: a RET on an empty prompt, a slash command such as `/status` or `/model`, a menu choice, or the answer to an approval while the tool runs. A write of the old rollout after the RET (a resume in the terminal) makes the rollout count again. The search runs again only when the RETs, the day folders, or the other conversations change.
 - **Limits.** The rollout can show another conversation than the one in the terminal:
-  - After `/new` or a fork, the instance keeps its old native ID. Until the next RET, the state is of the old conversation. After a RET, the rule of the last input gives UNTRACKED.
-  - A RET that Codex answers without a rollout record (a slash command, or an answer to an approval while a long command runs) also gives UNTRACKED until the next record.
+  - After `/new` or a fork, the state is of the old conversation until Codex makes the new rollout file (at the first prompt of the new conversation, NOT VERIFIED live).
+  - Another Codex outside Emacs, in the same folder, that starts a conversation right after a RET looks like `/new`.
   - An approval or a question waits inside a running turn. The rollout has no record of them, so they show as `working`.
   - Input that does not come from a key in the terminal buffer (for example a prompt that a coordinator sends) is not noted.
-- **Cheap polling.** The state of an instance is computed once for each refresh (one NOW), by the helper `claude-code-ide-session-status--once-per-refresh`, which the CLI file of Claude Code uses too. A change of the launch record, the native ID, or the last input counts as a new refresh. The provider caches the path. Emacs reads the file only when its modification time, size, inode, or device changed:
+- **Cheap polling.** The state of an instance is computed once for each refresh (one NOW), by the helper `claude-code-ide-session-status--once-per-refresh`, which the CLI file of Claude Code uses too. A change of the launch record, the native ID, or the last RET counts as a new refresh. The provider caches the path. Emacs reads the file only when its modification time, size, inode, or device changed:
   - The first read goes backward from the end, 64 KiB at a time, until it finds a turn record. A line longer than 8 MiB is skipped.
   - A file of the conversation that grew, with the same inode, is read only from the end of the last read on.
   - Any other change checks the session record again and reads the file again from the end backward: a new time with the same or a smaller size (a rewrite in place), a new inode or device (a rename over the file), or a file whose session record did not match or was not whole.
@@ -414,4 +421,3 @@ A failure whose plan does not include Codex (see "Quota limits") is `failed/quot
 | `claude-code-ide-codex-events-error-kind-states` | see "Quota limits" | The state of each Codex error kind: `quota-limit` or `error`. |
 | `claude-code-ide-codex-events-not-included-regexp` | see "Quota limits" | Texts that say that the plan does not include Codex. |
 | `claude-code-ide-codex-events-not-included-action` | `ask` | What a visit or the handover key does on a session whose plan lacks Codex. |
-| `claude-code-ide-codex-events-rollout-input-grace` | 5 | Seconds that Codex has to write the rollout after a RET in the terminal. |
