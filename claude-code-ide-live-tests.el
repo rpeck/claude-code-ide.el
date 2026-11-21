@@ -214,8 +214,12 @@ replaces all but the bypass."
   "Seconds that a claim of a live folder waits at most for the claim lock.")
 
 (defun claude-code-ide-live-tests--holder-text ()
-  "Return the holder text of this Emacs: its process ID and start time."
-  (format "%d %s" (emacs-pid) (claude-code-ide-live-tests--start-time (emacs-pid))))
+  "Return the holder text of this Emacs: its process ID and start time.
+Without a start time that can be read, the text is the process ID only."
+  (let ((start (claude-code-ide-live-tests--start-time (emacs-pid))))
+    (if start
+        (format "%d %s" (emacs-pid) start)
+      (format "%d" (emacs-pid)))))
 
 (defun claude-code-ide-live-tests--lock-holder (lock)
   "Return the text of the holder file in the claim LOCK folder, or nil."
@@ -224,38 +228,6 @@ replaces all but the bypass."
       (with-temp-buffer
         (insert-file-contents file)
         (string-trim (buffer-string))))))
-
-(defun claude-code-ide-live-tests--holder-gone-p (holder)
-  "Return non-nil when the Emacs of the holder text HOLDER no longer runs.
-HOLDER is \"PID START\".  It is gone when no process has that PID, or
-when the process with that PID started at another time (the PID names
-another process now).  A holder text that cannot be read counts as not
-gone: the lock stays."
-  (let* ((parts (and (stringp holder) (split-string holder)))
-         (pid (and parts (string-to-number (car parts))))
-         (start (and (cadr parts) (string-to-number (cadr parts)))))
-    (when (and (integerp pid) (> pid 0))
-      (let ((now (claude-code-ide-live-tests--start-time pid)))
-        (or (null now)
-            (and (numberp start) (> start 0) (>= (abs (- now start)) 1.0)))))))
-
-(defun claude-code-ide-live-tests--remove-gone-lock (lock holder)
-  "Remove the claim LOCK of the HOLDER that is gone.
-The lock moves aside first, with one rename.  When the lock that moved
-has another holder (another claimant took the lock after the check),
-it moves back, and nothing is removed."
-  (let ((aside (make-temp-name (concat lock ".gone-"))))
-    (when (ignore-errors (rename-file lock aside) t)
-      (if (equal (claude-code-ide-live-tests--lock-holder aside) holder)
-          (ignore-errors (delete-directory aside t))
-        (ignore-errors (rename-file aside lock))))))
-
-(defun claude-code-ide-live-tests--release-lock (lock holder)
-  "Remove the claim LOCK when its holder file still says HOLDER.
-A lock that another claimant holds now stays."
-  (when (equal (claude-code-ide-live-tests--lock-holder lock) holder)
-    (ignore-errors (delete-file (expand-file-name "holder" lock)))
-    (ignore-errors (delete-directory lock))))
 
 (defun claude-code-ide-live-tests--claim-root (root)
   "Claim the live folder ROOT for this Emacs, or signal a `user-error'.
@@ -266,65 +238,73 @@ would share the registry, the inbox and the hooks.
 The claim runs under a lock: the folder owner.lock in ROOT, made with
 `make-directory' without parents, which fails when the folder exists.
 So of two daemons that start at the same time, only one checks and
-writes the owner at a time.  The holder writes the file holder in the
-lock: its process ID and start time.
+writes the owner at a time.  The lock lives only for the claim: the
+claim removes it at its end, also after an error.
 
-- A lock goes only when its holder is gone
-  (`claude-code-ide-live-tests--holder-gone-p'), never because of its
-  age: a holder can pause.
-- A lock without a holder file stays: its holder may write it now.
-- After `claude-code-ide-live-tests--claim-wait' seconds the claim gives
-  up; a lock that stays is to be removed by hand.
-- The release removes the lock only when its holder file is still this
-  Emacs."
+No claim removes a lock that exists, whatever its age or its holder.
+A claim that finds the lock waits up to
+`claude-code-ide-live-tests--claim-wait' seconds, and then signals a
+`user-error' that names the lock, its holder file (the process ID and
+start time of its Emacs, for people only), and the command that
+removes it by hand after a crash."
   (let ((lock (expand-file-name "owner.lock" root))
-        (mine (claude-code-ide-live-tests--holder-text))
         (deadline (+ (float-time) claude-code-ide-live-tests--claim-wait))
         (held nil))
     (while (not held)
       (condition-case nil
           (progn
             (make-directory lock)
-            (write-region mine nil (expand-file-name "holder" lock) nil 'silent)
             (setq held t))
         (file-already-exists
-         (let ((holder (claude-code-ide-live-tests--lock-holder lock)))
-           (cond
-            ((and holder (claude-code-ide-live-tests--holder-gone-p holder))
-             (claude-code-ide-live-tests--remove-gone-lock lock holder))
-            ((> (float-time) deadline)
-             (user-error "Another Emacs claims the live folder %s now (lock %s, holder %s); remove the lock when no live test Emacs runs"
-                         root lock (or holder "unknown")))
-            (t (sleep-for 0.1)))))))
+         (when (> (float-time) deadline)
+           (user-error "The live folder %s is locked by another claim: %s (holder %s).  When no live test Emacs runs, remove it with: rm -r %s"
+                       root lock (or (claude-code-ide-live-tests--lock-holder lock) "unknown")
+                       (shell-quote-argument lock)))
+         (sleep-for 0.1))))
     (unwind-protect
-        (claude-code-ide-live-tests--claim-root-1 root)
-      (claude-code-ide-live-tests--release-lock lock mine))))
+        (progn
+          (write-region (claude-code-ide-live-tests--holder-text) nil
+                        (expand-file-name "holder" lock) nil 'silent)
+          (claude-code-ide-live-tests--claim-root-1 root))
+      (ignore-errors (delete-directory lock t)))))
+
+(defun claude-code-ide-live-tests--owner-runs-p (pid start)
+  "Return non-nil when the owner of a live folder may still run.
+PID is its process ID; START its start time, or nil when the owner file
+has none.  The owner is gone only when no process has PID, or when the
+process with PID started at a known other time.  An unknown start time,
+in the file or now, counts as still running: the safe side."
+  (let ((attributes (process-attributes pid)))
+    (and attributes
+         (let ((now (claude-code-ide-live-tests--start-time pid)))
+           (or (null start) (null now) (< (abs (- now start)) 1.0))))))
 
 (defun claude-code-ide-live-tests--claim-root-1 (root)
   "Claim ROOT for this Emacs; the caller holds the claim lock.
-A claim of an Emacs that ended, or of a process ID that now names
-another process, is old and is replaced.  A folder that has files but
-no owner file is no live folder, for example a folder of the user that
-CLAUDE_CODE_IDE_LIVE_DIR names: the claim refuses it."
+An owner that no longer runs (`claude-code-ide-live-tests--owner-runs-p')
+is replaced.  A folder that has files but no owner file is no live
+folder, for example a folder of the user that CLAUDE_CODE_IDE_LIVE_DIR
+names: the claim refuses it.  When this Emacs cannot read its own start
+time, it writes its process ID only."
   (let* ((file (expand-file-name "owner" root))
-         (own (claude-code-ide-live-tests--start-time (emacs-pid)))
-         (claim (when (file-readable-p file)
+         (words (when (file-readable-p file)
                   (with-temp-buffer
                     (insert-file-contents file)
-                    (mapcar #'string-to-number (split-string (buffer-string))))))
-         (pid (car claim))
-         (start (cadr claim)))
+                    (split-string (buffer-string)))))
+         (pid (and (car words) (string-match-p "\\`[0-9]+\\'" (car words))
+                   (string-to-number (car words))))
+         (start (and (cadr words) (string-match-p "\\`[0-9]+\\(?:\\.[0-9]+\\)?\\'" (cadr words))
+                     (string-to-number (cadr words)))))
     ;; A new folder has only the lock
     (when (and (not (file-exists-p file))
                (remove "owner.lock" (directory-files root nil directory-files-no-dot-files-regexp)))
       (user-error "%s has files and no owner file, so it is no live folder; choose an empty or new folder"
                   root))
-    (when (and (integerp pid) (> pid 0) (/= pid (emacs-pid)) (numberp start))
-      (let ((now (claude-code-ide-live-tests--start-time pid)))
-        (when (and now (< (abs (- now start)) 1.0))
-          (user-error "Live folder %s belongs to Emacs %d; use CLAUDE_CODE_IDE_LIVE_DIR for another folder"
-                      root pid))))
-    (write-region (format "%d %s\n" (emacs-pid) own) nil file nil 'silent)))
+    (when (and pid (> pid 0) (/= pid (emacs-pid))
+               (claude-code-ide-live-tests--owner-runs-p pid start))
+      (user-error "Live folder %s belongs to Emacs %d; use CLAUDE_CODE_IDE_LIVE_DIR for another folder"
+                  root pid))
+    (write-region (concat (claude-code-ide-live-tests--holder-text) "\n") nil file nil 'silent)))
 
 (defun claude-code-ide-live-tests-setup ()
   "Point the package at the live folder and turn on the session registry.
@@ -516,11 +496,9 @@ link), stays."
 
 (defun claude-code-ide-live-tests--stop (instance-id)
   "Stop INSTANCE-ID with the control operation, and return its result.
-The terminal of eat asks whether to kill its running process, and in a
-daemon that question blocks Emacs (see the tests stop-asks-nothing).
-So this stop of the tests binds `kill-buffer-query-functions' to nil."
-  (let ((kill-buffer-query-functions nil))
-    (claude-code-ide-control-stop instance-id)))
+The stop asks no question in any terminal (the tests stop-asks-nothing
+check it), so the tests stop as a coordinator does."
+  (claude-code-ide-control-stop instance-id))
 
 (defun claude-code-ide-live-tests--stop-all ()
   "Stop every instance of this Emacs, and wait until their terminals end."
@@ -1411,6 +1389,25 @@ that frame, as it does for a person, so its size is that of the window."
             (delete-other-windows window)))
         (set-window-buffer window buffer)))))
 
+(defvar claude-code-ide-live-tests--show-terminals t
+  "Non-nil: a dialog test shows the terminal in a window of the GUI frame.
+nil: the terminal shows in no window, as a buffer in the background.")
+
+(defun claude-code-ide-live-tests--hide-buffer (buffer)
+  "Show another buffer in each window that shows BUFFER, in every frame."
+  (let ((other (get-buffer-create "*scratch*")))
+    (dolist (window (get-buffer-window-list buffer nil t))
+      (set-window-buffer window other))))
+
+(defun claude-code-ide-live-tests--place (instance-id)
+  "Show the terminal of INSTANCE-ID, or hide it.
+The choice is `claude-code-ide-live-tests--show-terminals'."
+  (if claude-code-ide-live-tests--show-terminals
+      (claude-code-ide-live-tests--show instance-id)
+    (let ((buffer (claude-code-ide-live-tests--buffer instance-id)))
+      (claude-code-ide-live-tests--hide-buffer buffer)
+      (should-not (get-buffer-window-list buffer nil t)))))
+
 (defun claude-code-ide-live-tests--screen (instance-id)
   "Return the screen text of INSTANCE-ID, with runs of blanks as one space."
   (string-trim
@@ -1427,7 +1424,7 @@ INSTANCE-ID must be in STATE.
 STATE is (STATE REASON).  The submit of a prompt that holds MARKER
 while the dialog shows must queue it, and the terminal must not show
 it.  Return the submit result."
-  (claude-code-ide-live-tests--show instance-id)
+  (claude-code-ide-live-tests--place instance-id)
   (let ((found (claude-code-ide-live-tests--wait
                 (lambda () (eq (claude-code-ide-codex-screen-dialog
                                 (claude-code-ide-live-tests--buffer instance-id))
@@ -1479,30 +1476,66 @@ it.  Return the submit result."
         (claude-code-ide-live-tests--stop id))
       (claude-code-ide-live-tests--stop-all)
       ;; 3. Approval: an MCP tool that needs an approval
-      (let* ((claude-code-ide-mcp-allowed-tools nil)
-             (launched (float-time))
-             (id (claude-code-ide-live-tests--launch
-                  trusted 'codex
-                  (concat tag "-approval: call the MCP tool mcp__emacs_tools__claude_code_ide_mcp_project_info one time (it is in ALL_TOOLS), then reply with the single word called"))))
-        (let* ((start (float-time))
-               (result (claude-code-ide-live-tests--dialog-check
-                        id 'approval '(waiting-for-user approval) (concat tag "-queued")))
-               (request (plist-get result :request-id))
-               (text (claude-code-ide-live-tests--dialog-prompt (concat tag "-queued"))))
-          ;; The person allows only the call that the test asked for:
-          ;; the pending request must name that tool, else the test fails
-          (claude-code-ide-live-tests--expect-approval
-           id "mcp__emacs_tools__claude_code_ide_mcp_project_info" launched 30)
-          ;; The person allows the call; the first turn ends
-          (claude-code-ide-live-tests--send-key id 'return)
-          (should (claude-code-ide-live-tests--wait-turn id 0 claude-code-ide-live-tests--turn-limit))
-          ;; Then the queued prompt goes out, and its own turn answers it:
-          ;; only a turn end after its delivery counts
-          (let ((delivered (claude-code-ide-live-tests--wait-delivered id request text start)))
-            (should (claude-code-ide-live-tests--wait-turn
-                     id delivered claude-code-ide-live-tests--turn-limit))))
-        (claude-code-ide-live-tests--stop id))
+      (claude-code-ide-live-tests--approval-dialog trusted tag)
       (claude-code-ide-live-tests--stop-all))))
+
+(defun claude-code-ide-live-tests--approval-dialog (directory tag)
+  "Check the MCP approval dialog of Codex in DIRECTORY; TAG starts the prompts.
+The dialog shows, and the state is waiting-for-user/approval while it
+shows (the test reads it five times in five seconds).  A submit queues
+its prompt and types nothing.  The pending request must name the tool
+that the test asked for.  After the person allows the call, the tool
+ends and the state is no longer an approval; then the queued prompt
+goes out, and its own turn answers it."
+  (let* ((claude-code-ide-mcp-allowed-tools nil)
+         (tool "mcp__emacs_tools__claude_code_ide_mcp_project_info")
+         (launched (float-time))
+         (id (claude-code-ide-live-tests--launch
+              directory 'codex
+              (concat tag "-approval: call the MCP tool " tool
+                      " one time (it is in ALL_TOOLS), then reply with the single word called"))))
+    (let* ((start (float-time))
+           (result (claude-code-ide-live-tests--dialog-check
+                    id 'approval '(waiting-for-user approval) (concat tag "-queued")))
+           (request (plist-get result :request-id))
+           (text (claude-code-ide-live-tests--dialog-prompt (concat tag "-queued"))))
+      ;; The state stays an approval while the dialog waits
+      (dotimes (_ 5)
+        (accept-process-output nil 1)
+        (should (equal (claude-code-ide-live-tests--state id) '(waiting-for-user approval))))
+      (unless claude-code-ide-live-tests--show-terminals
+        (should-not (get-buffer-window-list (claude-code-ide-live-tests--buffer id) nil t)))
+      ;; The person allows only the call that the test asked for:
+      ;; the pending request must name that tool, else the test fails
+      (claude-code-ide-live-tests--expect-approval id tool launched 30)
+      ;; The person allows the call; the tool ends, then the first turn
+      (let ((allowed (float-time)))
+        (claude-code-ide-live-tests--send-key id 'return)
+        (should (claude-code-ide-live-tests--wait
+                 (lambda () (or (claude-code-ide-live-tests--event id 'tool-end allowed)
+                                (claude-code-ide-live-tests--event id 'turn-end allowed)))
+                 claude-code-ide-live-tests--turn-limit "the end of the allowed tool"))
+        (should-not (equal (claude-code-ide-live-tests--state id) '(waiting-for-user approval))))
+      (should (claude-code-ide-live-tests--wait-turn id 0 claude-code-ide-live-tests--turn-limit))
+      ;; Then the queued prompt goes out, and its own turn answers it:
+      ;; only a turn end after its delivery counts
+      (let ((delivered (claude-code-ide-live-tests--wait-delivered id request text start)))
+        (should (claude-code-ide-live-tests--wait-turn
+                 id delivered claude-code-ide-live-tests--turn-limit))))
+    (claude-code-ide-live-tests--stop id)))
+
+(ert-deftest claude-code-ide-live-test-codex-approval-eat-no-window ()
+  "The Codex approval dialog in an eat buffer that shows in no window.
+Such a buffer keeps only the end of the dialog; the dialog must still
+read as an approval, and the state must stay waiting-for-user/approval
+until the person allows the call and the tool ends."
+  :tags '(:live :dialogs)
+  (claude-code-ide-live-tests--live
+    (claude-code-ide-live-tests--with-backend 'eat
+      (let ((claude-code-ide-live-tests--show-terminals nil)
+            (trusted (claude-code-ide-live-tests--project "projA")))
+        (claude-code-ide-live-tests--ensure-codex-folder-trust trusted)
+        (claude-code-ide-live-tests--approval-dialog trusted "cci-test-L-eat-hidden")))))
 
 (ert-deftest claude-code-ide-live-test-codex-dialogs-vterm ()
   "The Codex dialogs in vterm: found, and no typed text."
@@ -1721,45 +1754,42 @@ The lock is old: its time is a minute ago.  Return the lock folder."
     lock))
 
 (ert-deftest claude-code-ide-live-tests-test-claim-lock ()
-  "The claim lock goes only when its holder no longer runs, never by its age.
-The holder file in the lock names the PID and the start time of the
-Emacs that holds it."
+  "A claim lock that exists stays: the claim waits its time, then gives up.
+No claim ever removes the lock of another: not because of its age, not
+because its holder seems gone.  The error names the lock, its holder,
+and the command to remove it by hand."
   (claude-code-ide-live-tests--with-temp-folder root
     (let ((owner (expand-file-name "owner" root))
-          (claude-code-ide-live-tests--claim-wait 0.3)
+          (claude-code-ide-live-tests--claim-wait 0.5)
           (other (make-process :name "cci-test-holder" :command '("sleep" "30")
                                :connection-type 'pipe :noquery t)))
       (unwind-protect
-          (let ((live (format "%d %s" (process-id other)
-                              (claude-code-ide-live-tests--start-time (process-id other)))))
-            ;; A live holder keeps its old lock: the claim gives up
-            (let ((lock (claude-code-ide-live-tests--test-lock root live)))
-              (should-error (claude-code-ide-live-tests--claim-root root) :type 'user-error)
+          (dolist (holder (list (format "%d %s" (process-id other)
+                                        (claude-code-ide-live-tests--start-time (process-id other)))
+                                nil
+                                "999999999 1.0"))
+            (let ((lock (claude-code-ide-live-tests--test-lock root holder))
+                  (start (float-time))
+                  (err nil))
+              ;; The deadline holds: no hang, whatever the holder is
+              (with-timeout (5 (ert-fail "the claim does not end"))
+                (setq err (should-error (claude-code-ide-live-tests--claim-root root)
+                                        :type 'user-error)))
+              (should (< (- (float-time) start) 3))
               (should (file-directory-p lock))
-              (should (equal (claude-code-ide-live-tests--file-text (expand-file-name "holder" lock))
-                             live))
+              (should (equal (and holder (claude-code-ide-live-tests--file-text
+                                          (expand-file-name "holder" lock)))
+                             holder))
               (should-not (file-exists-p owner))
-              (delete-directory lock t))
-            ;; A lock without a holder file (its holder may write it now) stays
-            (let ((lock (claude-code-ide-live-tests--test-lock root nil)))
-              (should-error (claude-code-ide-live-tests--claim-root root) :type 'user-error)
-              (should (file-directory-p lock))
-              (delete-directory lock t))
-            ;; A PID that now names another process: the holder is gone
-            (claude-code-ide-live-tests--test-lock root (format "%d 1.0" (process-id other)))
-            (claude-code-ide-live-tests--claim-root root)
-            (should (file-exists-p owner))
-            (should-not (file-exists-p (expand-file-name "owner.lock" root)))
-            (delete-file owner)
-            ;; A dead holder: its lock goes, and the claim goes on
-            (claude-code-ide-live-tests--test-lock root "999999999 1.0")
-            (claude-code-ide-live-tests--claim-root root)
-            (should (file-exists-p owner))
-            (should-not (file-exists-p (expand-file-name "owner.lock" root))))
+              (let ((text (error-message-string err)))
+                (should (string-search lock text))
+                (should (string-search (concat "rm -r " (shell-quote-argument lock)) text))
+                (when holder (should (string-search holder text))))
+              (delete-directory lock t)))
         (delete-process other)))))
 
 (ert-deftest claude-code-ide-live-tests-test-claim-lock-holder ()
-  "The claim writes its holder file, and its release leaves the lock of another."
+  "The claim writes its holder file, and removes its lock at the end."
   (claude-code-ide-live-tests--with-temp-folder root
     (let* ((lock (expand-file-name "owner.lock" root))
            (holder (expand-file-name "holder" lock))
@@ -1769,15 +1799,13 @@ Emacs that holds it."
                  (lambda (_root)
                    (setq seen (claude-code-ide-live-tests--file-text holder)))))
         (claude-code-ide-live-tests--claim-root root))
-      (should (string-prefix-p (format "%d " (emacs-pid)) seen))
+      (should (string-prefix-p (format "%d" (emacs-pid)) seen))
       (should-not (file-exists-p lock))
-      ;; Another claimant took the lock meanwhile: the release keeps it
+      ;; Also after an error in the claim
       (cl-letf (((symbol-function 'claude-code-ide-live-tests--claim-root-1)
-                 (lambda (_root)
-                   (write-region "999999998 2.0" nil holder nil 'silent))))
-        (claude-code-ide-live-tests--claim-root root))
-      (should (file-directory-p lock))
-      (should (equal (claude-code-ide-live-tests--file-text holder) "999999998 2.0")))))
+                 (lambda (_root) (user-error "cci-test"))))
+        (should-error (claude-code-ide-live-tests--claim-root root) :type 'user-error))
+      (should-not (file-exists-p lock)))))
 
 (ert-deftest claude-code-ide-live-tests-test-approval-names-tool ()
   "The person in a test allows only the tool that the test expects."
@@ -1856,6 +1884,21 @@ Emacs that holds it."
         (should (ert-test-skipped-p result))))
     ;; Only the cleanup after the body, no stop before it
     (should (equal calls '(cleanup)))))
+
+(ert-deftest claude-code-ide-live-tests-test-hide-buffer ()
+  "A hidden terminal buffer shows in no window of any frame."
+  (let ((buffer (generate-new-buffer " *cci-test-terminal*"))
+        (window (selected-window))
+        (old (window-buffer (selected-window))))
+    (unwind-protect
+        (progn
+          (set-window-buffer window buffer)
+          (should (get-buffer-window-list buffer nil t))
+          (claude-code-ide-live-tests--hide-buffer buffer)
+          (should-not (get-buffer-window-list buffer nil t))
+          (should (buffer-live-p buffer)))
+      (set-window-buffer window old)
+      (kill-buffer buffer))))
 
 (ert-deftest claude-code-ide-live-tests-test-gate ()
   "The live tests run only in a daemon, outside batch mode, without the mocks."
@@ -1965,20 +2008,40 @@ The package sets CLAUDE_CODE_SSE_PORT itself, so that one stays."
       ;; An Emacs that ended: its claim is old
       (with-temp-file owner (insert "999999999 0\n"))
       (claude-code-ide-live-tests--claim-root root)
-      ;; A process ID that now names another process (its start time
-      ;; differs) is an old claim too
-      (with-temp-file owner (insert (format "%d 1.0\n" (emacs-pid))))
-      (claude-code-ide-live-tests--claim-root root)
-      ;; A live process with the start time of the claim holds the folder
-      (let ((other (make-process :name "cci-test-owner" :command '("sleep" "30")
-                                 :connection-type 'pipe :noquery t)))
+      (let* ((other (make-process :name "cci-test-owner" :command '("sleep" "30")
+                                  :connection-type 'pipe :noquery t))
+             (pid (process-id other))
+             (start (claude-code-ide-live-tests--start-time pid)))
         (unwind-protect
             (progn
-              (with-temp-file owner
-                (insert (format "%d %s\n" (process-id other)
-                                (claude-code-ide-live-tests--start-time (process-id other)))))
-              (should-error (claude-code-ide-live-tests--claim-root root) :type 'user-error))
-          (delete-process other))))))
+              ;; A process ID that now names another process (a known
+              ;; other start time) is an old claim too
+              (with-temp-file owner (insert (format "%d 1.0\n" pid)))
+              (claude-code-ide-live-tests--claim-root root)
+              ;; A live process with the start time of the claim holds the folder
+              (with-temp-file owner (insert (format "%d %s\n" pid start)))
+              (should-error (claude-code-ide-live-tests--claim-root root) :type 'user-error)
+              ;; An unknown start time of the owner is the safe side: it
+              ;; still runs, also as "nil", never as 0
+              (dolist (text (list (format "%d\n" pid) (format "%d nil\n" pid)))
+                (with-temp-file owner (insert text))
+                (should-error (claude-code-ide-live-tests--claim-root root) :type 'user-error))
+              ;; So is a start time that cannot be read now
+              (with-temp-file owner (insert (format "%d %s\n" pid start)))
+              (let ((real (symbol-function 'claude-code-ide-live-tests--start-time)))
+                (cl-letf (((symbol-function 'claude-code-ide-live-tests--start-time)
+                           (lambda (p) (unless (eql p pid) (funcall real p)))))
+                  (should-error (claude-code-ide-live-tests--claim-root root) :type 'user-error))))
+          (delete-process other)))
+      ;; A dead owner PID is accepted, also without a start time
+      (with-temp-file owner (insert "999999999\n"))
+      (claude-code-ide-live-tests--claim-root root)
+      ;; This Emacs writes its PID only when it cannot read its own start time
+      (let ((real (symbol-function 'claude-code-ide-live-tests--start-time)))
+        (cl-letf (((symbol-function 'claude-code-ide-live-tests--start-time)
+                   (lambda (p) (unless (eql p (emacs-pid)) (funcall real p)))))
+          (claude-code-ide-live-tests--claim-root root)))
+      (should (equal (claude-code-ide-live-tests--file-text owner) (format "%d\n" (emacs-pid)))))))
 
 (ert-deftest claude-code-ide-live-tests-test-leftovers ()
   "The cleanup list names the trust entries and transcript folders of the live folder."
