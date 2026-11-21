@@ -110,8 +110,14 @@ The log never shows the secret."
 
 (defun claude-code-ide-mcp-http-server--header (headers name)
   "Return the value of the header NAME in the web-server HEADERS, or nil.
-web-server keys a header by its name in upper case, as a keyword."
-  (cdr (assq (intern (concat ":" (upcase name))) headers)))
+web-server keys a header by its name in upper case, as a keyword.  The
+reader keys a header whose keyword does not exist by its name in upper
+case, as a string; see `claude-code-ide-mcp-http-server--parse-head'.
+This function finds both, and interns nothing."
+  (let* ((upper (upcase name))
+         (key (intern-soft (concat ":" upper))))
+    (cdr (or (and key (assq key headers))
+             (assoc upper headers)))))
 
 (defun claude-code-ide-mcp-http-server--transport-refusal (headers)
   "Return (STATUS . REASON) when the request with HEADERS must be refused.
@@ -154,13 +160,18 @@ When the time passes, the connection gets 408 and is closed."
 Each function gets three arguments: METHOD (a string in upper case,
 such as \"POST\"), PATH (the URL path without its query) and HEADERS
 \(an alist from a header name in upper case, as a keyword such as
-:X-EMACS-MCP-TOKEN, to its value, in the form of web-server).
+:X-EMACS-MCP-TOKEN, to its value, in the form of web-server).  A
+header name that no loaded code uses (its keyword does not exist) is
+an upper case string; the server interns no name of the input.  A
+keyword written in the code of the function exists, so (alist-get
+:X-EMACS-MCP-TOKEN HEADERS) finds the header.
 
 A function returns nil to let the request pass, or (STATUS . REASON)
 \(or a STATUS alone) to refuse it.  The server then answers STATUS at
 once, before it reads the body, and the handler never runs.  The
-functions run for every request, after the built-in checks, until
-one refuses.  A function that signals an error refuses with 500.
+functions run for every request that passes the built-in checks,
+until one refuses.  A function that signals an error refuses with
+500.
 
 Use this hook, not an advice on the POST handler, for a check that
 needs only the head, such as a global token: the handler runs only
@@ -168,8 +179,26 @@ after the whole body has arrived."
   :type 'hook
   :group 'claude-code-ide-mcp-http-server)
 
+(defcustom claude-code-ide-mcp-http-server-max-connections 32
+  "The most connections that the MCP server keeps open at once.
+A connection above the limit gets 503 at once and is closed."
+  :type 'integer
+  :group 'claude-code-ide-mcp-http-server)
+
 (defconst claude-code-ide-mcp-http-server--max-header-bytes 65536
   "The largest header section that the MCP server reads.")
+
+(defconst claude-code-ide-mcp-http-server--max-header-lines 100
+  "The most header lines that the MCP server reads in one head.")
+
+(defconst claude-code-ide-mcp-http-server--known-headers
+  (list :ORIGIN :CONTENT-TYPE :CONTENT-LENGTH :TRANSFER-ENCODING :EXPECT
+        :AUTHORIZATION :HOST
+        (intern (concat ":" (upcase claude-code-ide-mcp-server-secret-header)))
+        (intern (concat ":" (upcase claude-code-ide-mcp-server-coordinator-header))))
+  "The header keywords that the server uses.
+They exist from the load of this file, so the reader finds them with
+`intern-soft'; it never interns a name of the input.")
 
 (defconst claude-code-ide-mcp-http-server--handled-path "\\`/mcp\\(?:/.*\\)?\\'"
   "The URL paths of the MCP handlers.")
@@ -181,8 +210,9 @@ after the whole body has arrived."
 (defconst claude-code-ide-mcp-http-server--reasons
   '((400 . "Bad Request") (403 . "Forbidden") (408 . "Request Timeout")
     (411 . "Length Required") (413 . "Content Too Large")
+    (404 . "Not Found") (405 . "Method Not Allowed")
     (415 . "Unsupported Media Type") (431 . "Request Header Fields Too Large")
-    (500 . "Internal Server Error"))
+    (500 . "Internal Server Error") (503 . "Service Unavailable"))
   "The reason phrases of the status codes that the reader sends.")
 
 (cl-defstruct (claude-code-ide-mcp-http-server--connection
@@ -214,6 +244,13 @@ upper case, as a keyword, and the value as web-server takes it (all
 the text after \": \").  A header that comes more than once has more
 than one entry.
 
+The reader interns no name of the input.  A name whose keyword does
+not exist yet (so no code uses it) is kept as an upper case string;
+a client cannot fill the obarray.  The keywords that the server uses
+are in `claude-code-ide-mcp-http-server--known-headers'.  More than
+`claude-code-ide-mcp-http-server--max-header-lines' header lines give
+431.
+
 The rules are stricter than those of web-server, so that both read a
 head that passes in the same way:
 - Lines end with CRLF only.  web-server would also start a line at a
@@ -228,26 +265,31 @@ head that passes in the same way:
         '(400 . "Bad line break in the head")
       (let* ((lines (split-string head "\r\n"))
              (request-line (car lines)))
-        (if (not (and (string-match "\\`\\([A-Za-z]+\\) \\([^[:space:]]+\\) HTTP/[0-9]\\.[0-9]\\'"
-                                    request-line)
-                      (member (match-string 1 request-line)
-                              claude-code-ide-mcp-http-server--methods)))
-            '(400 . "Bad request method or request line")
+        (cond
+         ((> (length (cdr lines)) claude-code-ide-mcp-http-server--max-header-lines)
+          '(431 . "Too many header lines"))
+         ((not (and (string-match "\\`\\([A-Za-z]+\\) \\([^[:space:]]+\\) HTTP/[0-9]\\.[0-9]\\'"
+                                  request-line)
+                    (member (match-string 1 request-line)
+                            claude-code-ide-mcp-http-server--methods)))
+          '(400 . "Bad request method or request line"))
+         (t
           (let ((method (match-string 1 request-line))
                 (path (car (split-string (match-string 2 request-line) "?")))
                 (headers nil)
                 (bad nil))
             (dolist (line (cdr lines))
               (if (string-match "\\`\\([!#$%&'*+.^_`|~0-9A-Za-z-]+\\): \\(.*\\)\\'" line)
-                  (push (cons (intern (concat ":" (upcase (match-string 1 line))))
-                              (match-string 2 line))
-                        headers)
+                  (let ((upper (upcase (match-string 1 line))))
+                    (push (cons (or (intern-soft (concat ":" upper)) upper)
+                                (match-string 2 line))
+                          headers))
                 (setq bad t)))
             (setq headers (nreverse headers))
             (cond
              (bad '(400 . "Bad header line"))
              ((assq :AUTHORIZATION headers) '(400 . "Authorization header not supported"))
-             (t (list method path headers)))))))))
+             (t (list method path headers))))))))))
 
 (defun claude-code-ide-mcp-http-server--body-length (method headers)
   "Return the body length of a request with METHOD and HEADERS.
@@ -329,7 +371,10 @@ METHOD, PATH and HEADERS come from
 `claude-code-ide-mcp-http-server--parse-head'.  CHECK is the value of
 `claude-code-ide-mcp-http-server--head-check' for them; it is computed
 when nil.  The checks, in this order:
-1. A multipart or form Content-Type, on every path; see
+0. The route: a path that is not /mcp... gets 404, and a method other
+   than POST gets 405.  So no request without a session check
+   collects a body or reaches web-server.
+1. A multipart or form Content-Type; see
    `claude-code-ide-mcp-http-server--type-refusal'.
 2. For a POST to an MCP path:
    `claude-code-ide-mcp-http-server--transport-refusal' and the session
@@ -339,7 +384,12 @@ when nil.  The checks, in this order:
 Return nil when the server may read the body."
   (let ((length (claude-code-ide-mcp-http-server--body-length method headers))
         (check (or check (claude-code-ide-mcp-http-server--head-check method path headers))))
-    (or (claude-code-ide-mcp-http-server--type-refusal headers)
+    (or (cond
+         ((not (string-match-p claude-code-ide-mcp-http-server--handled-path path))
+          '(404 . "Not found"))
+         ((not (equal method "POST"))
+          '(405 . "Method not allowed; use POST")))
+        (claude-code-ide-mcp-http-server--type-refusal headers)
         (and (equal method "POST")
              (string-match-p claude-code-ide-mcp-http-server--handled-path path)
              (or (claude-code-ide-mcp-http-server--transport-refusal headers)
@@ -393,15 +443,28 @@ reply.  The time limit of the connection still closes it."
 
 (defun claude-code-ide-mcp-http-server--connection (process)
   "Return the state of the connection PROCESS; make it when there is none.
-A new state starts the time limit of the connection."
-  (or (gethash process claude-code-ide-mcp-http-server--connections)
-      (let ((connection (claude-code-ide-mcp-http-server--make-connection
-                         :start (float-time))))
-        (setf (claude-code-ide-mcp-http-server--connection-timer connection)
-              (run-at-time claude-code-ide-mcp-http-server-body-timeout nil
-                           #'claude-code-ide-mcp-http-server--check-time-limit process))
-        (puthash process connection claude-code-ide-mcp-http-server--connections)
-        connection)))
+A new state starts the time limit of the connection.  When
+`claude-code-ide-mcp-http-server-max-connections' connections are open
+already, PROCESS gets 503 and is closed, and the value is nil."
+  (cond
+   ((gethash process claude-code-ide-mcp-http-server--connections))
+   ((>= (hash-table-count claude-code-ide-mcp-http-server--connections)
+        claude-code-ide-mcp-http-server-max-connections)
+    (claude-code-ide-debug "MCP server refuses a connection: %d open"
+                           (hash-table-count claude-code-ide-mcp-http-server--connections))
+    (ignore-errors
+      (claude-code-ide-mcp-http-server--send-status process 503 "Too many connections"))
+    (when (process-live-p process)
+      (delete-process process))
+    nil)
+   (t
+    (let ((connection (claude-code-ide-mcp-http-server--make-connection
+                       :start (float-time))))
+      (setf (claude-code-ide-mcp-http-server--connection-timer connection)
+            (run-at-time claude-code-ide-mcp-http-server-body-timeout nil
+                         #'claude-code-ide-mcp-http-server--check-time-limit process))
+      (puthash process connection claude-code-ide-mcp-http-server--connections)
+      connection))))
 
 (defun claude-code-ide-mcp-http-server--check-time-limit (process)
   "Close the connection PROCESS when its time limit has passed.
@@ -508,7 +571,7 @@ fails the checks of `claude-code-ide-mcp-http-server--early-refusal'.
 The time limit `claude-code-ide-mcp-http-server-body-timeout' closes
 a connection that does not complete its request.  Each part of the
 body is kept as it comes and joined once, not copied on each read."
-  (let ((connection (claude-code-ide-mcp-http-server--connection process)))
+  (when-let* ((connection (claude-code-ide-mcp-http-server--connection process)))
     (pcase (claude-code-ide-mcp-http-server--connection-state connection)
       ;; Data after the request (web-server has what it needs)
       ('passed nil)
