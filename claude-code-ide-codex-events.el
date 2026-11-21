@@ -834,15 +834,6 @@ key and a value.  The parsed line must still be an `event_msg'.")
   "Longest line of a rollout file that the reader reads, in bytes.
 A longer line is skipped; a turn record is much shorter.")
 
-(defcustom claude-code-ide-codex-events-rollout-input-grace 5
-  "Seconds that Codex has to write the rollout file after a RET in the terminal.
-For a Codex instance without status hooks, a RET in its terminal
-after which the rollout file gets no record for this time makes the
-state `disconnected/untracked': the terminal can be in another
-conversation, for example after /new."
-  :type 'number
-  :group 'claude-code-ide)
-
 (defvar claude-code-ide-codex-events--rollout-cache (make-hash-table :test 'eq :weakness 'key)
   "INSTANCE -> plist of what its rollout file gave, weak in INSTANCE.
 :native and :file are the conversation and its rollout file.  :stamp is
@@ -852,20 +843,27 @@ conversation, for example after /new."
 whole session record yet.  :end is the byte after the last whole line
 read, where the next read starts.  :turn is the last turn record (see
 `claude-code-ide-codex-events--turn-of-record').  :pid and :start are
-the terminal PID and the start of its process.")
+the terminal PID and the start of its process.  :switch is the rollout
+file of another conversation that the terminal shows, or nil, as found
+for the inputs and folders of :switch-key.")
 
 (defvar claude-code-ide-codex-events--state-cache (make-hash-table :test 'eq :weakness 'key)
   "INSTANCE -> the state and detail of one refresh; weak in INSTANCE.
 See `claude-code-ide-codex-events--state-and-detail'.")
 
-(defvar-local claude-code-ide-codex-events--last-input nil
-  "Float time of the last RET in this Codex terminal buffer, or nil.")
+(defconst claude-code-ide-codex-events--input-limit 32
+  "Number of RET times that each Codex terminal buffer keeps.")
+
+(defvar-local claude-code-ide-codex-events--inputs nil
+  "Float times of the last RETs in this Codex terminal buffer, newest first.")
 
 (defun claude-code-ide-codex-events--note-input ()
   "Note the time of a RET in the Codex terminal buffer.
 This is a function of the local `post-command-hook' of the buffer."
   (when (memq last-command-event '(?\r ?\n return))
-    (setq claude-code-ide-codex-events--last-input (float-time))))
+    (setq claude-code-ide-codex-events--inputs
+          (seq-take (cons (float-time) claude-code-ide-codex-events--inputs)
+                    claude-code-ide-codex-events--input-limit))))
 
 (defun claude-code-ide-codex-events--watch-input (buffer)
   "Note each RET in the terminal BUFFER from now on."
@@ -964,11 +962,43 @@ backward, one chunk at a time, until the turn record is found."
               (setq pos (+ start (1- first)))))))
       (cons turn (or end from)))))
 
+(defconst claude-code-ide-codex-events--meta-limit 4194304
+  "Bytes at the start of a rollout file in which its first line must end.
+`claude-code-ide-transcript-codex-meta' reads as much.")
+
+(defun claude-code-ide-codex-events--first-line-whole-p (file)
+  "Return non-nil when the first line of FILE is a whole session record.
+That line must end with a newline.  Codex writes the `session_meta'
+record first.  A first line without its
+newline is still being written, also when it is valid JSON already.  The
+check reads the bytes of FILE up to the first newline, and parses
+nothing."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (let ((size claude-code-ide-codex-events--rollout-chunk)
+          (end nil)
+          (done nil))
+      (while (not done)
+        (erase-buffer)
+        (let ((read (cadr (insert-file-contents-literally file nil 0 size))))
+          (goto-char (point-min))
+          (cond
+           ((search-forward "\n" nil t)
+            (setq end (point) done t))
+           ((or (< read size) (>= size claude-code-ide-codex-events--meta-limit))
+            (setq done t))
+           (t (setq size (min (* 2 size) claude-code-ide-codex-events--meta-limit))))))
+      (and end
+           (progn (goto-char (point-min))
+                  (search-forward "\"type\":\"session_meta\"" end t))))))
+
 (defun claude-code-ide-codex-events--rollout-owner (file native)
   "Return whose session the rollout FILE is: `yes' for NATIVE, else `no'.
-Return nil when FILE has no whole session record yet: Codex writes it
-first, and a line without its newline does not parse."
-  (when-let* ((meta (claude-code-ide-transcript-codex-meta file)))
+Return nil when FILE has no whole session record yet: its first line
+must be the `session_meta' record, with its newline.  The record is
+read by `claude-code-ide-transcript-codex-meta'."
+  (when-let* (((claude-code-ide-codex-events--first-line-whole-p file))
+              (meta (claude-code-ide-transcript-codex-meta file)))
     (if (equal (plist-get meta :id) native) 'yes 'no)))
 
 (defun claude-code-ide-codex-events--rollout-stamp (attributes)
@@ -1046,6 +1076,113 @@ terminal process.  ENTRY keeps the start of each PID that Emacs asked."
             (plist-put entry :start (claude-code-ide-session-registry--process-start-time pid)))
           (plist-get entry :start)))))
 
+(defconst claude-code-ide-codex-events--rollout-name-regexp
+  (concat "\\`rollout-\\([0-9]\\{4\\}\\)-\\([0-9]\\{2\\}\\)-\\([0-9]\\{2\\}\\)"
+          "T\\([0-9]\\{2\\}\\)-\\([0-9]\\{2\\}\\)-\\([0-9]\\{2\\}\\)-\\([A-Za-z0-9-]+\\)\\.jsonl\\'")
+  "Regexp for the name of a rollout file.
+The groups are the local time when Codex made the file (year, month,
+day, hour, minute, second) and the conversation ID.")
+
+(defun claude-code-ide-codex-events--rollout-name (name)
+  "Return (TIME . ID) of the rollout file NAME, or nil.
+TIME is the float time when Codex made the file, in whole seconds of
+local time; ID is the conversation ID."
+  (when (string-match claude-code-ide-codex-events--rollout-name-regexp name)
+    (let ((part (lambda (n) (string-to-number (match-string n name)))))
+      (cons (float-time (encode-time (list (funcall part 6) (funcall part 5) (funcall part 4)
+                                           (funcall part 3) (funcall part 2) (funcall part 1)
+                                           nil -1 nil)))
+            (match-string 7 name)))))
+
+(defun claude-code-ide-codex-events--day-folders (file now)
+  "Return the folders where Codex makes a new rollout next to FILE, at NOW.
+That is the folder of FILE and, when FILE is in a day folder
+YYYY/MM/DD of the sessions folder, the day folder of NOW."
+  (let* ((dir (file-name-directory (expand-file-name file)))
+         (root (and (string-match-p "/[0-9]\\{4\\}/[0-9]\\{2\\}/[0-9]\\{2\\}/\\'" dir)
+                    (file-name-directory
+                     (directory-file-name
+                      (file-name-directory
+                       (directory-file-name
+                        (file-name-directory (directory-file-name dir)))))))))
+    (delete-dups (delq nil (list dir (and root (expand-file-name
+                                                (format-time-string "%Y/%m/%d/" (seconds-to-time now))
+                                                root)))))))
+
+(defun claude-code-ide-codex-events--instance-folder (instance)
+  "Return the folder of INSTANCE (its worktree, else its project root), or nil."
+  (let ((dir (or (claude-code-ide-known-or-nil (claude-code-ide-instance-worktree instance))
+                 (claude-code-ide-known-or-nil (claude-code-ide-instance-project-root instance)))))
+    (and (stringp dir) (file-name-as-directory (expand-file-name dir)))))
+
+(defun claude-code-ide-codex-events--known-conversations (instance)
+  "Return the conversation IDs of INSTANCE and of the other Codex instances."
+  (delq nil (mapcar (lambda (other)
+                      (and (eq (claude-code-ide-instance-provider other) 'codex)
+                           (claude-code-ide-known-or-nil (claude-code-ide-instance-native-id other))))
+                    (cons instance (claude-code-ide-instances)))))
+
+(defun claude-code-ide-codex-events--find-new-conversation (instance file folders inputs)
+  "Return the rollout of a new conversation in the terminal of INSTANCE, or nil.
+FILE is the rollout of INSTANCE, FOLDERS are the day folders to look
+in, and INPUTS are the times of the RETs after the last record of FILE.
+A file counts when Codex made it at most a second before or after one
+of INPUTS, its conversation is of no instance of this Emacs, and its
+session record has the folder of INSTANCE."
+  (let ((own (expand-file-name file))
+        (folder (claude-code-ide-codex-events--instance-folder instance))
+        (known (claude-code-ide-codex-events--known-conversations instance)))
+    (when folder
+      (catch 'found
+        (dolist (dir folders)
+          (when (file-directory-p dir)
+            (dolist (name (directory-files dir nil "\\`rollout-.*\\.jsonl\\'" t))
+              (let ((path (expand-file-name name dir))
+                    (made (claude-code-ide-codex-events--rollout-name name)))
+                (when (and made
+                           (not (equal path own))
+                           (not (member (cdr made) known))
+                           (cl-some (lambda (input) (<= input (+ (car made) 1.0))) inputs)
+                           (let ((cwd (plist-get (ignore-errors
+                                                   (claude-code-ide-transcript-codex-meta path))
+                                                 :cwd)))
+                             (and (stringp cwd)
+                                  (equal (file-name-as-directory (expand-file-name cwd)) folder))))
+                  (throw 'found path))))))
+        nil))))
+
+(defun claude-code-ide-codex-events--new-conversation (instance entry file now)
+  "Return the rollout of another conversation in the terminal of INSTANCE.
+Return nil when the terminal shows the conversation of INSTANCE.
+After /new or a fork in the terminal, the native ID of INSTANCE
+stays, but Codex writes a new rollout file.  So a RET in the terminal after
+the last record of FILE, and a new rollout of another conversation in
+the same folder after that RET, mean that the terminal shows another
+conversation.  A RET without such a file (an empty prompt, a slash
+command such as /status, the answer to an approval) changes nothing.
+ENTRY is the cache entry of INSTANCE; the search runs again only when
+the RETs, the folders or the other conversations change.  NOW gives
+the day folder of today."
+  (let* ((buffer (claude-code-ide-instance-buffer instance))
+         (written (float-time (car (plist-get entry :stamp))))
+         (inputs (and (buffer-live-p buffer)
+                      (cl-remove-if-not
+                       (lambda (input) (> input (+ written 1.0)))
+                       (buffer-local-value 'claude-code-ide-codex-events--inputs buffer)))))
+    (when inputs
+      (let* ((folders (claude-code-ide-codex-events--day-folders file now))
+             (key (list written inputs
+                        (mapcar (lambda (dir) (file-attribute-modification-time (file-attributes dir)))
+                                folders)
+                        (claude-code-ide-codex-events--known-conversations instance))))
+        (if (equal key (plist-get entry :switch-key))
+            (plist-get entry :switch)
+          (let ((found (claude-code-ide-codex-events--find-new-conversation
+                        instance file folders inputs)))
+            (plist-put entry :switch-key key)
+            (plist-put entry :switch found)
+            found))))))
+
 (defun claude-code-ide-codex-events--rollout-turn-state (turn start)
   "Return (STATE . DETAIL) of the last TURN record of a rollout file.
 TURN nil is a conversation without a turn yet.  START is the start of
@@ -1093,18 +1230,15 @@ An approval or a question shows as `working': the rollout has no
 record of them.  These cases are `disconnected/untracked' without
 :source: a file that cannot be read, a file without a whole session
 record yet, a file whose session record is of another conversation,
-and a RET in the terminal at NOW after which the file got no record
-for `claude-code-ide-codex-events-rollout-input-grace' seconds.
-Without a known conversation or rollout file, return nil.  DETAIL does
-not say that the hooks are missing; the caller adds that."
+and a terminal that shows another conversation (see
+`claude-code-ide-codex-events--new-conversation').  Without a known
+conversation or rollout file, return nil.  DETAIL does not say that
+the hooks are missing; the caller adds that."
   (when-let* ((native (claude-code-ide-known-or-nil (claude-code-ide-instance-native-id instance)))
               (file (claude-code-ide-codex-events--rollout-file instance)))
     (let* ((entry (claude-code-ide-codex-events--rollout-read
                    (claude-code-ide-codex-events--rollout-entry instance native) file))
            (stamp (plist-get entry :stamp))
-           (buffer (claude-code-ide-instance-buffer instance))
-           (input (and (buffer-live-p buffer)
-                       (buffer-local-value 'claude-code-ide-codex-events--last-input buffer)))
            (untracked (lambda (detail)
                         (cons (claude-code-ide-instance-make-state 'disconnected 'untracked) detail))))
       (cond
@@ -1112,10 +1246,8 @@ not say that the hooks are missing; the caller adds that."
        ((null (plist-get entry :owner)) (funcall untracked "rollout file not readable yet"))
        ((eq (plist-get entry :owner) 'no)
         (funcall untracked "the rollout file is of another conversation"))
-       ((and input
-             (> input (+ (float-time (car stamp)) 1.0))
-             (> (- now input) claude-code-ide-codex-events-rollout-input-grace))
-        (funcall untracked "no rollout record since the last input in the terminal"))
+       ((claude-code-ide-codex-events--new-conversation instance entry file now)
+        (funcall untracked "the terminal shows another conversation (/new or a fork)"))
        (t (claude-code-ide-codex-events--rollout-turn-state
            (plist-get entry :turn)
            (claude-code-ide-codex-events--launch-start instance launch entry)))))))
@@ -1181,7 +1313,7 @@ launch record, the conversation and the last input do not change."
            (claude-code-ide-instance-native-id instance)
            (claude-code-ide-instance-generation instance)
            (and (buffer-live-p buffer)
-                (buffer-local-value 'claude-code-ide-codex-events--last-input buffer))))))
+                (car (buffer-local-value 'claude-code-ide-codex-events--inputs buffer)))))))
 
 (defun claude-code-ide-codex-events--instance-state (instance now)
   "Return the common state of the Codex INSTANCE at NOW, or nil.

@@ -1637,6 +1637,30 @@ A window made for the buffer goes; a reused window shows its old buffer."
         (should (eq (window-buffer (selected-window)) old)))
       (kill-buffer old))))
 
+(ert-deftest claude-code-ide-test-status-rate-limit-model-text-is-no-quota ()
+  "A rate_limit with error details uses only the details: model text is no quota limit."
+  (let ((status (claude-code-ide-session-status-create :nonce "rl" :since 0.0 :registered 0.0
+                                                       :last-event 0.0)))
+    (claude-code-ide-session-status--apply status "UserPromptSubmit" nil 1.0)
+    (claude-code-ide-session-status--apply
+     status "StopFailure"
+     '((error . "rate_limit")
+       (error_details . "Rate limit reached: tokens per minute")
+       (last_assistant_message . "I set the spend cap of the cci-test workspace to 50 dollars."))
+     2.0)
+    (should (eq (claude-code-ide-session-status--state status 3.0) 'error))
+    (should (eq (plist-get (claude-code-ide-session-status--common-state status 3.0) :reason) 'error))
+    ;; Without details, the last message is the limit message of the CLI
+    (claude-code-ide-session-status--apply status "UserPromptSubmit" nil 4.0)
+    (claude-code-ide-session-status--apply
+     status "StopFailure"
+     '((error . "rate_limit") (error_details . "  ")
+       (last_assistant_message . "Claude usage limit reached. Your limit will reset at 5pm"))
+     5.0)
+    (should (eq (claude-code-ide-session-status--state status 6.0) 'quota))
+    (should (equal (claude-code-ide-session-status--detail status 'quota 6.0)
+                   "Quota limit: Claude usage limit reached. Your limit will reset at 5pm"))))
+
 (provide 'claude-code-ide-session-status-tests)
 
 ;; Local Variables:

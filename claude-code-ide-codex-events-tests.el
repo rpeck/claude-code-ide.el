@@ -2413,40 +2413,99 @@ report folder; BODY writes it."
             (claude-code-ide-codex-events--launch-registered launch) 1600.0)
       (should (eq (car (claude-code-ide-codex-events-tests--full-state instance)) 'idle)))))
 
-(ert-deftest claude-code-ide-codex-events-test-rollout-after-input ()
-  "A RET in the terminal without a rollout record after it stops the trust in the rollout."
+(defun claude-code-ide-codex-events-tests--ret (buffer)
+  "Note a RET in the terminal BUFFER now, as a key in the terminal does."
+  (with-current-buffer buffer
+    (let ((last-command-event ?\r))
+      (claude-code-ide-codex-events--note-input))))
+
+(defun claude-code-ide-codex-events-tests--rollout-name (time native)
+  "Return the name of the rollout of NATIVE that Codex makes at the float TIME."
+  (format "rollout-%s-%s.jsonl" (format-time-string "%Y-%m-%dT%H-%M-%S" (seconds-to-time time)) native))
+
+(ert-deftest claude-code-ide-codex-events-test-rollout-input-without-record ()
+  "A RET that Codex answers without a rollout record changes nothing.
+This is a RET on an empty prompt, a slash command such as /status, or
+the answer to an approval while the tool runs for a long time."
   (claude-code-ide-codex-events-tests--with-rollout
-    (claude-code-ide-codex-events-tests--append file (claude-code-ide-codex-events-tests--meta)
-                                                (claude-code-ide-codex-events-tests--complete "t1" 1000))
-    (claude-code-ide-codex-events-tests--touch file 1000.0)
-    (let ((buffer (claude-code-ide-instance-buffer instance)))
-      (should (eq (car (claude-code-ide-codex-events-tests--full-state instance)) 'idle))
-      ;; The state watches the terminal for RET
+    (let* ((buffer (claude-code-ide-instance-buffer instance))
+           (now (float-time)))
+      (claude-code-ide-codex-events-tests--append file (claude-code-ide-codex-events-tests--meta)
+                                                  (claude-code-ide-codex-events-tests--complete "t1" 1000))
+      (claude-code-ide-codex-events-tests--touch file (- now 100))
+      (should (eq (plist-get (claude-code-ide-instance-state instance now) :state) 'idle))
+      ;; The state watches the terminal for RET; other keys do not count
       (with-current-buffer buffer
-        (should (memq #'claude-code-ide-codex-events--note-input post-command-hook))
-        (let ((last-command-event ?a))
-          (claude-code-ide-codex-events--note-input))
-        (should-not claude-code-ide-codex-events--last-input)
-        (let ((last-command-event ?\r))
-          (claude-code-ide-codex-events--note-input))
-        (should claude-code-ide-codex-events--last-input)
-        ;; A RET at 3000 (after /new, for example), and no record since
-        (setq claude-code-ide-codex-events--last-input 3000.0))
-      ;; Within the grace time the rollout still counts
-      (should (eq (plist-get (claude-code-ide-instance-state instance 3002.0) :state) 'idle))
-      (should (equal (seq-take (let ((state (claude-code-ide-instance-state instance 3010.0)))
-                                 (list (plist-get state :state) (plist-get state :reason)
-                                       (plist-get state :source)))
-                               3)
-                     '(disconnected untracked nil)))
-      (should (equal (claude-code-ide-codex-events--instance-detail instance 3011.0)
-                     "No status hooks; no rollout record since the last input in the terminal"))
-      ;; Codex writes a record after the RET: the rollout counts again
-      (claude-code-ide-codex-events-tests--append file (claude-code-ide-codex-events-tests--started "t2" 3001))
-      (claude-code-ide-codex-events-tests--touch file 3001.0)
-      (should (equal (let ((state (claude-code-ide-instance-state instance 3020.0)))
-                       (list (plist-get state :state) (plist-get state :guess) (plist-get state :source)))
-                     '(working t rollout))))))
+        (should (memq #'claude-code-ide-codex-events--note-input post-command-hook)))
+      (claude-code-ide-codex-events-tests--ret buffer)
+      ;; A minute later, no record came: the rollout state stays
+      (let ((state (claude-code-ide-instance-state instance (+ now 60))))
+        (should (equal (list (plist-get state :state) (plist-get state :guess) (plist-get state :source))
+                       '(idle t rollout))))
+      ;; A new rollout of another instance of Emacs, or of another folder, is no new conversation here
+      (let ((other (claude-code-ide-codex-events-tests--instance "cci-test-other" 1))
+            (other-id "cci-test-0031-0000-4000-8000-000000000000")
+            (foreign-id "cci-test-0032-0000-4000-8000-000000000000"))
+        (setf (claude-code-ide-instance-native-id other) other-id)
+        (claude-code-ide-codex-events-tests--append
+         (expand-file-name (claude-code-ide-codex-events-tests--rollout-name (+ now 2) other-id) registry-dir)
+         (claude-code-ide-codex-events-tests--meta other-id))
+        (let ((coding-system-for-write 'utf-8-unix))
+          (write-region (claude-code-ide-codex-events-tests--rollout-record
+                         "session_meta" `((id . ,foreign-id) (cwd . "/tmp/cci-test-elsewhere/")))
+                        nil (expand-file-name (claude-code-ide-codex-events-tests--rollout-name (+ now 3) foreign-id)
+                                              registry-dir)
+                        nil 'silent))
+        (let ((state (claude-code-ide-instance-state instance (+ now 61))))
+          (should (equal (list (plist-get state :state) (plist-get state :source)) '(idle rollout))))))))
+
+(ert-deftest claude-code-ide-codex-events-test-rollout-new-conversation-in-terminal ()
+  "A new rollout of another conversation in the same folder after a RET is UNTRACKED.
+That is /new or a fork in the terminal: the native ID of the instance
+stays, but the terminal shows another conversation."
+  (claude-code-ide-codex-events-tests--with-rollout
+    (let* ((buffer (claude-code-ide-instance-buffer instance))
+           (now (float-time))
+           (new-id "cci-test-0033-0000-4000-8000-000000000000")
+           (new-file nil))
+      (claude-code-ide-codex-events-tests--append file (claude-code-ide-codex-events-tests--meta)
+                                                  (claude-code-ide-codex-events-tests--complete "t1" 1000))
+      (claude-code-ide-codex-events-tests--touch file (- now 100))
+      (should (eq (plist-get (claude-code-ide-instance-state instance now) :state) 'idle))
+      ;; /new and RET: Codex starts a rollout of another conversation in the same folder
+      (claude-code-ide-codex-events-tests--ret buffer)
+      (setq new-file (expand-file-name (claude-code-ide-codex-events-tests--rollout-name (+ now 1) new-id)
+                                       registry-dir))
+      (claude-code-ide-codex-events-tests--append new-file (claude-code-ide-codex-events-tests--meta new-id))
+      ;; At once, not after a grace time
+      (let ((state (claude-code-ide-instance-state instance (+ now 2))))
+        (should (equal (list (plist-get state :state) (plist-get state :reason) (plist-get state :source))
+                       '(disconnected untracked nil))))
+      (should (equal (claude-code-ide-codex-events--instance-detail instance (+ now 3))
+                     "No status hooks; the terminal shows another conversation (/new or a fork)"))
+      ;; A prompt in the new conversation, with its own RET: still UNTRACKED
+      (claude-code-ide-codex-events-tests--ret buffer)
+      (claude-code-ide-codex-events-tests--append new-file (claude-code-ide-codex-events-tests--started "n1" 1500))
+      (should (eq (plist-get (claude-code-ide-instance-state instance (+ now 30)) :reason) 'untracked))
+      ;; The old conversation gets a record again (a resume in the terminal): it counts again
+      (claude-code-ide-codex-events-tests--append file (claude-code-ide-codex-events-tests--started "t2" 2000))
+      (claude-code-ide-codex-events-tests--touch file (+ now 40))
+      (let ((state (claude-code-ide-instance-state instance (+ now 41))))
+        (should (equal (list (plist-get state :state) (plist-get state :source)) '(working rollout)))))))
+
+(ert-deftest claude-code-ide-codex-events-test-rollout-session-record-without-newline ()
+  "A whole session record at the end of the file, without its newline, is not used yet."
+  (claude-code-ide-codex-events-tests--with-rollout
+    (let ((meta (claude-code-ide-codex-events-tests--meta)))
+      ;; The JSON is complete, but Codex has not written the newline yet
+      (claude-code-ide-codex-events-tests--append file (substring meta 0 -1))
+      (should (equal (seq-take (claude-code-ide-codex-events-tests--full-state instance) 4)
+                     '(disconnected untracked nil nil)))
+      (should (equal (claude-code-ide-codex-events-tests--detail instance)
+                     "No status hooks; rollout file not readable yet"))
+      ;; The newline and a turn come
+      (claude-code-ide-codex-events-tests--append file "\n" (claude-code-ide-codex-events-tests--started "t1" 1000))
+      (should (equal (claude-code-ide-codex-events-tests--full-state instance) '(working nil t rollout 1000.0))))))
 
 (ert-deftest claude-code-ide-codex-events-test-rollout-read-on-change ()
   "The rollout is read only when it changes, from the end of the last read, never written."

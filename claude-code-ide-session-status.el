@@ -710,13 +710,17 @@ See `claude-code-ide-session-status-quota-regexp' and
   "Return non-nil when the StopFailure input DATA reports a quota limit.
 `billing_error' means that the account has no credits.  `rate_limit'
 covers also short limits of a few seconds, so it counts only when
-`error_details' or the last message says that a usage or plan limit
-was reached; see `claude-code-ide-session-status-quota-regexp'."
+`error_details' says that a usage or plan limit was reached; see
+`claude-code-ide-session-status-quota-regexp'.  The last message can
+be text of the model, so it counts only when `error_details' is blank:
+then it is the limit message of the CLI."
   (pcase (alist-get 'error data)
     ("billing_error" t)
     ("rate_limit"
-     (or (claude-code-ide-session-status--quota-text-p (alist-get 'error_details data))
-         (claude-code-ide-session-status--quota-text-p (alist-get 'last_assistant_message data))))))
+     (let ((details (alist-get 'error_details data)))
+       (if (and (stringp details) (not (string-blank-p details)))
+           (claude-code-ide-session-status--quota-text-p details)
+         (claude-code-ide-session-status--quota-text-p (alist-get 'last_assistant_message data)))))))
 
 (defun claude-code-ide-session-status--failure-text (data)
   "Return the text that explains the StopFailure input DATA."
