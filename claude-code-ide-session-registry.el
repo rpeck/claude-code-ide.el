@@ -275,11 +275,11 @@ launch generation that Emacs counted, and has no role."
   (transcript-path nil :type (or null string)))
 
 (define-error 'claude-code-ide-session-registry-error
-  "Session registry error")
+              "Session registry error")
 (define-error 'claude-code-ide-session-registry-lock-busy
-  "State file is locked" 'claude-code-ide-session-registry-error)
+              "State file is locked" 'claude-code-ide-session-registry-error)
 (define-error 'claude-code-ide-session-registry-running
-  "The session runs already" 'user-error)
+              "The session runs already" 'user-error)
 
 ;;; State
 

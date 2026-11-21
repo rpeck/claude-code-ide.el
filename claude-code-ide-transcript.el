@@ -117,18 +117,18 @@ is the line number of its record.  Return the number of lines of FILE."
       (goto-char (point-min))
       (while (not (eobp))
         (setq lines (1+ lines))
-      (let ((end (line-end-position)))
-        (when (and (< (point) end)
-                   (or (null regexp)
-                       (save-excursion (re-search-forward regexp end t))))
-          (when-let* ((record (claude-code-ide-transcript--parse-line
-                               (buffer-substring-no-properties (point) end))))
-            ;; One bad record does not stop the read.
-            (condition-case nil
-                (let ((claude-code-ide-transcript--line lines))
-                  (funcall function record))
-              (error nil)))))
-      (forward-line 1))
+        (let ((end (line-end-position)))
+          (when (and (< (point) end)
+                     (or (null regexp)
+                         (save-excursion (re-search-forward regexp end t))))
+            (when-let* ((record (claude-code-ide-transcript--parse-line
+                                 (buffer-substring-no-properties (point) end))))
+              ;; One bad record does not stop the read.
+              (condition-case nil
+                  (let ((claude-code-ide-transcript--line lines))
+                    (funcall function record))
+                (error nil)))))
+        (forward-line 1))
       lines)))
 
 (defun claude-code-ide-transcript--adds-p (text tools)
@@ -534,27 +534,27 @@ META.  LINE is the line number of the last record that added to
 TURNS, or nil."
   (let (entries meta end-record)
     (progn
-     (claude-code-ide-transcript--map-records
-     file claude-code-ide-transcript--codex-line-regexp
-     (lambda (record)
-       (let ((payload (alist-get 'payload record))
-             (time (alist-get 'timestamp record))
-             (type (alist-get 'type record)))
-         (when (listp payload)
-           (cond
-            ((equal type "session_meta")
-             (unless meta (setq meta (claude-code-ide-transcript--codex-meta-of payload))))
-            ((not (equal type "event_msg")))
-            ((equal (alist-get 'type payload) "item_completed")
-             (when (listp (alist-get 'item payload))
-               (push (list 'item time (alist-get 'item payload)
-                           claude-code-ide-transcript--line)
-                     entries)))
-            ((equal (alist-get 'type payload) "task_started")
-             (push (list 'task time nil) entries))
-            ((member (alist-get 'type payload) '("user_message" "agent_message"))
-             (push (list 'event time payload claude-code-ide-transcript--line)
-                   entries))))))))
+      (claude-code-ide-transcript--map-records
+       file claude-code-ide-transcript--codex-line-regexp
+       (lambda (record)
+         (let ((payload (alist-get 'payload record))
+               (time (alist-get 'timestamp record))
+               (type (alist-get 'type record)))
+           (when (listp payload)
+             (cond
+              ((equal type "session_meta")
+               (unless meta (setq meta (claude-code-ide-transcript--codex-meta-of payload))))
+              ((not (equal type "event_msg")))
+              ((equal (alist-get 'type payload) "item_completed")
+               (when (listp (alist-get 'item payload))
+                 (push (list 'item time (alist-get 'item payload)
+                             claude-code-ide-transcript--line)
+                       entries)))
+              ((equal (alist-get 'type payload) "task_started")
+               (push (list 'task time nil) entries))
+              ((member (alist-get 'type payload) '("user_message" "agent_message"))
+               (push (list 'event time payload claude-code-ide-transcript--line)
+                     entries))))))))
     (let* ((entries (nreverse entries))
            (history-end (claude-code-ide-transcript--codex-history-end entries))
            (first-item t)
@@ -887,7 +887,7 @@ summary file of the target."
        (concat "- Legs of the chain, oldest first:\n"
                (mapconcat (lambda (leg)
                             (format "  - %s" (claude-code-ide-transcript--describe-leg leg)))
-                           legs "\n"))
+                          legs "\n"))
      "- Legs of the chain: this is the first handover.")))
 
 (defun claude-code-ide-transcript--render-workspace (state)

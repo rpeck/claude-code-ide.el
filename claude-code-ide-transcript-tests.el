@@ -341,24 +341,24 @@ arguments of this function."
            (append
             args
             (list
-           :source source
-           :chain (list (list :provider 'claude :instance-id "cci-test-instance-1"
-                              :native-id "cci-test-0000-0000-0000-000000000001"
-                              :transcript (claude-code-ide-transcript-tests--fixture
-                                           "claude-leg1.jsonl"))
-                        (list :provider 'codex :instance-id "cci-test-instance-2"
-                              :native-id "cci-test-codex-0002"
-                              :transcript (claude-code-ide-transcript-tests--fixture
-                                           "codex-leg2.jsonl")
-                              :handover-id "cci-test-h1" :document-hash "cci-test-hash-h1")
-                        ;; The record of the source leg: it gives the handover
-                        ;; that started the source.
-                        (list :provider 'claude :native-id "cci-test-0000-0000-0000-000000000003"
-                              :handover-id "cci-test-h2" :document-hash "cci-test-hash-h2"))
-           :context "cci-test-context: the coordinator wants format_summary kept."
-           :handover-id "cci-test-h3"
-           :target-provider 'codex
-           :time 0)))))
+             :source source
+             :chain (list (list :provider 'claude :instance-id "cci-test-instance-1"
+                                :native-id "cci-test-0000-0000-0000-000000000001"
+                                :transcript (claude-code-ide-transcript-tests--fixture
+                                             "claude-leg1.jsonl"))
+                          (list :provider 'codex :instance-id "cci-test-instance-2"
+                                :native-id "cci-test-codex-0002"
+                                :transcript (claude-code-ide-transcript-tests--fixture
+                                             "codex-leg2.jsonl")
+                                :handover-id "cci-test-h1" :document-hash "cci-test-hash-h1")
+                          ;; The record of the source leg: it gives the handover
+                          ;; that started the source.
+                          (list :provider 'claude :native-id "cci-test-0000-0000-0000-000000000003"
+                                :handover-id "cci-test-h2" :document-hash "cci-test-hash-h2"))
+             :context "cci-test-context: the coordinator wants format_summary kept."
+             :handover-id "cci-test-h3"
+             :target-provider 'codex
+             :time 0)))))
 
 (ert-deftest claude-code-ide-test-transcript-handover-chain ()
   "A chain of three legs (CC, Codex, CC) gives one document without nesting.
