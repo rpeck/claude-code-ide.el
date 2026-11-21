@@ -21,13 +21,22 @@ They check what the unit tests cannot: the handover between real conversations, 
 
 - **Codex needs the `claude-sessions` MCP server** for the test `handover-chain`. It reads past Claude Code sessions. The user's Codex config must have a `[mcp_servers.claude-sessions]` table. Without it, the document has no session tools, and the test fails.
 - **One live folder for each daemon.** Two daemons must not share one live folder: they would share the registry, the inbox, and the hooks.
-  - The setup claims the folder in the file `owner` (the process ID and the start time of the Emacs). It refuses a folder that a live Emacs holds; use `CLAUDE_CODE_IDE_LIVE_DIR` for a second daemon.
-  - The claim runs under a lock: the folder `owner.lock`, made with `make-directory` without parents, which fails when the folder exists. So two daemons that start at the same time cannot both claim.
-    - The holder writes the file `owner.lock/holder`: its process ID and start time.
-    - A lock goes only when its holder is gone: no process has that ID, or the process with that ID started at another time. The age of a lock never counts, because a holder can pause. The lock moves aside with one rename first, and moves back when another claimant took it meanwhile.
-    - A lock without a holder file stays. After 5 seconds the claim gives up and names the lock; remove it by hand when no live test Emacs runs.
-    - The release removes the lock only when its holder file still names this Emacs.
+  - The setup claims the folder in the file `owner` (the process ID and the start time of the Emacs). It refuses a folder whose owner may still run; use `CLAUDE_CODE_IDE_LIVE_DIR` for a second daemon.
+    - The owner is gone only when no process has its process ID, or when the process with that ID started at a known other time.
+    - An unknown start time, in the file or now, counts as "still runs". That is the safe side.
+    - An Emacs that cannot read its own start time writes its process ID only.
   - A claim of an Emacs that ended counts as old, so the recovery test can start its second daemon.
+  - The claim runs under a lock: the folder `owner.lock`, made with `make-directory` without parents, which fails when the folder exists. So two daemons that start at the same time cannot both claim.
+    - The lock lives only for the claim, which takes milliseconds. The claim removes it at its end, also after an error.
+    - The file `owner.lock/holder` names the process ID and start time of the claimant. It is information for people only.
+    - No claim removes a lock that exists. A claim that finds one waits up to 5 seconds, then stops with an error that names the lock, its holder, and the command to remove it.
+  - **After a crash during a claim**, `owner.lock` stays, and each new setup stops with that error. When no live test Emacs runs, remove the lock by hand:
+
+    ```sh
+    rm -r <live folder>/owner.lock
+    ```
+
+    With the default live folder: `rm -r tmp/live/owner.lock` in the repository.
   - A folder that has files but no `owner` file is no live folder, for example a folder of yours that `CLAUDE_CODE_IDE_LIVE_DIR` names by mistake. The setup refuses it.
 - **The setup runs only in a live daemon.** Where the gate is closed (batch Emacs, your own Emacs), `claude-code-ide-live-tests-setup` signals an error before it changes anything. It changes package options, adds advice, and turns on the session registry, whose recovery can start CLIs.
 
@@ -167,7 +176,12 @@ For each backend:
 
 1. **Folder trust:** Codex in a new repository. The state is `waiting-for-user/dialog`. Nobody answers, so no trust is saved.
 2. **Hooks review:** Codex with the hooks and without the bypass flag. The state is `waiting-for-user/dialog`. Nobody answers.
-3. **Approval:** Codex calls an MCP tool of `emacs_tools` that needs an approval (`claude-code-ide-mcp-allowed-tools` nil). The state is `waiting-for-user/approval`. Before it answers, the test checks that the pending `PermissionRequest` names exactly `mcp__emacs_tools__claude_code_ide_mcp_project_info`; any other tool fails the test. Then the test answers Return (allow), as a person.
+3. **Approval:** Codex calls an MCP tool of `emacs_tools` that needs an approval (`claude-code-ide-mcp-allowed-tools` nil).
+   - The state is `waiting-for-user/approval`, and it stays so while the dialog waits: the test reads it five times in five seconds.
+   - Before it answers, the test checks that the pending `PermissionRequest` names exactly `mcp__emacs_tools__claude_code_ide_mcp_project_info`. Any other tool fails the test.
+   - Then the test answers Return (allow), as a person. The tool ends, and the state is no longer an approval.
+
+The test `codex-approval-eat-no-window` runs the approval step in an eat buffer that shows in no window of any frame. Such a buffer keeps only the end of the dialog. The test checks that the dialog still reads as `approval`, and that the state stays `waiting-for-user/approval` until the tool ends (the fix of bug 3, PR #26).
 
 In each dialog, the test submits a prompt with `claude-code-ide-control-submit`:
 
@@ -175,11 +189,11 @@ In each dialog, the test submits a prompt with `claude-code-ide-control-submit`:
 - The terminal does not show the text, and the dialog stays.
 - After the approval, the queued prompt is delivered, and its own turn (the first turn end after its delivery) answers it.
 
-ghostel draws only in a window of a real frame. The test makes an invisible GUI frame in the daemon (`(make-frame '((window-system . ns) (visibility . nil)))`) and shows each terminal of the dialog tests there, for all backends, as a person sees it. An eat terminal that no window shows keeps only the end of the approval dialog, so the screen reader misses it (bug 3 of the report L.md).
+ghostel draws only in a window of a real frame. The test makes an invisible GUI frame in the daemon (`(make-frame '((window-system . ns) (visibility . nil)))`) and shows each terminal of the dialog tests there, for all backends, as a person sees it. Only `codex-approval-eat-no-window` keeps its terminal out of every window.
 
 - The test logs the screen text of each dialog to `log.txt`.
 - The approval prompt names the tool as Codex shows it (`mcp__emacs_tools__claude_code_ide_mcp_project_info`). With the name `claude-code-ide-mcp-project-info`, Codex found no tool and replied without a call.
-- The tests `stop-asks-nothing` check that a stop asks no question such as "Buffer has a running process; kill it?". An eat terminal asked it before `fix/eat-stop` (PR #22). The stops of the other tests still bind `kill-buffer-query-functions` to nil, so that an older package cannot block the daemon.
+- The tests `stop-asks-nothing` check that a stop asks no question such as "Buffer has a running process; kill it?". An eat terminal asked it before `fix/eat-stop` (PR #22). The other tests stop their instances as a coordinator does, with `claude-code-ide-control-stop` and no binding.
 
 ## What the tests write outside the live folder
 
