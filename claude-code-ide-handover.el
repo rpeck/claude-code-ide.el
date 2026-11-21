@@ -122,6 +122,25 @@ cancelled at the start, and the later ones wait for
   :type 'boolean
   :group 'claude-code-ide-handover)
 
+(defcustom claude-code-ide-handover-unsaved-target 'fresh
+  "What the recovery does with a target that never saved its conversation.
+A crash right after the stage target-identified can end the target CLI
+before it saves its first turn.  Its native ID is known, but a resume
+of it fails: Claude Code prints \"No conversation found with session
+ID\".  The target counts as unsaved when its provider finds no
+transcript file for its native ID (for Claude Code the session file of
+its registry entry, for Codex its rollout file).
+- `fresh': start the target fresh, with the same instance ID and the
+  same document.  A Claude Code target gets the same session ID
+  (--session-id); a fork, and a Codex target, get the new ID that the
+  CLI chooses.  No person is asked.
+- `ask': the handover needs a person (reason `unsaved-target').  The
+  choice retry starts the target fresh, as `fresh' does.
+A target with a saved conversation is resumed in both cases."
+  :type '(choice (const :tag "Start the target fresh" fresh)
+                 (const :tag "Ask a person" ask))
+  :group 'claude-code-ide-handover)
+
 (defcustom claude-code-ide-handover-delivery-timeout 600
   "Seconds that a started target has to get its handover document.
 Without the delivery in that time, the handover needs a person, who
@@ -1176,6 +1195,9 @@ coordinator sees the status `needs-user', and Emacs shows a message."
     ('target-exited
      '((?r retry "start the target again")
        (?c cancel "cancel the handover")))
+    ('unsaved-target
+     '((?r retry "start the target fresh, with the same document")
+       (?c cancel "cancel the handover")))
     ('registry-entry-missing
      '((?c cancel "cancel the handover")))
     (_
@@ -1336,6 +1358,10 @@ Interactively, choose the handover and the action."
            (claude-code-ide-handover--resume run)
            (claude-code-ide-handover--check-identified run)
            (claude-code-ide-handover--start-watch run))
+          ;; A target that never saved its conversation: a fresh start
+          ;; of the same target ID, with the same document
+          ((eq (claude-code-ide-handover--run-reason run) 'unsaved-target)
+           (claude-code-ide-handover--start-fresh-target run))
           ;; A target that ended: a new launch of the same target ID,
           ;; with the same document, after a scan for writers
           ((eq (claude-code-ide-handover--run-reason run) 'target-exited)
@@ -1555,8 +1581,23 @@ PENDING is as for `claude-code-ide-handover--target-leg'."
                     leg))
             (list (claude-code-ide-handover--target-leg run pending)))))
 
+(defun claude-code-ide-handover--fresh-session-flags (run)
+  "Return the flags that start the Claude Code target of RUN with its ID, or nil.
+The ID is the known native ID.  A fresh start of an unsaved target (see
+`claude-code-ide-handover-unsaved-target') keeps the target's native
+ID: --session-id comes after the user's flags.  A first start has no
+native ID yet, a fork gets a new one from the CLI, and another provider
+chooses its own; they get nil."
+  (let ((native (claude-code-ide-handover--run-target-native-id run)))
+    (when (and (eq (claude-code-ide-handover--run-target-provider run) 'claude)
+               (stringp native)
+               (not (claude-code-ide-handover--run-fork-id run)))
+      (string-trim (concat (or claude-code-ide-cli-extra-flags "") " --session-id " native)))))
+
 (defun claude-code-ide-handover--start-spec (run prompt)
-  "Return the start spec of the target of RUN, with PROMPT as its first prompt."
+  "Return the start spec of the target of RUN, with PROMPT as its first prompt.
+A Claude Code target with a known native ID gets it again; see
+`claude-code-ide-handover--fresh-session-flags'."
   (let* ((id (claude-code-ide-handover--run-target-id run))
          (entry (claude-code-ide-session-registry-entry-of id))
          (last (max (or (claude-code-ide-instance-current-generation id) 0)
@@ -1566,6 +1607,7 @@ PENDING is as for `claude-code-ide-handover--target-leg'."
      :instance-name (claude-code-ide-handover--run-instance-name run)
      :prompt prompt
      :provider (claude-code-ide-handover--run-target-provider run)
+     :extra-flags (claude-code-ide-handover--fresh-session-flags run)
      :instance-id id
      ;; A start of an instance ID that has a record names its generation
      :last-generation (and (> last 0) last)
@@ -1805,6 +1847,53 @@ The registry entry of the target gives its process ID and start time."
           :reason 'target
           :start (claude-code-ide-session-registry-entry-process-start-time entry))))
 
+(defun claude-code-ide-handover--target-native (run)
+  "Return the native ID of the target of RUN: its own, else that of its entry."
+  (or (claude-code-ide-handover--run-target-native-id run)
+      (when-let* ((entry (claude-code-ide-session-registry-entry-of
+                          (claude-code-ide-handover--run-target-id run))))
+        (claude-code-ide-session-registry-entry-session-id entry))))
+
+(defun claude-code-ide-handover--unsaved-target-p (run)
+  "Return non-nil when the identified target of RUN never saved its conversation.
+That is a target that does not run, has a native ID, and has no
+transcript file for it: the provider finds none (for Claude Code the
+session file of its registry entry, for Codex its rollout file).  A
+resume of such a target fails, so the recovery starts it fresh; see
+`claude-code-ide-handover-unsaved-target'."
+  (let ((native (claude-code-ide-handover--target-native run)))
+    (and (stringp native)
+         (not (claude-code-ide-handover--live-target run))
+         (not (claude-code-ide-handover--transcript-file
+               (claude-code-ide-handover--run-target-provider run)
+               native
+               (claude-code-ide-session-registry-entry-of
+                (claude-code-ide-handover--run-target-id run)))))))
+
+(defun claude-code-ide-handover--start-fresh-target (run)
+  "Start the unsaved target of RUN fresh, with the same instance ID and document.
+A Claude Code target keeps its native ID, which the start names with
+--session-id (see `claude-code-ide-handover--fresh-session-flags').  A
+fork, and a target of another provider, get the new ID of the CLI.  The
+worktree scan runs first, as for every new start of a target."
+  (setf (claude-code-ide-handover--run-target-native-id run)
+        (and (eq (claude-code-ide-handover--run-target-provider run) 'claude)
+             (not (claude-code-ide-handover--run-fork-id run))
+             (claude-code-ide-handover--target-native run))
+        (claude-code-ide-handover--run-stage run) 'target-started
+        (claude-code-ide-handover--run-reason run) nil
+        (claude-code-ide-handover--run-message run) nil)
+  (claude-code-ide-handover--scan-then run 'start-target))
+
+(defun claude-code-ide-handover--recover-unsaved-target (run)
+  "Recover RUN, whose identified target never saved its conversation.
+See `claude-code-ide-handover-unsaved-target'."
+  (if (eq claude-code-ide-handover-unsaved-target 'ask)
+      (claude-code-ide-handover--needs-user
+       run 'unsaved-target
+       "The target never saved its conversation, so it cannot be resumed; retry starts it fresh")
+    (claude-code-ide-handover--start-fresh-target run)))
+
 (defun claude-code-ide-handover--restart-target (run)
   "Start the target of RUN again after a crash, when no writer is left.
 The worktree scan runs first, and a target CLI that outlived the crash
@@ -1840,11 +1929,13 @@ person about stray processes."
             (claude-code-ide-handover--write-document run))
            ((eq stage 'committed)
             (claude-code-ide-handover--commit run))
+           ;; An identified target that never saved its conversation
+           ;; cannot be resumed: start it fresh, or ask a person
+           ((and (claude-code-ide-handover--stage< stage 'delivered)
+                 (claude-code-ide-handover--unsaved-target-p run))
+            (claude-code-ide-handover--recover-unsaved-target run))
            ;; Never both: the source is not started again
-           ((or (claude-code-ide-handover--run-target-native-id run)
-                (when-let* ((entry (claude-code-ide-session-registry-entry-of
-                                    (claude-code-ide-handover--run-target-id run))))
-                  (claude-code-ide-session-registry-entry-session-id entry)))
+           ((claude-code-ide-handover--target-native run)
             (claude-code-ide-handover--scan-then run 'resume-target))
            (t (claude-code-ide-handover--restart-target run)))
         (error
@@ -1869,7 +1960,10 @@ start time), not the owner of the source entry."
 A handover before the stage source-stopped is cancelled: its source
 stays current.  A later one never starts its source again: its target
 is resumed when its native ID is known, else started again with the
-same document.  Each run is claimed in the registry first, so that two
+same document.  A target whose native ID is known but whose
+conversation was never saved cannot be resumed; see
+`claude-code-ide-handover-unsaved-target'.  Each run is claimed in the
+registry first, so that two
 Emacs never recover the same handover.  With EARLY-ONLY, only cancel
 the early ones.  INTERACTIVE non-nil (always for the command) lets
 Emacs ask about stray processes.  Return the results."
