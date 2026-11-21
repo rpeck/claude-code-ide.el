@@ -1023,7 +1023,8 @@ LINES are the records, one string each.  Return the file."
   "The first lookup of an ID searches all of sessions once; the newest rollout wins.
 A newer rollout in a day folder that is neither today nor near the
 creation day counts, also when the creation day holds an older one.
-Later lookups and rechecks do not search all of sessions again."
+Later lookups and rechecks within the recheck limit do not search all
+of sessions again."
   (claude-code-ide-codex-tests--with-home
     (let* ((sessions (expand-file-name "sessions" home))
            (walks 0)
@@ -1135,6 +1136,24 @@ the full search one time, and the cached file stays a candidate."
                           (lambda (&rest _) (setq walks (1+ walks)) nil)))
                  (should (equal (claude-code-ide-codex-rollout-file id) third)))
                (should (= walks 3))))))))))
+
+(ert-deftest claude-code-ide-test-codex-rollout-recheck-max-days-large ()
+  "A large `claude-code-ide-codex-rollout-recheck-max-days' skips no day.
+The day folders of a recheck span at most a year; a longer gap runs the
+full search, also when the option allows more days."
+  (claude-code-ide-codex-tests--with-home
+    (claude-code-ide-tests--call-with-clock
+     (lambda ()
+       (let* ((claude-code-ide-codex-rollout-recheck-max-days 500)
+              (start (claude-code-ide-codex-tests--local-time 460 12 0 0))
+              (id (claude-code-ide-codex-tests--uuid7 (- start 86400)))
+              (old (claude-code-ide-codex-tests--rollout home (- start 86400) id)))
+         (setq claude-code-ide-tests--clock start)
+         (should (equal (claude-code-ide-codex-rollout-file id) old))
+         ;; 450 days without a lookup; a resume wrote a rollout on day 420
+         (let ((resume (claude-code-ide-codex-tests--rollout home (+ start (* 420 86400)) id)))
+           (claude-code-ide-tests--advance-clock (* 450 86400))
+           (should (equal (claude-code-ide-codex-rollout-file id) resume))))))))
 
 (ert-deftest claude-code-ide-test-codex-rollout-cache-limit-lowered ()
   "A lower limit trims the cache to it in one insert; the oldest entries go first.
