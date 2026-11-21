@@ -701,7 +701,8 @@ before the last check to today, and those of the creation time.")
   "Days after which a recheck searches the whole sessions folder.
 When more days passed since the last check of a found rollout file,
 the recheck runs the full search one time, in place of a read of each
-day folder; the cached file stays a candidate.")
+day folder; the cached file stays a candidate.  A value above 366
+counts as 366, as the day folders of a recheck span at most a year.")
 
 (defvar claude-code-ide-codex-rollout-miss-seconds 60
   "Seconds that a miss of the full search for a rollout file is kept.
@@ -893,7 +894,8 @@ by name wins.  The lookup is cheap:
                (file (cond
                       ;; A recheck after a long time: the full search, and the old file
                       ((and old (> (- now (plist-get cached :time))
-                                   (* claude-code-ide-codex-rollout-recheck-max-days 86400)))
+                                   (* (min claude-code-ide-codex-rollout-recheck-max-days 366)
+                                      86400)))
                        (claude-code-ide-codex--newest
                         (list old (claude-code-ide-codex--search-rollout sessions native-id))))
                       ;; A recheck: the day folders since the day before the last check
