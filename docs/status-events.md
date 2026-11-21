@@ -205,7 +205,19 @@ Rules:
 
 - **Subagents.** An event with `agent_id` belongs to a subagent. It never changes the turn of the main agent. A subagent's approval or question waits for the user too.
 - **Deny and Esc.** Both give only `Interrupt`. Emacs cannot tell them apart.
-- **Allow.** No event shows it. The approval stays until the `PostToolUse` of the tool. Without a screen read, the approval is a guess after `claude-code-ide-codex-events-approval-guess-time` (10 seconds). The result of a screen read belongs to each approval of the main agent, so the end of a subagent does not change it.
+- **Allow.** No event shows it. The approval stays until the `PostToolUse` of the tool, a `Stop`, an `Interrupt`, or the end of the session. Without a screen read that confirms the dialog, the approval is a guess after `claude-code-ide-codex-events-approval-guess-time` (10 seconds). The result of a screen read belongs to each approval of the main agent, so the end of a subagent does not change it.
+- **A screen read without the dialog.** `claude-code-ide-codex-events-approval-end` decides whether it ends the wait for an approval:
+
+| Value | A read without the dialog ends the wait | Use |
+|---|---|---|
+| `window` (default) | Only when a window of a display shows the terminal | An eat buffer without a window keeps only the last lines of a dialog, so the read can miss it. Then only an event ends the wait. |
+| `event` | Never | A long tool run after an allow shows as `waiting-for-user/approval` (a guess after 10 s) until its `PostToolUse`. |
+| `screen` | Always | The rule before 1.2.0. In an eat buffer without a window, an open dialog can show as `working`. |
+
+- **Which window counts.** `claude-code-ide-codex-screen-window` gives a window of the terminal buffer on a frame of a display, visible or not. VERIFIED in an `emacs -Q` daemon:
+  - The initial frame of a daemon (and the frame of batch Emacs) is on the terminal `initial_terminal`. It says that it is visible (`frame-visible-p` is t), but nobody sees it. Its window does not count.
+  - A frame that is not visible, on a display (`(make-frame '((window-system . ns) (visibility . nil)))`), counts. `get-buffer-window` with ALL-FRAMES t finds its window; `visible` and 0 do not. L's live test showed that the terminal in such a window keeps the whole dialog.
+  - A daemon without a client frame has no window that counts. Its eat buffers keep the tail of a dialog only (L's bug 3: "Field 1/1", "› 1. Allow  Run the tool and", "option 1/2 | enter to submit | esc").
 - **Automatic review.** It gives the same events as a user dialog.
 - **Background terminals** give no events. So Codex never shows `waiting-for-task/background-task`.
 - **A killed terminal buffer** gives no `SessionEnd`. The process check of `claude-code-ide-instance-state` gives `disconnected`.
@@ -277,9 +289,9 @@ The tests use these texts as fixtures (`claude-code-ide-codex-events-tests--quot
 2. A failed model request: `failed/error` or `failed/quota-limit`.
 3. An open question: `waiting-for-user/question`.
 4. An open approval:
-   - The screen shows the approval dialog: `waiting-for-user/approval`, not a guess.
-   - The screen shows no dialog: `working`, a guess ("Approved, runs?").
-   - No screen read: `waiting-for-user/approval`, a guess after 10 seconds.
+   - The screen shows the approval dialog, also only its tail: `waiting-for-user/approval`, not a guess.
+   - A read found no dialog, and the rule of `claude-code-ide-codex-events-approval-end` lets that end the wait (by default: a window of a display shows the terminal): `working`, a guess ("Approved, runs?").
+   - Else: `waiting-for-user/approval`, a guess after 10 seconds.
 5. A startup dialog on the screen: `waiting-for-user/dialog`.
 6. A subagent runs: `waiting-for-task/subagent`.
 7. No event yet. Codex sends `SessionStart` only with the first prompt:
@@ -408,6 +420,7 @@ A failure whose plan does not include Codex (see "Quota limits") is `failed/quot
 | `claude-code-ide-codex-events-trust-timeout` | 5 | Seconds that a start waits for the trust check. |
 | `claude-code-ide-codex-events-startup-grace` | 3 | Seconds before the first screen read of a launch. |
 | `claude-code-ide-codex-events-approval-guess-time` | 10 | Seconds after which an unconfirmed approval is a guess. |
+| `claude-code-ide-codex-events-approval-end` | `window` | When a screen read without the dialog ends the wait for an approval: `window`, `event`, or `screen`. |
 | `claude-code-ide-session-status-quota-regexp` | see "Quota limits" | The usage-limit pattern of both providers. |
 | `claude-code-ide-session-status-transient-regexp` | see "Quota limits" | Texts of short limits, which are never a usage limit (both providers). |
 | `claude-code-ide-codex-events-error-kind-states` | see "Quota limits" | The state of each Codex error kind: `quota-limit` or `error`. |
