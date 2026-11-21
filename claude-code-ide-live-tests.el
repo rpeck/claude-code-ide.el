@@ -73,14 +73,19 @@ The test skips unless the live tests may run here
 \(`claude-code-ide-live-tests--live-p'); else the setup runs.  Before
 BODY, every instance of this Emacs stops.  After BODY, also after a
 failure or a skip, every instance stops again and the codeword files
-of the test projects go."
+that the test made go.
+
+When BODY starts with :keep-instances, nothing stops before BODY: the
+test checks instances that this Emacs started before it, such as the
+target that the recovery at the start of Emacs started."
   (declare (indent 0))
-  `(progn
-     (claude-code-ide-live-tests--skip-unless-live)
-     (claude-code-ide-live-tests--stop-all)
-     (unwind-protect
-         (progn ,@body)
-       (claude-code-ide-live-tests--cleanup))))
+  (let ((keep (eq (car body) :keep-instances)))
+    `(progn
+       (claude-code-ide-live-tests--skip-unless-live)
+       ,@(unless keep '((claude-code-ide-live-tests--stop-all)))
+       (unwind-protect
+           (progn ,@(if keep (cdr body) body))
+         (claude-code-ide-live-tests--cleanup)))))
 
 (defun claude-code-ide-live-tests--root ()
   "Return the live folder, with a final slash."
@@ -205,13 +210,53 @@ replaces all but the bypass."
   (when-let* ((start (alist-get 'start (process-attributes pid))))
     (float-time start)))
 
+(defvar claude-code-ide-live-tests--claim-wait 5
+  "Seconds that a claim of a live folder waits at most for the claim lock.")
+
+(defconst claude-code-ide-live-tests--claim-stale 10
+  "Seconds after which a claim lock is old: its Emacs died while it held it.
+A claim holds the lock for milliseconds.")
+
 (defun claude-code-ide-live-tests--claim-root (root)
   "Claim the live folder ROOT for this Emacs, or signal a `user-error'.
 The file owner in ROOT holds the process ID and the start time of the
 Emacs that uses ROOT.  Two daemons must not share one live folder: they
-would share the registry, the inbox and the hooks.  A claim of an Emacs
-that ended, or of a process ID that now names another process, is old
-and is replaced."
+would share the registry, the inbox and the hooks.
+
+The claim runs under a lock: the folder owner.lock in ROOT, made with
+`make-directory' without parents, which fails when the folder exists.
+So of two daemons that start at the same time, only one checks and
+writes the owner at a time.  A lock older than
+`claude-code-ide-live-tests--claim-stale' seconds is removed; after
+`claude-code-ide-live-tests--claim-wait' seconds the claim gives up."
+  (let ((lock (expand-file-name "owner.lock" root))
+        (deadline (+ (float-time) claude-code-ide-live-tests--claim-wait))
+        (held nil))
+    (while (not held)
+      (condition-case nil
+          (progn
+            (make-directory lock)
+            (setq held t))
+        (file-already-exists
+         (let ((attributes (file-attributes lock)))
+           (cond
+            ((and attributes
+                  (> (float-time (time-subtract nil (file-attribute-modification-time attributes)))
+                     claude-code-ide-live-tests--claim-stale))
+             (ignore-errors (delete-directory lock)))
+            ((> (float-time) deadline)
+             (user-error "Another Emacs claims the live folder %s now (lock %s)" root lock))
+            (t (sleep-for 0.1)))))))
+    (unwind-protect
+        (claude-code-ide-live-tests--claim-root-1 root)
+      (ignore-errors (delete-directory lock)))))
+
+(defun claude-code-ide-live-tests--claim-root-1 (root)
+  "Claim ROOT for this Emacs; the caller holds the claim lock.
+A claim of an Emacs that ended, or of a process ID that now names
+another process, is old and is replaced.  A folder that has files but
+no owner file is no live folder, for example a folder of the user that
+CLAUDE_CODE_IDE_LIVE_DIR names: the claim refuses it."
   (let* ((file (expand-file-name "owner" root))
          (own (claude-code-ide-live-tests--start-time (emacs-pid)))
          (claim (when (file-readable-p file)
@@ -220,6 +265,11 @@ and is replaced."
                     (mapcar #'string-to-number (split-string (buffer-string))))))
          (pid (car claim))
          (start (cadr claim)))
+    ;; A new folder has only the lock
+    (when (and (not (file-exists-p file))
+               (remove "owner.lock" (directory-files root nil directory-files-no-dot-files-regexp)))
+      (user-error "%s has files and no owner file, so it is no live folder; choose an empty or new folder"
+                  root))
     (when (and (integerp pid) (> pid 0) (/= pid (emacs-pid)) (numberp start))
       (let ((now (claude-code-ide-live-tests--start-time pid)))
         (when (and now (< (abs (- now start)) 1.0))
@@ -229,7 +279,14 @@ and is replaced."
 
 (defun claude-code-ide-live-tests-setup ()
   "Point the package at the live folder and turn on the session registry.
-It runs once in each Emacs; a second call does nothing."
+It runs once in each Emacs; a second call does nothing.  It runs only
+where the live tests may run (`claude-code-ide-live-tests--live-p'):
+elsewhere, for example in batch Emacs or in a person's Emacs, it
+signals a `user-error' before it changes anything, because it changes
+the options of the package, adds advice, and turns on the session
+registry, whose recovery can start CLIs."
+  (unless (claude-code-ide-live-tests--live-p)
+    (user-error "The live test setup runs only in an own daemon with CLAUDE_CODE_IDE_LIVE_TESTS=1; see docs/live-tests.md"))
   (unless claude-code-ide-live-tests--setup-done
     (let ((root (claude-code-ide-live-tests--root)))
       (make-directory root t)
@@ -376,11 +433,29 @@ Return its status plist, or nil after SECONDS."
   "Return a new codeword that starts with PREFIX, such as PREFIX-482."
   (format "%s-%03d" prefix (+ 100 (random 900))))
 
+(defvar claude-code-ide-live-tests--created-files nil
+  "The codeword files that the tests of this Emacs made and did not delete yet.")
+
 (defun claude-code-ide-live-tests--write-secret (directory name codeword)
-  "Write CODEWORD to the file NAME in DIRECTORY, and return the file."
+  "Write CODEWORD to the new file NAME in DIRECTORY, and return the file.
+The file must not exist: the write uses the `excl' flag, so a file of
+the user is never overwritten.  The file is recorded, so that
+`claude-code-ide-live-tests--delete-secret' and the cleanup delete it,
+and only it."
   (let ((file (expand-file-name name directory)))
-    (write-region (concat "The codeword is " codeword ".\n") nil file nil 'silent)
+    (write-region (concat "The codeword is " codeword ".\n") nil file nil 'silent nil 'excl)
+    (push file claude-code-ide-live-tests--created-files)
     file))
+
+(defun claude-code-ide-live-tests--delete-secret (file)
+  "Delete the codeword FILE when a test of this Emacs made it.
+A file that no test made, or that is no regular file now (for example a
+link), stays."
+  (when (member file claude-code-ide-live-tests--created-files)
+    (when (and (file-regular-p file) (not (file-symlink-p file)))
+      (delete-file file))
+    (setq claude-code-ide-live-tests--created-files
+          (delete file claude-code-ide-live-tests--created-files))))
 
 (defun claude-code-ide-live-tests--launch (directory provider prompt)
   "Start PROVIDER in DIRECTORY with the first PROMPT, and return the instance ID."
@@ -408,15 +483,11 @@ So this stop of the tests binds `kill-buffer-query-functions' to nil."
    30 "the end of all instances"))
 
 (defun claude-code-ide-live-tests--cleanup ()
-  "Stop every instance, and delete the codeword files of the projects.
-The codeword files are note-*.txt in the folders of the live folder."
+  "Stop every instance, and delete the codeword files that the tests made.
+Only the files of `claude-code-ide-live-tests--created-files' go."
   (ignore-errors (claude-code-ide-live-tests--stop-all))
-  (let ((root (claude-code-ide-live-tests--root)))
-    (when (file-directory-p root)
-      (dolist (dir (directory-files root t "\\`[^.]"))
-        (when (file-directory-p dir)
-          (dolist (file (directory-files dir t "\\`note-.*\\.txt\\'"))
-            (ignore-errors (delete-file file))))))))
+  (dolist (file (copy-sequence claude-code-ide-live-tests--created-files))
+    (ignore-errors (claude-code-ide-live-tests--delete-secret file))))
 
 (defun claude-code-ide-live-tests--buffer (instance-id)
   "Return the terminal buffer of INSTANCE-ID."
@@ -709,7 +780,7 @@ say it later.  With PROMPT-ONLY, return the prompt and do nothing else."
         prompt
       (claude-code-ide-live-tests--write-secret directory file-name codeword)
       (should (claude-code-ide-live-tests--submit-and-reply instance-id prompt))
-      (delete-file (expand-file-name file-name directory)))))
+      (claude-code-ide-live-tests--delete-secret (expand-file-name file-name directory)))))
 
 (defun claude-code-ide-live-tests--first-turn (instance-id directory file-name codeword)
   "Wait for the first turn of INSTANCE-ID, then delete FILE-NAME.
@@ -717,7 +788,7 @@ That turn reads the file.
 The file with CODEWORD in DIRECTORY must exist before the start."
   (ignore codeword)
   (should (claude-code-ide-live-tests--wait-turn instance-id 0 claude-code-ide-live-tests--turn-limit))
-  (delete-file (expand-file-name file-name directory)))
+  (claude-code-ide-live-tests--delete-secret (expand-file-name file-name directory)))
 
 (defun claude-code-ide-live-tests--request-id (label)
   "Return a new request ID that starts with LABEL.
@@ -754,6 +825,20 @@ Only requests after the float time AFTER count.  The tool is the
 tool_name of the PermissionRequest hook."
   (when-let* ((event (claude-code-ide-live-tests--event instance-id 'approval-request after)))
     (claude-code-ide-handover--event-value (plist-get event :data) "tool_name")))
+
+(defun claude-code-ide-live-tests--expect-approval (instance-id tool after seconds)
+  "Check that the pending approval request of INSTANCE-ID names exactly TOOL.
+The request is the newest PermissionRequest event after the float time
+AFTER; the test waits for it at most SECONDS.  Any other tool, or no
+request, fails the test, so that the person in the test never allows
+a call that the test did not ask for.  Return non-nil."
+  (let ((named (claude-code-ide-live-tests--wait
+                (lambda () (claude-code-ide-live-tests--approval-tool instance-id after))
+                seconds (format "an approval request of %s" instance-id))))
+    (claude-code-ide-live-tests--log "%s asks to approve %S" instance-id named)
+    (unless (equal named tool)
+      (ert-fail (format "%s asks to approve %S, not %s" instance-id named tool)))
+    t))
 
 (defun claude-code-ide-live-tests--approve-while (instance-id predicate seconds &optional after)
   "Wait until PREDICATE is non-nil, and approve the read tools of INSTANCE-ID.
@@ -883,20 +968,43 @@ The state summary must exist then.  Return the target ID."
                             (file-name-directory (plist-get status :document)))))
     target))
 
+(defun claude-code-ide-live-tests--session-tool-call (record)
+  "Return the claude-sessions tool that the rollout RECORD calls, or nil.
+RECORD is one parsed line of a Codex rollout, an alist.  Two records
+are calls, read by their fields only, never by the text in them:
+- an `item_completed' event whose item is an McpToolCall of the server
+  claude-sessions with the status completed (Codex in code mode calls
+  MCP tools from its exec tool, and records each call so);
+- a `function_call' response item whose name is
+  mcp__claude_sessions__TOOL (a direct call)."
+  (let* ((payload (alist-get 'payload record))
+         (kind (alist-get 'type payload)))
+    (cond
+     ((and (equal (alist-get 'type record) "event_msg") (equal kind "item_completed"))
+      (let ((item (alist-get 'item payload)))
+        (and (equal (alist-get 'type item) "McpToolCall")
+             (equal (alist-get 'server item) "claude-sessions")
+             (equal (alist-get 'status item) "completed")
+             (stringp (alist-get 'tool item))
+             (alist-get 'tool item))))
+     ((and (equal (alist-get 'type record) "response_item") (equal kind "function_call"))
+      (let ((name (alist-get 'name payload)))
+        (and (stringp name)
+             (string-match "\\`mcp__claude_sessions__\\([a-z_]+\\)\\'" name)
+             (match-string 1 name)))))))
+
 (defun claude-code-ide-live-tests--session-tool-calls (rollout)
   "Return the names of the claude-sessions tools that the Codex ROLLOUT calls.
-A tool call is a record of the type function_call, custom_tool_call or
-mcp_tool_call; Codex in code mode calls MCP tools from its exec tool,
-as tools.mcp__claude_sessions__NAME."
+See `claude-code-ide-live-tests--session-tool-call'.  A line that is no
+JSON object counts as no call."
   (let ((names nil))
     (dolist (line (split-string (claude-code-ide-live-tests--file-text rollout) "\n" t))
-      (when (string-match-p "\"type\":\"\\(?:function_call\\|custom_tool_call\\|mcp_tool_call[a-z_]*\\)\"" line)
-        (let ((start 0))
-          (while (string-match "mcp__claude_sessions__\\([a-z_]+\\)" line start)
-            (cl-pushnew (match-string 1 line) names :test #'equal)
-            (setq start (match-end 0))))
-        (when (string-match-p "\"server\":\"claude-sessions\"" line)
-          (cl-pushnew "mcp_tool_call" names :test #'equal))))
+      (when-let* ((record (ignore-errors
+                            (json-parse-string line :object-type 'alist :array-type 'list
+                                               :null-object nil :false-object nil)))
+                  ((consp record))
+                  (tool (claude-code-ide-live-tests--session-tool-call record)))
+        (cl-pushnew tool names :test #'equal)))
     (nreverse names)))
 
 ;;; The handover tests
@@ -1148,6 +1256,8 @@ the source never starts again, that the target runs with its instance
 ID, that the handover commits, and that the target has the work."
   :tags '(:live)
   (claude-code-ide-live-tests--live
+    ;; The recovery started the target already; it must still run
+    :keep-instances
     (skip-unless (file-exists-p (claude-code-ide-live-tests--recovery-file)))
     (let* ((state (with-temp-buffer
                     (insert-file-contents (claude-code-ide-live-tests--recovery-file))
@@ -1306,6 +1416,7 @@ it.  Return the submit result."
       (claude-code-ide-live-tests--stop-all)
       ;; 3. Approval: an MCP tool that needs an approval
       (let* ((claude-code-ide-mcp-allowed-tools nil)
+             (launched (float-time))
              (id (claude-code-ide-live-tests--launch
                   trusted 'codex
                   (concat tag "-approval: call the MCP tool mcp__emacs_tools__claude_code_ide_mcp_project_info one time (it is in ALL_TOOLS), then reply with the single word called"))))
@@ -1314,6 +1425,10 @@ it.  Return the submit result."
                         id 'approval '(waiting-for-user approval) (concat tag "-queued")))
                (request (plist-get result :request-id))
                (text (claude-code-ide-live-tests--dialog-prompt (concat tag "-queued"))))
+          ;; The person allows only the call that the test asked for:
+          ;; the pending request must name that tool, else the test fails
+          (claude-code-ide-live-tests--expect-approval
+           id "mcp__emacs_tools__claude_code_ide_mcp_project_info" launched 30)
           ;; The person allows the call; the first turn ends
           (claude-code-ide-live-tests--send-key id 'return)
           (should (claude-code-ide-live-tests--wait-turn id 0 claude-code-ide-live-tests--turn-limit))
@@ -1451,21 +1566,179 @@ question blocks Emacs."
       (should-not (string-match-p "--allowedTools [^ ]*Bash" flags)))))
 
 (ert-deftest claude-code-ide-live-tests-test-every-live-test-skips ()
-  "Each live test skips here, before it does anything.
-A live test without the gate would start the CLIs in the batch suite."
+  "Each live test skips with a closed gate, before it does anything.
+A live test without the gate would start the CLIs in the batch suite.
+The gate is closed here also in a live daemon, so that this test never
+runs a live body: no setup, no cleanup, no stop, no launch."
   (let ((tests (cl-remove-if-not
                 (lambda (test)
                   (string-prefix-p "claude-code-ide-live-test-" (symbol-name (ert-test-name test))))
                 (ert-select-tests t t)))
-        (launches 0))
+        (calls nil))
     (should (> (length tests) 10))
-    (cl-letf (((symbol-function 'claude-code-ide-control-launch)
-               (lambda (&rest _) (cl-incf launches) (list :status 'error :reason 'cci-test))))
+    (cl-letf (((symbol-function 'claude-code-ide-live-tests--live-p) #'ignore)
+              ((symbol-function 'claude-code-ide-live-tests-setup)
+               (lambda (&rest _) (push 'setup calls)))
+              ((symbol-function 'claude-code-ide-live-tests--cleanup)
+               (lambda (&rest _) (push 'cleanup calls)))
+              ((symbol-function 'claude-code-ide-live-tests--stop-all)
+               (lambda (&rest _) (push 'stop-all calls)))
+              ((symbol-function 'claude-code-ide-control-launch)
+               (lambda (&rest _) (push 'launch calls) (list :status 'error :reason 'cci-test))))
       (dolist (test tests)
         (let ((result (ert-run-test test)))
           (should (equal (list (ert-test-name test) t)
                          (list (ert-test-name test) (ert-test-skipped-p result)))))))
-    (should (= launches 0))))
+    (should-not calls)))
+
+(ert-deftest claude-code-ide-live-tests-test-setup-needs-gate ()
+  "The setup refuses to run outside a live test daemon, before it changes anything."
+  (let ((claude-code-ide-live-tests--setup-done nil)
+        (claude-code-ide-state-file "/cci-test/unchanged.json")
+        (claude-code-ide-cli-extra-flags "cci-test-flags")
+        (claude-code-ide-cli-environment-unset '("CCI_TEST_ONLY"))
+        (claude-code-ide-enable-mcp-server nil)
+        (changes nil))
+    (cl-letf (((symbol-function 'claude-code-ide-live-tests--live-p) #'ignore)
+              ((symbol-function 'advice-add) (lambda (&rest args) (push (cons 'advice args) changes)))
+              ((symbol-function 'add-hook) (lambda (&rest args) (push (cons 'hook args) changes)))
+              ((symbol-function 'make-directory) (lambda (&rest args) (push (cons 'mkdir args) changes)))
+              ((symbol-function 'claude-code-ide-live-tests--claim-root)
+               (lambda (&rest args) (push (cons 'claim args) changes)))
+              ((symbol-function 'claude-code-ide-emacs-tools-setup)
+               (lambda (&rest args) (push (cons 'tools args) changes)))
+              ((symbol-function 'claude-code-ide-session-registry-mode)
+               (lambda (&rest args) (push (cons 'registry args) changes))))
+      (should-error (claude-code-ide-live-tests-setup) :type 'user-error))
+    (should-not changes)
+    (should-not claude-code-ide-live-tests--setup-done)
+    (should (equal claude-code-ide-state-file "/cci-test/unchanged.json"))
+    (should (equal claude-code-ide-cli-extra-flags "cci-test-flags"))
+    (should (equal claude-code-ide-cli-environment-unset '("CCI_TEST_ONLY")))
+    (should-not claude-code-ide-enable-mcp-server)))
+
+(ert-deftest claude-code-ide-live-tests-test-codeword-files ()
+  "A test creates only new codeword files, and the cleanup deletes only those."
+  (claude-code-ide-live-tests--with-temp-folder root
+    (let* ((process-environment (cons (concat "CLAUDE_CODE_IDE_LIVE_DIR=" root) process-environment))
+           (project (file-name-as-directory (expand-file-name "projA" root)))
+           (user-file (expand-file-name "note-user.txt" project))
+           (outside (file-name-as-directory (expand-file-name "outside" root)))
+           (outside-file (expand-file-name "note-outside.txt" outside))
+           (claude-code-ide-live-tests--created-files nil))
+      (make-directory project t)
+      (make-directory outside t)
+      (write-region "the user's note\n" nil user-file nil 'silent)
+      (write-region "the user's other note\n" nil outside-file nil 'silent)
+      ;; A child folder that links elsewhere
+      (make-symbolic-link outside (expand-file-name "linked" root))
+      ;; A file that exists is never overwritten
+      (should-error (claude-code-ide-live-tests--write-secret project "note-user.txt" "CCI-TEST-1"))
+      (should (equal (claude-code-ide-live-tests--file-text user-file) "the user's note\n"))
+      ;; A new file is written and recorded
+      (let ((file (claude-code-ide-live-tests--write-secret project "note-1.txt" "CCI-TEST-2")))
+        (should (file-exists-p file))
+        (should (member file claude-code-ide-live-tests--created-files))
+        (claude-code-ide-live-tests--cleanup)
+        (should-not (file-exists-p file)))
+      ;; The files that no test made stay
+      (should (file-exists-p user-file))
+      (should (file-exists-p outside-file))
+      (should-not claude-code-ide-live-tests--created-files))))
+
+(ert-deftest claude-code-ide-live-tests-test-claim-lock ()
+  "The claim of a live folder takes a lock folder first, as one atomic step."
+  (claude-code-ide-live-tests--with-temp-folder root
+    (let ((lock (expand-file-name "owner.lock" root)))
+      ;; Another Emacs holds the lock now: the claim gives up
+      (make-directory lock)
+      (let ((claude-code-ide-live-tests--claim-wait 0.3))
+        (should-error (claude-code-ide-live-tests--claim-root root) :type 'user-error))
+      (should-not (file-exists-p (expand-file-name "owner" root)))
+      ;; A lock of an Emacs that died while it held it is old
+      (set-file-times lock (time-subtract nil 60))
+      (claude-code-ide-live-tests--claim-root root)
+      (should (file-exists-p (expand-file-name "owner" root)))
+      ;; The claim leaves no lock behind
+      (should-not (file-exists-p lock)))))
+
+(ert-deftest claude-code-ide-live-tests-test-approval-names-tool ()
+  "The person in a test allows only the tool that the test expects."
+  (let ((claude-code-ide-live-tests--events
+         (list (cons 20.0 (list :instance-id "cci-test-a" :event 'approval-request
+                                :data '((tool_name . "mcp__emacs_tools__emacs_eval"))))
+               (cons 10.0 (list :instance-id "cci-test-b" :event 'approval-request
+                                :data '((tool_name . "mcp__emacs_tools__claude_code_ide_mcp_project_info")))))))
+    (should (claude-code-ide-live-tests--expect-approval
+             "cci-test-b" "mcp__emacs_tools__claude_code_ide_mcp_project_info" 0 0.2))
+    (should-error (claude-code-ide-live-tests--expect-approval
+                   "cci-test-a" "mcp__emacs_tools__claude_code_ide_mcp_project_info" 0 0.2)
+                  :type 'ert-test-failed)
+    ;; No request at all fails too
+    (should-error (claude-code-ide-live-tests--expect-approval
+                   "cci-test-c" "mcp__emacs_tools__claude_code_ide_mcp_project_info" 0 0.2)
+                  :type 'ert-test-failed)))
+
+(ert-deftest claude-code-ide-live-tests-test-session-tool-calls ()
+  "Only real calls of the claude-sessions tools count, by the tool fields of the record."
+  (claude-code-ide-live-tests--with-temp-folder root
+    (let ((rollout (expand-file-name "rollout.jsonl" root))
+          (lines
+           (list
+            ;; An exec call that only prints the name
+            '((type . "response_item")
+              (payload . ((type . "custom_tool_call") (name . "exec")
+                          (input . "text(\"mcp__claude_sessions__get_messages\")"))))
+            ;; Its text in a message
+            '((type . "response_item")
+              (payload . ((type . "message")
+                          (content . [((type . "output_text")
+                                       (text . "I call mcp__claude_sessions__get_session_outline"))]))))
+            ;; A call of another server
+            '((type . "event_msg")
+              (payload . ((type . "item_completed")
+                          (item . ((type . "McpToolCall") (server . "emacs-tools")
+                                   (tool . "get_messages") (status . "completed"))))))
+            ;; A failed call
+            '((type . "event_msg")
+              (payload . ((type . "item_completed")
+                          (item . ((type . "McpToolCall") (server . "claude-sessions")
+                                   (tool . "get_session_outline") (status . "failed"))))))
+            ;; Real calls: an MCP item of code mode, and a direct function call
+            '((type . "event_msg")
+              (payload . ((type . "item_completed")
+                          (item . ((type . "McpToolCall") (server . "claude-sessions")
+                                   (tool . "get_messages") (status . "completed"))))))
+            '((type . "response_item")
+              (payload . ((type . "function_call")
+                          (name . "mcp__claude_sessions__get_session_outline")))))))
+      (with-temp-file rollout
+        (dolist (line (butlast lines 2))
+          (insert (json-encode line) "\n")))
+      (should-not (claude-code-ide-live-tests--session-tool-calls rollout))
+      (with-temp-file rollout
+        (dolist (line lines)
+          (insert (json-encode line) "\n"))
+        (insert "not json\n"))
+      (should (equal (claude-code-ide-live-tests--session-tool-calls rollout)
+                     '("get_messages" "get_session_outline"))))))
+
+(ert-deftest claude-code-ide-live-tests-test-recovery-keeps-target ()
+  "The recovery test does not stop the recovered target before it checks it."
+  (let ((calls nil))
+    (cl-letf (((symbol-function 'claude-code-ide-live-tests--live-p) (lambda () t))
+              ((symbol-function 'claude-code-ide-live-tests-setup) #'ignore)
+              ((symbol-function 'claude-code-ide-live-tests--stop-all)
+               (lambda (&rest _) (push 'stop-all calls)))
+              ((symbol-function 'claude-code-ide-live-tests--cleanup)
+               (lambda (&rest _) (push 'cleanup calls)))
+              ;; No recovery state: the body skips at once
+              ((symbol-function 'claude-code-ide-live-tests--recovery-file)
+               (lambda () "/cci-test/no-such-recovery.eld")))
+      (let ((result (ert-run-test (ert-get-test 'claude-code-ide-live-test-recovery-2-after-kill))))
+        (should (ert-test-skipped-p result))))
+    ;; Only the cleanup after the body, no stop before it
+    (should (equal calls '(cleanup)))))
 
 (ert-deftest claude-code-ide-live-tests-test-gate ()
   "The live tests run only in a daemon, outside batch mode, without the mocks."
