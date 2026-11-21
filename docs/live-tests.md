@@ -22,7 +22,11 @@ They check what the unit tests cannot: the handover between real conversations, 
 - **Codex needs the `claude-sessions` MCP server** for the test `handover-chain`. It reads past Claude Code sessions. The user's Codex config must have a `[mcp_servers.claude-sessions]` table. Without it, the document has no session tools, and the test fails.
 - **One live folder for each daemon.** Two daemons must not share one live folder: they would share the registry, the inbox, and the hooks.
   - The setup claims the folder in the file `owner` (the process ID and the start time of the Emacs). It refuses a folder that a live Emacs holds; use `CLAUDE_CODE_IDE_LIVE_DIR` for a second daemon.
-  - The claim runs under a lock: the folder `owner.lock`, made with `make-directory` without parents, which fails when the folder exists. So two daemons that start at the same time cannot both claim. A lock older than 10 seconds comes from an Emacs that died while it held the lock, and is removed.
+  - The claim runs under a lock: the folder `owner.lock`, made with `make-directory` without parents, which fails when the folder exists. So two daemons that start at the same time cannot both claim.
+    - The holder writes the file `owner.lock/holder`: its process ID and start time.
+    - A lock goes only when its holder is gone: no process has that ID, or the process with that ID started at another time. The age of a lock never counts, because a holder can pause. The lock moves aside with one rename first, and moves back when another claimant took it meanwhile.
+    - A lock without a holder file stays. After 5 seconds the claim gives up and names the lock; remove it by hand when no live test Emacs runs.
+    - The release removes the lock only when its holder file still names this Emacs.
   - A claim of an Emacs that ended counts as old, so the recovery test can start its second daemon.
   - A folder that has files but no `owner` file is no live folder, for example a folder of yours that `CLAUDE_CODE_IDE_LIVE_DIR` names by mistake. The setup refuses it.
 - **The setup runs only in a live daemon.** Where the gate is closed (batch Emacs, your own Emacs), `claude-code-ide-live-tests-setup` signals an error before it changes anything. It changes package options, adds advice, and turns on the session registry, whose recovery can start CLIs.

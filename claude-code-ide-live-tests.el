@@ -213,9 +213,49 @@ replaces all but the bypass."
 (defvar claude-code-ide-live-tests--claim-wait 5
   "Seconds that a claim of a live folder waits at most for the claim lock.")
 
-(defconst claude-code-ide-live-tests--claim-stale 10
-  "Seconds after which a claim lock is old: its Emacs died while it held it.
-A claim holds the lock for milliseconds.")
+(defun claude-code-ide-live-tests--holder-text ()
+  "Return the holder text of this Emacs: its process ID and start time."
+  (format "%d %s" (emacs-pid) (claude-code-ide-live-tests--start-time (emacs-pid))))
+
+(defun claude-code-ide-live-tests--lock-holder (lock)
+  "Return the text of the holder file in the claim LOCK folder, or nil."
+  (let ((file (expand-file-name "holder" lock)))
+    (when (file-regular-p file)
+      (with-temp-buffer
+        (insert-file-contents file)
+        (string-trim (buffer-string))))))
+
+(defun claude-code-ide-live-tests--holder-gone-p (holder)
+  "Return non-nil when the Emacs of the holder text HOLDER no longer runs.
+HOLDER is \"PID START\".  It is gone when no process has that PID, or
+when the process with that PID started at another time (the PID names
+another process now).  A holder text that cannot be read counts as not
+gone: the lock stays."
+  (let* ((parts (and (stringp holder) (split-string holder)))
+         (pid (and parts (string-to-number (car parts))))
+         (start (and (cadr parts) (string-to-number (cadr parts)))))
+    (when (and (integerp pid) (> pid 0))
+      (let ((now (claude-code-ide-live-tests--start-time pid)))
+        (or (null now)
+            (and (numberp start) (> start 0) (>= (abs (- now start)) 1.0)))))))
+
+(defun claude-code-ide-live-tests--remove-gone-lock (lock holder)
+  "Remove the claim LOCK of the HOLDER that is gone.
+The lock moves aside first, with one rename.  When the lock that moved
+has another holder (another claimant took the lock after the check),
+it moves back, and nothing is removed."
+  (let ((aside (make-temp-name (concat lock ".gone-"))))
+    (when (ignore-errors (rename-file lock aside) t)
+      (if (equal (claude-code-ide-live-tests--lock-holder aside) holder)
+          (ignore-errors (delete-directory aside t))
+        (ignore-errors (rename-file aside lock))))))
+
+(defun claude-code-ide-live-tests--release-lock (lock holder)
+  "Remove the claim LOCK when its holder file still says HOLDER.
+A lock that another claimant holds now stays."
+  (when (equal (claude-code-ide-live-tests--lock-holder lock) holder)
+    (ignore-errors (delete-file (expand-file-name "holder" lock)))
+    (ignore-errors (delete-directory lock))))
 
 (defun claude-code-ide-live-tests--claim-root (root)
   "Claim the live folder ROOT for this Emacs, or signal a `user-error'.
@@ -226,30 +266,39 @@ would share the registry, the inbox and the hooks.
 The claim runs under a lock: the folder owner.lock in ROOT, made with
 `make-directory' without parents, which fails when the folder exists.
 So of two daemons that start at the same time, only one checks and
-writes the owner at a time.  A lock older than
-`claude-code-ide-live-tests--claim-stale' seconds is removed; after
-`claude-code-ide-live-tests--claim-wait' seconds the claim gives up."
+writes the owner at a time.  The holder writes the file holder in the
+lock: its process ID and start time.
+
+- A lock goes only when its holder is gone
+  (`claude-code-ide-live-tests--holder-gone-p'), never because of its
+  age: a holder can pause.
+- A lock without a holder file stays: its holder may write it now.
+- After `claude-code-ide-live-tests--claim-wait' seconds the claim gives
+  up; a lock that stays is to be removed by hand.
+- The release removes the lock only when its holder file is still this
+  Emacs."
   (let ((lock (expand-file-name "owner.lock" root))
+        (mine (claude-code-ide-live-tests--holder-text))
         (deadline (+ (float-time) claude-code-ide-live-tests--claim-wait))
         (held nil))
     (while (not held)
       (condition-case nil
           (progn
             (make-directory lock)
+            (write-region mine nil (expand-file-name "holder" lock) nil 'silent)
             (setq held t))
         (file-already-exists
-         (let ((attributes (file-attributes lock)))
+         (let ((holder (claude-code-ide-live-tests--lock-holder lock)))
            (cond
-            ((and attributes
-                  (> (float-time (time-subtract nil (file-attribute-modification-time attributes)))
-                     claude-code-ide-live-tests--claim-stale))
-             (ignore-errors (delete-directory lock)))
+            ((and holder (claude-code-ide-live-tests--holder-gone-p holder))
+             (claude-code-ide-live-tests--remove-gone-lock lock holder))
             ((> (float-time) deadline)
-             (user-error "Another Emacs claims the live folder %s now (lock %s)" root lock))
+             (user-error "Another Emacs claims the live folder %s now (lock %s, holder %s); remove the lock when no live test Emacs runs"
+                         root lock (or holder "unknown")))
             (t (sleep-for 0.1)))))))
     (unwind-protect
         (claude-code-ide-live-tests--claim-root-1 root)
-      (ignore-errors (delete-directory lock)))))
+      (claude-code-ide-live-tests--release-lock lock mine))))
 
 (defun claude-code-ide-live-tests--claim-root-1 (root)
   "Claim ROOT for this Emacs; the caller holds the claim lock.
@@ -1661,21 +1710,74 @@ runs a live body: no setup, no cleanup, no stop, no launch."
       (should (file-exists-p outside-file))
       (should-not claude-code-ide-live-tests--created-files))))
 
+(defun claude-code-ide-live-tests--test-lock (root holder)
+  "Make the claim lock of ROOT, held by HOLDER (a text \"PID START\"), or by nobody.
+The lock is old: its time is a minute ago.  Return the lock folder."
+  (let ((lock (expand-file-name "owner.lock" root)))
+    (make-directory lock)
+    (when holder
+      (write-region holder nil (expand-file-name "holder" lock) nil 'silent))
+    (set-file-times lock (time-subtract nil 60))
+    lock))
+
 (ert-deftest claude-code-ide-live-tests-test-claim-lock ()
-  "The claim of a live folder takes a lock folder first, as one atomic step."
+  "The claim lock goes only when its holder no longer runs, never by its age.
+The holder file in the lock names the PID and the start time of the
+Emacs that holds it."
   (claude-code-ide-live-tests--with-temp-folder root
-    (let ((lock (expand-file-name "owner.lock" root)))
-      ;; Another Emacs holds the lock now: the claim gives up
-      (make-directory lock)
-      (let ((claude-code-ide-live-tests--claim-wait 0.3))
-        (should-error (claude-code-ide-live-tests--claim-root root) :type 'user-error))
-      (should-not (file-exists-p (expand-file-name "owner" root)))
-      ;; A lock of an Emacs that died while it held it is old
-      (set-file-times lock (time-subtract nil 60))
-      (claude-code-ide-live-tests--claim-root root)
-      (should (file-exists-p (expand-file-name "owner" root)))
-      ;; The claim leaves no lock behind
-      (should-not (file-exists-p lock)))))
+    (let ((owner (expand-file-name "owner" root))
+          (claude-code-ide-live-tests--claim-wait 0.3)
+          (other (make-process :name "cci-test-holder" :command '("sleep" "30")
+                               :connection-type 'pipe :noquery t)))
+      (unwind-protect
+          (let ((live (format "%d %s" (process-id other)
+                              (claude-code-ide-live-tests--start-time (process-id other)))))
+            ;; A live holder keeps its old lock: the claim gives up
+            (let ((lock (claude-code-ide-live-tests--test-lock root live)))
+              (should-error (claude-code-ide-live-tests--claim-root root) :type 'user-error)
+              (should (file-directory-p lock))
+              (should (equal (claude-code-ide-live-tests--file-text (expand-file-name "holder" lock))
+                             live))
+              (should-not (file-exists-p owner))
+              (delete-directory lock t))
+            ;; A lock without a holder file (its holder may write it now) stays
+            (let ((lock (claude-code-ide-live-tests--test-lock root nil)))
+              (should-error (claude-code-ide-live-tests--claim-root root) :type 'user-error)
+              (should (file-directory-p lock))
+              (delete-directory lock t))
+            ;; A PID that now names another process: the holder is gone
+            (claude-code-ide-live-tests--test-lock root (format "%d 1.0" (process-id other)))
+            (claude-code-ide-live-tests--claim-root root)
+            (should (file-exists-p owner))
+            (should-not (file-exists-p (expand-file-name "owner.lock" root)))
+            (delete-file owner)
+            ;; A dead holder: its lock goes, and the claim goes on
+            (claude-code-ide-live-tests--test-lock root "999999999 1.0")
+            (claude-code-ide-live-tests--claim-root root)
+            (should (file-exists-p owner))
+            (should-not (file-exists-p (expand-file-name "owner.lock" root))))
+        (delete-process other)))))
+
+(ert-deftest claude-code-ide-live-tests-test-claim-lock-holder ()
+  "The claim writes its holder file, and its release leaves the lock of another."
+  (claude-code-ide-live-tests--with-temp-folder root
+    (let* ((lock (expand-file-name "owner.lock" root))
+           (holder (expand-file-name "holder" lock))
+           (seen nil))
+      ;; While the claim holds the lock, the holder file names this Emacs
+      (cl-letf (((symbol-function 'claude-code-ide-live-tests--claim-root-1)
+                 (lambda (_root)
+                   (setq seen (claude-code-ide-live-tests--file-text holder)))))
+        (claude-code-ide-live-tests--claim-root root))
+      (should (string-prefix-p (format "%d " (emacs-pid)) seen))
+      (should-not (file-exists-p lock))
+      ;; Another claimant took the lock meanwhile: the release keeps it
+      (cl-letf (((symbol-function 'claude-code-ide-live-tests--claim-root-1)
+                 (lambda (_root)
+                   (write-region "999999998 2.0" nil holder nil 'silent))))
+        (claude-code-ide-live-tests--claim-root root))
+      (should (file-directory-p lock))
+      (should (equal (claude-code-ide-live-tests--file-text holder) "999999998 2.0")))))
 
 (ert-deftest claude-code-ide-live-tests-test-approval-names-tool ()
   "The person in a test allows only the tool that the test expects."
