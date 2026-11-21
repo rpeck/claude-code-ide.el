@@ -2414,19 +2414,27 @@ report folder; BODY writes it."
       (should (eq (car (claude-code-ide-codex-events-tests--full-state instance)) 'idle)))))
 
 (defun claude-code-ide-codex-events-tests--ret (buffer)
-  "Note a RET in the terminal BUFFER now, as a key in the terminal does."
+  "Run the command hooks of a RET in the terminal BUFFER, as a key there does."
   (with-current-buffer buffer
     (let ((last-command-event ?\r))
-      (claude-code-ide-codex-events--note-input))))
+      (run-hooks 'post-command-hook))))
 
 (defun claude-code-ide-codex-events-tests--rollout-name (time native)
   "Return the name of the rollout of NATIVE that Codex makes at the float TIME."
   (format "rollout-%s-%s.jsonl" (format-time-string "%Y-%m-%dT%H-%M-%S" (seconds-to-time time)) native))
 
+(defun claude-code-ide-codex-events-tests--package-hooks (buffer)
+  "Return the functions of this package in the local `post-command-hook' of BUFFER."
+  (with-current-buffer buffer
+    (cl-remove-if-not (lambda (fn)
+                        (and (symbolp fn) (string-prefix-p "claude-code-ide-" (symbol-name fn))))
+                      post-command-hook)))
+
 (ert-deftest claude-code-ide-codex-events-test-rollout-input-without-record ()
   "A RET that Codex answers without a rollout record changes nothing.
 This is a RET on an empty prompt, a slash command such as /status, or
-the answer to an approval while the tool runs for a long time."
+the answer to an approval while the tool runs for a long time.  Emacs
+does not watch the keys of the terminal."
   (claude-code-ide-codex-events-tests--with-rollout
     (let* ((buffer (claude-code-ide-instance-buffer instance))
            (now (float-time)))
@@ -2434,64 +2442,39 @@ the answer to an approval while the tool runs for a long time."
                                                   (claude-code-ide-codex-events-tests--complete "t1" 1000))
       (claude-code-ide-codex-events-tests--touch file (- now 100))
       (should (eq (plist-get (claude-code-ide-instance-state instance now) :state) 'idle))
-      ;; The state watches the terminal for RET; other keys do not count
-      (with-current-buffer buffer
-        (should (memq #'claude-code-ide-codex-events--note-input post-command-hook)))
       (claude-code-ide-codex-events-tests--ret buffer)
       ;; A minute later, no record came: the rollout state stays
       (let ((state (claude-code-ide-instance-state instance (+ now 60))))
         (should (equal (list (plist-get state :state) (plist-get state :guess) (plist-get state :source))
                        '(idle t rollout))))
-      ;; A new rollout of another instance of Emacs, or of another folder, is no new conversation here
-      (let ((other (claude-code-ide-codex-events-tests--instance "cci-test-other" 1))
-            (other-id "cci-test-0031-0000-4000-8000-000000000000")
-            (foreign-id "cci-test-0032-0000-4000-8000-000000000000"))
-        (setf (claude-code-ide-instance-native-id other) other-id)
-        (claude-code-ide-codex-events-tests--append
-         (expand-file-name (claude-code-ide-codex-events-tests--rollout-name (+ now 2) other-id) registry-dir)
-         (claude-code-ide-codex-events-tests--meta other-id))
-        (let ((coding-system-for-write 'utf-8-unix))
-          (write-region (claude-code-ide-codex-events-tests--rollout-record
-                         "session_meta" `((id . ,foreign-id) (cwd . "/tmp/cci-test-elsewhere/")))
-                        nil (expand-file-name (claude-code-ide-codex-events-tests--rollout-name (+ now 3) foreign-id)
-                                              registry-dir)
-                        nil 'silent))
-        (let ((state (claude-code-ide-instance-state instance (+ now 61))))
-          (should (equal (list (plist-get state :state) (plist-get state :source)) '(idle rollout))))))))
+      (should-not (claude-code-ide-codex-events-tests--package-hooks buffer)))))
 
-(ert-deftest claude-code-ide-codex-events-test-rollout-new-conversation-in-terminal ()
-  "A new rollout of another conversation in the same folder after a RET is UNTRACKED.
-That is /new or a fork in the terminal: the native ID of the instance
-stays, but the terminal shows another conversation."
+(ert-deftest claude-code-ide-codex-events-test-rollout-follows-known-conversation ()
+  "Without hooks, the state follows the rollout of the known native ID, also after /new.
+This is a limit of 1.2.0: after /new or a fork in the terminal, Codex
+makes a rollout of another conversation, but the native ID of the
+instance stays.  The state then comes from the old conversation, as a
+guess, until Emacs learns the new native ID."
   (claude-code-ide-codex-events-tests--with-rollout
     (let* ((buffer (claude-code-ide-instance-buffer instance))
            (now (float-time))
-           (new-id "cci-test-0033-0000-4000-8000-000000000000")
-           (new-file nil))
+           (new-id "cci-test-0033-0000-4000-8000-000000000000"))
       (claude-code-ide-codex-events-tests--append file (claude-code-ide-codex-events-tests--meta)
                                                   (claude-code-ide-codex-events-tests--complete "t1" 1000))
       (claude-code-ide-codex-events-tests--touch file (- now 100))
       (should (eq (plist-get (claude-code-ide-instance-state instance now) :state) 'idle))
       ;; /new and RET: Codex starts a rollout of another conversation in the same folder
       (claude-code-ide-codex-events-tests--ret buffer)
-      (setq new-file (expand-file-name (claude-code-ide-codex-events-tests--rollout-name (+ now 1) new-id)
-                                       registry-dir))
-      (claude-code-ide-codex-events-tests--append new-file (claude-code-ide-codex-events-tests--meta new-id))
-      ;; At once, not after a grace time
+      (claude-code-ide-codex-events-tests--append
+       (expand-file-name (claude-code-ide-codex-events-tests--rollout-name (+ now 1) new-id) registry-dir)
+       (claude-code-ide-codex-events-tests--meta new-id)
+       (claude-code-ide-codex-events-tests--started "n1" 1500))
       (let ((state (claude-code-ide-instance-state instance (+ now 2))))
-        (should (equal (list (plist-get state :state) (plist-get state :reason) (plist-get state :source))
-                       '(disconnected untracked nil))))
+        (should (equal (list (plist-get state :state) (plist-get state :reason)
+                             (plist-get state :guess) (plist-get state :source))
+                       '(idle nil t rollout))))
       (should (equal (claude-code-ide-codex-events--instance-detail instance (+ now 3))
-                     "No status hooks; the terminal shows another conversation (/new or a fork)"))
-      ;; A prompt in the new conversation, with its own RET: still UNTRACKED
-      (claude-code-ide-codex-events-tests--ret buffer)
-      (claude-code-ide-codex-events-tests--append new-file (claude-code-ide-codex-events-tests--started "n1" 1500))
-      (should (eq (plist-get (claude-code-ide-instance-state instance (+ now 30)) :reason) 'untracked))
-      ;; The old conversation gets a record again (a resume in the terminal): it counts again
-      (claude-code-ide-codex-events-tests--append file (claude-code-ide-codex-events-tests--started "t2" 2000))
-      (claude-code-ide-codex-events-tests--touch file (+ now 40))
-      (let ((state (claude-code-ide-instance-state instance (+ now 41))))
-        (should (equal (list (plist-get state :state) (plist-get state :source)) '(working rollout)))))))
+                     "From rollout: turn ended · No status hooks")))))
 
 (ert-deftest claude-code-ide-codex-events-test-rollout-session-record-without-newline ()
   "A whole session record at the end of the file, without its newline, is not used yet."
