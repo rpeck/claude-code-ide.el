@@ -38,19 +38,12 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT" || exit 1
 echo "Running compile and test checks..." >&2
 
-# Use $EMACS, else emacs on PATH, else a macOS application bundle such
-# as "Emacs.app" or "Emacs 30.1.app" (the last one in sort order wins)
-if [ -z "$EMACS" ]; then
-    if command -v emacs >/dev/null 2>&1; then
-        EMACS=emacs
-    else
-        EMACS=emacs
-        for app in /Applications/Emacs*.app ~/Applications/Emacs*.app; do
-            if [ -x "$app/Contents/MacOS/Emacs" ]; then
-                EMACS="$app/Contents/MacOS/Emacs"
-            fi
-        done
-    fi
+# Find Emacs (EMACS) and the package folders
+# shellcheck source=scripts/common.sh
+source "$SCRIPT_DIR/common.sh"
+if ! find_emacs; then
+    echo "Emacs not found (set EMACS); trying emacs" >&2
+    EMACS=emacs
 fi
 
 # Mocking primitives with cl-letf makes Emacs 29+ native-compile a
@@ -58,49 +51,18 @@ fi
 # without trampolines in batch mode.
 NO_TRAMPOLINES="(setq native-comp-enable-subr-trampolines nil)"
 
-# Function to check if Emacs package directory exists
-find_emacs_package() {
-    local package="$1"
-    # Check common locations
-    for dir in \
-        ~/.emacs.d/.cache/straight/repos/"$package" \
-        ~/.emacs.d/elpa/"$package"* \
-        ~/.config/emacs/.cache/straight/repos/"$package" \
-        ~/.config/emacs/elpa/"$package"*; do
-        if [ -d "$dir" ]; then
-            echo "$dir"
-            return 0
-        fi
-    done
-    return 1
-}
-
-# Build load path for dependencies
-LOAD_PATH="-L ."
-
-# Try to find optional dependencies
-if WEBSOCKET_DIR=$(find_emacs_package "emacs-websocket"); then
-    LOAD_PATH="$LOAD_PATH -L $WEBSOCKET_DIR"
-fi
-
-if TRANSIENT_DIR=$(find_emacs_package "transient"); then
-    LOAD_PATH="$LOAD_PATH -L $TRANSIENT_DIR"
-fi
-
-# Recent transient releases depend on cond-let and llama
-for package in cond-let llama; do
-    if PACKAGE_DIR=$(find_emacs_package "$package"); then
-        LOAD_PATH="$LOAD_PATH -L $PACKAGE_DIR"
-    fi
-done
-
-if VTERM_DIR=$(find_emacs_package "emacs-libvterm"); then
-    LOAD_PATH="$LOAD_PATH -L $VTERM_DIR"
-fi
+# Build load path for dependencies.  LOAD_PATH is an array, so a
+# package folder with a space stays one argument.  The optional
+# dependencies: websocket, transient (recent releases depend on
+# cond-let and llama), vterm, and web-server (the MCP tests that use the
+# real web-server package run when it is found, and are skipped
+# otherwise)
+LOAD_PATH=(-L .)
+add_emacs_packages emacs-websocket transient cond-let llama emacs-libvterm web-server
 
 # STEP 1: Compile all elisp files
 echo "=== Running byte-compilation check ===" >&2
-"$EMACS" -batch $LOAD_PATH \
+"$EMACS" -batch "${LOAD_PATH[@]}" \
     --eval "(setq byte-compile-warnings '(not free-vars unresolved))" \
     -f batch-byte-compile *.el
 COMPILE_EXIT_CODE=$?
@@ -124,7 +86,7 @@ if [ $COMPILE_EXIT_CODE -eq 0 ] && [ "$WITH_NATIVE_COMPILE" = true ]; then
     if [ "$NATIVE_COMPILE_AVAILABLE" = true ]; then
         echo "" >&2
         echo "=== Running native-compilation check ===" >&2
-        "$EMACS" -batch $LOAD_PATH -f batch-native-compile *.el
+        "$EMACS" -batch "${LOAD_PATH[@]}" -f batch-native-compile *.el
         NATIVE_COMPILE_EXIT_CODE=$?
 
         if [ $NATIVE_COMPILE_EXIT_CODE -eq 0 ]; then
@@ -155,7 +117,7 @@ TEST_FAILED=0
 if [ $COMPILE_EXIT_CODE -eq 0 ] && [ $NATIVE_COMPILE_EXIT_CODE -eq 0 ]; then
     echo "" >&2
     echo "=== Running tests ===" >&2
-    "$EMACS" -batch $LOAD_PATH --eval "$NO_TRAMPOLINES" -l ert -l claude-code-ide-tests.el -f ert-run-tests-batch-and-exit >&2
+    "$EMACS" -batch "${LOAD_PATH[@]}" --eval "$NO_TRAMPOLINES" -l ert -l claude-code-ide-tests.el -f ert-run-tests-batch-and-exit >&2
     TEST_EXIT_CODE=$?
 
     if [ $TEST_EXIT_CODE -eq 0 ]; then
@@ -164,6 +126,18 @@ if [ $COMPILE_EXIT_CODE -eq 0 ] && [ $NATIVE_COMPILE_EXIT_CODE -eq 0 ]; then
         echo "✗ Tests failed!" >&2
         TEST_FAILED=1
     fi
+
+    # The tests of the scripts: scripts/test-*.sh
+    for script_test in "$SCRIPT_DIR"/test-*.sh; do
+        echo "" >&2
+        echo "=== Running $(basename "$script_test") ===" >&2
+        if "$script_test"; then
+            echo "✓ $(basename "$script_test") passed!" >&2
+        else
+            echo "✗ $(basename "$script_test") failed!" >&2
+            TEST_FAILED=1
+        fi
+    done
 else
     echo "" >&2
     echo "=== Skipping tests due to compilation errors ===" >&2

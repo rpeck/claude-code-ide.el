@@ -17,6 +17,7 @@
 
 (require 'ert)
 (require 'cl-lib)
+(require 'subr-x)
 (require 'json)
 (require 'claude-code-ide)
 (require 'claude-code-ide-mcp)
@@ -1107,6 +1108,863 @@ of a coordinator ID never get the header."
     (should-not (alist-get 'X-Emacs-MCP-Coordinator
                            (claude-code-ide-mcp-routing-tests--config-headers "cci-test-inst-a")))
     (should-not (file-exists-p (claude-code-ide-mcp-server-coordinator-credential-file)))))
+
+;;; A body that arrives after the headers
+
+(cl-defstruct claude-code-ide-mcp-routing-tests--parsed-request
+  "A stand-in for a web-server request, with the active slot of the parser."
+  process headers body (active t))
+
+(defun claude-code-ide-mcp-routing-tests--initialize-body (id)
+  "Return the JSON text of an initialize request with ID."
+  (json-encode `((jsonrpc . "2.0") (id . ,id) (method . "initialize")
+                 (params . ,(make-hash-table)))))
+
+(defun claude-code-ide-mcp-routing-tests--post-parsed (request)
+  "Run the HTTP handler on REQUEST, a parsed-request stand-in.
+Return a plist: :thrown is the value thrown to `close-connection',
+:status and :body describe the reply (nil when none was sent), and
+:sent lists the strings that the handler sent to the process
+directly, oldest first."
+  (let ((reply (list :thrown nil :status nil :body nil :sent nil)))
+    (cl-letf (((symbol-function 'ws-headers)
+               #'claude-code-ide-mcp-routing-tests--parsed-request-headers)
+              ((symbol-function 'ws-body)
+               #'claude-code-ide-mcp-routing-tests--parsed-request-body)
+              ((symbol-function 'ws-response-header)
+               (lambda (_process status &rest _headers)
+                 (plist-put reply :status status)))
+              ((symbol-function 'ws-send)
+               (lambda (_process data)
+                 (plist-put reply :body
+                            (json-parse-string data :object-type 'alist))))
+              ((symbol-function 'process-send-string)
+               (lambda (_process string)
+                 (plist-put reply :sent
+                            (append (plist-get reply :sent) (list string))))))
+      (plist-put reply :thrown
+                 (catch 'close-connection
+                   (claude-code-ide-mcp-http-server--handle-post request)
+                   :no-throw)))
+    reply))
+
+(ert-deftest claude-code-ide-mcp-routing-test-content-length ()
+  "The one Content-Length parser gives a number, or a refusal.
+Only plain digits are a length; a GET without the header has none."
+  (should (equal 42 (claude-code-ide-mcp-http-server--body-length
+                     "POST" '((:CONTENT-LENGTH . "42")))))
+  (should (equal 0 (claude-code-ide-mcp-http-server--body-length "GET" nil)))
+  (should (equal 411 (car (claude-code-ide-mcp-http-server--body-length "POST" nil))))
+  (dolist (value '(" 0 " "12abc" "-1" "+1" "1.0" ""))
+    (should (equal 400 (car (claude-code-ide-mcp-http-server--body-length
+                             "POST" (list (cons :CONTENT-LENGTH value))))))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-handler-short-body ()
+  "The handler never parses a body that is shorter than its Content-Length.
+It answers 400 at once, and no tool runs."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (let* ((ran nil)
+           (claude-code-ide-mcp-server-tools
+            (list (list :function (lambda () (setq ran t) "cci-test")
+                        :name "cci_test_tool" :description "cci-test" :args nil)))
+           (body (json-encode '((jsonrpc . "2.0") (id . 41) (method . "tools/call")
+                                (params . ((name . "cci_test_tool"))))))
+           (request (make-claude-code-ide-mcp-routing-tests--parsed-request
+                     :process 'cci-test-process
+                     :headers `((:POST . "/mcp/cci-test-cowork")
+                                (:CONTENT-TYPE . "application/json")
+                                (:CONTENT-LENGTH . ,(number-to-string (string-bytes body))))
+                     :body (substring body 0 10)))
+           (reply (claude-code-ide-mcp-routing-tests--post-parsed request)))
+      (should (equal 400 (plist-get reply :status)))
+      (should-not (eq :keep-alive (plist-get reply :thrown)))
+      (should-not ran))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-body-multibyte-length ()
+  "Content-Length counts bytes, not characters.
+A body with non-ASCII text is complete when it has that many bytes."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (let* ((body (encode-coding-string
+                  (json-encode '((jsonrpc . "2.0") (id . 43) (method . "initialize")
+                                 (params . ((note . "cci-test \u00e9\u2603")))))
+                  'utf-8))
+           (request (make-claude-code-ide-mcp-routing-tests--parsed-request
+                     :process 'cci-test-process
+                     :headers `((:POST . "/mcp/cci-test-cowork")
+                                (:CONTENT-TYPE . "application/json")
+                                (:CONTENT-LENGTH . ,(number-to-string (length body))))
+                     :body body))
+           (reply (claude-code-ide-mcp-routing-tests--post-parsed request)))
+      (should (> (length body) (length (decode-coding-string body 'utf-8))))
+      (should (equal 200 (plist-get reply :status)))
+      (should (equal 43 (alist-get 'id (plist-get reply :body)))))))
+
+;;; The reader of whole requests
+
+;; These tests use a real local server process with the filter and
+;; the sentinel of the MCP server, and a stand-in for `ws-filter' that
+;; records each request it gets.  They do not need web-server.
+
+(defvar claude-code-ide-mcp-routing-tests--passed nil
+  "The requests that the stand-in for `ws-filter' got, newest first.")
+
+(defun claude-code-ide-mcp-routing-tests--stand-in-ws-filter (process data)
+  "Record DATA, answer 200 on PROCESS and close it, as web-server does."
+  (push data claude-code-ide-mcp-routing-tests--passed)
+  (process-send-string process "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+  (delete-process process))
+
+(defmacro claude-code-ide-mcp-routing-tests--with-reader (&rest body)
+  "Run BODY with a server that reads requests with the MCP filter.
+BODY can read the port from the variable `cci-test-port'.  The server,
+its connections and their timers end after BODY."
+  (declare (indent 0))
+  `(let* ((claude-code-ide-mcp-http-server--connections (make-hash-table :test 'eq))
+          (claude-code-ide-mcp-routing-tests--passed nil)
+          (cci-test-server
+           (make-network-process
+            :name "cci-test-reader" :server t :host "127.0.0.1" :service 0
+            :family 'ipv4 :coding 'binary :noquery t
+            :filter #'claude-code-ide-mcp-http-server--filter
+            :sentinel #'claude-code-ide-mcp-http-server--sentinel))
+          (cci-test-port (process-contact cci-test-server :service)))
+     (ignore cci-test-port)
+     (unwind-protect
+         (cl-letf (((symbol-function 'ws-filter)
+                    #'claude-code-ide-mcp-routing-tests--stand-in-ws-filter))
+           ,@body)
+       (delete-process cci-test-server)
+       (let ((processes nil))
+         (maphash (lambda (process _) (push process processes))
+                  claude-code-ide-mcp-http-server--connections)
+         (mapc #'claude-code-ide-mcp-http-server--close processes)))))
+
+(defun claude-code-ide-mcp-routing-tests--client (port)
+  "Connect to PORT and return the client process.
+The data that it receives is in its property `reply'."
+  (let ((client (make-network-process
+                 :name "cci-test-client" :host "127.0.0.1" :service port
+                 :coding 'binary :noquery t
+                 :filter (lambda (process string)
+                           (process-put process 'reply
+                                        (concat (process-get process 'reply) string))))))
+    (process-put client 'reply "")
+    client))
+
+(defun claude-code-ide-mcp-routing-tests--reply (client)
+  "Return the data that CLIENT has received."
+  (process-get client 'reply))
+
+(defun claude-code-ide-mcp-routing-tests--wait-reply (client regexp)
+  "Wait until the data of CLIENT matches REGEXP; return non-nil when it does."
+  (claude-code-ide-tests--wait-until
+   (lambda () (string-match-p regexp (claude-code-ide-mcp-routing-tests--reply client)))))
+
+(defun claude-code-ide-mcp-routing-tests--head (path headers)
+  "Return the header section of a POST to PATH with the header lines HEADERS."
+  (concat "POST " path " HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+          (mapconcat (lambda (line) (concat line "\r\n")) headers "")
+          "\r\n"))
+
+(defun claude-code-ide-mcp-routing-tests--json-head (path length &rest headers)
+  "Return the header section of a JSON POST to PATH with LENGTH and HEADERS."
+  (claude-code-ide-mcp-routing-tests--head
+   path (append (list "Content-Type: application/json"
+                      (format "Content-Length: %d" length))
+                headers)))
+
+(defun claude-code-ide-mcp-routing-tests--connection-in (state)
+  "Return a connection of the reader in STATE, or nil."
+  (let ((found nil))
+    (maphash (lambda (process connection)
+               (when (eq (claude-code-ide-mcp-http-server--connection-state connection) state)
+                 (setq found (cons process connection))))
+             claude-code-ide-mcp-http-server--connections)
+    found))
+
+(ert-deftest claude-code-ide-mcp-routing-test-reader-split-body ()
+  "The reader gives web-server a request only when its whole body is there.
+The client sends the headers, then the body in three parts.  web-server
+gets one call with the whole request."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (claude-code-ide-mcp-routing-tests--with-reader
+      (let* ((body (claude-code-ide-mcp-routing-tests--initialize-body 51))
+             (head (claude-code-ide-mcp-routing-tests--json-head
+                    "/mcp/cci-test-cowork" (string-bytes body)))
+             (client (claude-code-ide-mcp-routing-tests--client cci-test-port)))
+        (process-send-string client head)
+        (should (claude-code-ide-tests--wait-until
+                 (lambda () (claude-code-ide-mcp-routing-tests--connection-in 'body))))
+        (dolist (part (list (substring body 0 5) (substring body 5 20)))
+          (process-send-string client part)
+          (let ((size (+ 5 (if (= (length part) 5) 0 15))))
+            (should (claude-code-ide-tests--wait-until
+                     (lambda ()
+                       (= size (claude-code-ide-mcp-http-server--connection-bytes
+                                (cdr (claude-code-ide-mcp-routing-tests--connection-in
+                                      'body)))))))))
+        (should-not claude-code-ide-mcp-routing-tests--passed)
+        (should (string-empty-p (claude-code-ide-mcp-routing-tests--reply client)))
+        (process-send-string client (substring body 20))
+        (should (claude-code-ide-mcp-routing-tests--wait-reply client "ok\\'"))
+        (should (equal (list (concat head body)) claude-code-ide-mcp-routing-tests--passed))))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-reader-whole-request-at-once ()
+  "A request that comes in one read goes to web-server at once.
+A GET gets 405 at once: only a POST is served."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (claude-code-ide-mcp-routing-tests--with-reader
+      (let* ((body (claude-code-ide-mcp-routing-tests--initialize-body 52))
+             (request (concat (claude-code-ide-mcp-routing-tests--json-head
+                               "/mcp/cci-test-cowork" (string-bytes body))
+                              body))
+             (client (claude-code-ide-mcp-routing-tests--client cci-test-port)))
+        (process-send-string client request)
+        (should (claude-code-ide-mcp-routing-tests--wait-reply client "ok\\'"))
+        (should (equal (list request) claude-code-ide-mcp-routing-tests--passed)))
+      (setq claude-code-ide-mcp-routing-tests--passed nil)
+      (claude-code-ide-mcp-routing-tests--early-reply
+       cci-test-port "GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n" 405))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-reader-100-continue ()
+  "A request with Expect: 100-continue and no body yet gets 100 Continue."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (claude-code-ide-mcp-routing-tests--with-reader
+      (let* ((body (claude-code-ide-mcp-routing-tests--initialize-body 53))
+             (client (claude-code-ide-mcp-routing-tests--client cci-test-port)))
+        (process-send-string client (claude-code-ide-mcp-routing-tests--json-head
+                                     "/mcp/cci-test-cowork" (string-bytes body)
+                                     "Expect: 100-continue"))
+        (should (claude-code-ide-mcp-routing-tests--wait-reply
+                 client "\\`HTTP/1.1 100 Continue\r\n\r\n\\'"))
+        (process-send-string client body)
+        (should (claude-code-ide-mcp-routing-tests--wait-reply client "ok\\'"))
+        (should (= 1 (length claude-code-ide-mcp-routing-tests--passed)))))))
+
+(defun claude-code-ide-mcp-routing-tests--early-reply (port head status)
+  "Send HEAD (no body) to the reader on PORT; check that it answers STATUS at once.
+The request never reaches web-server, no body is kept, and the reader
+closes its side of the connection.  Return the reply."
+  (let ((client (claude-code-ide-mcp-routing-tests--client port)))
+    (process-send-string client head)
+    (should (claude-code-ide-mcp-routing-tests--wait-reply
+             client (format "\\`HTTP/1.1 %d [^\0]*}\\'" status)))
+    (should-not claude-code-ide-mcp-routing-tests--passed)
+    (should (claude-code-ide-tests--wait-until
+             (lambda () (not (process-live-p client)))))
+    (claude-code-ide-mcp-routing-tests--reply client)))
+
+(ert-deftest claude-code-ide-mcp-routing-test-reader-checks-before-body ()
+  "A request that fails the session check gets 403 before its body.
+So does a request with an Origin header; one that is not JSON gets
+415.  The client never sends the body; the reply comes anyway."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-routing-tests--start "cci-test-inst-a" cci-test-dir)
+    (claude-code-ide-mcp-routing-tests--with-reader
+      (should (string-match-p
+               "Forbidden: unknown session"
+               (claude-code-ide-mcp-routing-tests--early-reply cci-test-port
+                                                               (claude-code-ide-mcp-routing-tests--json-head "/mcp/cci-test-unknown" 1000)
+                                                               403)))
+      (should (string-match-p
+               "Forbidden: wrong instance secret"
+               (claude-code-ide-mcp-routing-tests--early-reply cci-test-port
+                                                               (claude-code-ide-mcp-routing-tests--json-head
+                                                                "/mcp/cci-test-inst-a" 1000
+                                                                (concat claude-code-ide-mcp-server-secret-header ": cci-test-wrong"))
+                                                               403)))
+      (should (string-match-p
+               "Forbidden: missing instance secret"
+               (claude-code-ide-mcp-routing-tests--early-reply cci-test-port
+                                                               (claude-code-ide-mcp-routing-tests--json-head "/mcp/cci-test-inst-a" 1000)
+                                                               403)))
+      (claude-code-ide-mcp-routing-tests--early-reply cci-test-port
+                                                      (claude-code-ide-mcp-routing-tests--json-head
+                                                       "/mcp/cci-test-inst-a" 1000 "Origin: http://cci-test.invalid")
+                                                      403)
+      (claude-code-ide-mcp-routing-tests--early-reply cci-test-port
+                                                      (claude-code-ide-mcp-routing-tests--head
+                                                       "/mcp/cci-test-inst-a" '("Content-Type: text/plain" "Content-Length: 1000"))
+                                                      415))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-reader-body-limit ()
+  "A Content-Length above the limit gets 413 at once."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (claude-code-ide-mcp-routing-tests--with-reader
+      (let ((claude-code-ide-mcp-http-server-max-body-bytes 100))
+        (claude-code-ide-mcp-routing-tests--early-reply cci-test-port
+                                                        (claude-code-ide-mcp-routing-tests--json-head "/mcp/cci-test-cowork" 101)
+                                                        413)
+        ;; At the limit the reader waits for the body
+        (let ((client (claude-code-ide-mcp-routing-tests--client cci-test-port)))
+          (process-send-string client (claude-code-ide-mcp-routing-tests--json-head
+                                       "/mcp/cci-test-cowork" 100))
+          (should (claude-code-ide-tests--wait-until
+                   (lambda () (claude-code-ide-mcp-routing-tests--connection-in 'body))))
+          (should (string-empty-p (claude-code-ide-mcp-routing-tests--reply client))))))
+    (should (equal 16777216 (default-value 'claude-code-ide-mcp-http-server-max-body-bytes)))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-reader-length-rules ()
+  "A request without a usable Content-Length is refused at once.
+Transfer-Encoding and a POST without Content-Length get 411.  A value
+that is not a plain non-negative integer, or two different values,
+get 400."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (claude-code-ide-mcp-routing-tests--with-reader
+      (dolist (case '(((("Transfer-Encoding: chunked")) . 411)
+                      (nil . 411)
+                      ((("Content-Length: 12abc")) . 400)
+                      ((("Content-Length: -1")) . 400)
+                      ((("Content-Length: 1e3")) . 400)
+                      ((("Content-Length: 10" "Content-Length: 11")) . 400)))
+        (claude-code-ide-mcp-routing-tests--early-reply cci-test-port
+                                                        (claude-code-ide-mcp-routing-tests--head
+                                                         "/mcp/cci-test-cowork"
+                                                         (cons "Content-Type: application/json" (caar case)))
+                                                        (cdr case))))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-reader-time-limit ()
+  "A connection whose request is not complete in time gets 408 and is closed.
+Before the limit it stays.  A connection that sends nothing is closed
+too.  The test runs on the virtual clock."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (claude-code-ide-mcp-routing-tests--with-reader
+      (claude-code-ide-tests--call-with-clock
+       (lambda ()
+         (let ((client (claude-code-ide-mcp-routing-tests--client cci-test-port))
+               (silent (claude-code-ide-mcp-routing-tests--client cci-test-port)))
+           (process-send-string client (claude-code-ide-mcp-routing-tests--json-head
+                                        "/mcp/cci-test-cowork" 100))
+           (should (claude-code-ide-tests--wait-until
+                    (lambda () (and (claude-code-ide-mcp-routing-tests--connection-in 'body)
+                                    (= 2 (hash-table-count
+                                          claude-code-ide-mcp-http-server--connections))))
+                    5))
+           (let ((processes (hash-table-keys claude-code-ide-mcp-http-server--connections)))
+             (claude-code-ide-tests--advance-clock
+              (- claude-code-ide-mcp-http-server-body-timeout 5))
+             (mapc #'claude-code-ide-mcp-http-server--check-time-limit processes)
+             (should (= 2 (hash-table-count claude-code-ide-mcp-http-server--connections)))
+             (should (string-empty-p (claude-code-ide-mcp-routing-tests--reply client)))
+             (claude-code-ide-tests--advance-clock 6)
+             (mapc #'claude-code-ide-mcp-http-server--check-time-limit processes)
+             (should (= 0 (hash-table-count claude-code-ide-mcp-http-server--connections)))
+             (should-not (cl-some #'process-live-p processes)))
+           (should (claude-code-ide-mcp-routing-tests--wait-reply client "\\`HTTP/1.1 408 "))
+           (should (string-match-p "\\`HTTP/1.1 408 "
+                                   (claude-code-ide-mcp-routing-tests--reply silent)))
+           (should-not claude-code-ide-mcp-routing-tests--passed)))))
+    (should (equal 30 (default-value 'claude-code-ide-mcp-http-server-body-timeout)))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-reader-forgets-closed ()
+  "A connection that the client closes is forgotten, with its timer."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (claude-code-ide-mcp-routing-tests--with-reader
+      (let ((client (claude-code-ide-mcp-routing-tests--client cci-test-port)))
+        (process-send-string client (claude-code-ide-mcp-routing-tests--json-head
+                                     "/mcp/cci-test-cowork" 100))
+        (let ((entry nil))
+          (should (claude-code-ide-tests--wait-until
+                   (lambda () (setq entry (claude-code-ide-mcp-routing-tests--connection-in
+                                           'body)))))
+          (delete-process client)
+          (should (claude-code-ide-tests--wait-until
+                   (lambda () (= 0 (hash-table-count
+                                    claude-code-ide-mcp-http-server--connections)))))
+          (should-not (memq (claude-code-ide-mcp-http-server--connection-timer (cdr entry))
+                            timer-list)))))))
+
+;;; The reader is the authority on the head (second review)
+
+(ert-deftest claude-code-ide-mcp-routing-test-reader-method-case ()
+  "A method that is not all upper case gets 400 at once.
+web-server matches the method without case and takes \"post\" as a
+POST, so the reader must not let such a head pass its POST checks."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (claude-code-ide-mcp-routing-tests--with-reader
+      ;; With an Origin and a wrong Content-Type
+      (claude-code-ide-mcp-routing-tests--early-reply
+       cci-test-port
+       (concat "post /mcp/cci-test-cowork HTTP/1.1\r\nOrigin: http://cci-test.invalid\r\n"
+               "Content-Type: text/plain\r\nContent-Length: 3\r\n\r\n")
+       400)
+      ;; Without Content-Length, then a part of a body
+      (let* ((head (concat "post /mcp/cci-test-cowork HTTP/1.1\r\n"
+                           "Content-Type: application/json\r\n\r\n"))
+             (reply (claude-code-ide-mcp-routing-tests--early-reply
+                     cci-test-port (concat head "{\"a\":") 400)))
+        (should (string-match-p "method" reply)))
+      (let ((head (concat "Post /mcp/cci-test-cowork HTTP/1.1\r\n"
+                          "Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{}")))
+        (claude-code-ide-mcp-routing-tests--early-reply cci-test-port head 400)))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-reader-lone-line-break ()
+  "A head with a lone CR or LF outside CRLF line breaks gets 400 at once.
+web-server would read the text after a lone LF as a new line, for
+example as a request line \"POST /mcp/…\" that the reader never saw."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (claude-code-ide-mcp-routing-tests--with-reader
+      (claude-code-ide-mcp-routing-tests--early-reply
+       cci-test-port
+       (concat "GET /x HTTP/1.1\r\nFoo: bar\nPOST /mcp/cci-test-cowork HTTP/1.1\r\n"
+               "Content-Type: application/json\r\n\r\n{\"a\":")
+       400)
+      (claude-code-ide-mcp-routing-tests--early-reply
+       cci-test-port
+       (concat "GET /x HTTP/1.1\r\nFoo: bar\rBaz: 1\r\n\r\n")
+       400))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-reader-strict-header-lines ()
+  "A header line that web-server would read in another way gets 400.
+web-server reads only NAME: VALUE with one space; the reader takes
+the value as web-server does, so a Content-Length with extra space is
+not a plain integer for both."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (claude-code-ide-mcp-routing-tests--with-reader
+      (dolist (line '("Content-Length:2" "Content-Length:  2" "Content-Length: 2 "
+                      "Content-Length : 2" "Bad header"))
+        (claude-code-ide-mcp-routing-tests--early-reply
+         cci-test-port
+         (claude-code-ide-mcp-routing-tests--head
+          "/mcp/cci-test-cowork" (list "Content-Type: application/json" line))
+         400)))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-reader-form-types ()
+  "A multipart or form Content-Type gets 415 at once.
+web-server parses such a body in its own way and can wait for more
+data that never comes.  (A path that is not served gets 404 first.)"
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (claude-code-ide-mcp-routing-tests--with-reader
+      (dolist (type '("multipart/form-data; boundary=zz"
+                      "application/x-www-form-urlencoded"
+                      "Multipart/Mixed; boundary=zz"))
+        (should (string-match-p
+                 "Multipart and form bodies"
+                 (claude-code-ide-mcp-routing-tests--early-reply
+                  cci-test-port
+                  (concat "POST /mcp/cci-test-cowork HTTP/1.1\r\nContent-Type: " type
+                          "\r\nContent-Length: 5\r\n\r\n")
+                  415)))))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-reader-closes-unanswered ()
+  "A connection that web-server leaves open without a reply is closed.
+The client gets 400, and the reader forgets the connection."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (claude-code-ide-mcp-routing-tests--with-reader
+      (cl-letf (((symbol-function 'ws-filter)
+                 (lambda (_process data)
+                   (push data claude-code-ide-mcp-routing-tests--passed))))
+        (let ((client (claude-code-ide-mcp-routing-tests--client cci-test-port)))
+          (process-send-string client (concat (claude-code-ide-mcp-routing-tests--json-head
+                                               "/mcp/cci-test-cowork" 2)
+                                              "{}"))
+          (should (claude-code-ide-mcp-routing-tests--wait-reply client "\\`HTTP/1.1 400 "))
+          (should (claude-code-ide-tests--wait-until
+                   (lambda () (not (process-live-p client)))))
+          (should (= 1 (length claude-code-ide-mcp-routing-tests--passed)))
+          (should (claude-code-ide-tests--wait-until
+                   (lambda () (= 0 (hash-table-count
+                                    claude-code-ide-mcp-http-server--connections))))))))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-reader-pipelined ()
+  "web-server gets the head and exactly Content-Length bytes of body.
+Bytes after the body (a pipelined request) are dropped, in the same
+read and in later reads, and the first request gets its reply."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (claude-code-ide-mcp-routing-tests--with-reader
+      (let* ((head (claude-code-ide-mcp-routing-tests--json-head "/mcp/cci-test-cowork" 7))
+             (extra "POST /mcp/cci-test-cowork HTTP/1.1\r\n\r\n")
+             (client (claude-code-ide-mcp-routing-tests--client cci-test-port)))
+        (process-send-string client (concat head "{\"a\":1}" extra))
+        (should (claude-code-ide-mcp-routing-tests--wait-reply client "ok\\'"))
+        (should (equal (list (concat head "{\"a\":1}"))
+                       claude-code-ide-mcp-routing-tests--passed)))
+      (setq claude-code-ide-mcp-routing-tests--passed nil)
+      (let* ((head (claude-code-ide-mcp-routing-tests--json-head "/mcp/cci-test-cowork" 7))
+             (client (claude-code-ide-mcp-routing-tests--client cci-test-port)))
+        (process-send-string client (concat head "{\"a\""))
+        (should (claude-code-ide-tests--wait-until
+                 (lambda () (claude-code-ide-mcp-routing-tests--connection-in 'body))))
+        (process-send-string client ":1}GET / HTTP/1.1\r\n\r\n")
+        (should (claude-code-ide-mcp-routing-tests--wait-reply client "ok\\'"))
+        (should (equal (list (concat head "{\"a\":1}"))
+                       claude-code-ide-mcp-routing-tests--passed))))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-reader-header-limit-one-read ()
+  "The header limit holds also when the whole head comes in one read."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (claude-code-ide-mcp-routing-tests--with-reader
+      (claude-code-ide-mcp-routing-tests--early-reply
+       cci-test-port
+       (claude-code-ide-mcp-routing-tests--json-head
+        "/mcp/cci-test-cowork" 2
+        (concat "X-Cci-Test: " (make-string (* 70 1024) ?a)))
+       431))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-handler-length-parser ()
+  "The handler reads Content-Length with the parser of the reader.
+A value that the reader refuses (here one with a space before the
+digits, as web-server stores \"Content-Length:  3\") gets 400 from the
+handler too, and the body is not parsed."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (dolist (value '(" 3" "3 " "+3" "3.0"))
+      (let* ((request (make-claude-code-ide-mcp-routing-tests--parsed-request
+                       :process 'cci-test-process
+                       :headers `((:POST . "/mcp/cci-test-cowork")
+                                  (:CONTENT-TYPE . "application/json")
+                                  (:CONTENT-LENGTH . ,value))
+                       :body "abc"))
+             (reply (claude-code-ide-mcp-routing-tests--post-parsed request)))
+        (should (equal 400 (plist-get reply :status)))
+        (should (consp (claude-code-ide-mcp-http-server--body-length
+                        "POST" (list (cons :CONTENT-LENGTH value)))))))))
+
+(defun claude-code-ide-mcp-routing-tests--handler-ws-filter (process data)
+  "A stand-in for `ws-filter' that runs the real POST handler on DATA.
+It parses DATA with the reader, calls the handler with a stand-in
+request on PROCESS, sends the reply and closes PROCESS."
+  (push data claude-code-ide-mcp-routing-tests--passed)
+  (let* ((end (string-search "\r\n\r\n" data))
+         (parsed (claude-code-ide-mcp-http-server--parse-head (substring data 0 end)))
+         (request (make-claude-code-ide-mcp-routing-tests--parsed-request
+                   :process process
+                   :headers (cons (cons :POST (nth 1 parsed)) (nth 2 parsed))
+                   :body (substring data (+ end 4))))
+         (reply (claude-code-ide-mcp-routing-tests--post-parsed request)))
+    (process-send-string process (format "HTTP/1.1 %d X\r\n\r\n%s"
+                                         (plist-get reply :status)
+                                         (json-encode (plist-get reply :body))))
+    (delete-process process)))
+
+(ert-deftest claude-code-ide-mcp-routing-test-reader-one-session-check ()
+  "A request through the reader runs the session check once.
+The handler uses the result of the reader; it does not check, or read
+the coordinator credential, a second time."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (claude-code-ide-mcp-routing-tests--with-reader
+      (let* ((checks 0)
+             (real-check (symbol-function 'claude-code-ide-mcp-server-check-request))
+             (body (claude-code-ide-mcp-routing-tests--initialize-body 61))
+             (client nil))
+        (cl-letf (((symbol-function 'ws-filter)
+                   #'claude-code-ide-mcp-routing-tests--handler-ws-filter)
+                  ((symbol-function 'claude-code-ide-mcp-server-check-request)
+                   (lambda (&rest args)
+                     (setq checks (1+ checks))
+                     (apply real-check args))))
+          (setq client (claude-code-ide-mcp-routing-tests--client cci-test-port))
+          (process-send-string client (concat (claude-code-ide-mcp-routing-tests--json-head
+                                               "/mcp/cci-test-cowork" (string-bytes body))
+                                              body))
+          (should (claude-code-ide-mcp-routing-tests--wait-reply client "}\\'"))
+          (should (string-prefix-p "HTTP/1.1 200" (claude-code-ide-mcp-routing-tests--reply client)))
+          (should (string-match-p "\"id\":61" (claude-code-ide-mcp-routing-tests--reply client)))
+          (should (= 1 checks)))))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-reader-head-functions ()
+  "A function of `claude-code-ide-mcp-http-server-head-functions' can refuse.
+It runs on the parsed head before any body is read.  A refusal gives
+its status at once; nil lets the request pass; an error refuses with
+500."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (claude-code-ide-mcp-routing-tests--with-reader
+      (let* ((seen nil)
+             (claude-code-ide-mcp-http-server-head-functions
+              (list (lambda (method path headers)
+                      (push (list method path) seen)
+                      (unless (equal (cdr (assq :X-CCI-TEST-TOKEN headers)) "cci-test-good")
+                        '(403 . "cci-test bad token"))))))
+        (should (string-match-p
+                 "Forbidden: cci-test bad token"
+                 (claude-code-ide-mcp-routing-tests--early-reply
+                  cci-test-port
+                  (claude-code-ide-mcp-routing-tests--json-head "/mcp/cci-test-cowork" 1000)
+                  403)))
+        (should (equal '(("POST" "/mcp/cci-test-cowork")) seen))
+        (let* ((body (claude-code-ide-mcp-routing-tests--initialize-body 62))
+               (client (claude-code-ide-mcp-routing-tests--client cci-test-port)))
+          (process-send-string client (concat (claude-code-ide-mcp-routing-tests--json-head
+                                               "/mcp/cci-test-cowork" (string-bytes body)
+                                               "X-Cci-Test-Token: cci-test-good")
+                                              body))
+          (should (claude-code-ide-mcp-routing-tests--wait-reply client "ok\\'"))))
+      (let ((claude-code-ide-mcp-http-server-head-functions
+             (list (lambda (&rest _) (error "cci-test failure")))))
+        (setq claude-code-ide-mcp-routing-tests--passed nil)
+        (claude-code-ide-mcp-routing-tests--early-reply
+         cci-test-port
+         (claude-code-ide-mcp-routing-tests--json-head "/mcp/cci-test-cowork" 2)
+         500)))))
+
+;;; Resource limits of the reader (gate review)
+
+(defvar claude-code-ide-mcp-http-server-max-connections)
+
+(defun claude-code-ide-mcp-routing-tests--unique-names (count)
+  "Return COUNT header names that no code uses, made at run time.
+The names are strings; making them interns no symbol."
+  (let ((stamp (format "%d%d" (emacs-pid) (random 1000000000))))
+    (cl-loop for i below count
+             collect (format "X-Cci-Test-Unique-%s-%d" stamp i))))
+
+(defun claude-code-ide-mcp-routing-tests--interned (names)
+  "Return the NAMES whose header keyword or name is in the obarray."
+  (cl-remove-if-not (lambda (name)
+                      (or (intern-soft (concat ":" (upcase name)))
+                          (intern-soft (upcase name))
+                          (intern-soft name)))
+                    names))
+
+(ert-deftest claude-code-ide-mcp-routing-test-reader-no-intern ()
+  "The reader interns no header name of the input.
+Not for a refused request, and not for one that it passes on."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (claude-code-ide-mcp-routing-tests--with-reader
+      (let ((refused (claude-code-ide-mcp-routing-tests--unique-names 20))
+            (passed (claude-code-ide-mcp-routing-tests--unique-names 20)))
+        (claude-code-ide-mcp-routing-tests--early-reply
+         cci-test-port
+         (apply #'claude-code-ide-mcp-routing-tests--json-head "/mcp/cci-test-unknown" 10
+                (mapcar (lambda (name) (concat name ": 1")) refused))
+         403)
+        (let* ((body (claude-code-ide-mcp-routing-tests--initialize-body 71))
+               (client (claude-code-ide-mcp-routing-tests--client cci-test-port)))
+          (process-send-string
+           client
+           (concat (apply #'claude-code-ide-mcp-routing-tests--json-head
+                          "/mcp/cci-test-cowork" (string-bytes body)
+                          (mapcar (lambda (name) (concat name ": 1")) passed))
+                   body))
+          (should (claude-code-ide-mcp-routing-tests--wait-reply client "ok\\'")))
+        (should-not (claude-code-ide-mcp-routing-tests--interned refused))
+        (should-not (claude-code-ide-mcp-routing-tests--interned passed))))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-reader-header-count ()
+  "A head with more than 100 header lines gets 431 at once."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (claude-code-ide-mcp-routing-tests--with-reader
+      (claude-code-ide-mcp-routing-tests--early-reply
+       cci-test-port
+       (apply #'claude-code-ide-mcp-routing-tests--json-head "/mcp/cci-test-cowork" 2
+              (cl-loop for i below 99 collect (format "X-Cci-Test-%d: 1" i)))
+       431))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-reader-unhandled-routes ()
+  "A path or a method that no handler serves is refused before the body.
+A path that is not /mcp gets 404 and a method other than POST gets
+405, with or without Content-Length; such a request never collects a
+body and never reaches web-server."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (claude-code-ide-mcp-routing-tests--with-reader
+      (pcase-dolist (`(,line . ,status)
+                     '(("GET /x HTTP/1.1" . 404)
+                       ("POST /x HTTP/1.1" . 404)
+                       ("POST /mcpx HTTP/1.1" . 404)
+                       ("GET /mcp HTTP/1.1" . 405)
+                       ("PUT /mcp/cci-test-cowork HTTP/1.1" . 405)
+                       ("GET /mcp/cci-test-cowork HTTP/1.1" . 405)))
+        (claude-code-ide-mcp-routing-tests--early-reply
+         cci-test-port
+         (concat line "\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n")
+         status)
+        (should-not (claude-code-ide-mcp-routing-tests--connection-in 'body))))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-reader-405-allow ()
+  "A 405 reply names the method that the server serves; other replies do not."
+  (let ((sent nil))
+    (cl-letf (((symbol-function 'process-send-string)
+               (lambda (_process string) (push string sent))))
+      (claude-code-ide-mcp-http-server--send-status 'cci-test-process 405 "Method not allowed")
+      (claude-code-ide-mcp-http-server--send-status 'cci-test-process 404 "Not found"))
+    (should (string-match-p "\\`HTTP/1.1 405 [^\r]*\r\n\\(?:[^\r]+\r\n\\)*Allow: POST\r\n" (cadr sent)))
+    (should-not (string-match-p "^Allow:" (car sent)))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-reader-max-connections ()
+  "Connections above the limit get 503 at once and are closed.
+After the open connections close, new ones are served again."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (claude-code-ide-mcp-routing-tests--with-reader
+      (let* ((claude-code-ide-mcp-http-server-max-connections 3)
+             (open (cl-loop repeat 3 collect
+                            (claude-code-ide-mcp-routing-tests--client cci-test-port))))
+        (should (claude-code-ide-tests--wait-until
+                 (lambda () (= 3 (hash-table-count claude-code-ide-mcp-http-server--connections)))))
+        (let ((extra (claude-code-ide-mcp-routing-tests--client cci-test-port)))
+          (should (claude-code-ide-mcp-routing-tests--wait-reply extra "\\`HTTP/1.1 503 "))
+          (should (claude-code-ide-tests--wait-until (lambda () (not (process-live-p extra))))))
+        (should (= 3 (hash-table-count claude-code-ide-mcp-http-server--connections)))
+        (mapc #'delete-process open)
+        (should (claude-code-ide-tests--wait-until
+                 (lambda () (= 0 (hash-table-count claude-code-ide-mcp-http-server--connections)))))
+        (let* ((body (claude-code-ide-mcp-routing-tests--initialize-body 72))
+               (client (claude-code-ide-mcp-routing-tests--client cci-test-port)))
+          (process-send-string client (concat (claude-code-ide-mcp-routing-tests--json-head
+                                               "/mcp/cci-test-cowork" (string-bytes body))
+                                              body))
+          (should (claude-code-ide-mcp-routing-tests--wait-reply client "ok\\'")))))
+    (should (equal 32 (default-value 'claude-code-ide-mcp-http-server-max-connections)))))
+
+;;; The real web-server package
+
+;; These tests run only when the web-server package is on the
+;; load-path.  ./scripts/compile-and-test.sh adds the newest
+;; ~/.emacs.d/elpa/web-server-* folder when there is one.
+
+(defun claude-code-ide-mcp-routing-tests--web-server-p ()
+  "Return non-nil when the real web-server package is loaded or can be."
+  (and (require 'web-server nil t)
+       (fboundp 'ws-start)
+       (fboundp 'ws-filter)))
+
+(ert-deftest claude-code-ide-mcp-routing-test-web-server-split-body ()
+  "With the real web-server, a body sent after the headers is read.
+The client sends the headers, waits until the reader has them, and
+then sends the body.  The reply carries the id of the request and a
+result, not a parse error."
+  (skip-unless (claude-code-ide-mcp-routing-tests--web-server-p))
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (let* ((claude-code-ide-mcp-http-server--connections (make-hash-table :test 'eq))
+           (started (claude-code-ide-mcp-http-server-start 0))
+           (server (car started))
+           (body (claude-code-ide-mcp-routing-tests--initialize-body 44))
+           (client nil))
+      (unwind-protect
+          (progn
+            (setq client (claude-code-ide-mcp-routing-tests--client (cdr started)))
+            (process-send-string client (claude-code-ide-mcp-routing-tests--json-head
+                                         "/mcp/cci-test-cowork" (string-bytes body)))
+            (should (claude-code-ide-tests--wait-until
+                     (lambda () (claude-code-ide-mcp-routing-tests--connection-in 'body))))
+            (should (string-empty-p (claude-code-ide-mcp-routing-tests--reply client)))
+            (process-send-string client body)
+            (should (claude-code-ide-mcp-routing-tests--wait-reply client "}\\'"))
+            (let ((reply (claude-code-ide-mcp-routing-tests--reply client)))
+              (should (string-prefix-p "HTTP/1.1 200" reply))
+              (let ((json (json-parse-string (substring reply (string-match "{" reply))
+                                             :object-type 'alist)))
+                (should (equal 44 (alist-get 'id json)))
+                (should (alist-get 'result json))))
+            ;; web-server closed the connection, and the reader forgot it
+            (should (claude-code-ide-tests--wait-until
+                     (lambda () (= 0 (hash-table-count
+                                      claude-code-ide-mcp-http-server--connections))))))
+        (when (process-live-p client)
+          (delete-process client))
+        (claude-code-ide-mcp-http-server-stop server)))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-web-server-early-403 ()
+  "With the real web-server, a wrong session gets 403 before its body."
+  (skip-unless (claude-code-ide-mcp-routing-tests--web-server-p))
+  (claude-code-ide-mcp-routing-tests--with-state
+    (let* ((claude-code-ide-mcp-http-server--connections (make-hash-table :test 'eq))
+           (started (claude-code-ide-mcp-http-server-start 0))
+           (server (car started))
+           (client nil))
+      (unwind-protect
+          (progn
+            (setq client (claude-code-ide-mcp-routing-tests--client (cdr started)))
+            (process-send-string client (claude-code-ide-mcp-routing-tests--json-head
+                                         "/mcp/cci-test-unknown" 5000))
+            (should (claude-code-ide-mcp-routing-tests--wait-reply
+                     client "\\`HTTP/1.1 403 [^\0]*unknown session[^\0]*}\\'")))
+        (when (process-live-p client)
+          (delete-process client))
+        (claude-code-ide-mcp-http-server-stop server)))))
+
+(defun claude-code-ide-mcp-routing-tests--web-server-probe (parts)
+  "Send PARTS to a real MCP server, one per write; return (REPLY . LIVE).
+LIVE is non-nil when the connection is still open after the reply
+stops.  The session cci-test-cowork must be registered."
+  (let* ((claude-code-ide-mcp-http-server--connections (make-hash-table :test 'eq))
+         (started (claude-code-ide-mcp-http-server-start 0))
+         (client nil))
+    (unwind-protect
+        (progn
+          (setq client (claude-code-ide-mcp-routing-tests--client (cdr started)))
+          ;; A refusal can close the connection before the later parts
+          (dolist (part parts)
+            (ignore-errors (process-send-string client part))
+            (accept-process-output nil 0.1))
+          (claude-code-ide-tests--wait-until (lambda () (not (process-live-p client))) 5)
+          (cons (claude-code-ide-mcp-routing-tests--reply client) (process-live-p client)))
+      (when (process-live-p client)
+        (delete-process client))
+      (claude-code-ide-mcp-http-server-stop (car started)))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-web-server-review-sequences ()
+  "The sequences of the second review, against the real web-server.
+A lower-case post, a smuggled request line and a multipart GET are
+refused and closed; a pipelined request gets its normal reply."
+  (skip-unless (claude-code-ide-mcp-routing-tests--web-server-p))
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (let ((handled nil))
+      (cl-letf (((symbol-function 'claude-code-ide-mcp-http-server--handle-post)
+                 (let ((real (symbol-function 'claude-code-ide-mcp-http-server--handle-post)))
+                   (lambda (request)
+                     (push (ws-body request) handled)
+                     (funcall real request)))))
+        (pcase-dolist (`(,parts ,status)
+                       `((("post /mcp/cci-test-cowork HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"a\":"
+                           "1}")
+                          400)
+                         (("GET /x HTTP/1.1\r\nFoo: bar\nPOST /mcp/cci-test-cowork HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"a\":"
+                           "1}")
+                          400)
+                         (("post /mcp/cci-test-cowork HTTP/1.1\r\nOrigin: http://evil\r\nContent-Type: text/plain\r\nContent-Length: 3\r\n\r\n"
+                           "abc")
+                          400)
+                         ;; A path that is not served gets 404 before the type check
+                         (("GET /x HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=zz\r\n\r\n"
+                           "more data that goes to pending")
+                          404)))
+          (let ((result (claude-code-ide-mcp-routing-tests--web-server-probe parts)))
+            (should (string-prefix-p (format "HTTP/1.1 %d " status) (car result)))
+            (should-not (cdr result))))
+        ;; web-server never sees the head of a refused request, so it
+        ;; interns none of its header names
+        (let ((names (claude-code-ide-mcp-routing-tests--unique-names 20)))
+          (should (string-prefix-p
+                   "HTTP/1.1 404 "
+                   (car (claude-code-ide-mcp-routing-tests--web-server-probe
+                         (list (concat "GET /x HTTP/1.1\r\n"
+                                       (mapconcat (lambda (name) (concat name ": 1\r\n"))
+                                                  names "")
+                                       "\r\n"))))))
+          (should-not (claude-code-ide-mcp-routing-tests--interned names)))
+        (should-not handled)
+        (let ((result (claude-code-ide-mcp-routing-tests--web-server-probe
+                       (list (concat "POST /mcp/cci-test-cowork HTTP/1.1\r\n"
+                                     "Content-Type: application/json\r\nContent-Length: 7\r\n\r\n"
+                                     "{\"a\":1}POST /mcp/cci-test-cowork HTTP/1.1\r\n\r\n")))))
+          (should (equal '("{\"a\":1}") handled))
+          ;; The normal reply to a notification
+          (should (string-prefix-p "HTTP/1.1 202" (car result)))
+          (should-not (string-match-p "Parse error" (car result))))))))
 
 (provide 'claude-code-ide-mcp-routing-tests)
 ;;; claude-code-ide-mcp-routing-tests.el ends here
