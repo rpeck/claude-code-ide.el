@@ -167,10 +167,15 @@ The other events are `other'.")
                   "Continue without trusting")
     (update "Update now" "Skip until next version")
     (approval "Allow the [^ ]+ MCP server to run tool" "Yes, proceed"
-              "Yes, just this once" "No, and tell Codex what to do differently"))
+              "Yes, just this once" "No, and tell Codex what to do differently"
+              ;; The tail of the MCP approval dialog, which is all that an
+              ;; eat buffer without a window keeps: "› 1. Allow  Run the
+              ;; tool and" (white space is one space here)
+              "[0-9]+\\. Allow Run the tool"))
   "Text patterns of the Codex dialogs, as (KIND REGEXP...).
-The first kind with a matching regexp wins.  The texts are those of
-Codex 0.164.0.")
+The first kind with a matching regexp wins.  The regexps match the
+screen text with each run of white space as one space.  The texts are
+those of Codex 0.164.0.")
 
 (defvar claude-code-ide-codex--screen-lines 50
   "Lines of a terminal screen when no window shows the terminal buffer.")
@@ -1084,12 +1089,33 @@ native ID: a new conversation gets it only at its first prompt."
 
 ;;; Dialogs on the screen
 
+(defun claude-code-ide-codex--display-frame-p (frame)
+  "Return non-nil when FRAME is on a display, visible or not.
+The initial frame of a daemon, and the frame of batch Emacs, are on the
+terminal \"initial_terminal\": they show nothing to anybody.  That
+frame says that it is visible, so `frame-visible-p' cannot tell."
+  (and (frame-live-p frame)
+       (not (equal (terminal-name (frame-terminal frame)) "initial_terminal"))))
+
+(defun claude-code-ide-codex-screen-window (buffer)
+  "Return a window that shows the whole terminal screen of BUFFER, or nil.
+That is a window of BUFFER on a frame of a display
+\(`claude-code-ide-codex--display-frame-p'), also of a frame that is not
+visible: the terminal keeps the size of that window.  Without such a
+window, a terminal such as eat can keep only the last lines of a
+dialog, so a screen read cannot tell that no dialog is open."
+  (and (buffer-live-p buffer)
+       (cl-find-if (lambda (window)
+                     (claude-code-ide-codex--display-frame-p (window-frame window)))
+                   (get-buffer-window-list buffer nil t))))
+
 (defun claude-code-ide-codex--screen-text (buffer)
   "Return the text of the terminal screen of BUFFER.
 The screen is the last lines of the buffer, as many as the window that
-shows BUFFER has, else `claude-code-ide-codex--screen-lines'."
+shows BUFFER has (`claude-code-ide-codex-screen-window'), else
+`claude-code-ide-codex--screen-lines'."
   (with-current-buffer buffer
-    (let* ((window (get-buffer-window buffer t))
+    (let* ((window (claude-code-ide-codex-screen-window buffer))
            (lines (if window (window-body-height window) claude-code-ide-codex--screen-lines)))
       (save-excursion
         (goto-char (point-max))

@@ -810,6 +810,68 @@ The texts follow the captures and the reports of the T1 and T2 tests.")
       (kill-buffer buffer)
       (should-not (claude-code-ide-codex-screen-dialog buffer)))))
 
+(ert-deftest claude-code-ide-test-codex-screen-dialog-approval-tail ()
+  "The tail of the MCP approval dialog is an approval."
+  (with-temp-buffer
+    (insert "\n  Field 1/1\n  › 1. Allow  Run the tool and\n"
+            "  option 1/2 | enter to submit | esc\n\n")
+    (should (eq (claude-code-ide-codex-screen-dialog (current-buffer)) 'approval))))
+
+(ert-deftest claude-code-ide-test-codex-screen-dialog-approval-tail-wrapped ()
+  "The tail of the MCP approval dialog is an approval, also wrapped or after other text."
+  (dolist (text '(;; A narrow eat terminal wraps the choice
+                  "  Field 1/1\n  › 1. Allow\n  Run the tool and\n  option 1/2 | enter to submit\n  | esc\n"
+                  ;; Output of the turn before the dialog
+                  "• Calling emacs_tools.claude_code_ide_mcp_project_info\n\n  Field 1/1\n  › 1. Allow  Run the tool and\n  option 1/2 | enter to submit | esc\n"))
+    (with-temp-buffer
+      (insert text)
+      (should (eq (claude-code-ide-codex-screen-dialog (current-buffer)) 'approval))))
+  ;; A reply that names the choice is no dialog
+  (with-temp-buffer
+    (insert "• The dialog said: Allow, Run the tool and continue.\n\n› Ask Codex to do anything\n")
+    (should-not (claude-code-ide-codex-screen-dialog (current-buffer)))))
+
+(ert-deftest claude-code-ide-test-codex-screen-window ()
+  "Only a window of a frame on a display shows the whole terminal screen.
+The initial frame of a daemon, or of batch Emacs, is on the terminal
+\"initial_terminal\": nobody sees it, so its window does not count.  A
+window of an invisible frame on a display counts: the terminal keeps
+the size of that window."
+  (let ((buffer (generate-new-buffer " *cci-test-screen-window*")))
+    (unwind-protect
+        (progn
+          ;; No window shows the buffer
+          (should-not (claude-code-ide-codex-screen-window buffer))
+          (save-window-excursion
+            (set-window-buffer (selected-window) buffer)
+            ;; The window of the initial frame of batch Emacs
+            (should-not (claude-code-ide-codex--display-frame-p (selected-frame)))
+            (should-not (claude-code-ide-codex-screen-window buffer))
+            ;; A frame on a display, visible or not
+            (cl-letf (((symbol-function 'claude-code-ide-codex--display-frame-p)
+                       (lambda (frame) (eq frame (selected-frame)))))
+              (should (eq (claude-code-ide-codex-screen-window buffer) (selected-window))))))
+      (kill-buffer buffer))))
+
+(ert-deftest claude-code-ide-test-codex-screen-text-without-display-window ()
+  "A window of the initial frame does not set the size of the screen."
+  (let ((buffer (generate-new-buffer " *cci-test-screen-text*"))
+        (claude-code-ide-codex--screen-lines 50))
+    (unwind-protect
+        (with-current-buffer buffer
+          (dotimes (i 100) (insert (format "line %d\n" (1+ i))))
+          (save-window-excursion
+            (set-window-buffer (selected-window) buffer)
+            (should (< (window-body-height (selected-window)) 50))
+            ;; The last 50 lines, and the empty line after the last newline
+            (should (string-prefix-p "line 52\n" (claude-code-ide-codex--screen-text buffer)))
+            ;; A window of a frame on a display sets it
+            (cl-letf (((symbol-function 'claude-code-ide-codex--display-frame-p) #'always))
+              (let ((height (window-body-height (selected-window))))
+                (should (string-prefix-p (format "line %d\n" (- 102 height))
+                                         (claude-code-ide-codex--screen-text buffer)))))))
+      (kill-buffer buffer))))
+
 ;;; Commands
 
 (ert-deftest claude-code-ide-test-codex-command-starts-codex ()
