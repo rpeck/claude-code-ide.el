@@ -1129,14 +1129,25 @@ module, so it gives nil."
                    (buffer-local-value 'ghostel--term-rows buffer)))))
       (and (integerp lines) (> lines 0) lines))))
 
+(defun claude-code-ide-codex--size-function (buffer)
+  "Return the value of `window-adjust-process-window-size-function' in BUFFER."
+  (buffer-local-value 'window-adjust-process-window-size-function buffer))
+
+(defun claude-code-ide-codex--known-size-function-p (buffer)
+  "Return non-nil when BUFFER sizes its terminal by the smallest or largest window."
+  (memq (claude-code-ide-codex--size-function buffer)
+        '(window-adjust-process-window-size-smallest
+          window-adjust-process-window-size-largest)))
+
 (defun claude-code-ide-codex--window-lines (windows)
   "Return the terminal height that the WINDOWS of a terminal give it, or nil.
-Emacs sizes the terminal with `window-adjust-process-window-size-function':
-the smallest window by default, the largest with
-`window-adjust-process-window-size-largest'."
+Emacs sizes the terminal with `window-adjust-process-window-size-function'
+of the buffer: the smallest window by default, the largest with
+`window-adjust-process-window-size-largest'.  Another function counts
+as the smallest."
   (when windows
     (let ((heights (mapcar #'window-body-height windows)))
-      (apply (if (eq window-adjust-process-window-size-function
+      (apply (if (eq (claude-code-ide-codex--size-function (window-buffer (car windows)))
                      #'window-adjust-process-window-size-largest)
                  #'max
                #'min)
@@ -1149,11 +1160,14 @@ and a sure size of the screen: the size that the backend gives
 \(`claude-code-ide-codex--terminal-lines'), else one height of all the
 windows of a display.  Windows of other heights, without a size of the
 backend, make the size unsure: the read can cover another part than
-the terminal screen."
+the terminal screen.  So does a `window-adjust-process-window-size-function'
+other than the smallest or the largest: it can give the terminal more
+lines than the windows have."
   (let ((windows (claude-code-ide-codex--display-windows buffer)))
     (and windows
          (or (claude-code-ide-codex--terminal-lines buffer)
-             (null (cdr (delete-dups (mapcar #'window-body-height windows)))))
+             (and (claude-code-ide-codex--known-size-function-p buffer)
+                  (null (cdr (delete-dups (mapcar #'window-body-height windows))))))
          t)))
 
 (defun claude-code-ide-codex--screen-text (buffer)

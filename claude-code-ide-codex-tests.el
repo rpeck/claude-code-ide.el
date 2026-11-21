@@ -957,6 +957,27 @@ The frame of batch Emacs counts as a frame of a display here."
             (should (claude-code-ide-codex-screen-whole-p buffer))))
       (kill-buffer buffer))))
 
+(ert-deftest claude-code-ide-test-codex-screen-custom-size-function-unsure ()
+  "A custom sizing function, without a backend size, makes the screen size unsure.
+The function can give the terminal more lines than the window shows, so
+a read of one window is not whole.  The known functions keep it whole,
+also as a buffer-local value."
+  (let ((buffer (generate-new-buffer " *cci-test-custom-size*")))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (set-window-buffer (selected-window) buffer)
+          (cl-letf (((symbol-function 'claude-code-ide-codex--display-frame-p) #'always))
+            (with-current-buffer buffer
+              (setq-local window-adjust-process-window-size-function
+                          (lambda (_process _windows) (cons 80 40))))
+            (should-not (claude-code-ide-codex-screen-whole-p buffer))
+            (with-current-buffer buffer
+              (setq-local window-adjust-process-window-size-function
+                          #'window-adjust-process-window-size-largest))
+            (should (claude-code-ide-codex-screen-whole-p buffer))))
+      (kill-buffer buffer))))
+
 ;;; Commands
 
 (ert-deftest claude-code-ide-test-codex-command-starts-codex ()
