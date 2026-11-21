@@ -52,11 +52,13 @@
 
 (defun claude-code-ide-live-tests--live-p ()
   "Return non-nil when the live tests may run in this Emacs.
-They need CLAUDE_CODE_IDE_LIVE_TESTS=1, an Emacs that is not in batch
-mode (the CLIs need real terminals), and the real packages, not the
-mocks of claude-code-ide-tests.el."
+They need CLAUDE_CODE_IDE_LIVE_TESTS=1, a daemon of their own that is
+not in batch mode (the CLIs need real terminals, and a person's Emacs
+must never run them), and the real packages, not the mocks of
+claude-code-ide-tests.el."
   (and (equal (getenv "CLAUDE_CODE_IDE_LIVE_TESTS") "1")
        (not noninteractive)
+       (daemonp)
        (not (featurep 'claude-code-ide-tests))))
 
 (defmacro claude-code-ide-live-tests--skip-unless-live ()
@@ -64,6 +66,21 @@ mocks of claude-code-ide-tests.el."
   '(progn
      (skip-unless (claude-code-ide-live-tests--live-p))
      (claude-code-ide-live-tests-setup)))
+
+(defmacro claude-code-ide-live-tests--live (&rest body)
+  "Run BODY of a live test between two cleanups, or skip the test.
+The test skips unless the live tests may run here
+\(`claude-code-ide-live-tests--live-p'); else the setup runs.  Before
+BODY, every instance of this Emacs stops.  After BODY, also after a
+failure or a skip, every instance stops again and the codeword files
+of the test projects go."
+  (declare (indent 0))
+  `(progn
+     (claude-code-ide-live-tests--skip-unless-live)
+     (claude-code-ide-live-tests--stop-all)
+     (unwind-protect
+         (progn ,@body)
+       (claude-code-ide-live-tests--cleanup))))
 
 (defun claude-code-ide-live-tests--root ()
   "Return the live folder, with a final slash."
@@ -136,11 +153,38 @@ that a test after a restart of Emacs sees the starts before it."
 
 (defun claude-code-ide-live-tests--claude-flags ()
   "Return the Claude Code flags of the live tests.
-CLAUDE_CODE_IDE_LIVE_CLAUDE_FLAGS replaces them."
-  (or (getenv "CLAUDE_CODE_IDE_LIVE_CLAUDE_FLAGS")
-      (format "--model sonnet --permission-mode acceptEdits --add-dir %s"
-              (shell-quote-argument
-               (expand-file-name "sessions" (claude-code-ide-handover--codex-home))))))
+The model is sonnet.  The CLI may read the Codex sessions folder, and
+it may use Read, Glob and Grep, and write the files of the handover
+folder (the state summary), without a question.  It has no Bash, so it
+reads the transcripts with the read tools.  Any other tool asks, and
+`claude-code-ide-live-tests--approve-while' fails the test then.
+CLAUDE_CODE_IDE_LIVE_CLAUDE_FLAGS, when set and not empty, replaces
+them."
+  (let ((flags (getenv "CLAUDE_CODE_IDE_LIVE_CLAUDE_FLAGS")))
+    (if (and flags (not (string-empty-p flags)))
+        flags
+      (format "--model sonnet --add-dir %s --disallowedTools Bash --allowedTools %s"
+              (shell-quote-argument (expand-file-name "sessions" (claude-code-ide-codex-home)))
+              ;; One word; the quotes keep the shell off the parentheses
+              "'Read,Glob,Grep,Edit(.handover/**),Write(.handover/**)'"))))
+
+(defconst claude-code-ide-live-tests--unset-names
+  '("ANTHROPIC_API_KEY" "OPENAI_API_KEY" "CLAUDECODE"
+    "CLAUDE_CODE_CHILD_SESSION" "CLAUDE_CODE_ENTRYPOINT")
+  "Variables that the Claude Code CLI of the live tests must not inherit.
+An API key would bill the API instead of the subscription.  The
+markers of a parent CLI make a child that saves no transcript.
+CLAUDE_CODE_SSE_PORT is not here: the package sets it for each CLI,
+and a name in `claude-code-ide-cli-environment-unset' would remove
+that value too.")
+
+(defun claude-code-ide-live-tests--environment-unset ()
+  "Return `claude-code-ide-cli-environment-unset' with the names of the live tests."
+  (let ((names (copy-sequence claude-code-ide-cli-environment-unset)))
+    (dolist (name claude-code-ide-live-tests--unset-names)
+      (unless (member name names)
+        (setq names (append names (list name)))))
+    names))
 
 (defun claude-code-ide-live-tests--codex-flags (&optional bypass)
   "Return the Codex flags of the live tests.
@@ -156,7 +200,33 @@ replaces all but the bypass."
                            " -c 'mcp_servers.claude-sessions.default_tools_approval_mode=\"approve\"'"))))
    " "))
 
-;;;###autoload
+(defun claude-code-ide-live-tests--start-time (pid)
+  "Return the start time of the process PID as a float, or nil."
+  (when-let* ((start (alist-get 'start (process-attributes pid))))
+    (float-time start)))
+
+(defun claude-code-ide-live-tests--claim-root (root)
+  "Claim the live folder ROOT for this Emacs, or signal a `user-error'.
+The file owner in ROOT holds the process ID and the start time of the
+Emacs that uses ROOT.  Two daemons must not share one live folder: they
+would share the registry, the inbox and the hooks.  A claim of an Emacs
+that ended, or of a process ID that now names another process, is old
+and is replaced."
+  (let* ((file (expand-file-name "owner" root))
+         (own (claude-code-ide-live-tests--start-time (emacs-pid)))
+         (claim (when (file-readable-p file)
+                  (with-temp-buffer
+                    (insert-file-contents file)
+                    (mapcar #'string-to-number (split-string (buffer-string))))))
+         (pid (car claim))
+         (start (cadr claim)))
+    (when (and (integerp pid) (> pid 0) (/= pid (emacs-pid)) (numberp start))
+      (let ((now (claude-code-ide-live-tests--start-time pid)))
+        (when (and now (< (abs (- now start)) 1.0))
+          (user-error "Live folder %s belongs to Emacs %d; use CLAUDE_CODE_IDE_LIVE_DIR for another folder"
+                      root pid))))
+    (write-region (format "%d %s\n" (emacs-pid) own) nil file nil 'silent)))
+
 (defun claude-code-ide-live-tests-setup ()
   "Point the package at the live folder and turn on the session registry.
 It runs once in each Emacs; a second call does nothing."
@@ -164,6 +234,11 @@ It runs once in each Emacs; a second call does nothing."
     (let ((root (claude-code-ide-live-tests--root)))
       (make-directory root t)
       (set-file-modes root #o700)
+      (claude-code-ide-live-tests--claim-root root)
+      ;; The CLIs get no API key and no marker of a parent CLI.  The test
+      ;; checks only the names; it never reads a value.
+      (setq claude-code-ide-cli-environment-unset (claude-code-ide-live-tests--environment-unset)
+            claude-code-ide-codex-remove-openai-api-key t)
       (setq claude-code-ide-state-file (expand-file-name "state.json" root)
             claude-code-ide-session-registry-report-directory nil
             claude-code-ide-control-inbox-directory nil
@@ -332,6 +407,17 @@ So this stop of the tests binds `kill-buffer-query-functions' to nil."
    (lambda () (not (cl-some #'claude-code-ide-instance-live-p (claude-code-ide-instances))))
    30 "the end of all instances"))
 
+(defun claude-code-ide-live-tests--cleanup ()
+  "Stop every instance, and delete the codeword files of the projects.
+The codeword files are note-*.txt in the folders of the live folder."
+  (ignore-errors (claude-code-ide-live-tests--stop-all))
+  (let ((root (claude-code-ide-live-tests--root)))
+    (when (file-directory-p root)
+      (dolist (dir (directory-files root t "\\`[^.]"))
+        (when (file-directory-p dir)
+          (dolist (file (directory-files dir t "\\`note-.*\\.txt\\'"))
+            (ignore-errors (delete-file file))))))))
+
 (defun claude-code-ide-live-tests--buffer (instance-id)
   "Return the terminal buffer of INSTANCE-ID."
   (claude-code-ide-instance-buffer (claude-code-ide-instance-by-id instance-id)))
@@ -386,37 +472,60 @@ KEY is `return', `escape', `down' or a string."
   "Return the text of the Codex config file."
   (claude-code-ide-live-tests--file-text (claude-code-ide-transcript--codex-config-file)))
 
+(defun claude-code-ide-live-tests--folder-key (directory)
+  "Return the key of DIRECTORY in the config files of the CLIs.
+That is its true name, without the final slash: the CLIs resolve links,
+for example /var to /private/var on macOS."
+  (directory-file-name (file-truename (expand-file-name directory))))
+
 (defun claude-code-ide-live-tests--codex-trusts-folder-p (directory)
   "Return non-nil when the Codex config has a trust entry for DIRECTORY."
-  (string-search (format "[projects.%S]" (directory-file-name (expand-file-name directory)))
+  (string-search (format "[projects.%S]" (claude-code-ide-live-tests--folder-key directory))
                  (claude-code-ide-live-tests--codex-config-text)))
+
+(defun claude-code-ide-live-tests--codex-trust-screen (text)
+  "Return what the Codex screen TEXT shows at its start.
+`dialog' for the folder trust dialog, `ready' for the composer (the
+folder needs no question), else nil."
+  (let ((flat (replace-regexp-in-string "[ \t\n]+" " " (or text ""))))
+    (cond
+     ((string-match-p "Trust and continue\\|Your trust decision will be saved\\|Trust this folder\\?"
+                      flat)
+      'dialog)
+     ((string-match-p "Ask Codex to do anything" flat) 'ready))))
 
 (defun claude-code-ide-live-tests--ensure-codex-folder-trust (directory)
   "Make sure that Codex trusts DIRECTORY, or skip the test.
 Codex asks one time for each new repository root, and it saves the
-answer in its config file; no flag avoids the question.  With
-CLAUDE_CODE_IDE_LIVE_CODEX_TRUST=1 the test answers \"Trust and
+answer in its config file; no flag avoids the question.  A Codex that
+reaches its composer without the question trusts the folder already.
+With CLAUDE_CODE_IDE_LIVE_TRUST=1 the test answers \"Trust and
 continue\" as a person, which writes [projects.\"DIRECTORY\"] to the
-Codex config.  Without the variable, a folder without trust skips the
-test."
+Codex config.  Without the variable, a folder that gets the question
+skips the test."
   (unless (claude-code-ide-live-tests--codex-trusts-folder-p directory)
-    (unless (claude-code-ide-live-tests--may-trust-p)
-      (ert-skip (format "Codex does not trust %s; see docs/live-tests.md" directory)))
-    (let ((id (claude-code-ide-live-tests--launch directory 'codex nil)))
-      (should (claude-code-ide-live-tests--wait
-               (lambda () (eq (claude-code-ide-codex-screen-dialog
-                               (claude-code-ide-live-tests--buffer id))
-                              'folder-trust))
-               60 "the folder trust dialog"))
-      (claude-code-ide-live-tests--send-key id 'return)
-      (should (claude-code-ide-live-tests--wait
-               (lambda () (claude-code-ide-live-tests--codex-trusts-folder-p directory))
-               30 "the trust entry"))
-      (claude-code-ide-live-tests--log "Codex trusts %s now (written by Codex)" directory)
-      (claude-code-ide-live-tests--stop id)
-      (claude-code-ide-live-tests--wait
-       (lambda () (not (claude-code-ide-live-tests--running-p id)))
-       30 "the end of the trust instance"))))
+    (let* ((id (claude-code-ide-live-tests--launch directory 'codex nil))
+           (seen (claude-code-ide-live-tests--wait
+                  (lambda () (claude-code-ide-live-tests--codex-trust-screen
+                              (claude-code-ide-live-tests--buffer-text id)))
+                  60 "the Codex folder trust dialog or composer")))
+      (unwind-protect
+          (pcase seen
+            ('ready (claude-code-ide-live-tests--log "Codex trusts %s already" directory))
+            ('dialog
+             (unless (claude-code-ide-live-tests--may-trust-p)
+               (ert-skip (format "Codex does not trust %s; see docs/live-tests.md" directory)))
+             (claude-code-ide-live-tests--send-key id 'return)
+             (should (claude-code-ide-live-tests--wait
+                      (lambda () (claude-code-ide-live-tests--codex-trusts-folder-p directory))
+                      30 "the trust entry"))
+             (claude-code-ide-live-tests--log "Codex trusts %s now (written by Codex)" directory))
+            (_ (ert-fail (format "Codex showed neither its trust dialog nor its composer in %s"
+                                 directory))))
+        (claude-code-ide-live-tests--stop id)
+        (claude-code-ide-live-tests--wait
+         (lambda () (not (claude-code-ide-live-tests--running-p id)))
+         30 "the end of the trust instance")))))
 
 ;;; Claude Code folder trust
 
@@ -425,53 +534,147 @@ test."
   (equal (getenv "CLAUDE_CODE_IDE_LIVE_TRUST") "1"))
 
 (defun claude-code-ide-live-tests--claude-trusts-folder-p (directory)
-  "Return non-nil when the Claude Code config trusts DIRECTORY itself."
-  (let ((file (expand-file-name ".claude.json" "~")))
+  "Return non-nil when the Claude Code config trusts DIRECTORY itself.
+The config file is that of `claude-code-ide-transcript--claude-config-file',
+in CLAUDE_CONFIG_DIR when that is set."
+  (let ((file (claude-code-ide-transcript--claude-config-file)))
     (when (file-readable-p file)
-      (let* ((config (with-temp-buffer
-                       (let ((coding-system-for-read 'utf-8))
-                         (insert-file-contents file))
-                       (json-parse-buffer :object-type 'hash-table :false-object nil)))
-             (projects (gethash "projects" config))
+      (let* ((config (ignore-errors
+                       (with-temp-buffer
+                         (let ((coding-system-for-read 'utf-8))
+                           (insert-file-contents file))
+                         (json-parse-buffer :object-type 'hash-table :false-object nil))))
+             (projects (and (hash-table-p config) (gethash "projects" config)))
              (entry (and (hash-table-p projects)
-                         (gethash (directory-file-name (expand-file-name directory)) projects))))
+                         (gethash (claude-code-ide-live-tests--folder-key directory) projects))))
         (and (hash-table-p entry) (gethash "hasTrustDialogAccepted" entry))))))
+
+(defun claude-code-ide-live-tests--claude-trust-screen (text started)
+  "Return what the Claude Code screen TEXT shows at its start.
+`dialog' for the folder trust question.  `ready' when STARTED, that is
+when the CLI sent its session start: Claude Code runs no hook in a
+folder that it does not trust, so the folder needs no question.  Else
+nil."
+  (cond
+   ((string-search "Yes, I trust this folder" (or text "")) 'dialog)
+   (started 'ready)))
 
 (defun claude-code-ide-live-tests--ensure-claude-folder-trust (directory)
   "Make sure that Claude Code trusts DIRECTORY, or skip the test.
 A new folder gets the question \"Is this a project you created or one
-you trust?\", whose default is \"No, exit\".  With
+you trust?\", whose default is \"No, exit\".  A CLI that starts without
+the question (a session start comes) trusts the folder already.  With
 CLAUDE_CODE_IDE_LIVE_TRUST=1 the test chooses \"Yes, I trust this
-folder\" as a person, which writes the trust of DIRECTORY to
-~/.claude.json.  Without the variable, the test skips."
+folder\" as a person, which writes the trust of DIRECTORY to the Claude
+Code config.  Without the variable, a folder that gets the question
+skips the test."
   (unless (claude-code-ide-live-tests--claude-trusts-folder-p directory)
-    (unless (claude-code-ide-live-tests--may-trust-p)
-      (ert-skip (format "Claude Code does not trust %s; see docs/live-tests.md" directory)))
-    (let ((id (claude-code-ide-live-tests--launch directory 'claude nil)))
-      (should (claude-code-ide-live-tests--wait
-               (lambda () (string-search "Yes, I trust this folder"
-                                         (claude-code-ide-live-tests--buffer-text id)))
-               60 "the Claude Code folder trust dialog"))
-      ;; Down to the second choice, then Return.  The key goes only
-      ;; when the dialog takes input, and Return only when the choice
-      ;; shows as selected: a lone Escape would cancel, which exits.
-      (should (claude-code-ide-live-tests--wait
-               (lambda ()
-                 (accept-process-output nil 1)
-                 (claude-code-ide-live-tests--send-key id 'down)
-                 (accept-process-output nil 1)
-                 (string-match-p "❯ *\\(?:[0-9]\\. \\)?Yes, I trust this folder"
-                                 (claude-code-ide-live-tests--buffer-text id)))
-               30 "the choice Yes, I trust this folder"))
-      (claude-code-ide-live-tests--send-key id 'return)
-      (should (claude-code-ide-live-tests--wait
-               (lambda () (claude-code-ide-live-tests--claude-trusts-folder-p directory))
-               30 "the Claude Code trust entry"))
-      (claude-code-ide-live-tests--log "Claude Code trusts %s now (written by Claude Code)" directory)
-      (claude-code-ide-live-tests--stop id)
-      (claude-code-ide-live-tests--wait
-       (lambda () (not (claude-code-ide-live-tests--running-p id)))
-       30 "the end of the trust instance"))))
+    (let* ((id (claude-code-ide-live-tests--launch directory 'claude nil))
+           (seen (claude-code-ide-live-tests--wait
+                  (lambda () (claude-code-ide-live-tests--claude-trust-screen
+                              (claude-code-ide-live-tests--buffer-text id)
+                              (claude-code-ide-live-tests--event id 'session-start)))
+                  60 "the Claude Code folder trust dialog or session start")))
+      (unwind-protect
+          (pcase seen
+            ('ready (claude-code-ide-live-tests--log "Claude Code trusts %s already" directory))
+            ('dialog
+             (unless (claude-code-ide-live-tests--may-trust-p)
+               (ert-skip (format "Claude Code does not trust %s; see docs/live-tests.md" directory)))
+             ;; Down to the second choice, then Return.  The key goes only
+             ;; when the dialog takes input, and Return only when the choice
+             ;; shows as selected: a lone Escape would cancel, which exits.
+             (should (claude-code-ide-live-tests--wait
+                      (lambda ()
+                        (accept-process-output nil 1)
+                        (claude-code-ide-live-tests--send-key id 'down)
+                        (accept-process-output nil 1)
+                        (string-match-p "❯ *\\(?:[0-9]\\. \\)?Yes, I trust this folder"
+                                        (claude-code-ide-live-tests--buffer-text id)))
+                      30 "the choice Yes, I trust this folder"))
+             (claude-code-ide-live-tests--send-key id 'return)
+             (should (claude-code-ide-live-tests--wait
+                      (lambda () (claude-code-ide-live-tests--claude-trusts-folder-p directory))
+                      30 "the Claude Code trust entry"))
+             (claude-code-ide-live-tests--log "Claude Code trusts %s now (written by Claude Code)"
+                                              directory))
+            (_ (ert-fail (format "Claude Code showed neither its trust dialog nor a session start in %s"
+                                 directory))))
+        (claude-code-ide-live-tests--stop id)
+        (claude-code-ide-live-tests--wait
+         (lambda () (not (claude-code-ide-live-tests--running-p id)))
+         30 "the end of the trust instance")))))
+
+;;; What the tests leave outside the live folder
+
+(defun claude-code-ide-live-tests--claude-folder-name (directory)
+  "Return the name of the transcript folder of DIRECTORY under projects/.
+Claude Code puts a - for each character that is not a letter or a digit."
+  (replace-regexp-in-string "[^A-Za-z0-9]" "-" (claude-code-ide-live-tests--folder-key directory)))
+
+(defun claude-code-ide-live-tests-leftovers (&optional root)
+  "Return what the live tests of ROOT left in the config folders of the CLIs.
+ROOT defaults to the live folder.  The result is a plist:
+- :codex-trust, the folders with a [projects.\"FOLDER\"] table in the
+  Codex config;
+- :claude-trust, the folders with a project entry with
+  hasTrustDialogAccepted in the Claude Code config;
+- :claude-transcripts, the transcript folders of Claude Code.
+Each folder is in ROOT.  This only reads; docs/live-tests.md tells how
+to remove them."
+  (let* ((root (or root (claude-code-ide-live-tests--root)))
+         (key (claude-code-ide-live-tests--folder-key root))
+         (inside (lambda (folder) (string-prefix-p (concat key "/") folder)))
+         (codex nil) (claude nil) (transcripts nil))
+    (let ((text (claude-code-ide-live-tests--codex-config-text))
+          (start 0))
+      (while (string-match "^\\[projects\\.\"\\([^\"]+\\)\"\\]" text start)
+        (when (funcall inside (match-string 1 text))
+          (push (match-string 1 text) codex))
+        (setq start (match-end 0))))
+    (let ((file (claude-code-ide-transcript--claude-config-file)))
+      (when (file-readable-p file)
+        (when-let* ((config (ignore-errors
+                              (with-temp-buffer
+                                (let ((coding-system-for-read 'utf-8))
+                                  (insert-file-contents file))
+                                (json-parse-buffer :object-type 'hash-table :false-object nil))))
+                    (projects (and (hash-table-p config) (gethash "projects" config)))
+                    ((hash-table-p projects)))
+          (maphash (lambda (folder entry)
+                     (when (and (funcall inside folder) (hash-table-p entry)
+                                (gethash "hasTrustDialogAccepted" entry))
+                       (push folder claude)))
+                   projects))))
+    (let ((dir (expand-file-name "projects" (claude-code-ide-session-registry--claude-config-directory)))
+          (prefix (concat (claude-code-ide-live-tests--claude-folder-name root) "-")))
+      (when (file-directory-p dir)
+        (dolist (name (directory-files dir))
+          (when (string-prefix-p prefix name)
+            (push (file-name-as-directory (expand-file-name name dir)) transcripts)))))
+    (list :codex-trust (sort codex #'string<)
+          :claude-trust (sort claude #'string<)
+          :claude-transcripts (sort transcripts #'string<))))
+
+(defun claude-code-ide-live-tests-show-leftovers ()
+  "Show what the live tests left in the config folders of the CLIs.
+See `claude-code-ide-live-tests-leftovers'.  It changes no file."
+  (interactive)
+  (let ((left (claude-code-ide-live-tests-leftovers)))
+    (with-current-buffer (get-buffer-create "*Live test leftovers*")
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (format "Codex config (%s), [projects.\"…\"] tables:\n"
+                        (claude-code-ide-transcript--codex-config-file)))
+        (dolist (folder (plist-get left :codex-trust)) (insert "  " folder "\n"))
+        (insert (format "\nClaude Code config (%s), \"projects\" entries:\n"
+                        (claude-code-ide-transcript--claude-config-file)))
+        (dolist (folder (plist-get left :claude-trust)) (insert "  " folder "\n"))
+        (insert "\nClaude Code transcript folders:\n")
+        (dolist (folder (plist-get left :claude-transcripts)) (insert "  " folder "\n"))
+        (insert "\nRemove them by hand when no CLI runs; see docs/live-tests.md.\n"))
+      (display-buffer (current-buffer)))
+    left))
 
 (defun claude-code-ide-live-tests--claude-project (name)
   "Return the project NAME, trusted by Claude Code."
@@ -505,11 +708,7 @@ say it later.  With PROMPT-ONLY, return the prompt and do nothing else."
     (if prompt-only
         prompt
       (claude-code-ide-live-tests--write-secret directory file-name codeword)
-      (let ((start (float-time)))
-        (should (eq (plist-get (claude-code-ide-control-submit instance-id prompt :queue t) :result)
-                    'queued))
-        (should (claude-code-ide-live-tests--wait-turn
-                 instance-id start claude-code-ide-live-tests--turn-limit)))
+      (should (claude-code-ide-live-tests--submit-and-reply instance-id prompt))
       (delete-file (expand-file-name file-name directory)))))
 
 (defun claude-code-ide-live-tests--first-turn (instance-id directory file-name codeword)
@@ -539,42 +738,117 @@ REQUEST-ID names the call.  Return the committed status."
       (should (eq (plist-get status :status) 'committed))
       status)))
 
-(defun claude-code-ide-live-tests--approve-while (instance-id predicate seconds)
-  "Wait until PREDICATE is non-nil, and approve the tools of INSTANCE-ID.
-The test answers \"1. Yes\" as a person, and logs the screen of each
-approval.  Use it only for a question that needs reads alone.  Return
-the value of PREDICATE, or nil after SECONDS."
-  (claude-code-ide-live-tests--wait
-   (lambda ()
-     (or (funcall predicate)
-         (progn
-           (when (equal (claude-code-ide-live-tests--state instance-id) '(waiting-for-user approval))
-             (let ((text (claude-code-ide-live-tests--buffer-text instance-id)))
-               (when (string-match-p "Do you want to proceed" text)
-                 (claude-code-ide-live-tests--log
-                  "%s: the test approves, as a person: %s" instance-id
-                  (replace-regexp-in-string
-                   "[ \t\n│]+" " " (substring text (max 0 (- (length text) 600)))))
-                 (claude-code-ide-live-tests--send-key instance-id "1")
-                 (accept-process-output nil 3))))
-           nil)))
-   seconds (format "a turn end of %s with approvals" instance-id)))
+(defun claude-code-ide-live-tests--read-tool-p (tool)
+  "Return non-nil when TOOL, a tool name of a CLI, only reads.
+These are Read, Glob and Grep, and the tools of the claude-sessions
+server (Claude Code names them mcp__claude-sessions__NAME, Codex
+mcp__claude_sessions__NAME).  Every other tool, also Bash, is not."
+  (and (stringp tool)
+       (or (member tool '("Read" "Glob" "Grep"))
+           (string-match-p "\\`mcp__claude[-_]sessions__[a-z_]+\\'" tool))
+       t))
+
+(defun claude-code-ide-live-tests--approval-tool (instance-id after)
+  "Return the tool of the newest approval request of INSTANCE-ID, or nil.
+Only requests after the float time AFTER count.  The tool is the
+tool_name of the PermissionRequest hook."
+  (when-let* ((event (claude-code-ide-live-tests--event instance-id 'approval-request after)))
+    (claude-code-ide-handover--event-value (plist-get event :data) "tool_name")))
+
+(defun claude-code-ide-live-tests--approve-while (instance-id predicate seconds &optional after)
+  "Wait until PREDICATE is non-nil, and approve the read tools of INSTANCE-ID.
+A tool that only reads (`claude-code-ide-live-tests--read-tool-p') gets
+\"1. Yes\" from the test, as a person; the log has the tool and the
+screen.  Any other tool fails the test: the test never allows a write
+or a command.  AFTER is the float time from which approval requests
+count.  Return the value of PREDICATE, or nil after SECONDS."
+  (let ((answered nil)
+        (after (or after (float-time))))
+    (claude-code-ide-live-tests--wait
+     (lambda ()
+       (or (funcall predicate)
+           (progn
+             (when (equal (claude-code-ide-live-tests--state instance-id) '(waiting-for-user approval))
+               (let ((entry (cl-find-if
+                             (lambda (entry)
+                               (and (> (car entry) after)
+                                    (not (memq (cdr entry) answered))
+                                    (equal (plist-get (cdr entry) :instance-id) instance-id)
+                                    (eq (plist-get (cdr entry) :event) 'approval-request)))
+                             claude-code-ide-live-tests--events))
+                     (text (claude-code-ide-live-tests--buffer-text instance-id)))
+                 (when entry
+                   (let ((tool (claude-code-ide-handover--event-value
+                                (plist-get (cdr entry) :data) "tool_name"))
+                         (screen (replace-regexp-in-string
+                                  "[ \t\n│]+" " " (substring text (max 0 (- (length text) 600))))))
+                     (unless (claude-code-ide-live-tests--read-tool-p tool)
+                       (claude-code-ide-live-tests--log "%s asks for the tool %S: %s"
+                                                        instance-id tool screen)
+                       (ert-fail (format "%s asks for the tool %S, which the test does not approve"
+                                         instance-id tool)))
+                     (when (string-match-p "Do you want to proceed\\|Allow the" text)
+                       (claude-code-ide-live-tests--log
+                        "%s: the test approves the read tool %s, as a person: %s"
+                        instance-id tool screen)
+                       (push (cdr entry) answered)
+                       (claude-code-ide-live-tests--send-key instance-id "1"))))))
+             nil)))
+     seconds (format "a turn end of %s with approvals" instance-id))))
+
+(defun claude-code-ide-live-tests--prompt-of (event)
+  "Return the prompt text of the prompt-submit EVENT, trimmed, or nil."
+  (when-let* ((prompt (claude-code-ide-handover--event-value (plist-get event :data) "prompt")))
+    (and (stringp prompt) (string-trim prompt))))
+
+(defun claude-code-ide-live-tests--delivery-time (instance-id text after)
+  "Return the time of the prompt-submit event of INSTANCE-ID with TEXT, or nil.
+Only events after the float time AFTER count.  The turn that answers
+TEXT is the first turn end after this time: a turn end before it
+belongs to an earlier prompt."
+  (car (cl-find-if (lambda (entry)
+                     (and (> (car entry) after)
+                          (equal (plist-get (cdr entry) :instance-id) instance-id)
+                          (eq (plist-get (cdr entry) :event) 'prompt-submit)
+                          (equal (claude-code-ide-live-tests--prompt-of (cdr entry))
+                                 (string-trim text))))
+                   claude-code-ide-live-tests--events)))
+
+(defun claude-code-ide-live-tests--wait-delivered (instance-id request-id text after)
+  "Wait until the prompt TEXT of REQUEST-ID reached INSTANCE-ID; return the time.
+The request status must be `delivered', and the time is that of its
+prompt-submit event after the float time AFTER."
+  (should (claude-code-ide-live-tests--wait
+           (lambda () (eq (plist-get (claude-code-ide-control-request-status instance-id request-id)
+                                     :result)
+                          'delivered))
+           claude-code-ide-live-tests--turn-limit (format "the delivery of %s" request-id)))
+  (let ((time (claude-code-ide-live-tests--wait
+               (lambda () (claude-code-ide-live-tests--delivery-time instance-id text after))
+               30 (format "the prompt-submit event of %s" request-id))))
+    (should time)
+    time))
+
+(defun claude-code-ide-live-tests--submit-and-reply (instance-id text)
+  "Submit TEXT to INSTANCE-ID, and return the reply of the turn that answers it.
+The prompt may wait in the inbox while the instance runs a turn.  The
+turn is the first one that ends after the delivery of TEXT.  The read
+tools of the turn are approved as a person; see
+`claude-code-ide-live-tests--approve-while'."
+  (let* ((start (float-time))
+         (result (claude-code-ide-control-submit instance-id text :queue t))
+         (request (plist-get result :request-id)))
+    (should (memq (plist-get result :result) '(queued delivered)))
+    (let ((delivered (claude-code-ide-live-tests--wait-delivered instance-id request text start)))
+      (claude-code-ide-live-tests--approve-while
+       instance-id (lambda () (claude-code-ide-live-tests--event instance-id 'turn-end delivered))
+       claude-code-ide-live-tests--turn-limit delivered)
+      (claude-code-ide-live-tests--wait-turn instance-id delivered claude-code-ide-live-tests--turn-limit))))
 
 (defun claude-code-ide-live-tests--ask (instance-id question)
   "Submit QUESTION to INSTANCE-ID, and return the reply of its turn.
-A question needs reads only, so the test approves the tool calls of
-the turn as a person; see `claude-code-ide-live-tests--approve-while'."
-  (let ((start (float-time)))
-    ;; The target may still run its first turn: the inbox sends when idle
-    (should (memq (plist-get (claude-code-ide-control-submit instance-id question :queue t) :result)
-                  '(queued delivered)))
-    (claude-code-ide-live-tests--wait
-     (lambda () (claude-code-ide-live-tests--event instance-id 'prompt-submit start))
-     claude-code-ide-live-tests--turn-limit "the delivery of the question")
-    (claude-code-ide-live-tests--approve-while
-     instance-id (lambda () (claude-code-ide-live-tests--event instance-id 'turn-end start))
-     claude-code-ide-live-tests--turn-limit)
-    (claude-code-ide-live-tests--wait-turn instance-id start claude-code-ide-live-tests--turn-limit)))
+See `claude-code-ide-live-tests--submit-and-reply'."
+  (claude-code-ide-live-tests--submit-and-reply instance-id question))
 
 (defun claude-code-ide-live-tests--question (label file-name)
   "Return the question that asks for the codeword of FILE-NAME, with LABEL first.
@@ -634,125 +908,125 @@ file is deleted, so the codeword is only in a tool result of the source.
 Leg 2 (Codex) must read it with the claude-sessions tools; leg 3 (CC)
 reads the Codex rollout through the file reference."
   :tags '(:live)
-  (claude-code-ide-live-tests--skip-unless-live)
-  (claude-code-ide-live-tests--stop-all)
-  (let* ((dir (claude-code-ide-live-tests--trusted-project "projA"))
-         (word-1 (claude-code-ide-live-tests--codeword "MARMOT"))
-         (word-2 (claude-code-ide-live-tests--codeword "HERON"))
-         (claude-code-ide-handover-session-server "claude-sessions")
-         (claude-code-ide-live-tests--assume-hook-trust t))
-    (claude-code-ide-live-tests--write-secret dir "note-1.txt" word-1)
-    (let* ((leg-1 (claude-code-ide-live-tests--launch
-                   dir 'claude
-                   (claude-code-ide-live-tests--read-secret-turn
-                    nil dir "note-1.txt" word-1 "cci-test-L1 original task" t))))
-      (claude-code-ide-live-tests--first-turn leg-1 dir "note-1.txt" word-1)
-      ;; Leg 1 -> leg 2: CC -> Codex, with the session server
-      (let* ((status-2 (claude-code-ide-live-tests--hand-over leg-1 'codex (claude-code-ide-live-tests--request-id "cci-test-L1-to-codex")))
-             (doc-2 (claude-code-ide-live-tests--check-document status-2 (list word-1)))
-             (leg-2 (claude-code-ide-live-tests--target-ready status-2)))
-        (should (string-search "mcp__claude_sessions__get_session_outline" doc-2))
-        (let ((reply (claude-code-ide-live-tests--ask
-                      leg-2 (concat (claude-code-ide-live-tests--question "cci-test-L1q" "note-1.txt")
-                                    " Use the claude-sessions tools that the document names, not the file.")))
-              (rollout (claude-code-ide-live-tests--transcript leg-2)))
-          (should (stringp reply))
-          (should (string-search word-1 reply))
-          ;; The detail came through the tools of claude-sessions
-          (let ((calls (claude-code-ide-live-tests--session-tool-calls rollout)))
-            (claude-code-ide-live-tests--log "case 1 rollout %s: claude-sessions calls %S" rollout calls)
-            (should calls)))
-        ;; Leg 2 reads a second codeword; then leg 2 -> leg 3: Codex -> CC
-        (claude-code-ide-live-tests--read-secret-turn leg-2 dir "note-2.txt" word-2 "cci-test-L3")
-        (let* ((status-3 (claude-code-ide-live-tests--hand-over leg-2 'claude (claude-code-ide-live-tests--request-id "cci-test-L3-to-claude")))
-               ;; Leg 2 said codeword 1 in its answer, so only codeword 2
-               ;; must be absent: it is only in a tool result of leg 2
-               (doc-3 (claude-code-ide-live-tests--check-document status-3 (list word-2)))
-               (leg-3 (claude-code-ide-live-tests--target-ready status-3)))
-          ;; The chain of three legs
-          (should (= 1 (claude-code-ide-live-tests--count "cci-test-L1 original task" doc-3)))
-          (should (= 1 (claude-code-ide-live-tests--count
-                        (format "<!-- claude-code-ide-handover-document id=%s -->"
-                                (plist-get status-3 :handover-id))
-                        doc-3)))
-          (should (equal (mapcar (lambda (leg) (plist-get leg :provider))
-                                 (claude-code-ide-session-registry-entry-legs
-                                  (claude-code-ide-session-registry-entry-of leg-3)))
-                         '(claude codex claude)))
-          (should-not (cl-some (lambda (leg) (plist-get leg :pending))
-                               (claude-code-ide-session-registry-entry-legs
-                                (claude-code-ide-session-registry-entry-of leg-3))))
-          (should (equal (claude-code-ide-session-registry-chain-current leg-1) leg-3))
-          (should (equal (claude-code-ide-session-registry-chain-current leg-2) leg-3))
+  (claude-code-ide-live-tests--live
+    (let* ((dir (claude-code-ide-live-tests--trusted-project "projA"))
+           (word-1 (claude-code-ide-live-tests--codeword "MARMOT"))
+           (word-2 (claude-code-ide-live-tests--codeword "HERON"))
+           (claude-code-ide-handover-session-server "claude-sessions")
+           (claude-code-ide-live-tests--assume-hook-trust t))
+      (claude-code-ide-live-tests--write-secret dir "note-1.txt" word-1)
+      (let* ((leg-1 (claude-code-ide-live-tests--launch
+                     dir 'claude
+                     (claude-code-ide-live-tests--read-secret-turn
+                      nil dir "note-1.txt" word-1 "cci-test-L1 original task" t))))
+        (claude-code-ide-live-tests--first-turn leg-1 dir "note-1.txt" word-1)
+        ;; Leg 1 -> leg 2: CC -> Codex, with the session server
+        (let* ((status-2 (claude-code-ide-live-tests--hand-over leg-1 'codex (claude-code-ide-live-tests--request-id "cci-test-L1-to-codex")))
+               (doc-2 (claude-code-ide-live-tests--check-document status-2 (list word-1)))
+               (leg-2 (claude-code-ide-live-tests--target-ready status-2)))
+          (should (string-search "mcp__claude_sessions__get_session_outline" doc-2))
           (let ((reply (claude-code-ide-live-tests--ask
-                        leg-3 (claude-code-ide-live-tests--question "cci-test-L3q" "note-2.txt"))))
+                        leg-2 (concat (claude-code-ide-live-tests--question "cci-test-L1q" "note-1.txt")
+                                      " Use the claude-sessions tools that the document names, not the file.")))
+                (rollout (claude-code-ide-live-tests--transcript leg-2)))
             (should (stringp reply))
-            (should (string-search word-2 reply))))))
-    (claude-code-ide-live-tests--stop-all)))
+            (should (string-search word-1 reply))
+            (should (and (stringp rollout) (file-readable-p rollout)))
+            ;; The detail came through the tools of claude-sessions
+            (let ((calls (claude-code-ide-live-tests--session-tool-calls rollout)))
+              (claude-code-ide-live-tests--log "case 1 rollout %s: claude-sessions calls %S" rollout calls)
+              (should calls)))
+          ;; Leg 2 reads a second codeword; then leg 2 -> leg 3: Codex -> CC
+          (claude-code-ide-live-tests--read-secret-turn leg-2 dir "note-2.txt" word-2 "cci-test-L3")
+          (let* ((status-3 (claude-code-ide-live-tests--hand-over leg-2 'claude (claude-code-ide-live-tests--request-id "cci-test-L3-to-claude")))
+                 ;; Leg 2 said codeword 1 in its answer, so only codeword 2
+                 ;; must be absent: it is only in a tool result of leg 2
+                 (doc-3 (claude-code-ide-live-tests--check-document status-3 (list word-2)))
+                 (leg-3 (claude-code-ide-live-tests--target-ready status-3)))
+            ;; The chain of three legs
+            (should (= 1 (claude-code-ide-live-tests--count "cci-test-L1 original task" doc-3)))
+            (should (= 1 (claude-code-ide-live-tests--count
+                          (format "<!-- claude-code-ide-handover-document id=%s -->"
+                                  (plist-get status-3 :handover-id))
+                          doc-3)))
+            (should (equal (mapcar (lambda (leg) (plist-get leg :provider))
+                                   (claude-code-ide-session-registry-entry-legs
+                                    (claude-code-ide-session-registry-entry-of leg-3)))
+                           '(claude codex claude)))
+            (should-not (cl-some (lambda (leg) (plist-get leg :pending))
+                                 (claude-code-ide-session-registry-entry-legs
+                                  (claude-code-ide-session-registry-entry-of leg-3))))
+            (should (equal (claude-code-ide-session-registry-chain-current leg-1) leg-3))
+            (should (equal (claude-code-ide-session-registry-chain-current leg-2) leg-3))
+            (let ((reply (claude-code-ide-live-tests--ask
+                          leg-3 (claude-code-ide-live-tests--question "cci-test-L3q" "note-2.txt"))))
+              (should (stringp reply))
+              (should (string-search word-2 reply))))))
+      (claude-code-ide-live-tests--stop-all))))
 
 (ert-deftest claude-code-ide-live-test-handover-file-reference ()
   "CC -> Codex without the session server: the target reads the transcript file."
   :tags '(:live)
-  (claude-code-ide-live-tests--skip-unless-live)
-  (claude-code-ide-live-tests--stop-all)
-  (let* ((dir (claude-code-ide-live-tests--trusted-project "projA"))
-         (word (claude-code-ide-live-tests--codeword "OSPREY"))
-         (claude-code-ide-handover-session-server nil)
-         (claude-code-ide-live-tests--assume-hook-trust t))
-    (claude-code-ide-live-tests--write-secret dir "note-b.txt" word)
-    (let ((source (claude-code-ide-live-tests--launch
-                   dir 'claude
-                   (claude-code-ide-live-tests--read-secret-turn
-                    nil dir "note-b.txt" word "cci-test-L2 file reference" t))))
-      (claude-code-ide-live-tests--first-turn source dir "note-b.txt" word)
-      (let* ((status (claude-code-ide-live-tests--hand-over source 'codex (claude-code-ide-live-tests--request-id "cci-test-L2-to-codex")))
-             (doc (claude-code-ide-live-tests--check-document status (list word)))
-             (target (claude-code-ide-live-tests--target-ready status)))
-        (should (= 0 (claude-code-ide-live-tests--count "mcp__" doc)))
-        (should (= 0 (claude-code-ide-live-tests--count "claude-sessions" doc)))
-        (should (string-search "Read it with: the file" doc))
-        (let ((reply (claude-code-ide-live-tests--ask
-                      target (claude-code-ide-live-tests--question "cci-test-L2q" "note-b.txt"))))
-          (should (stringp reply))
-          (should (string-search word reply))
-          ;; The target read the file, not the session server
-          (should-not (claude-code-ide-live-tests--session-tool-calls
-                       (claude-code-ide-live-tests--transcript target))))))
-    (claude-code-ide-live-tests--stop-all)))
+  (claude-code-ide-live-tests--live
+    (let* ((dir (claude-code-ide-live-tests--trusted-project "projA"))
+           (word (claude-code-ide-live-tests--codeword "OSPREY"))
+           (claude-code-ide-handover-session-server nil)
+           (claude-code-ide-live-tests--assume-hook-trust t))
+      (claude-code-ide-live-tests--write-secret dir "note-b.txt" word)
+      (let ((source (claude-code-ide-live-tests--launch
+                     dir 'claude
+                     (claude-code-ide-live-tests--read-secret-turn
+                      nil dir "note-b.txt" word "cci-test-L2 file reference" t))))
+        (claude-code-ide-live-tests--first-turn source dir "note-b.txt" word)
+        (let* ((status (claude-code-ide-live-tests--hand-over source 'codex (claude-code-ide-live-tests--request-id "cci-test-L2-to-codex")))
+               (doc (claude-code-ide-live-tests--check-document status (list word)))
+               (target (claude-code-ide-live-tests--target-ready status)))
+          (should (= 0 (claude-code-ide-live-tests--count "mcp__" doc)))
+          (should (= 0 (claude-code-ide-live-tests--count "claude-sessions" doc)))
+          (should (string-search "Read it with: the file" doc))
+          (let ((reply (claude-code-ide-live-tests--ask
+                        target (claude-code-ide-live-tests--question "cci-test-L2q" "note-b.txt"))))
+            (should (stringp reply))
+            (should (string-search word reply))
+            ;; The target read the file, not the session server.  A
+            ;; missing rollout would hide its calls, so it must exist.
+            (let ((rollout (claude-code-ide-live-tests--transcript target)))
+              (should (and (stringp rollout) (file-readable-p rollout)))
+              (should-not (claude-code-ide-live-tests--session-tool-calls rollout))))))
+      (claude-code-ide-live-tests--stop-all))))
 
 (ert-deftest claude-code-ide-live-test-handover-hooks-not-trusted ()
   "A coordinator handover to Codex without trusted hooks is refused, and nothing changes."
   :tags '(:live)
-  (claude-code-ide-live-tests--skip-unless-live)
-  (claude-code-ide-live-tests--stop-all)
-  (let* ((dir (claude-code-ide-live-tests--project "projA"))
-         (source (claude-code-ide-live-tests--launch dir 'claude nil))
-         (claude-code-ide-live-tests--assume-hook-trust nil))
-    (should (claude-code-ide-live-tests--wait
-             (lambda () (claude-code-ide-session-registry-entry-of source)) 30 "the registry entry"))
-    ;; The first call misses the cache and starts the check; the second
-    ;; one, after the check, has the real result
-    (dolist (attempt '(1 2))
-      (let ((result (claude-code-ide-handover-session source 'codex
-                                                      :request-id (format "cci-test-L5-%d" attempt))))
-        (claude-code-ide-live-tests--log "hooks-not-trusted attempt %d: %S" attempt result)
-        (should (eq (plist-get result :status) 'error))
-        (should (eq (plist-get result :reason) 'hooks-not-trusted))
-        (should (eq (plist-get (claude-code-ide-handover-status (format "cci-test-L5-%d" attempt))
-                               :reason)
-                    'unknown-handover))
-        (should (claude-code-ide-live-tests--running-p source))
-        (should-not (claude-code-ide-session-registry-entry-handover
-                     (claude-code-ide-session-registry-entry-of source)))
-        ;; The real check of the first call fills the cache
-        (let ((cached (claude-code-ide-live-tests--wait
-                       (lambda () (gethash (claude-code-ide-codex-events--trust-key)
-                                           claude-code-ide-codex-events--trust-cache))
-                       30 "the result of the trust check")))
-          (claude-code-ide-live-tests--log "trust cache after attempt %d: %S"
-                                           attempt (plist-get cached :status))
-          (should (eq (plist-get cached :status) 'untrusted)))))
-    (claude-code-ide-live-tests--stop-all)))
+  (claude-code-ide-live-tests--live
+    (let* ((dir (claude-code-ide-live-tests--project "projA"))
+           (source (claude-code-ide-live-tests--launch dir 'claude nil))
+           (claude-code-ide-live-tests--assume-hook-trust nil))
+      (should (claude-code-ide-live-tests--wait
+               (lambda () (claude-code-ide-session-registry-entry-of source)) 30 "the registry entry"))
+      ;; The first call misses the cache and starts the check; the second
+      ;; one, after the check, has the real result
+      (dolist (attempt '(1 2))
+        (let ((result (claude-code-ide-handover-session source 'codex
+                                                        :request-id (format "cci-test-L5-%d" attempt))))
+          (claude-code-ide-live-tests--log "hooks-not-trusted attempt %d: %S" attempt result)
+          (should (eq (plist-get result :status) 'error))
+          (should (eq (plist-get result :reason) 'hooks-not-trusted))
+          (should (eq (plist-get (claude-code-ide-handover-status (format "cci-test-L5-%d" attempt))
+                                 :reason)
+                      'unknown-handover))
+          (should (claude-code-ide-live-tests--running-p source))
+          (should-not (claude-code-ide-session-registry-entry-handover
+                       (claude-code-ide-session-registry-entry-of source)))
+          ;; The real check of the first call fills the cache
+          (let ((cached (claude-code-ide-live-tests--wait
+                         (lambda () (gethash (claude-code-ide-codex-events--trust-key)
+                                             claude-code-ide-codex-events--trust-cache))
+                         30 "the result of the trust check")))
+            (claude-code-ide-live-tests--log "trust cache after attempt %d: %S"
+                                             attempt (plist-get cached :status))
+            (should (eq (plist-get cached :status) 'untrusted)))))
+      (claude-code-ide-live-tests--stop-all))))
 
 (defun claude-code-ide-live-tests--start-stray (directory)
   "Start `sleep 900' in DIRECTORY outside Emacs, and return its process ID.
@@ -765,36 +1039,35 @@ The shell that starts it ends at once, so the sleep is no child of Emacs."
 (ert-deftest claude-code-ide-live-test-handover-stray ()
   "A stray process in the worktree stops the handover with needs-user; end goes on."
   :tags '(:live)
-  (claude-code-ide-live-tests--skip-unless-live)
-  (claude-code-ide-live-tests--stop-all)
-  (let* ((dir (claude-code-ide-live-tests--claude-project "projB"))
-         (source (claude-code-ide-live-tests--launch dir 'claude "cci-test-L6 stray: reply with the single word ok"))
-         (stray nil))
-    (should (claude-code-ide-live-tests--wait-turn source 0 claude-code-ide-live-tests--turn-limit))
-    (setq stray (claude-code-ide-live-tests--start-stray dir))
-    (claude-code-ide-live-tests--log "stray sleep %d in %s" stray dir)
-    (unwind-protect
-        (let* ((result (claude-code-ide-handover-session source 'claude :request-id (claude-code-ide-live-tests--request-id "cci-test-L6")))
-               (id (plist-get result :handover-id))
-               (status (claude-code-ide-live-tests--wait-handover
-                        id '(needs-user committed cancelled failed) 120)))
-          (should (eq (plist-get status :status) 'needs-user))
-          (should (eq (plist-get status :reason) 'strays))
-          (should (eq (plist-get status :stage) 'source-stopped))
-          (should (null (plist-get status :target-id)))
-          (should (member stray (mapcar (lambda (s) (plist-get s :pid)) (plist-get status :strays))))
-          (should-not (claude-code-ide-live-tests--running-p source))
-          (claude-code-ide-handover-resolve id 'end)
-          (should (claude-code-ide-live-tests--wait
-                   (lambda () (not (process-attributes stray))) 60 "the end of the stray"))
-          (let ((final (claude-code-ide-live-tests--wait-handover
-                        id '(committed cancelled failed needs-user)
-                        claude-code-ide-live-tests--handover-limit)))
-            (should (eq (plist-get final :status) 'committed))
-            (claude-code-ide-live-tests--target-ready final)))
-      (when (process-attributes stray)
-        (signal-process stray 'SIGKILL)))
-    (claude-code-ide-live-tests--stop-all)))
+  (claude-code-ide-live-tests--live
+    (let* ((dir (claude-code-ide-live-tests--claude-project "projB"))
+           (source (claude-code-ide-live-tests--launch dir 'claude "cci-test-L6 stray: reply with the single word ok"))
+           (stray nil))
+      (should (claude-code-ide-live-tests--wait-turn source 0 claude-code-ide-live-tests--turn-limit))
+      (setq stray (claude-code-ide-live-tests--start-stray dir))
+      (claude-code-ide-live-tests--log "stray sleep %d in %s" stray dir)
+      (unwind-protect
+          (let* ((result (claude-code-ide-handover-session source 'claude :request-id (claude-code-ide-live-tests--request-id "cci-test-L6")))
+                 (id (plist-get result :handover-id))
+                 (status (claude-code-ide-live-tests--wait-handover
+                          id '(needs-user committed cancelled failed) 120)))
+            (should (eq (plist-get status :status) 'needs-user))
+            (should (eq (plist-get status :reason) 'strays))
+            (should (eq (plist-get status :stage) 'source-stopped))
+            (should (null (plist-get status :target-id)))
+            (should (member stray (mapcar (lambda (s) (plist-get s :pid)) (plist-get status :strays))))
+            (should-not (claude-code-ide-live-tests--running-p source))
+            (claude-code-ide-handover-resolve id 'end)
+            (should (claude-code-ide-live-tests--wait
+                     (lambda () (not (process-attributes stray))) 60 "the end of the stray"))
+            (let ((final (claude-code-ide-live-tests--wait-handover
+                          id '(committed cancelled failed needs-user)
+                          claude-code-ide-live-tests--handover-limit)))
+              (should (eq (plist-get final :status) 'committed))
+              (claude-code-ide-live-tests--target-ready final)))
+        (when (process-attributes stray)
+          (signal-process stray 'SIGKILL)))
+      (claude-code-ide-live-tests--stop-all))))
 
 ;;; Recovery after a crash of Emacs
 
@@ -829,33 +1102,33 @@ It runs only with CLAUDE_CODE_IDE_LIVE_KILL set to a stage, for example
 target-identified, because it ends this Emacs.  Part 2 runs in the next
 Emacs."
   :tags '(:live :kill)
-  (claude-code-ide-live-tests--skip-unless-live)
-  (skip-unless (member (getenv "CLAUDE_CODE_IDE_LIVE_KILL")
-                       '("source-stopped" "document-written" "target-started" "target-identified" "delivered")))
-  (claude-code-ide-live-tests--stop-all)
-  (let* ((dir (claude-code-ide-live-tests--claude-project "projC"))
-         (word (claude-code-ide-live-tests--codeword "BADGER")))
-    (claude-code-ide-live-tests--write-secret dir "note-7.txt" word)
-    (let ((source (claude-code-ide-live-tests--launch
-                   dir 'claude
-                   (claude-code-ide-live-tests--read-secret-turn
-                    nil dir "note-7.txt" word "cci-test-L7 recovery" t))))
-      (claude-code-ide-live-tests--first-turn source dir "note-7.txt" word)
-      (when (file-exists-p (claude-code-ide-live-tests--recovery-file))
-        (delete-file (claude-code-ide-live-tests--recovery-file)))
-      (setq claude-code-ide-live-tests--kill-stage (intern (getenv "CLAUDE_CODE_IDE_LIVE_KILL")))
-      (put 'claude-code-ide-live-tests--kill-stage 'codeword word)
-      (advice-add 'claude-code-ide-handover--enter :around #'claude-code-ide-live-tests--kill-at-stage)
-      (unwind-protect
-          (let ((result (claude-code-ide-handover-session source 'claude :request-id (claude-code-ide-live-tests--request-id "cci-test-L7"))))
-            (should (eq (plist-get result :status) 'running))
-            ;; This Emacs ends at the kill stage; a wait that ends means a failure
-            (claude-code-ide-live-tests--wait-handover
-             (plist-get result :handover-id) '(committed cancelled failed needs-user)
-             claude-code-ide-live-tests--handover-limit)
-            (ert-fail "Emacs was not killed at the stage"))
-        (advice-remove 'claude-code-ide-handover--enter #'claude-code-ide-live-tests--kill-at-stage)
-        (setq claude-code-ide-live-tests--kill-stage nil)))))
+  (claude-code-ide-live-tests--live
+    (skip-unless (member (getenv "CLAUDE_CODE_IDE_LIVE_KILL")
+                         '("source-stopped" "document-written" "target-started" "target-identified" "delivered")))
+    (claude-code-ide-live-tests--stop-all)
+    (let* ((dir (claude-code-ide-live-tests--claude-project "projC"))
+           (word (claude-code-ide-live-tests--codeword "BADGER")))
+      (claude-code-ide-live-tests--write-secret dir "note-7.txt" word)
+      (let ((source (claude-code-ide-live-tests--launch
+                     dir 'claude
+                     (claude-code-ide-live-tests--read-secret-turn
+                      nil dir "note-7.txt" word "cci-test-L7 recovery" t))))
+        (claude-code-ide-live-tests--first-turn source dir "note-7.txt" word)
+        (when (file-exists-p (claude-code-ide-live-tests--recovery-file))
+          (delete-file (claude-code-ide-live-tests--recovery-file)))
+        (setq claude-code-ide-live-tests--kill-stage (intern (getenv "CLAUDE_CODE_IDE_LIVE_KILL")))
+        (put 'claude-code-ide-live-tests--kill-stage 'codeword word)
+        (advice-add 'claude-code-ide-handover--enter :around #'claude-code-ide-live-tests--kill-at-stage)
+        (unwind-protect
+            (let ((result (claude-code-ide-handover-session source 'claude :request-id (claude-code-ide-live-tests--request-id "cci-test-L7"))))
+              (should (eq (plist-get result :status) 'running))
+              ;; This Emacs ends at the kill stage; a wait that ends means a failure
+              (claude-code-ide-live-tests--wait-handover
+               (plist-get result :handover-id) '(committed cancelled failed needs-user)
+               claude-code-ide-live-tests--handover-limit)
+              (ert-fail "Emacs was not killed at the stage"))
+          (advice-remove 'claude-code-ide-handover--enter #'claude-code-ide-live-tests--kill-at-stage)
+          (setq claude-code-ide-live-tests--kill-stage nil))))))
 
 (defun claude-code-ide-live-tests--cli-processes (native-id)
   "Return the process IDs of the CLIs whose command line names NATIVE-ID."
@@ -874,43 +1147,43 @@ runs in the first idle moment, before this test.  The test checks that
 the source never starts again, that the target runs with its instance
 ID, that the handover commits, and that the target has the work."
   :tags '(:live)
-  (claude-code-ide-live-tests--skip-unless-live)
-  (skip-unless (file-exists-p (claude-code-ide-live-tests--recovery-file)))
-  (let* ((state (with-temp-buffer
-                  (insert-file-contents (claude-code-ide-live-tests--recovery-file))
-                  (read (current-buffer))))
-         (id (plist-get state :handover-id))
-         (source (plist-get state :source-id))
-         (target (plist-get state :target-id))
-         (source-entry (claude-code-ide-session-registry-entry-of source)))
-    (claude-code-ide-live-tests--log "recovery state: %S" state)
-    (should-not (equal (plist-get state :emacs-pid) (emacs-pid)))
-    (let ((final (claude-code-ide-live-tests--wait-handover
-                  id '(committed cancelled failed needs-user) claude-code-ide-live-tests--handover-limit)))
-      (should (eq (plist-get final :status) 'committed))
-      ;; Before target-started, the target has no ID yet
-      (if target
-          (should (equal (plist-get final :target-id) target))
-        (setq target (plist-get final :target-id))))
-    ;; Only the target started in this Emacs
-    (let ((starts (cl-remove-if-not (lambda (record) (equal (cadr record) (emacs-pid)))
-                                    (claude-code-ide-live-tests--starts-on-disk))))
-      (claude-code-ide-live-tests--log "starts in this Emacs: %S" starts)
-      (should (cl-every (lambda (record) (equal (car (nth 2 record)) target)) starts))
-      (should starts))
-    (should-not (claude-code-ide-instance-by-id source))
-    (should (claude-code-ide-live-tests--running-p target))
-    (should-not (claude-code-ide-live-tests--cli-processes
-                 (claude-code-ide-session-registry-entry-session-id source-entry)))
-    (should (equal (claude-code-ide-session-registry-chain-current source) target))
-    (claude-code-ide-live-tests--target-ready (claude-code-ide-handover-status id))
-    (let ((reply (claude-code-ide-live-tests--ask
-                  target (claude-code-ide-live-tests--question "cci-test-L7q" "note-7.txt"))))
-      (should (stringp reply))
-      (should (string-search (plist-get state :codeword) reply)))
-    (rename-file (claude-code-ide-live-tests--recovery-file)
-                 (concat (claude-code-ide-live-tests--recovery-file) ".done") t)
-    (claude-code-ide-live-tests--stop-all)))
+  (claude-code-ide-live-tests--live
+    (skip-unless (file-exists-p (claude-code-ide-live-tests--recovery-file)))
+    (let* ((state (with-temp-buffer
+                    (insert-file-contents (claude-code-ide-live-tests--recovery-file))
+                    (read (current-buffer))))
+           (id (plist-get state :handover-id))
+           (source (plist-get state :source-id))
+           (target (plist-get state :target-id))
+           (source-entry (claude-code-ide-session-registry-entry-of source)))
+      (claude-code-ide-live-tests--log "recovery state: %S" state)
+      (should-not (equal (plist-get state :emacs-pid) (emacs-pid)))
+      (let ((final (claude-code-ide-live-tests--wait-handover
+                    id '(committed cancelled failed needs-user) claude-code-ide-live-tests--handover-limit)))
+        (should (eq (plist-get final :status) 'committed))
+        ;; Before target-started, the target has no ID yet
+        (if target
+            (should (equal (plist-get final :target-id) target))
+          (setq target (plist-get final :target-id))))
+      ;; Only the target started in this Emacs
+      (let ((starts (cl-remove-if-not (lambda (record) (equal (cadr record) (emacs-pid)))
+                                      (claude-code-ide-live-tests--starts-on-disk))))
+        (claude-code-ide-live-tests--log "starts in this Emacs: %S" starts)
+        (should (cl-every (lambda (record) (equal (car (nth 2 record)) target)) starts))
+        (should starts))
+      (should-not (claude-code-ide-instance-by-id source))
+      (should (claude-code-ide-live-tests--running-p target))
+      (should-not (claude-code-ide-live-tests--cli-processes
+                   (claude-code-ide-session-registry-entry-session-id source-entry)))
+      (should (equal (claude-code-ide-session-registry-chain-current source) target))
+      (claude-code-ide-live-tests--target-ready (claude-code-ide-handover-status id))
+      (let ((reply (claude-code-ide-live-tests--ask
+                    target (claude-code-ide-live-tests--question "cci-test-L7q" "note-7.txt"))))
+        (should (stringp reply))
+        (should (string-search (plist-get state :codeword) reply)))
+      (rename-file (claude-code-ide-live-tests--recovery-file)
+                   (concat (claude-code-ide-live-tests--recovery-file) ".done") t)
+      (claude-code-ide-live-tests--stop-all))))
 
 (defun claude-code-ide-live-tests--starts-on-disk ()
   "Return the starts in starts.txt of the live folder, as (TIME PID RECORD)."
@@ -955,14 +1228,24 @@ that frame, as it does for a person, so its size is that of the window."
   (when-let* ((frame (cl-find-if (lambda (frame) (memq (framep frame) '(ns x w32 pgtk)))
                                  (frame-list)))
               (buffer (claude-code-ide-live-tests--buffer instance-id)))
+    ;; The start of the instance may have split the frame (a side
+    ;; window): the terminal gets the whole frame, as one window
     (with-selected-frame frame
-      (set-window-buffer (frame-root-window frame) buffer))))
+      (let ((window (frame-first-window frame)))
+        (ignore-errors
+          (let ((ignore-window-parameters t))
+            (delete-other-windows window)))
+        (set-window-buffer window buffer)))))
 
 (defun claude-code-ide-live-tests--screen (instance-id)
   "Return the screen text of INSTANCE-ID, with runs of blanks as one space."
   (string-trim
    (replace-regexp-in-string
     "[ \t]+" " " (claude-code-ide-codex--screen-text (claude-code-ide-live-tests--buffer instance-id)))))
+
+(defun claude-code-ide-live-tests--dialog-prompt (marker)
+  "Return the prompt with MARKER that a dialog test submits."
+  (format "%s: reply with the single word queued" marker))
 
 (defun claude-code-ide-live-tests--dialog-check (instance-id kind state marker)
   "Check that INSTANCE-ID shows the dialog KIND and gets no typed text.
@@ -984,7 +1267,7 @@ it.  Return the submit result."
   (should (equal (claude-code-ide-live-tests--wait-state instance-id (list state) 30) state))
   (let* ((before (claude-code-ide-live-tests--buffer-text instance-id))
          (result (claude-code-ide-control-submit
-                  instance-id (format "%s: reply with the single word queued" marker) :queue t)))
+                  instance-id (claude-code-ide-live-tests--dialog-prompt marker) :queue t)))
     (claude-code-ide-live-tests--log "%s: submit in the dialog %s: %S" instance-id kind result)
     (should (eq (plist-get result :result) 'queued))
     (accept-process-output nil 3)
@@ -1026,38 +1309,39 @@ it.  Return the submit result."
              (id (claude-code-ide-live-tests--launch
                   trusted 'codex
                   (concat tag "-approval: call the MCP tool mcp__emacs_tools__claude_code_ide_mcp_project_info one time (it is in ALL_TOOLS), then reply with the single word called"))))
-        (let* ((result (claude-code-ide-live-tests--dialog-check
+        (let* ((start (float-time))
+               (result (claude-code-ide-live-tests--dialog-check
                         id 'approval '(waiting-for-user approval) (concat tag "-queued")))
                (request (plist-get result :request-id))
-               (start (float-time)))
-          ;; The person allows the call; then the queued prompt goes out
+               (text (claude-code-ide-live-tests--dialog-prompt (concat tag "-queued"))))
+          ;; The person allows the call; the first turn ends
           (claude-code-ide-live-tests--send-key id 'return)
           (should (claude-code-ide-live-tests--wait-turn id 0 claude-code-ide-live-tests--turn-limit))
-          (should (claude-code-ide-live-tests--wait
-                   (lambda () (eq (plist-get (claude-code-ide-control-request-status id request) :result)
-                                  'delivered))
-                   claude-code-ide-live-tests--turn-limit "the delivery of the queued prompt"))
-          (should (claude-code-ide-live-tests--wait-turn id start claude-code-ide-live-tests--turn-limit)))
+          ;; Then the queued prompt goes out, and its own turn answers it:
+          ;; only a turn end after its delivery counts
+          (let ((delivered (claude-code-ide-live-tests--wait-delivered id request text start)))
+            (should (claude-code-ide-live-tests--wait-turn
+                     id delivered claude-code-ide-live-tests--turn-limit))))
         (claude-code-ide-live-tests--stop id))
       (claude-code-ide-live-tests--stop-all))))
 
 (ert-deftest claude-code-ide-live-test-codex-dialogs-vterm ()
   "The Codex dialogs in vterm: found, and no typed text."
   :tags '(:live :dialogs)
-  (claude-code-ide-live-tests--skip-unless-live)
-  (claude-code-ide-live-tests--dialogs 'vterm))
+  (claude-code-ide-live-tests--live
+    (claude-code-ide-live-tests--dialogs 'vterm)))
 
 (ert-deftest claude-code-ide-live-test-codex-dialogs-eat ()
   "The Codex dialogs in eat: found, and no typed text."
   :tags '(:live :dialogs)
-  (claude-code-ide-live-tests--skip-unless-live)
-  (claude-code-ide-live-tests--dialogs 'eat))
+  (claude-code-ide-live-tests--live
+    (claude-code-ide-live-tests--dialogs 'eat)))
 
 (ert-deftest claude-code-ide-live-test-codex-dialogs-ghostel ()
   "The Codex dialogs in ghostel, in an invisible GUI frame: found, and no typed text."
   :tags '(:live :dialogs)
-  (claude-code-ide-live-tests--skip-unless-live)
-  (claude-code-ide-live-tests--dialogs 'ghostel))
+  (claude-code-ide-live-tests--live
+    (claude-code-ide-live-tests--dialogs 'ghostel)))
 
 ;;; The stop asks nothing
 
@@ -1100,24 +1384,242 @@ question blocks Emacs."
 (ert-deftest claude-code-ide-live-test-stop-asks-nothing-eat ()
   "A stop of a Codex instance in eat asks no question."
   :tags '(:live)
-  (claude-code-ide-live-tests--skip-unless-live)
-  (claude-code-ide-live-tests--stop-asks-nothing 'eat 'codex))
+  (claude-code-ide-live-tests--live
+    (claude-code-ide-live-tests--stop-asks-nothing 'eat 'codex)))
 
 (ert-deftest claude-code-ide-live-test-stop-asks-nothing-ghostel ()
   "A stop of a Codex instance in ghostel asks no question."
   :tags '(:live)
-  (claude-code-ide-live-tests--skip-unless-live)
-  (claude-code-ide-live-tests--stop-asks-nothing 'ghostel 'codex))
+  (claude-code-ide-live-tests--live
+    (claude-code-ide-live-tests--stop-asks-nothing 'ghostel 'codex)))
 
 (ert-deftest claude-code-ide-live-test-stop-asks-nothing-vterm ()
   "A stop of a Codex instance in vterm asks no question."
   :tags '(:live)
-  (claude-code-ide-live-tests--skip-unless-live)
-  (claude-code-ide-live-tests--stop-asks-nothing 'vterm 'codex))
+  (claude-code-ide-live-tests--live
+    (claude-code-ide-live-tests--stop-asks-nothing 'vterm 'codex)))
+
+;;; Unit tests of the helpers
+;;
+;; These run in the batch suite, with the mocks of
+;; claude-code-ide-tests.el.  They start no CLI and use only temporary
+;; folders.
+
+(defmacro claude-code-ide-live-tests--with-temp-folder (var &rest body)
+  "Bind VAR to a new temporary folder (a directory name), run BODY, then remove it."
+  (declare (indent 1))
+  `(let ((,var (file-name-as-directory (make-temp-file "cci-test-live-" t))))
+     (unwind-protect
+         (progn ,@body)
+       (delete-directory ,var t))))
+
+(ert-deftest claude-code-ide-live-tests-test-read-tools ()
+  "Only the read tools are approved for a person; every other tool is not."
+  (dolist (tool '("Read" "Glob" "Grep"
+                  "mcp__claude-sessions__get_session_outline"
+                  "mcp__claude-sessions__get_messages"
+                  "mcp__claude_sessions__get_messages"))
+    (should (claude-code-ide-live-tests--read-tool-p tool)))
+  (dolist (tool '("Bash" "Write" "Edit" "MultiEdit" "NotebookEdit" "WebFetch"
+                  "mcp__emacs-tools__emacs_eval" "mcp__emacs_tools__claude_code_ide_mcp_project_info"
+                  "mcp__claude-sessions-evil__x" "Readx" "" nil))
+    (should-not (claude-code-ide-live-tests--read-tool-p tool))))
+
+(ert-deftest claude-code-ide-live-tests-test-approval-tool ()
+  "The tool of an approval is that of the newest approval request after the time."
+  (let ((claude-code-ide-live-tests--events
+         (list (cons 30.0 (list :instance-id "cci-test-a" :event 'approval-request
+                                :data '((tool_name . "Bash"))))
+               (cons 20.0 (list :instance-id "cci-test-b" :event 'approval-request
+                                :data '((tool_name . "Read"))))
+               (cons 10.0 (list :instance-id "cci-test-a" :event 'approval-request
+                                :data '((tool_name . "Grep")))))))
+    (should (equal (claude-code-ide-live-tests--approval-tool "cci-test-a" 0) "Bash"))
+    (should (equal (claude-code-ide-live-tests--approval-tool "cci-test-b" 0) "Read"))
+    (should-not (claude-code-ide-live-tests--approval-tool "cci-test-a" 40))
+    (should-not (claude-code-ide-live-tests--approval-tool "cci-test-c" 0))))
+
+(ert-deftest claude-code-ide-live-tests-test-claude-flags ()
+  "The Claude Code flags of the live tests accept no edits by themselves."
+  (let ((process-environment (cons "CLAUDE_CODE_IDE_LIVE_CLAUDE_FLAGS" process-environment)))
+    (let ((flags (claude-code-ide-live-tests--claude-flags)))
+      (should-not (string-match-p "acceptEdits\\|bypassPermissions\\|dangerously" flags))
+      ;; Only the summary folder of the handover may get writes
+      (should (string-match-p "Write(\\.handover/\\*\\*)" flags))
+      ;; No command runs: Bash is off, and not in the allowed tools
+      (should (string-match-p "--disallowedTools Bash" flags))
+      (should-not (string-match-p "--allowedTools [^ ]*Bash" flags)))))
+
+(ert-deftest claude-code-ide-live-tests-test-every-live-test-skips ()
+  "Each live test skips here, before it does anything.
+A live test without the gate would start the CLIs in the batch suite."
+  (let ((tests (cl-remove-if-not
+                (lambda (test)
+                  (string-prefix-p "claude-code-ide-live-test-" (symbol-name (ert-test-name test))))
+                (ert-select-tests t t)))
+        (launches 0))
+    (should (> (length tests) 10))
+    (cl-letf (((symbol-function 'claude-code-ide-control-launch)
+               (lambda (&rest _) (cl-incf launches) (list :status 'error :reason 'cci-test))))
+      (dolist (test tests)
+        (let ((result (ert-run-test test)))
+          (should (equal (list (ert-test-name test) t)
+                         (list (ert-test-name test) (ert-test-skipped-p result)))))))
+    (should (= launches 0))))
+
+(ert-deftest claude-code-ide-live-tests-test-gate ()
+  "The live tests run only in a daemon, outside batch mode, without the mocks."
+  (let ((process-environment (cons "CLAUDE_CODE_IDE_LIVE_TESTS=1" process-environment))
+        (real-featurep (symbol-function 'featurep)))
+    (cl-letf (((symbol-function 'featurep)
+               (lambda (feature &rest args)
+                 (and (not (eq feature 'claude-code-ide-tests))
+                      (apply real-featurep feature args)))))
+      (let ((noninteractive nil))
+        (cl-letf (((symbol-function 'daemonp) (lambda () "cci-test")))
+          (should (claude-code-ide-live-tests--live-p)))
+        ;; An Emacs with a frame of its own is not the test daemon
+        (cl-letf (((symbol-function 'daemonp) (lambda () nil)))
+          (should-not (claude-code-ide-live-tests--live-p))))
+      (let ((noninteractive t))
+        (cl-letf (((symbol-function 'daemonp) (lambda () "cci-test")))
+          (should-not (claude-code-ide-live-tests--live-p)))))
+    ;; With the mocks, never
+    (should-not (claude-code-ide-live-tests--live-p))))
+
+(ert-deftest claude-code-ide-live-tests-test-environment ()
+  "The Claude Code CLI of the live tests gets no key and no marker of a parent CLI.
+The package sets CLAUDE_CODE_SSE_PORT itself, so that one stays."
+  (let ((claude-code-ide-cli-environment-unset '("CCI_TEST_USER_VAR"))
+        (claude-code-ide-no-flicker nil))
+    (setq claude-code-ide-cli-environment-unset (claude-code-ide-live-tests--environment-unset))
+    (let ((env (claude-code-ide--cli-environment 4242)))
+      (dolist (name '("ANTHROPIC_API_KEY" "OPENAI_API_KEY" "CLAUDECODE"
+                      "CLAUDE_CODE_CHILD_SESSION" "CLAUDE_CODE_ENTRYPOINT" "CCI_TEST_USER_VAR"))
+        (should (member name env)))
+      ;; The first entry of a name wins: the port of this Emacs
+      (should (equal (seq-find (lambda (entry) (string-prefix-p "CLAUDE_CODE_SSE_PORT" entry)) env)
+                     "CLAUDE_CODE_SSE_PORT=4242")))
+    ;; A second call adds nothing twice
+    (should (= (length claude-code-ide-cli-environment-unset)
+               (length (delete-dups (claude-code-ide-live-tests--environment-unset)))))))
+
+(ert-deftest claude-code-ide-live-tests-test-trust-files ()
+  "The trust checks read the config files of the CLIs, by the true folder name."
+  (claude-code-ide-live-tests--with-temp-folder root
+    (let* ((project (file-name-as-directory (expand-file-name "projA" root)))
+           (true (directory-file-name (file-truename project)))
+           (claude-dir (expand-file-name "claude-config" root))
+           (codex-dir (expand-file-name "codex-home" root))
+           (process-environment (append (list (concat "CLAUDE_CONFIG_DIR=" claude-dir)
+                                              (concat "CODEX_HOME=" codex-dir))
+                                        process-environment)))
+      (make-directory project t)
+      (make-directory claude-dir t)
+      (make-directory codex-dir t)
+      (should-not (claude-code-ide-live-tests--claude-trusts-folder-p project))
+      (should-not (claude-code-ide-live-tests--codex-trusts-folder-p project))
+      (with-temp-file (expand-file-name ".claude.json" claude-dir)
+        (insert (json-encode `((projects . ((,(intern true) . ((hasTrustDialogAccepted . t)))))))))
+      (with-temp-file (expand-file-name "config.toml" codex-dir)
+        (insert (format "[projects.%S]\ntrust_level = \"trusted\"\n" true)))
+      ;; The temporary folder of macOS is a link (/var -> /private/var)
+      (should (claude-code-ide-live-tests--claude-trusts-folder-p project))
+      (should (claude-code-ide-live-tests--codex-trusts-folder-p project)))))
+
+(ert-deftest claude-code-ide-live-tests-test-trust-screens ()
+  "A trust check sees the dialog, or the CLI at its prompt, which counts as trusted."
+  (should (eq (claude-code-ide-live-tests--claude-trust-screen
+               " Quick safety check: Is this a project you created or one you trust?\n ❯ No, exit\n   Yes, I trust this folder\n" nil)
+              'dialog))
+  ;; Hooks run only after the trust, so a session start means trusted
+  (should (eq (claude-code-ide-live-tests--claude-trust-screen "╭───╮\n│ > \n" t) 'ready))
+  (should-not (claude-code-ide-live-tests--claude-trust-screen "Loading" nil))
+  (should (eq (claude-code-ide-live-tests--codex-trust-screen
+               "Do you trust the contents of this directory?\n› 1. Trust and continue\n  2. Quit\n Your trust decision will be saved")
+              'dialog))
+  (should (eq (claude-code-ide-live-tests--codex-trust-screen
+               "  >_ OpenAI Codex (v0.164.0)\n› Ask Codex to do anything\n")
+              'ready))
+  (should-not (claude-code-ide-live-tests--codex-trust-screen "")))
+
+(ert-deftest claude-code-ide-live-tests-test-delivery-time ()
+  "The turn of a prompt is the first turn end after the delivery of that prompt."
+  (let ((claude-code-ide-live-tests--events
+         ;; Newest first
+         (list (cons 40.0 (list :instance-id "cci-test-a" :event 'turn-end
+                                :data '((last_assistant_message . "answer"))))
+               (cons 30.0 (list :instance-id "cci-test-a" :event 'prompt-submit
+                                :data '((prompt . "cci-test-L-q: the question"))))
+               (cons 20.0 (list :instance-id "cci-test-a" :event 'turn-end
+                                :data '((last_assistant_message . "first turn"))))
+               (cons 10.0 (list :instance-id "cci-test-a" :event 'prompt-submit
+                                :data '((prompt . "cci-test-L first task")))))))
+    (should (= (claude-code-ide-live-tests--delivery-time "cci-test-a" "cci-test-L-q: the question" 0)
+               30.0))
+    (should-not (claude-code-ide-live-tests--delivery-time "cci-test-a" "cci-test-L-q: the question" 35))
+    (should-not (claude-code-ide-live-tests--delivery-time "cci-test-a" "another text" 0))
+    ;; The first turn end does not count for the question
+    (should (equal (claude-code-ide-live-tests--reply
+                    (claude-code-ide-live-tests--event "cci-test-a" 'turn-end 30.0))
+                   "answer"))))
+
+(ert-deftest claude-code-ide-live-tests-test-one-daemon-per-folder ()
+  "A live folder belongs to one live Emacs at a time."
+  (claude-code-ide-live-tests--with-temp-folder root
+    (let ((owner (expand-file-name "owner" root)))
+      ;; A new folder: this Emacs takes it, and takes it again
+      (claude-code-ide-live-tests--claim-root root)
+      (should (file-exists-p owner))
+      (claude-code-ide-live-tests--claim-root root)
+      ;; An Emacs that ended: its claim is old
+      (with-temp-file owner (insert "999999999 0\n"))
+      (claude-code-ide-live-tests--claim-root root)
+      ;; A process ID that now names another process (its start time
+      ;; differs) is an old claim too
+      (with-temp-file owner (insert (format "%d 1.0\n" (emacs-pid))))
+      (claude-code-ide-live-tests--claim-root root)
+      ;; A live process with the start time of the claim holds the folder
+      (let ((other (make-process :name "cci-test-owner" :command '("sleep" "30")
+                                 :connection-type 'pipe :noquery t)))
+        (unwind-protect
+            (progn
+              (with-temp-file owner
+                (insert (format "%d %s\n" (process-id other)
+                                (claude-code-ide-live-tests--start-time (process-id other)))))
+              (should-error (claude-code-ide-live-tests--claim-root root) :type 'user-error))
+          (delete-process other))))))
+
+(ert-deftest claude-code-ide-live-tests-test-leftovers ()
+  "The cleanup list names the trust entries and transcript folders of the live folder."
+  (claude-code-ide-live-tests--with-temp-folder root
+    (let* ((live (file-name-as-directory (expand-file-name "live" root)))
+           (project (directory-file-name (file-truename (expand-file-name "projA" live))))
+           (other "/Users/cci-test/elsewhere")
+           (claude-dir (expand-file-name "claude-config" root))
+           (codex-dir (expand-file-name "codex-home" root))
+           (transcripts (expand-file-name
+                         (concat "projects/" (replace-regexp-in-string "[^A-Za-z0-9]" "-" project))
+                         claude-dir))
+           (process-environment (append (list (concat "CLAUDE_CONFIG_DIR=" claude-dir)
+                                              (concat "CODEX_HOME=" codex-dir))
+                                        process-environment)))
+      (make-directory (expand-file-name "projA" live) t)
+      (make-directory transcripts t)
+      (make-directory codex-dir t)
+      (with-temp-file (expand-file-name ".claude.json" claude-dir)
+        (insert (json-encode `((projects . ((,(intern project) . ((hasTrustDialogAccepted . t)))
+                                            (,(intern other) . ((hasTrustDialogAccepted . t)))))))))
+      (with-temp-file (expand-file-name "config.toml" codex-dir)
+        (insert (format "[projects.%S]\ntrust_level = \"trusted\"\n\n[projects.%S]\ntrust_level = \"trusted\"\n"
+                        project other)))
+      (let ((left (claude-code-ide-live-tests-leftovers live)))
+        (should (equal (plist-get left :codex-trust) (list project)))
+        (should (equal (plist-get left :claude-trust) (list project)))
+        (should (equal (plist-get left :claude-transcripts) (list (file-name-as-directory transcripts))))))))
 
 ;;; Running the tests in the daemon
 
-;;;###autoload
 (defun claude-code-ide-live-tests-run (selector output)
   "Run the live tests of SELECTOR from a timer, and write the results to OUTPUT.
 SELECTOR is an ERT selector, such as a regexp.  The call returns at
