@@ -1728,27 +1728,27 @@ next toggle, independent of which project the instances belong to."
   "Test the openFile tool implementation."
   ;; Test successful file open
   (claude-code-ide-mcp-tests--with-temp-file test-file "Line 1\nLine 2\nLine 3\nLine 4"
-                                             (let ((result (claude-code-ide-mcp-handle-open-file `((filePath . ,test-file)))))
-                                               (should (listp result))
-                                               (let ((first-item (car result)))
-                                                 (should (equal (alist-get 'type first-item) "text"))
-                                                 (should (equal (alist-get 'text first-item) "FILE_OPENED")))
-                                               (should (equal (buffer-file-name) test-file))
-                                               (kill-buffer)))
+    (let ((result (claude-code-ide-mcp-handle-open-file `((filePath . ,test-file)))))
+      (should (listp result))
+      (let ((first-item (car result)))
+        (should (equal (alist-get 'type first-item) "text"))
+        (should (equal (alist-get 'text first-item) "FILE_OPENED")))
+      (should (equal (buffer-file-name) test-file))
+      (kill-buffer)))
 
   ;; Test with selection
   (claude-code-ide-mcp-tests--with-temp-file test-file "Line 1\nLine 2\nLine 3\nLine 4"
-                                             (let ((result (claude-code-ide-mcp-handle-open-file
-                                                            `((filePath . ,test-file)
-                                                              (startLine . 2)
-                                                              (endLine . 3)))))
-                                               (should (listp result))
-                                               (let ((first-item (car result)))
-                                                 (should (equal (alist-get 'type first-item) "text"))
-                                                 (should (equal (alist-get 'text first-item) "FILE_OPENED")))
-                                               (should (use-region-p))
-                                               (should (= (line-number-at-pos (region-beginning)) 2))
-                                               (kill-buffer)))
+    (let ((result (claude-code-ide-mcp-handle-open-file
+                   `((filePath . ,test-file)
+                     (startLine . 2)
+                     (endLine . 3)))))
+      (should (listp result))
+      (let ((first-item (car result)))
+        (should (equal (alist-get 'type first-item) "text"))
+        (should (equal (alist-get 'text first-item) "FILE_OPENED")))
+      (should (use-region-p))
+      (should (= (line-number-at-pos (region-beginning)) 2))
+      (kill-buffer)))
 
   ;; Test missing filePath parameter
   (should-error (claude-code-ide-mcp-handle-open-file '())
@@ -1758,47 +1758,47 @@ next toggle, independent of which project the instances belong to."
   "Test the selection payload builder."
   ;; Test with active selection
   (claude-code-ide-mcp-tests--with-temp-buffer "Line 1\nLine 2\nLine 3"
-                                               (goto-char (point-min))
-                                               (set-mark (point))
-                                               (forward-line 2)
-                                               ;; Ensure transient-mark-mode is on and region is active
-                                               (let ((transient-mark-mode t))
-                                                 (activate-mark)
-                                                 (let ((result (claude-code-ide-mcp--get-current-selection)))
-                                                   (should (equal (alist-get 'text result) "Line 1\nLine 2\n"))
-                                                   (should-not (assq 'fileUrl result))
-                                                   (let ((selection (alist-get 'selection result)))
-                                                     (should selection)
-                                                     (should-not (assq 'isEmpty selection))
-                                                     (let ((start (alist-get 'start selection))
-                                                           (end (alist-get 'end selection)))
-                                                       (should (= (alist-get 'line start) 1))  ; 1-based
-                                                       (should (= (alist-get 'line end) 3)))))))  ; 1-based
+    (goto-char (point-min))
+    (set-mark (point))
+    (forward-line 2)
+    ;; Ensure transient-mark-mode is on and region is active
+    (let ((transient-mark-mode t))
+      (activate-mark)
+      (let ((result (claude-code-ide-mcp--get-current-selection)))
+        (should (equal (alist-get 'text result) "Line 1\nLine 2\n"))
+        (should-not (assq 'fileUrl result))
+        (let ((selection (alist-get 'selection result)))
+          (should selection)
+          (should-not (assq 'isEmpty selection))
+          (let ((start (alist-get 'start selection))
+                (end (alist-get 'end selection)))
+            (should (= (alist-get 'line start) 1))  ; 1-based
+            (should (= (alist-get 'line end) 3)))))))  ; 1-based
 
   ;; Test without selection
   (claude-code-ide-mcp-tests--with-temp-buffer "Test"
-                                               (let ((result (claude-code-ide-mcp--get-current-selection)))
-                                                 (should (equal (alist-get 'text result) ""))
-                                                 (let ((selection (alist-get 'selection result)))
-                                                   (should selection)
-                                                   ;; No selection: start and end should be equal (cursor position)
-                                                   (should (equal (alist-get 'start selection) (alist-get 'end selection)))
-                                                   ;; Should not contain isEmpty or fileUrl
-                                                   (should-not (assq 'isEmpty selection))
-                                                   (should-not (assq 'fileUrl result))))))
+    (let ((result (claude-code-ide-mcp--get-current-selection)))
+      (should (equal (alist-get 'text result) ""))
+      (let ((selection (alist-get 'selection result)))
+        (should selection)
+        ;; No selection: start and end should be equal (cursor position)
+        (should (equal (alist-get 'start selection) (alist-get 'end selection)))
+        ;; Should not contain isEmpty or fileUrl
+        (should-not (assq 'isEmpty selection))
+        (should-not (assq 'fileUrl result))))))
 
 (ert-deftest claude-code-ide-test-mcp-close-tab ()
   "Test the close_tab tool implementation."
   (claude-code-ide-mcp-tests--with-temp-file test-file "Content"
-                                             (find-file-noselect test-file)
-                                             ;; Close using tool
-                                             (let ((result (claude-code-ide-mcp-handle-close-tab `((path . ,test-file)))))
-                                               ;; Handler returns VS Code format
-                                               (should (listp result))
-                                               (let ((first-item (car result)))
-                                                 (should (equal (alist-get 'type first-item) "text"))
-                                                 (should (equal (alist-get 'text first-item) "TAB_CLOSED")))
-                                               (should-not (find-buffer-visiting test-file))))
+    (find-file-noselect test-file)
+    ;; Close using tool
+    (let ((result (claude-code-ide-mcp-handle-close-tab `((path . ,test-file)))))
+      ;; Handler returns VS Code format
+      (should (listp result))
+      (let ((first-item (car result)))
+        (should (equal (alist-get 'type first-item) "text"))
+        (should (equal (alist-get 'text first-item) "TAB_CLOSED")))
+      (should-not (find-buffer-visiting test-file))))
 
   ;; Test non-existent buffer - should throw an error
   (should-error (claude-code-ide-mcp-handle-close-tab '((path . "/nonexistent/file")))
@@ -4145,23 +4145,23 @@ LSP-ON is the buffer's initial `lsp-mode' value; PROJECT is what
 (ert-deftest claude-code-ide-test-cci-ensure-lsp-starts-and-primes ()
   "A project file without lsp-mode gets it started and its cache filled."
   (claude-code-ide-tests--with-lsp-mocks nil '(transient . "/tmp/")
-                                         (cci-ensure-lsp "some_symbol" file)
-                                         (should (= started 1))
-                                         (should (= primed 1))))
+    (cci-ensure-lsp "some_symbol" file)
+    (should (= started 1))
+    (should (= primed 1))))
 
 (ert-deftest claude-code-ide-test-cci-ensure-lsp-running-only-primes ()
   "When lsp-mode already runs, only the symbol cache is filled."
   (claude-code-ide-tests--with-lsp-mocks t '(transient . "/tmp/")
-                                         (cci-ensure-lsp "some_symbol" file)
-                                         (should (= started 0))
-                                         (should (= primed 1))))
+    (cci-ensure-lsp "some_symbol" file)
+    (should (= started 0))
+    (should (= primed 1))))
 
 (ert-deftest claude-code-ide-test-cci-ensure-lsp-skips-loose-files ()
   "A file outside any project does not start lsp-mode."
   (claude-code-ide-tests--with-lsp-mocks nil nil
-                                         (cci-ensure-lsp "some_symbol" file)
-                                         (should (= started 0))
-                                         (should (= primed 0))))
+    (cci-ensure-lsp "some_symbol" file)
+    (should (= started 0))
+    (should (= primed 0))))
 
 (ert-deftest claude-code-ide-test-cci-ensure-lsp-without-lsp-mode ()
   "Without lsp-mode loaded the function does nothing."
@@ -4176,18 +4176,18 @@ LSP-ON is the buffer's initial `lsp-mode' value; PROJECT is what
 (ert-deftest claude-code-ide-test-cci-ensure-lsp-gives-up-after-timeout ()
   "If lsp-mode never attaches, the wait ends and the cache is not filled."
   (claude-code-ide-tests--with-lsp-mocks nil '(transient . "/tmp/")
-                                         (cl-letf (((symbol-function 'lsp)
-                                                    (lambda (&rest _) (setq started (1+ started)))))
-                                           ;; On the virtual clock, only the
-                                           ;; wait for lsp-mode takes time
-                                           (claude-code-ide-tests--call-with-clock
-                                            (lambda ()
-                                              (let ((cci-ensure-lsp-timeout 0.3)
-                                                    (t0 (float-time)))
-                                                (cci-ensure-lsp "some_symbol" file)
-                                                (should (= started 1))
-                                                (should (= primed 0))
-                                                (should (< (- (float-time) t0) 2))))))))
+    (cl-letf (((symbol-function 'lsp)
+               (lambda (&rest _) (setq started (1+ started)))))
+      ;; On the virtual clock, only the
+      ;; wait for lsp-mode takes time
+      (claude-code-ide-tests--call-with-clock
+       (lambda ()
+         (let ((cci-ensure-lsp-timeout 0.3)
+               (t0 (float-time)))
+           (cci-ensure-lsp "some_symbol" file)
+           (should (= started 1))
+           (should (= primed 0))
+           (should (< (- (float-time) t0) 2))))))))
 
 (ert-deftest claude-code-ide-test-cci-ensure-lsp-advises-xref-tools ()
   "References resolve their arguments first; apropos ensures lsp-mode first."
@@ -4233,38 +4233,38 @@ reports, or nil.  Binds `file', `other' (a second temp file) and
 (ert-deftest claude-code-ide-test-cci-resolve-defined-in-file ()
   "A name the file defines keeps the arguments unchanged."
   (claude-code-ide-tests--with-resolve-mocks "def target():\n    pass\n" '(("target" . 1)) nil
-                                             (should (equal (cci-resolve-reference-args (list "target" file))
-                                                            (list "target" file)))))
+    (should (equal (cci-resolve-reference-args (list "target" file))
+                   (list "target" file)))))
 
 (ert-deftest claude-code-ide-test-cci-resolve-used-in-file ()
   "A name the file only uses is cached at its first code occurrence."
   (claude-code-ide-tests--with-resolve-mocks
-   "# target in a comment\nfrom lib import target\ntarget()\n" nil nil
-   (should (equal (cci-resolve-reference-args (list "target" file))
-                  (list "target" file)))
-   (with-current-buffer buf
-     (let ((pos (cdr (assoc "target" lsp--symbols-cache))))
-       (should pos)
-       (should (= (line-number-at-pos pos) 2))))))
+      "# target in a comment\nfrom lib import target\ntarget()\n" nil nil
+    (should (equal (cci-resolve-reference-args (list "target" file))
+                   (list "target" file)))
+    (with-current-buffer buf
+      (let ((pos (cdr (assoc "target" lsp--symbols-cache))))
+        (should pos)
+        (should (= (line-number-at-pos pos) 2))))))
 
 (ert-deftest claude-code-ide-test-cci-resolve-whole-symbol-only ()
   "A longer symbol containing the name is not an occurrence."
   (claude-code-ide-tests--with-resolve-mocks "target_helper()\n" nil nil
-                                             (cci-resolve-reference-args (list "target" file))
-                                             (with-current-buffer buf
-                                               (should-not (assoc "target" lsp--symbols-cache)))))
+    (cci-resolve-reference-args (list "target" file))
+    (with-current-buffer buf
+      (should-not (assoc "target" lsp--symbols-cache)))))
 
 (ert-deftest claude-code-ide-test-cci-resolve-redirects-to-definition ()
   "A name the file never mentions is searched from its defining file."
   (claude-code-ide-tests--with-resolve-mocks "x = 1\n" nil other
-                                             (should (equal (cci-resolve-reference-args (list "target" file))
-                                                            (list "target" other)))))
+    (should (equal (cci-resolve-reference-args (list "target" file))
+                   (list "target" other)))))
 
 (ert-deftest claude-code-ide-test-cci-resolve-unknown-name ()
   "With no occurrence and no workspace match the arguments are unchanged."
   (claude-code-ide-tests--with-resolve-mocks "x = 1\n" nil nil
-                                             (should (equal (cci-resolve-reference-args (list "target" file))
-                                                            (list "target" file)))))
+    (should (equal (cci-resolve-reference-args (list "target" file))
+                   (list "target" file)))))
 
 (ert-deftest claude-code-ide-test-cci-resolve-without-lsp-mode ()
   "Without lsp-mode loaded the arguments pass through untouched."

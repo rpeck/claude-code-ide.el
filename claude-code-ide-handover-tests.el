@@ -1116,7 +1116,7 @@ own ID, so a Codex target gets no such flag."
       ;; The SessionStart report of the target gave the registry its transcript
       (claude-code-ide-session-registry--submit
        "report" (claude-code-ide-session-registry--change-reported
-                  "cci-test-tgt" "cci-test-tgt-native" file nil 3))
+                 "cci-test-tgt" "cci-test-tgt-native" file nil 3))
       (claude-code-ide-handover-recover)
       (claude-code-ide-handover-tests--run-timers 3)
       ;; The resume gets no second pointer

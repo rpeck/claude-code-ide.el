@@ -1065,16 +1065,16 @@ and each Codex operation passes it to the status hook arguments."
           (dolist (interactive '(t nil))
             (claude-code-ide-codex--launch instance (claude-code-ide-codex-tests--spec :interactive interactive) nil)
             (claude-code-ide-codex--resume instance (claude-code-ide-codex-tests--spec :interactive interactive
-                                                                                      :resume-id "cci-test-id")
+                                                                                       :resume-id "cci-test-id")
                                            nil)
             (claude-code-ide-codex--resume instance (claude-code-ide-codex-tests--spec :interactive interactive
-                                                                                      :continue t)
+                                                                                       :continue t)
                                            nil)
             (claude-code-ide-codex--resume instance (claude-code-ide-codex-tests--spec :interactive interactive
-                                                                                      :resume t)
+                                                                                       :resume t)
                                            nil)
             (claude-code-ide-codex--fork instance (claude-code-ide-codex-tests--spec :interactive interactive
-                                                                                    :resume-id "cci-test-id")
+                                                                                     :resume-id "cci-test-id")
                                          nil)))))
     (should (equal (reverse passed) '(t t t t t nil nil nil nil nil)))))
 
