@@ -22,7 +22,10 @@
 (require 'claude-code-ide-session-registry)
 (require 'claude-code-ide-session-status)
 (require 'claude-code-ide-codex-events)
+(require 'claude-code-ide-codex)
 (require 'claude-code-ide-session-registry-tests)
+
+(defvar claude-code-ide-codex--rollout-cache)
 
 (declare-function claude-code-ide-tests--make-session "claude-code-ide-tests")
 (declare-function claude-code-ide-tests--clear-processes "claude-code-ide-tests")
@@ -2672,6 +2675,72 @@ report folder; BODY writes it."
         (should (null (alist-get 'source record)))
         (should (equal (alist-get 'reason record) "untracked"))
         (should (equal (alist-get 'detail record) "No status hooks"))))))
+
+(ert-deftest claude-code-ide-codex-events-test-rollout-through-the-codex-provider ()
+  "The transcript operation of the real Codex provider finds the rollout of the fallback."
+  (claude-code-ide-codex-events-tests--with-codex
+    (let* ((claude-code-ide-codex--rollout-cache (make-hash-table :test 'equal))
+           (claude-code-ide-codex-events--rollout-cache (make-hash-table :test 'eq :weakness 'key))
+           (claude-code-ide-codex-events--state-cache (make-hash-table :test 'eq :weakness 'key))
+           (native "cc1e7e57-0000-4000-8000-0000000000a1")
+           (home (getenv "CODEX_HOME"))
+           (dir (expand-file-name "sessions/2026/11/20/" home))
+           (file (expand-file-name (format "rollout-2026-11-20T10-00-00-%s.jsonl" native) dir))
+           (instance (claude-code-ide-codex-events-tests--instance "cci-test-provider" 1)))
+      (unwind-protect
+          (progn
+            ;; The Codex home of the test, never ~/.codex
+            (should (string-prefix-p (file-name-as-directory (expand-file-name registry-dir))
+                                     (expand-file-name home)))
+            (should (claude-code-ide-provider-supports-p (claude-code-ide-get-provider 'codex) 'transcript))
+            (setf (claude-code-ide-instance-native-id instance) native)
+            ;; No rollout yet: no state from it
+            (should (equal (claude-code-ide-codex-events-tests--full-state instance)
+                           '(disconnected untracked nil nil nil)))
+            (make-directory dir t)
+            (claude-code-ide-codex-events-tests--append
+             file (claude-code-ide-codex-events-tests--meta native)
+             (claude-code-ide-codex-events-tests--started "t1" 1000))
+            ;; The provider keeps a miss for some seconds
+            (clrhash claude-code-ide-codex--rollout-cache)
+            (should (equal (claude-code-ide-provider-call 'codex 'transcript instance 'file) file))
+            (should (equal (claude-code-ide-codex-events-tests--full-state instance)
+                           '(working nil t rollout 1000.0)))
+            (claude-code-ide-codex-events-tests--append
+             file (claude-code-ide-codex-events-tests--complete
+                   "t1" 1010 `((message . ,(car claude-code-ide-codex-events-tests--quota-texts))
+                               (codex_error_info . "usage_limit_exceeded"))))
+            (should (equal (claude-code-ide-codex-events-tests--full-state instance)
+                           '(failed quota-limit t rollout 1010.0)))
+            ;; Another conversation of the instance has no rollout: no state of the old one
+            (setf (claude-code-ide-instance-native-id instance) "cc1e7e57-0000-4000-8000-0000000000a2")
+            (should (equal (seq-take (claude-code-ide-codex-events-tests--full-state instance) 4)
+                           '(disconnected untracked nil nil))))
+        (claude-code-ide-codex-events-tests--kill-instances)))))
+
+(ert-deftest claude-code-ide-codex-events-test-rollout-relative-codex-home ()
+  "A relative CODEX_HOME is found from the folder of the instance, as Codex finds it."
+  (claude-code-ide-codex-events-tests--with-codex
+    (let* ((claude-code-ide-codex--rollout-cache (make-hash-table :test 'equal))
+           (claude-code-ide-codex-events--rollout-cache (make-hash-table :test 'eq :weakness 'key))
+           (claude-code-ide-codex-events--state-cache (make-hash-table :test 'eq :weakness 'key))
+           (project (file-name-as-directory (expand-file-name "cci-test-project" registry-dir)))
+           (process-environment (cons "CODEX_HOME=cci-test-codex-home" process-environment))
+           (native "cc1e7e57-0000-4000-8000-0000000000b1")
+           (dir (expand-file-name "cci-test-codex-home/sessions/2026/11/20/" project))
+           (file (expand-file-name (format "rollout-2026-11-20T10-00-00-%s.jsonl" native) dir))
+           (instance (claude-code-ide-codex-events-tests--instance "cci-test-relative" 1)))
+      (unwind-protect
+          (progn
+            (make-directory dir t)
+            (claude-code-ide-codex-events-tests--append
+             file (claude-code-ide-codex-events-tests--meta native)
+             (claude-code-ide-codex-events-tests--started "t1" 1000))
+            (setf (claude-code-ide-instance-native-id instance) native
+                  (claude-code-ide-instance-project-root instance) project)
+            (should (equal (claude-code-ide-codex-events-tests--full-state instance)
+                           '(working nil t rollout 1000.0))))
+        (claude-code-ide-codex-events-tests--kill-instances)))))
 
 (ert-deftest claude-code-ide-codex-events-test-shared-helpers ()
   "The rollout reader uses the transcript parsers; both fallbacks share one memo helper."
