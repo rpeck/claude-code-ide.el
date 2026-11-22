@@ -1295,16 +1295,46 @@ After `timeout' or `error', keep TRACK, so that a later stop can use it."
       (when (eq (gethash id claude-code-ide-process--tracks) track)
         (claude-code-ide-process-untrack id)))))
 
-(defun claude-code-ide-process--empty-result (&optional instance)
+(declare-function claude-code-ide-mcp-session-process "claude-code-ide-mcp" (session))
+
+(defun claude-code-ide-process--descriptor (instance)
+  "Return the descriptor of INSTANCE, a descriptor or an instance ID, or nil."
+  (cond ((claude-code-ide-instance-p instance) instance)
+        (instance (claude-code-ide-instance-by-id instance))))
+
+(defun claude-code-ide-process--terminal-process (instance process)
+  "Return the terminal process of INSTANCE that a stop knows, or nil.
+That is PROCESS, the :process of the stop, when it belongs to INSTANCE;
+else the process of its terminal buffer; else the process that its
+MCP session keeps, also after it exited.  INSTANCE is a descriptor or
+an instance ID."
+  (when-let* ((descriptor (claude-code-ide-process--descriptor instance)))
+    (or (and (processp process)
+             (claude-code-ide-process--accept-process descriptor process))
+        (let ((buffer (claude-code-ide-instance-buffer descriptor)))
+          (and (buffer-live-p buffer) (get-buffer-process buffer)))
+        (when-let* ((session (claude-code-ide-instance-session descriptor))
+                    ((fboundp 'claude-code-ide-mcp-session-process))
+                    (kept (ignore-errors (claude-code-ide-mcp-session-process session)))
+                    ((processp kept)))
+          kept))))
+
+(defun claude-code-ide-process--empty-result (&optional instance process)
   "Return the stop result for INSTANCE, which has no known process ID.
-When the terminal of INSTANCE still runs, its CLI runs too, and the
-stop could neither end it nor check it: the result is `error' with a
-reason, never `stopped'.  Else nothing runs, and the result is
-`stopped'.  INSTANCE is a descriptor or an instance ID."
-  (let ((descriptor (if (claude-code-ide-instance-p instance)
-                        instance
-                      (and instance (claude-code-ide-instance-by-id instance)))))
-    (if (and descriptor (claude-code-ide-instance-live-p descriptor))
+PROCESS is its terminal process that the stop knew when it began, or
+nil; see `claude-code-ide-process--terminal-process'.  INSTANCE is a
+descriptor or an instance ID.
+
+- The terminal does not run (no live descriptor or buffer): `stopped'.
+- The known terminal process has exited: `stopped', also when the
+  buffer and the descriptor stay a moment longer.
+- The known terminal process runs, or no terminal process is known:
+  the CLI may run, and the stop could neither end it nor check it.
+  The result is `error' with a reason, never `stopped'."
+  (let ((descriptor (claude-code-ide-process--descriptor instance)))
+    (if (and descriptor
+             (claude-code-ide-instance-live-p descriptor)
+             (not (and (processp process) (not (process-live-p process)))))
         (list :status 'error
               :reason "the process ID of the CLI is unknown, so the stop could not end or check it"
               :strays nil :ended nil :escalated nil)
@@ -1363,18 +1393,25 @@ TRACKS has one track or nil for each instance; ITEMS is the list of
                         (delq nil (copy-sequence tracks)))))
     (cons tracks items)))
 
-(defun claude-code-ide-process--collect (instances tracks results)
+(defun claude-code-ide-process--collect (instances tracks results &optional processes)
   "Return the alist (INSTANCE-ID . RESULT) for INSTANCES in order.
 TRACKS has the track of each instance or nil; RESULTS is a list of
-\(TRACK . RESULT).  Each track is finished."
+\(TRACK . RESULT); PROCESSES has the terminal process of each instance
+that the stop knew when it began, or nil.  Each track is finished."
   (dolist (pair results)
     (claude-code-ide-process--finish (car pair) (cdr pair)))
-  (cl-mapcar (lambda (instance track)
+  (cl-mapcar (lambda (instance track process)
                (cons (claude-code-ide-process--instance-id instance)
                      (if track
                          (cdr (assq track results))
-                       (claude-code-ide-process--empty-result instance))))
-             instances tracks))
+                       (claude-code-ide-process--empty-result instance process))))
+             instances tracks (or processes (make-list (length instances) nil))))
+
+(defun claude-code-ide-process--terminal-processes (instances options)
+  "Return the terminal process of each of INSTANCES for a stop with OPTIONS."
+  (mapcar (lambda (instance)
+            (claude-code-ide-process--terminal-process instance (plist-get options :process)))
+          instances))
 
 ;;;###autoload
 (defun claude-code-ide-process-stop (instance &rest args)
@@ -1429,11 +1466,12 @@ INSTANCES are descriptors or instance IDs.  ARGS are the keys of
 instance, so give them only for one.  Return an alist
 \(INSTANCE-ID . RESULT) in the order of INSTANCES.  `kill-emacs-hook'
 uses it with :budget `claude-code-ide-process-quit-timeout'."
-  (let* ((resolved (claude-code-ide-process--items instances args))
+  (let* ((processes (claude-code-ide-process--terminal-processes instances args))
+         (resolved (claude-code-ide-process--items instances args))
          (results (when (cdr resolved)
                     (claude-code-ide-process--run-sync
                      (claude-code-ide-process--make-job (cdr resolved) args)))))
-    (claude-code-ide-process--collect instances (car resolved) results)))
+    (claude-code-ide-process--collect instances (car resolved) results processes)))
 
 (defun claude-code-ide-process-stop-later (instance &rest args)
   "Record the groups of INSTANCE now, and stop it from timers.
@@ -1445,6 +1483,8 @@ between them.  ARGS are as for `claude-code-ide-process-stop', plus
   (let* ((args (if (plist-member args :soft-end) args
                  (append (list :soft-end 'none) args)))
          (callback (plist-get args :callback))
+         ;; The terminal process now: it can exit before the result
+         (processes (claude-code-ide-process--terminal-processes (list instance) args))
          (resolved (claude-code-ide-process--items (list instance) args))
          (track (caar resolved)))
     (when track
@@ -1458,7 +1498,7 @@ between them.  ARGS are as for `claude-code-ide-process-stop', plus
            track (claude-code-ide-process--snapshot table) (float-time)))))
     (let ((deliver (lambda (results)
                      (let ((result (cdar (claude-code-ide-process--collect
-                                          (list instance) (car resolved) results))))
+                                          (list instance) (car resolved) results processes))))
                        (when callback
                          (condition-case err
                              (funcall callback result)
