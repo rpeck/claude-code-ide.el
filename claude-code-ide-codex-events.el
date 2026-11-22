@@ -289,6 +289,12 @@ Starts of the same key share it.")
 No start asks again for them; `claude-code-ide-codex-trust-hooks'
 still trusts them.")
 
+(defvar claude-code-ide-codex-events--offer-running nil
+  "Non-nil while `claude-code-ide-codex-events--offer-trust' runs.
+A question waits for the trust write in `accept-process-output', where
+timers run; so the trust check after the start of Emacs waits while it
+is set, and a second offer asks nothing.")
+
 (defconst claude-code-ide-codex-events--background-limit 30
   "Seconds after which a trust check that nobody waits for ends.")
 
@@ -2022,6 +2028,12 @@ Never without the yes.  A no puts the hook definitions in
 `claude-code-ide-codex-events--declined', so that no start asks again
 in this Emacs.  C-g is a no for this question only.
 
+One question runs at a time (`claude-code-ide-codex-events--offer-running',
+released by `unwind-protect'): while another one runs, nothing is asked,
+and the trust command signals a `user-error'.  When the cache says
+trusted (another question trusted the hooks), nothing is asked either,
+and the cached result is returned.
+
 SERVER is the app-server of the check, when it still runs; else one
 starts for the write.  After the question, the write and the second
 list each get the full time limit
@@ -2036,52 +2048,66 @@ the result plist is returned, also for an error."
                  (if manual
                      (user-error "%s" text)
                    (list :status 'error :message text)))))
-    (if (null untrusted)
-        result
-      (claude-code-ide-codex-events--show-hooks untrusted disabled)
-      (let* ((yes (condition-case nil
-                      (yes-or-no-p
-                       (format "Codex runs status hooks only when trusted.  Trust these %d hook commands in %s? "
-                               (length untrusted)
-                               (abbreviate-file-name (claude-code-ide-transcript--codex-config-file))))
-                    (quit 'quit))))
-        (cond
-         ((eq yes 'quit)
-          (if manual (signal 'quit nil) result))
-         ((not yes)
-          (cl-pushnew key claude-code-ide-codex-events--declined :test #'equal)
-          (message "Codex status hooks not trusted: M-x claude-code-ide-codex-trust-hooks trusts them later")
-          result)
-         (t
-          (claude-code-ide-codex-events--install-script)
-          (let* ((own (not (and server (process-live-p
-                                        (claude-code-ide-codex-events--server-process server)))))
-                 (server (if own
-                             (claude-code-ide-codex-events--server-start
-                              (claude-code-ide-codex-events--hook-args) directory)
-                           server)))
-            (unwind-protect
-                (let ((write (claude-code-ide-codex-events--server-call
-                              server "config/batchWrite"
-                              `((edits . ,(claude-code-ide-codex-events--trust-edits untrusted)))
-                              claude-code-ide-codex-events-trust-timeout)))
-                  (if (plist-get write :error)
-                      (funcall fail (format "Codex did not write the trust (%s): run /hooks in a Codex terminal and trust the claude-code-ide hooks"
-                                            (plist-get write :error)))
-                    (let ((check (claude-code-ide-codex-events--trust-result
-                                  (claude-code-ide-codex-events--server-call
-                                   server "hooks/list" (claude-code-ide-codex-events--list-params directory)
-                                   claude-code-ide-codex-events-trust-timeout))))
-                      (setq claude-code-ide-codex-events--declined
-                            (delete key claude-code-ide-codex-events--declined))
-                      (claude-code-ide-codex-events--remember-trust key check)
-                      (claude-code-ide-codex-events--set-trust key check)
-                      (message "%s" (if (eq (plist-get check :status) 'trusted)
-                                        (format "Trusted %d Codex status hooks" (length untrusted))
-                                      (plist-get check :message)))
-                      check)))
-              (when own
-                (claude-code-ide-codex-events--server-stop server))))))))))
+    (cond
+     ((null untrusted) result)
+     ;; One question at a time: a timer can run while a question waits
+     ;; for the trust write in `accept-process-output'
+     (claude-code-ide-codex-events--offer-running
+      (if manual
+          (user-error "Another Codex hook trust question runs; answer it first")
+        result))
+     ;; Another question trusted the hooks in the meantime
+     ((let ((current (claude-code-ide-codex-events--cached-trust key)))
+        (and (eq (claude-code-ide-codex-events--result-status current) 'trusted) current)))
+     (t
+      (setq claude-code-ide-codex-events--offer-running t)
+      (unwind-protect
+          (progn
+            (claude-code-ide-codex-events--show-hooks untrusted disabled)
+            (let* ((yes (condition-case nil
+                            (yes-or-no-p
+                             (format "Codex runs status hooks only when trusted.  Trust these %d hook commands in %s? "
+                                     (length untrusted)
+                                     (abbreviate-file-name (claude-code-ide-transcript--codex-config-file))))
+                          (quit 'quit))))
+              (cond
+               ((eq yes 'quit)
+                (if manual (signal 'quit nil) result))
+               ((not yes)
+                (cl-pushnew key claude-code-ide-codex-events--declined :test #'equal)
+                (message "Codex status hooks not trusted: M-x claude-code-ide-codex-trust-hooks trusts them later")
+                result)
+               (t
+                (claude-code-ide-codex-events--install-script)
+                (let* ((own (not (and server (process-live-p
+                                              (claude-code-ide-codex-events--server-process server)))))
+                       (server (if own
+                                   (claude-code-ide-codex-events--server-start
+                                    (claude-code-ide-codex-events--hook-args) directory)
+                                 server)))
+                  (unwind-protect
+                      (let ((write (claude-code-ide-codex-events--server-call
+                                    server "config/batchWrite"
+                                    `((edits . ,(claude-code-ide-codex-events--trust-edits untrusted)))
+                                    claude-code-ide-codex-events-trust-timeout)))
+                        (if (plist-get write :error)
+                            (funcall fail (format "Codex did not write the trust (%s): run /hooks in a Codex terminal and trust the claude-code-ide hooks"
+                                                  (plist-get write :error)))
+                          (let ((check (claude-code-ide-codex-events--trust-result
+                                        (claude-code-ide-codex-events--server-call
+                                         server "hooks/list" (claude-code-ide-codex-events--list-params directory)
+                                         claude-code-ide-codex-events-trust-timeout))))
+                            (setq claude-code-ide-codex-events--declined
+                                  (delete key claude-code-ide-codex-events--declined))
+                            (claude-code-ide-codex-events--remember-trust key check)
+                            (claude-code-ide-codex-events--set-trust key check)
+                            (message "%s" (if (eq (plist-get check :status) 'trusted)
+                                              (format "Trusted %d Codex status hooks" (length untrusted))
+                                            (plist-get check :message)))
+                            check)))
+                    (when own
+                      (claude-code-ide-codex-events--server-stop server))))))))
+        (setq claude-code-ide-codex-events--offer-running nil))))))
 
 (defun claude-code-ide-codex-events--ask-trust (directory &optional manual)
   "List the hooks in DIRECTORY, and offer their trust when they are not trusted.
@@ -2193,8 +2219,10 @@ is no CLI."
          t)))
 
 (defun claude-code-ide-codex-events--minibuffer-busy-p ()
-  "Return non-nil while the minibuffer is active."
-  (or (active-minibuffer-window) (> (minibuffer-depth) 0)))
+  "Return non-nil while the minibuffer is active or a recursive edit runs."
+  (or (active-minibuffer-window)
+      (> (minibuffer-depth) 0)
+      (> (recursion-depth) 0)))
 
 (defun claude-code-ide-codex-events--display-frame-exists-p ()
   "Return non-nil when a frame on a display exists.
@@ -2205,6 +2233,24 @@ the Codex launch."
        (cl-some (lambda (frame) (funcall 'claude-code-ide-codex--display-frame-p frame))
                 (frame-list))
        t))
+
+(defun claude-code-ide-codex-events--in-startup-p ()
+  "Return non-nil while the start of Emacs runs.
+That is while `normal-top-level' or `command-line' is on the call
+stack: `after-init-hook', `emacs-startup-hook', and a `sit-for' in them
+run inside them.  `after-init-time' is set before `after-init-hook', so
+it cannot tell."
+  (catch 'startup
+    (mapbacktrace (lambda (_evald function _args _flags)
+                    (when (memq function '(normal-top-level command-line))
+                      (throw 'startup t))))
+    nil))
+
+(defun claude-code-ide-codex-events--startup-complete-p ()
+  "Return non-nil when the start of Emacs is complete.
+See `claude-code-ide-codex-events--in-startup-p'."
+  (and after-init-time
+       (not (claude-code-ide-codex-events--in-startup-p))))
 
 (defun claude-code-ide-codex-events--load-check-wanted-p ()
   "Return non-nil when the trust check after the start may run now."
@@ -2243,23 +2289,30 @@ initial terminal changes nothing."
     (setq claude-code-ide-codex-events--load-check 'scheduled)
     (claude-code-ide-codex-events--load-check-later #'claude-code-ide-codex-events--load-check-run)))
 
+(defun claude-code-ide-codex-events--load-check-wait-for-frame ()
+  "Wait for the first frame on a display, then run the check again."
+  (setq claude-code-ide-codex-events--load-check 'frame)
+  (add-hook 'server-after-make-frame-hook #'claude-code-ide-codex-events--load-check-on-frame))
+
 (defun claude-code-ide-codex-events--load-check-done ()
   "End the trust check after the start of Emacs for this Emacs."
   (setq claude-code-ide-codex-events--load-check 'done))
 
 (defun claude-code-ide-codex-events--load-check-run ()
   "Check the hook trust after the start of Emacs, and ask when needed.
-Without a frame on a display (a daemon), wait for one.  Without a Codex
-CLI, or with trusted, disabled or declined hooks, end.  A cached
-untrusted result asks; else the background check of the app-server
-lists the hooks, without a wait in this function."
+Before the start of Emacs is complete, look again at the next idle
+moment.  Without a frame on a display (a daemon), wait for one.
+Without a Codex CLI, or with trusted, disabled or declined hooks, end.
+A valid cached result goes on at once; else the background check of
+the app-server lists the hooks, without a wait in this function."
   (cond
    ((eq claude-code-ide-codex-events--load-check 'done))
    ((not (claude-code-ide-codex-events--load-check-wanted-p))
     (claude-code-ide-codex-events--load-check-done))
+   ((not (claude-code-ide-codex-events--startup-complete-p))
+    (claude-code-ide-codex-events--load-check-later #'claude-code-ide-codex-events--load-check-run))
    ((not (claude-code-ide-codex-events--display-frame-exists-p))
-    (setq claude-code-ide-codex-events--load-check 'frame)
-    (add-hook 'server-after-make-frame-hook #'claude-code-ide-codex-events--load-check-on-frame))
+    (claude-code-ide-codex-events--load-check-wait-for-frame))
    ((not (claude-code-ide-codex-events--codex-available-p))
     (claude-code-ide-codex-events--load-check-done))
    (t
@@ -2268,53 +2321,69 @@ lists the hooks, without a wait in this function."
       (cond
        ((member key claude-code-ide-codex-events--declined)
         (claude-code-ide-codex-events--load-check-done))
-       (cached (claude-code-ide-codex-events--load-check-result cached))
+       (cached (claude-code-ide-codex-events--load-check-result key cached))
        (t
         (setq claude-code-ide-codex-events--load-check 'checking)
         (claude-code-ide-codex-events--load-check-wait
-         (claude-code-ide-codex-events--start-trust-check key nil)
+         key (claude-code-ide-codex-events--start-trust-check key nil)
          (+ (float-time) claude-code-ide-codex-events--background-limit))))))))
 
-(defun claude-code-ide-codex-events--load-check-wait (check deadline)
-  "Go on with the result of the background CHECK, or look again soon.
+(defun claude-code-ide-codex-events--load-check-wait (key check deadline)
+  "Go on with the result of the background CHECK of KEY, or look again soon.
 After the float time DEADLINE, end without a question."
   (let ((result (claude-code-ide-codex-events--check-result check)))
     (cond
-     (result (claude-code-ide-codex-events--load-check-result result))
+     (result (claude-code-ide-codex-events--load-check-result key result))
      ((< (float-time) deadline)
-      (run-with-timer 0.5 nil #'claude-code-ide-codex-events--load-check-wait check deadline))
+      (run-with-timer 0.5 nil #'claude-code-ide-codex-events--load-check-wait key check deadline))
      (t (claude-code-ide-codex-events--load-check-done)))))
 
-(defun claude-code-ide-codex-events--load-check-result (result)
-  "Ask for the trust when RESULT is `untrusted'; else end the check."
+(defun claude-code-ide-codex-events--load-check-result (key result)
+  "Ask for the trust when RESULT of KEY is `untrusted'; else end the check."
   (if (eq (claude-code-ide-codex-events--result-status result) 'untrusted)
-      (claude-code-ide-codex-events--load-check-ask result)
+      (claude-code-ide-codex-events--load-check-ask key result)
     (claude-code-ide-codex-events--load-check-done)))
 
-(defun claude-code-ide-codex-events--load-check-ask (result)
-  "Ask once for the trust of the hooks in the `untrusted' RESULT.
-While the minibuffer is active, ask at the next idle moment.  No
-question when a start trusted the hooks or the user declined them in
-the meantime.  The question counts also after a no or C-g: the check
-ends with it."
-  (let ((key (claude-code-ide-codex-events--trust-key)))
+(defun claude-code-ide-codex-events--load-check-ask (key result)
+  "Ask once for the trust of the hooks in the `untrusted' RESULT of KEY.
+Just before the question, Emacs looks again:
+
+- The option, the status tracking, or batch Emacs no longer want the
+  check: end.
+- The start of Emacs runs, the minibuffer is active, a recursive edit
+  runs, or another trust question runs: ask at the next idle moment.
+- No frame on a display (the last frame of a daemon closed): wait for
+  one, and check again.
+- KEY is no longer the key of the hook definitions: check again.
+- The user declined the hooks, or the cache says trusted or disabled:
+  end.  A newer cached `untrusted' result replaces RESULT.
+
+The question counts also after a no or C-g: the check ends with it."
+  (let ((cached (claude-code-ide-codex-events--cached-trust key)))
     (cond
      ((eq claude-code-ide-codex-events--load-check 'done))
-     ((or (member key claude-code-ide-codex-events--declined)
-          (eq (claude-code-ide-codex-events--result-status
-               (claude-code-ide-codex-events--cached-trust key))
-              'trusted))
+     ((not (claude-code-ide-codex-events--load-check-wanted-p))
       (claude-code-ide-codex-events--load-check-done))
-     ((claude-code-ide-codex-events--minibuffer-busy-p)
+     ((or (not (claude-code-ide-codex-events--startup-complete-p))
+          (claude-code-ide-codex-events--minibuffer-busy-p)
+          claude-code-ide-codex-events--offer-running)
       (setq claude-code-ide-codex-events--load-check 'asking)
-      (claude-code-ide-codex-events--load-check-later #'claude-code-ide-codex-events--load-check-ask result))
+      (claude-code-ide-codex-events--load-check-later
+       #'claude-code-ide-codex-events--load-check-ask key result))
+     ((not (claude-code-ide-codex-events--display-frame-exists-p))
+      (claude-code-ide-codex-events--load-check-wait-for-frame))
+     ((not (equal key (claude-code-ide-codex-events--trust-key)))
+      (claude-code-ide-codex-events--load-check-run))
+     ((or (member key claude-code-ide-codex-events--declined)
+          (memq (claude-code-ide-codex-events--result-status cached) '(trusted disabled)))
+      (claude-code-ide-codex-events--load-check-done))
      (t
       (claude-code-ide-codex-events--load-check-done)
       (condition-case err
-          (claude-code-ide-codex-events--offer-trust result nil)
+          (claude-code-ide-codex-events--offer-trust
+           (if (eq (claude-code-ide-codex-events--result-status cached) 'untrusted) cached result)
+           nil)
         (error (message "Codex hook trust unknown: %s" (error-message-string err))))))))
-
-;;; Timers
 
 (defun claude-code-ide-codex-events--prune ()
   "Forget the launches whose instance no longer runs this launch."

@@ -150,6 +150,7 @@ A start from a coordinator or an agent never asks: it gets only the refusal `hoo
 - **Only a schedule at load.** The load of `claude-code-ide-codex-events.el` calls `claude-code-ide-codex-events--schedule-load-check`. It never checks inside `load`:
   - During the start of Emacs (`after-init-time` is nil), it waits for `emacs-startup-hook`.
   - After the start (a later load of the package), it waits for the next idle moment (an idle timer of 2 seconds).
+- **Not before the end of the start of Emacs.** `after-init-time` is set before `after-init-hook` runs, so a load from that hook, followed by a `sit-for`, could run the idle timer early. So each step looks at `claude-code-ide-codex-events--startup-complete-p`: the start runs while `normal-top-level` or `command-line` is on the call stack. Until it ends, the step waits for the next idle moment.
 - **A daemon** waits for its first frame on a display. The initial frame of a daemon is on the terminal `initial_terminal` and does not count (`claude-code-ide-codex--display-frame-p`). The check then waits for `server-after-make-frame-hook`; a frame on the initial terminal changes nothing.
 - **No check** in these cases:
   - Batch Emacs (`noninteractive`).
@@ -161,9 +162,14 @@ A start from a coordinator or an agent never asks: it gets only the refusal `hoo
   1. A valid cached result is used as it is.
   2. Else the background check of the app-server (`hooks/list`, the same as a start) lists the hooks. Emacs does not wait for it: a timer looks for its result every 0.5 seconds.
   3. An `untrusted` result asks, through `claude-code-ide-codex-events--offer-trust`, the same question as a start: the hooks in `*Codex status hooks*` and `yes-or-no-p`. A yes writes the trust. A no adds the hooks to the declined keys.
-- **Not while the minibuffer is active.** The question waits for the next idle moment instead.
+- **Not while the minibuffer is active, or a recursive edit runs.** The question waits for the next idle moment instead.
+- **One trust question at a time.** `claude-code-ide-codex-events--offer-trust` sets `claude-code-ide-codex-events--offer-running` while it asks and writes, and clears it in `unwind-protect`. A start that waits for its trust write in `accept-process-output` runs timers, so the question after the start waits while the guard is set. A second offer asks nothing, and the trust command says that another question runs. Each offer reads the cache again first: trusted hooks get no question.
 - **At most once in each Emacs.** The state `claude-code-ide-codex-events--load-check` ends at `done` after the question, also after a no or C-g, and after each case without a question. A `defvar` keeps it at `claude-code-ide-reload`, so a reload checks and asks no second time.
-- Before the question, Emacs looks again: a start that trusted the hooks, or a no in the meantime, ends the check without a question.
+- **Just before the question, Emacs looks again**, because the question can wait long:
+  - The option is `never`, the status tracking is off, or the session is no longer interactive: the check ends.
+  - No frame on a display (the last frame of a daemon closed): the check waits for one, and runs again.
+  - The key of the hook definitions changed (the key goes with the result): the check runs again.
+  - The user declined the hooks, or the cache says trusted or disabled: the check ends. A newer cached `untrusted` result is the one that the question shows.
 
 ### The trust command
 
