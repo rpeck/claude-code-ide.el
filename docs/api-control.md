@@ -30,7 +30,7 @@ This document describes the control operations of claude-code-ide.el, the prompt
 | `resume` | `(claude-code-ide-control-resume INSTANCE-ID &key PROMPT DIRECTORY NATIVE-ID PROVIDER)` | The same as `launch`. |
 | `submit-prompt` | `(claude-code-ide-control-submit INSTANCE-ID TEXT &key REQUEST-ID QUEUE)` | `(:destination :request-id :result :reason ...)`. |
 | `stop` | `(claude-code-ide-control-stop INSTANCE-ID)` | `(:status ok :instance-id ID :result stopped)`. |
-| `handover` | `(claude-code-ide-handover-session INSTANCE-ID TARGET-PROVIDER &key METHOD CONTEXT INTERRUPT FORCE REQUEST-ID)` | Defined by `claude-code-ide-handover.el`; see [handover.md](handover.md). It returns at once. |
+| `handover` | `(claude-code-ide-handover-session INSTANCE-ID TARGET-PROVIDER &key METHOD CONTEXT INTERRUPT FORCE REQUEST-ID CONTINUE)` | Defined by `claude-code-ide-handover.el`; see [handover.md](handover.md). It returns at once. CONTINUE t or nil decides whether the target gets the continue prompt after the commit; without it, `claude-code-ide-handover-continue` decides, with `ask` as `always`. |
 | `track-review` | Phase 3 (`feat/review-tracking`) | Unavailable until that file defines it. |
 
 `claude-code-ide-control-request-status (INSTANCE-ID REQUEST-ID)` gives the current result of a submitted prompt. REQUEST-ID is a string or a number, as for `submit-prompt`.

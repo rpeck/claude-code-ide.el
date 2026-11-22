@@ -19,6 +19,7 @@ The usual reason is a quota limit of the source. So the source never runs one mo
 - When the source is busy, it asks whether to interrupt it. Else the handover waits until the source is idle.
 - When subagents or background tasks run, or the state of the source is unknown (`disconnected`), it asks for a confirmation. The same yes lets the handover go on while other instances run in the worktree.
 - For a Codex target whose status hooks are not trusted, it asks for the trust (`claude-code-ide-codex-prepare-trust`).
+- With `claude-code-ide-handover-continue` at `ask` (the default), the last question is whether the target goes on with the task after the commit (see "The target goes on"). It comes with the other questions, before the handover starts, never later from a timer. The answers: `y` yes, this time; `n` no, this time; `a` always (saved with `customize-save-variable`); `v` never (saved). When the save fails, the value holds in this Emacs.
 - In the status buffer `*Coding Agents Sessions*`, the key `H` offers a handover of the session on the line. Without a session on the line, it offers the first session at a quota limit (`failed/quota-limit`).
 - Emacs never starts a handover by itself.
 
@@ -26,7 +27,7 @@ The usual reason is a quota limit of the source. So the source never runs one mo
 
 ```elisp
 (claude-code-ide-handover-session INSTANCE-ID TARGET-PROVIDER
-  &key METHOD CONTEXT INTERRUPT FORCE REQUEST-ID INTERACTIVE)
+  &key METHOD CONTEXT INTERRUPT FORCE REQUEST-ID INTERACTIVE CONTINUE)
 ```
 
 | Key | Value |
@@ -37,6 +38,7 @@ The usual reason is a quota limit of the source. So the source never runs one mo
 | `:force` | Non-nil: go on while subagents or background tasks run, and while other instances run in the worktree. |
 | `:request-id` | A string that the caller chooses. A second call with a known request ID returns the current result of the first call, with `:duplicate t`, and starts nothing. |
 | `:interactive` | Non-nil when a person asks in Emacs. Then Emacs asks that person about stray processes and about the Codex hook trust. A coordinator call gets the status `needs-user`, or the refusal `hooks-not-trusted`, instead. |
+| `:continue` | `t`: after the commit, the target gets the continue prompt. `nil`: it gets nothing more. Without the key, `claude-code-ide-handover-continue` decides, and its value `ask` counts as `always`: this function never asks. |
 
 - The handover runs from timers and events. The function returns at once.
 - The control operation `handover` is this function (`claude-code-ide-control-call 'handover ...`).
@@ -128,6 +130,24 @@ Emacs saves each stage in the registry entry of the source **before** the step o
   - A target that ends before the delivery gives `needs-user` with the reason `target-exited`.
   - No delivery within `claude-code-ide-handover-delivery-timeout` (600 s) gives `needs-user` with the reason `no-delivery`.
   - Before either, and before a "wait" again, the watch looks for the marker in the transcript of the target: an event can be lost, and the transcript tells.
+### The target goes on
+
+- **The `ready` step stays.** The document asks the target to read it, write its state summary, and reply `ready`. The reply confirms the delivery.
+- **The continue prompt.** With `:continue` t (see `claude-code-ide-handover-continue`), the commit then sends the target one more prompt:
+
+  ```text
+  The handover is complete. Go on now with the task that your state summary describes, from its next step. Do not wait for another prompt.
+  ```
+
+  - It goes through `claude-code-ide-control-submit`, with the request ID `handover-continue:<handover-id>` and `:queue t`. So the inbox rules hold: it waits until the target is idle (after its `ready`).
+  - The commit sends it after the inbox move and before the final save. A crash in between sends it again at the recovery; the fixed request ID makes that second submit a duplicate, so the target gets it once.
+  - A handover that is cancelled, or that waits for a person and never commits, sends nothing.
+- **The decision is in the handover record** (`continue`), so a recovery keeps it. A record of an older release has no `continue` field and sends nothing.
+- **Where the decision comes from:**
+  - `M-x claude-code-ide-handover` and `H` in the status buffer: the question, when the option is `ask`; else the option.
+  - A coordinator (the operation `handover`, the MCP tool): its `continue` value; without it, the option, with `ask` as `always`.
+  - An agent's `request_handover`, after the user's yes: the option, with `ask` as `always`, because the request already means "go on".
+
 - **After a recovery,** a resumed target that lacks the document gets the pointer as the first prompt of its resume (`claude --resume ID -- PROMPT`, `codex resume ID PROMPT`). Only a target that already runs gets it through `claude-code-ide-control-submit`, with the request ID of the handover (or `handover-<id>`) and `:queue t`.
 
 ## Stray processes
@@ -257,7 +277,7 @@ The handover fields are in schema version 4, in its own file (`claude-code-ide-s
 
 | Tool | Arguments |
 |---|---|
-| `claude-code-ide-control-handover` | `instance_id`, `target_provider`, and optional `method`, `context`, `interrupt`, `force`, `request_id`. It returns at once. |
+| `claude-code-ide-control-handover` | `instance_id`, `target_provider`, and optional `method`, `context`, `interrupt`, `force`, `request_id`, `continue` (boolean: the continue prompt after the commit; without it, the user's option, with `ask` as true). It returns at once. |
 | `claude-code-ide-control-handover-status` | `handover_id` (the handover ID or the request ID). |
 
 - Both have the coordinator scope.
@@ -277,6 +297,7 @@ The handover fields are in schema version 4, in its own file (`claude-code-ide-s
 | `claude-code-ide-handover-session-server-detection` | `auto` | The `:session-server` of the document. |
 | `claude-code-ide-handover-budget` | nil | The size budget of the document. |
 | `claude-code-ide-handover-recover-at-start` | t | Continue the interrupted handovers when the registry mode turns on. With nil, only the early ones are cancelled then. |
+| `claude-code-ide-handover-continue` | `ask` | Whether the target goes on with the task after the commit: `ask` (the interactive handover asks y/n/a/v; a coordinator or Lisp call counts as `always`), `always`, or `never` (the target waits for your prompt). See "The target goes on". |
 | `claude-code-ide-handover-unsaved-target` | `fresh` | What the recovery does with an identified target that never saved its conversation: `fresh` starts it fresh with the same IDs and document, `ask` resumes it as before and then asks a person (`target-exited`). See "An unsaved target". |
 | `claude-code-ide-handover-enable-request-tool` | t | Give the agents the tool `request_handover`. |
 
