@@ -2760,6 +2760,45 @@ the move fails keeps the handover waiting for a person."
                      '("q1")))
       (should-not (claude-code-ide-control--pending-records "cci-test-src")))))
 
+(ert-deftest claude-code-ide-test-handover-skip-target-entry-missing ()
+  "A missing target entry after the chain save stays recoverable; skip does not end it.
+The fallback of skip that ends a run in this Emacs is only for a source
+record that cannot be saved.  With the source entry there, the record
+says needs-user, its message names the target, and this Emacs counts
+the run unfinished too, so the worktree hold and the record agree."
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (let* ((result (claude-code-ide-handover-session "cci-test-src" 'cci-test-b :continue t))
+           (id (plist-get result :handover-id))
+           target)
+      (claude-code-ide-handover-tests--run-timers)
+      (setq target (plist-get (claude-code-ide-handover-status id) :target-id))
+      ;; The chain saves, then the inbox move fails
+      (cl-letf (((symbol-function 'claude-code-ide-control-move-inbox)
+                 (lambda (&rest _) (error "cci-test: the move failed"))))
+        (claude-code-ide-handover-tests--deliver result))
+      (let ((run (gethash id claude-code-ide-handover--runs)))
+        (should (claude-code-ide-handover--run-chain-saved run))
+        ;; The target entry is gone now; the source entry stays
+        (cl-letf (((symbol-function 'claude-code-ide-session-registry-save-chain)
+                   (lambda (&rest _) :missing)))
+          (claude-code-ide-handover-resolve id 'skip))
+        (claude-code-ide-handover-tests--run-timers)
+        (should (claude-code-ide-session-registry-entry-of "cci-test-src"))
+        ;; Not ended in memory only
+        (should (claude-code-ide-handover--unfinished-p run))
+        (should (eq (claude-code-ide-handover--run-status run) 'needs-user))
+        (should (eq (claude-code-ide-handover--run-reason run) 'registry-entry-missing))
+        (should (string-match-p (regexp-quote target) (claude-code-ide-handover--run-message run)))
+        (should-not (string-match-p "entry of the source" (claude-code-ide-handover--run-message run)))
+        ;; The record agrees: unfinished, so the hold of the worktree is
+        ;; one that this Emacs counts as unfinished too
+        (should (equal (alist-get 'status (claude-code-ide-handover-tests--record "cci-test-src"))
+                       "needs-user"))
+        (should (eq (claude-code-ide-handover--holding-run worktree) run))
+        ;; The queued prompts of the source did not move by the skip
+        (should-not (claude-code-ide-handover--run-continue-sent run))))))
+
 (provide 'claude-code-ide-handover-tests)
 
 ;;; claude-code-ide-handover-tests.el ends here
