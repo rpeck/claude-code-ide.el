@@ -1832,7 +1832,8 @@ the repository, which also need not exist."
          (process-environment (cons (concat "CLAUDE_CODE_IDE_LIVE_DIR=" root)
                                     process-environment)))
     (unwind-protect
-        (progn
+        ;; Closed gate, also when this test runs in a live daemon
+        (cl-letf (((symbol-function 'claude-code-ide-live-tests--live-p) #'ignore))
           (claude-code-ide-live-tests--log "cci-test %s" "line")
           (should-not (file-exists-p (expand-file-name "log.txt" root)))
           ;; A live folder that does not exist gives no error either
@@ -1925,32 +1926,32 @@ the repository, which also need not exist."
 The package shows a terminal in a window that is dedicated to it; such
 a window goes, or, as the only window of its frame, shows another
 buffer."
-  (let ((buffer (generate-new-buffer " *cci-test-terminal*"))
-        (window (selected-window))
-        (old (window-buffer (selected-window))))
+  (let ((buffer (generate-new-buffer " *cci-test-terminal*")))
     (unwind-protect
-        (progn
-          ;; A plain window
-          (set-window-buffer window buffer)
-          (should (get-buffer-window-list buffer nil t))
-          (claude-code-ide-live-tests--hide-buffer buffer)
-          (should-not (get-buffer-window-list buffer nil t))
-          ;; A dedicated window next to another one
-          (let ((side (split-window window)))
-            (set-window-buffer side buffer)
-            (set-window-dedicated-p side t)
+        ;; The window layout of the Emacs that runs the test comes back
+        (save-window-excursion
+          (delete-other-windows)
+          (let ((window (selected-window)))
+            (set-window-dedicated-p window nil)
+            ;; A plain window
+            (set-window-buffer window buffer)
+            (should (get-buffer-window-list buffer nil t))
             (claude-code-ide-live-tests--hide-buffer buffer)
             (should-not (get-buffer-window-list buffer nil t))
-            (when (window-live-p side) (delete-window side)))
-          ;; A dedicated window that is the only one of its frame
-          (set-window-buffer window buffer)
-          (set-window-dedicated-p window t)
-          (claude-code-ide-live-tests--hide-buffer buffer)
-          (should-not (get-buffer-window-list buffer nil t))
-          (should (buffer-live-p buffer)))
-      (set-window-dedicated-p window nil)
-      (delete-other-windows window)
-      (set-window-buffer window old)
+            ;; A dedicated window next to another one
+            (let ((side (split-window window)))
+              (set-window-buffer side buffer)
+              (set-window-dedicated-p side t)
+              (claude-code-ide-live-tests--hide-buffer buffer)
+              (should-not (get-buffer-window-list buffer nil t))
+              (when (window-live-p side) (delete-window side)))
+            ;; A dedicated window that is the only one of its frame
+            (set-window-buffer window buffer)
+            (set-window-dedicated-p window t)
+            (claude-code-ide-live-tests--hide-buffer buffer)
+            (should-not (get-buffer-window-list buffer nil t))
+            (should (buffer-live-p buffer))
+            (set-window-dedicated-p window nil)))
       (kill-buffer buffer))))
 
 (ert-deftest claude-code-ide-live-tests-test-gate ()
