@@ -226,6 +226,7 @@ Emacs asks you whether to hand over."
   (continue nil :documentation "Non-nil to send the continue prompt to the target at the commit.")
   (continue-sent nil :documentation "Non-nil after the inbox of the target accepted the continue prompt.")
   (chain-saved nil :documentation "Non-nil after the commit saved the chain of the target.")
+  (missing-entry nil :documentation "`source' or `target': the registry entry that a save missed, or nil.")
   (stage 'requested :documentation "The stage that the run is in.")
   (status 'running :documentation "`running', `needs-user', `committed', `cancelled' or `failed'.")
   (reason nil :documentation "Symbol that says why the status is what it is.")
@@ -422,6 +423,7 @@ DROP is as for `claude-code-ide-session-registry-save-handover'."
           (claude-code-ide-handover--to-alist run)
           drop)
     (:missing
+     (setf (claude-code-ide-handover--run-missing-entry run) 'source)
      (claude-code-ide-handover--entry-missing
       run (format "The session registry has no entry of the source %s"
                   (claude-code-ide-handover--run-source-id run)))
@@ -435,9 +437,13 @@ A missing target entry makes RUN need a person, as for
   (pcase (claude-code-ide-session-registry-save-chain
           (claude-code-ide-handover--run-target-id run) legs)
     (:missing
+     (setf (claude-code-ide-handover--run-missing-entry run) 'target)
      (claude-code-ide-handover--entry-missing
       run (format "The session registry has no entry of the target %s"
                   (claude-code-ide-handover--run-target-id run)))
+     ;; The source entry is there: its record says needs-user too, so
+     ;; that a restart shows the same state as this Emacs
+     (claude-code-ide-handover--save run)
      nil)
     (result result)))
 
@@ -1334,7 +1340,8 @@ THEN, when given, runs first, with the strays of RUN."
   "Set RUN running again, without a reason, and save it."
   (setf (claude-code-ide-handover--run-status run) 'running
         (claude-code-ide-handover--run-reason run) nil
-        (claude-code-ide-handover--run-message run) nil)
+        (claude-code-ide-handover--run-message run) nil
+        (claude-code-ide-handover--run-missing-entry run) nil)
   (claude-code-ide-handover--save run))
 
 (defun claude-code-ide-handover--adopt (handover-id)
@@ -1395,9 +1402,11 @@ Interactively, choose the handover and the action."
          (claude-code-ide-handover--guarded run #'claude-code-ide-handover--commit run)
          ;; The record of the source cannot be saved (its entry is
          ;; gone): end the run in this Emacs, but only after the inbox
-         ;; of the source moved to the target
+         ;; of the source moved to the target.  A missing target entry
+         ;; stays a needs-user that the record holds too
          (when (and (claude-code-ide-handover--unfinished-p run)
-                    (eq (claude-code-ide-handover--run-reason run) 'registry-entry-missing))
+                    (eq (claude-code-ide-handover--run-reason run) 'registry-entry-missing)
+                    (eq (claude-code-ide-handover--run-missing-entry run) 'source))
            (condition-case err
                (progn
                  (claude-code-ide-control-move-inbox (claude-code-ide-handover--run-source-id run)
