@@ -1607,12 +1607,13 @@ For a kill of BUFFER that was refused or quit."
       (kill-buffer copy))))
 
 ;;;###autoload
-(defun claude-code-ide-kill-stopped-buffers (&optional directory all-projects)
+(defun claude-code-ide-kill-stopped-buffers (&optional directory all-projects report)
   "Kill the buffers that stopped instances left in the project DIRECTORY.
 DIRECTORY defaults to the current project.  With a prefix argument
 ALL-PROJECTS, kill those of all projects.  The buffers of running
-instances stay.  Return the number of killed buffers."
-  (interactive (list nil current-prefix-arg))
+instances stay.  REPORT non-nil (as interactively) shows the number in
+the echo area.  Return the number of killed buffers."
+  (interactive (list nil current-prefix-arg t))
   (let* ((directory (and (not all-projects)
                          (file-name-as-directory
                           (expand-file-name
@@ -1626,7 +1627,7 @@ instances stay.  Return the number of killed buffers."
           (let ((kill-buffer-query-functions nil))
             (when (kill-buffer buffer)
               (setq count (1+ count)))))))
-    (when (called-interactively-p 'interactive)
+    (when report
       (message "Killed %d stopped buffer%s" count (if (= count 1) "" "s")))
     count))
 
