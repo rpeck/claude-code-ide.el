@@ -48,6 +48,7 @@ This package integrates coding-agent CLIs with Emacs via the Model Context Proto
 - `claude-code-ide-process-tests.el` - Process tree tests; live tests run with `CLAUDE_CODE_IDE_LIVE_TESTS=1`
 - `claude-code-ide-reload-tests.el` - Reload tests; one test reloads a copy of the package in a new batch Emacs
 - `claude-code-ide-wiring-tests.el` - Tests of the core wiring: no IDE server without the IDE protocol, provider texts, flags per provider, forks, secrets in the debug log, the CC MCP config file, the process-tree calls, the prepare hook, and the provider choice. At load, it points the MCP config folder and the provider file at a temporary folder for the whole run.
+- `claude-code-ide-live-tests.el` - Live tests with the real `claude` and `codex` CLIs: handovers between both providers, recovery after a crash of Emacs, the Codex dialogs in each terminal, and stops without a question. They run only in an own `emacs -Q` daemon with `CLAUDE_CODE_IDE_LIVE_TESTS=1` (docs/live-tests.md); in the batch suite each one skips, and only the unit tests of its helpers run.
 
 **Design documents (docs/):**
 - Providers: docs/providers.md. Instances, events, states, registry: docs/session-schema.md.
@@ -57,6 +58,7 @@ This package integrates coding-agent CLIs with Emacs via the Model Context Proto
 - Reviews and dedicated ediff frames: docs/review.md.
 - Handover: docs/handover.md. The handover document: docs/handover-document.md. Process trees: docs/process-tree.md.
 - Updating the package and reloading it in a running Emacs: docs/updating.md.
+- Live tests with the real CLIs: docs/live-tests.md.
 
 ## Hooks
 
@@ -122,6 +124,7 @@ Tests must not depend on the machine load or on other test runs:
 - Wait for a condition with `claude-code-ide-tests--wait-until` (60 s limit), never for a fixed time.
 - A test of a time limit of the package runs on `claude-code-ide-tests--call-with-clock`: a virtual clock that moves only by the waits. The test also fails after 20 s of real time.
 - While ERT runs, `claude-code-ide-tests--isolate-run` (an advice on `ert-run-tests`) binds the state file, the lock file folder, the MCP config folder, the provider file, `CLAUDE_CONFIG_DIR` and `CODEX_HOME` to a new folder of the run (`claude-code-ide-tests--run-directory`), and removes it after the run. Never write to a fixed shared path in a test, and never read or write the user's live folders (`~/.claude`, `~/.codex`, the live state files).
+- The one exception is the live tests of `claude-code-ide-live-tests.el`, gated by `CLAUDE_CODE_IDE_LIVE_TESTS=1` and an own daemon. The real CLIs read their login and config there, and write transcripts; with `CLAUDE_CODE_IDE_LIVE_TRUST=1` they also write folder trust entries. The package state still goes to the live folder. docs/live-tests.md lists every such write and how to remove it.
 
 ## Committing code
 Never commit changes unless the user explicitly asks you to.
