@@ -1394,10 +1394,16 @@ that frame, as it does for a person, so its size is that of the window."
 nil: the terminal shows in no window, as a buffer in the background.")
 
 (defun claude-code-ide-live-tests--hide-buffer (buffer)
-  "Show another buffer in each window that shows BUFFER, in every frame."
+  "Take BUFFER out of each window that shows it, in every frame.
+A window that is dedicated to BUFFER (the package shows a terminal so)
+goes; when it is the only window of its frame, it stops being dedicated
+and shows another buffer.  Any other window shows another buffer."
   (let ((other (get-buffer-create "*scratch*")))
     (dolist (window (get-buffer-window-list buffer nil t))
-      (set-window-buffer window other))))
+      (unless (and (window-dedicated-p window)
+                   (ignore-errors (delete-window window) t))
+        (set-window-dedicated-p window nil)
+        (set-window-buffer window other)))))
 
 (defun claude-code-ide-live-tests--place (instance-id)
   "Show the terminal of INSTANCE-ID, or hide it.
@@ -1531,11 +1537,18 @@ read as an approval, and the state must stay waiting-for-user/approval
 until the person allows the call and the tool ends."
   :tags '(:live :dialogs)
   (claude-code-ide-live-tests--live
-    (claude-code-ide-live-tests--with-backend 'eat
-      (let ((claude-code-ide-live-tests--show-terminals nil)
-            (trusted (claude-code-ide-live-tests--project "projA")))
-        (claude-code-ide-live-tests--ensure-codex-folder-trust trusted)
-        (claude-code-ide-live-tests--approval-dialog trusted "cci-test-L-eat-hidden")))))
+    (unless (require 'eat nil t) (ert-skip "No eat"))
+    ;; No GUI frame, as in a daemon that a person never opened: the
+    ;; terminal never gets the size of a window.  A dialog test that
+    ;; needs a frame makes a new one.
+    (dolist (frame (frame-list))
+      (when (memq (framep frame) '(ns x w32 pgtk))
+        (delete-frame frame t)))
+    (let ((claude-code-ide-terminal-backend 'eat)
+          (claude-code-ide-live-tests--show-terminals nil)
+          (trusted (claude-code-ide-live-tests--project "projA")))
+      (claude-code-ide-live-tests--ensure-codex-folder-trust trusted)
+      (claude-code-ide-live-tests--approval-dialog trusted "cci-test-L-eat-hidden"))))
 
 (ert-deftest claude-code-ide-live-test-codex-dialogs-vterm ()
   "The Codex dialogs in vterm: found, and no typed text."
@@ -1886,17 +1899,35 @@ and the command to remove it by hand."
     (should (equal calls '(cleanup)))))
 
 (ert-deftest claude-code-ide-live-tests-test-hide-buffer ()
-  "A hidden terminal buffer shows in no window of any frame."
+  "A hidden terminal buffer shows in no window of any frame.
+The package shows a terminal in a window that is dedicated to it; such
+a window goes, or, as the only window of its frame, shows another
+buffer."
   (let ((buffer (generate-new-buffer " *cci-test-terminal*"))
         (window (selected-window))
         (old (window-buffer (selected-window))))
     (unwind-protect
         (progn
+          ;; A plain window
           (set-window-buffer window buffer)
           (should (get-buffer-window-list buffer nil t))
           (claude-code-ide-live-tests--hide-buffer buffer)
           (should-not (get-buffer-window-list buffer nil t))
+          ;; A dedicated window next to another one
+          (let ((side (split-window window)))
+            (set-window-buffer side buffer)
+            (set-window-dedicated-p side t)
+            (claude-code-ide-live-tests--hide-buffer buffer)
+            (should-not (get-buffer-window-list buffer nil t))
+            (when (window-live-p side) (delete-window side)))
+          ;; A dedicated window that is the only one of its frame
+          (set-window-buffer window buffer)
+          (set-window-dedicated-p window t)
+          (claude-code-ide-live-tests--hide-buffer buffer)
+          (should-not (get-buffer-window-list buffer nil t))
           (should (buffer-live-p buffer)))
+      (set-window-dedicated-p window nil)
+      (delete-other-windows window)
       (set-window-buffer window old)
       (kill-buffer buffer))))
 
