@@ -278,6 +278,57 @@ stop from timers, which the handover uses."
           (delete-process pipe)
           (kill-buffer buffer))))))
 
+(declare-function make-claude-code-ide-mcp-session "claude-code-ide-mcp" (&rest args))
+
+(ert-deftest claude-code-ide-test-process-stop-exited-cli-without-pid ()
+  "A stop with an unknown PID reports stopped once the terminal process has exited.
+The buffer and the descriptor stay after the CLI exits, so
+`claude-code-ide-instance-live-p' still says live; the stop must decide
+by the terminal process that it knows.  An exited process gives
+`stopped', in the stop that waits and in the stop from timers.  A
+terminal process that was never known stays `error'."
+  (dolist (provider '(claude codex))
+    (claude-code-ide-process-tests--with-table nil
+      (let* ((claude-code-ide-instance--all nil)
+             (buffer (generate-new-buffer " *cci-test-ghostel*"))
+             (instance (claude-code-ide-process-tests--ghostel-instance provider buffer)))
+        (unwind-protect
+            (progn
+              ;; The process that the stop gets has exited
+              (let ((pipe (make-pipe-process :name "cci-test-exited" :buffer buffer :noquery t)))
+                (delete-process pipe)
+                (should (claude-code-ide-instance-live-p instance))
+                (should (equal (list provider (plist-get (claude-code-ide-process-stop
+                                                          instance :process pipe :scan nil)
+                                                         :status))
+                               (list provider 'stopped))))
+              ;; The session keeps the exited process of the terminal
+              (let ((pipe (make-pipe-process :name "cci-test-exited" :buffer buffer :noquery t)))
+                (setf (claude-code-ide-instance-session instance)
+                      (make-claude-code-ide-mcp-session :buffer buffer :process pipe))
+                (delete-process pipe)
+                (should (equal (list provider (plist-get (claude-code-ide-process-stop
+                                                          instance :scan nil)
+                                                         :status))
+                               (list provider 'stopped)))
+                (setf (claude-code-ide-instance-session instance) nil))
+              ;; The process exits between the start of the stop from
+              ;; timers and its result
+              (let ((pipe (make-pipe-process :name "cci-test-exits" :buffer buffer :noquery t))
+                    (later nil))
+                (claude-code-ide-process-stop-later instance :callback (lambda (r) (setq later r)))
+                (delete-process pipe)
+                (should (claude-code-ide-tests--wait-until (lambda () later) 5))
+                (should (equal (list provider (plist-get later :status))
+                               (list provider 'stopped))))
+              ;; No terminal process was ever known: the CLI may run
+              (should-not (get-buffer-process buffer))
+              (should (equal (list provider (plist-get (claude-code-ide-process-stop instance :scan nil)
+                                                       :status))
+                             (list provider 'error)))
+              (should-not claude-code-ide-process-tests--signals))
+          (kill-buffer buffer))))))
+
 ;;; Records
 
 (ert-deftest claude-code-ide-test-process-parent-chain ()
