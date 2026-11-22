@@ -275,9 +275,11 @@ cdr of its :cleanup key."
   (should-not (claude-code-ide-provider-call 'claude 'status-events nil)))
 
 (ert-deftest claude-code-ide-test-provider-claude-submit-and-stop ()
-  "Submit types the text and return; stop kills the terminal buffer."
+  "Submit types the text and return; stop kills the terminal buffer.
+This is the stop with `claude-code-ide-keep-stopped-buffers' nil."
   (claude-code-ide-tests--clear-processes)
-  (let* ((buffer (generate-new-buffer "*cci-test-submit*"))
+  (let* ((claude-code-ide-keep-stopped-buffers nil)
+         (buffer (generate-new-buffer "*cci-test-submit*"))
          (session (claude-code-ide-tests--make-session "/tmp/cci-test-submit/" :buffer buffer))
          (instance (claude-code-ide-instance-create :id "cci-test-s" :provider 'claude
                                                     :buffer buffer :session session))

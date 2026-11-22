@@ -301,6 +301,19 @@ Claude Code's TUI with the fewest artifacts (see the README)."
                  (const :tag "ghostel" ghostel))
   :group 'claude-code-ide)
 
+(defcustom claude-code-ide-keep-stopped-buffers t
+  "When non-nil, the terminal buffer of an instance stays after its stop.
+This holds for every stop: `claude-code-ide-stop', the stop operation
+of a coordinator, the source of a handover, and a CLI that ends by
+itself.  The CLI ends as before; a read-only copy of its buffer stays,
+with the last screen and the suffix \" [stopped]\" in its name.  Close it
+with \\[kill-buffer], or close all of a project with
+`claude-code-ide-kill-stopped-buffers'.  A kill of the buffer of a
+running instance still ends the instance and the buffer.
+nil kills the buffer at the stop."
+  :type 'boolean
+  :group 'claude-code-ide)
+
 (defcustom claude-code-ide-show-backend-recommendation t
   "When non-nil, recommend the ghostel backend once per Emacs session.
 Starting an instance on the vterm or eat backend echoes a one-time
@@ -1186,13 +1199,13 @@ toggles independently, which reads as broken toggling.  New tabs start
 Claude-free instead — summon instances there explicitly."
   (dolist (window (window-list))
     (when (and (window-live-p window)
-               (claude-code-ide--buffer-session (window-buffer window)))
+               (claude-code-ide--claude-buffer-project (window-buffer window)))
       (unless (ignore-errors (delete-window window) t)
         ;; The sole window of the tab cannot be deleted — show another
         ;; buffer in it instead
         (when (window-live-p window)
           (switch-to-prev-buffer window 'bury)
-          (when (claude-code-ide--buffer-session (window-buffer window))
+          (when (claude-code-ide--claude-buffer-project (window-buffer window))
             (set-window-buffer window (get-buffer-create "*scratch*"))))))))
 
 (defun claude-code-ide--note-window-selection (frame)
@@ -1236,18 +1249,21 @@ most recently used one — only displaying or hiding windows would."
 
 (defun claude-code-ide--cleanup-all-sessions ()
   "Clean up all active instances of every provider."
-  ;; End all CLIs first, with one short shared wait, so that each one
-  ;; has time for its soft end before Emacs exits
-  (when (fboundp 'claude-code-ide-process-stop-many)
-    (condition-case err
-        (claude-code-ide-process-stop-many (claude-code-ide-instances)
-                                           ;; 1.5 s for all waits together
-                                           :budget claude-code-ide-process-quit-timeout
-                                           :timeout 1 :kill-wait 0.25 :scan nil)
-      (error
-       (message "Error stopping the agent CLIs: %s" (error-message-string err)))))
-  (dolist (session (claude-code-ide-mcp--active-sessions))
-    (claude-code-ide--cleanup-session session))
+  ;; Emacs exits, so no buffer is worth a copy, also not in the
+  ;; sentinels that run in the wait below
+  (let ((claude-code-ide-keep-stopped-buffers nil))
+    ;; End all CLIs first, with one short shared wait, so that each one
+    ;; has time for its soft end before Emacs exits
+    (when (fboundp 'claude-code-ide-process-stop-many)
+      (condition-case err
+          (claude-code-ide-process-stop-many (claude-code-ide-instances)
+                                             ;; 1.5 s for all waits together
+                                             :budget claude-code-ide-process-quit-timeout
+                                             :timeout 1 :kill-wait 0.25 :scan nil)
+        (error
+         (message "Error stopping the agent CLIs: %s" (error-message-string err)))))
+    (dolist (session (claude-code-ide-mcp--active-sessions))
+      (claude-code-ide--cleanup-session session)))
   ;; A config file whose session is already gone from the table
   (claude-code-ide--delete-all-mcp-config-files))
 
@@ -1268,16 +1284,16 @@ A second call, as at a reload, keeps the same depth."
 (claude-code-ide--install-quit-hook)
 
 (defun claude-code-ide--hide-foreign-side-windows (project-dir)
-  "Delete every Claude side window whose session is not in PROJECT-DIR.
+  "Delete every Claude side window whose project is not PROJECT-DIR.
 This is how `project' scope keeps one project on screen.  Only windows
-that hold a Claude session buffer are touched."
+that hold a Claude session buffer, or the buffer that a stopped
+instance left, are touched."
   (when project-dir
     (let ((keep (expand-file-name project-dir)))
       (dolist (win (window-list nil 'never))
         (when (and (window-live-p win)
                    (window-parameter win 'window-side))
-          (when-let* ((session (claude-code-ide--buffer-session (window-buffer win)))
-                      (dir (claude-code-ide-mcp-session-project-dir session)))
+          (when-let* ((dir (claude-code-ide--claude-buffer-project (window-buffer win))))
             (unless (string= (expand-file-name dir) keep)
               (delete-window win))))))))
 
@@ -1461,6 +1477,159 @@ See `claude-code-ide--display-buffer-in-side-window'."
       (claude-code-ide--sync-all-session-windows))
     window))
 
+(defvar-local claude-code-ide--stopped-project nil
+  "The project folder of the instance whose stop left this buffer.")
+(put 'claude-code-ide--stopped-project 'permanent-local t)
+
+(define-derived-mode claude-code-ide-stopped-mode special-mode "Stopped"
+  "Mode of the buffer that a stopped instance left.
+The buffer holds the text of the terminal at the stop, with its faces,
+read-only.  It has no terminal keys, so no key goes to another
+instance.  See `claude-code-ide-keep-stopped-buffers'."
+  (setq-local revert-buffer-function
+              (lambda (&rest _)
+                (message "This buffer holds the last screen of a stopped instance"))))
+
+(defun claude-code-ide--claude-buffer-project (buffer)
+  "Return the project folder of BUFFER, a terminal of an instance, or nil.
+This is also true of a buffer that a stopped instance left."
+  (when (buffer-live-p buffer)
+    (if-let* ((session (claude-code-ide--buffer-session buffer)))
+        (claude-code-ide-mcp-session-project-dir session)
+      (buffer-local-value 'claude-code-ide--stopped-project buffer))))
+
+(defun claude-code-ide--stopped-buffer-of (session)
+  "Return the live buffer that the stop of SESSION left, or nil."
+  (let ((buffer (claude-code-ide-mcp-session-stopped-buffer session)))
+    (and (buffer-live-p buffer) buffer)))
+
+(defun claude-code-ide--stopped-windows (&optional project-dir)
+  "Return the windows of the selected frame that show a stopped buffer.
+With PROJECT-DIR, only those of the buffers that its instances left."
+  (let ((keep (and project-dir (expand-file-name project-dir))))
+    (cl-remove-if-not
+     (lambda (window)
+       (let ((project (buffer-local-value 'claude-code-ide--stopped-project
+                                          (window-buffer window))))
+         (and project (or (not keep) (string= (expand-file-name project) keep)))))
+     (window-list nil 'never))))
+
+(defun claude-code-ide--flush-terminal-output (buffer)
+  "Draw the output that the terminal BUFFER has not drawn yet.
+vterm, eat and ghostel draw from timers, and the vterm render queue of
+this package waits too; without this, a copy misses the last output."
+  (with-current-buffer buffer
+    (ignore-errors
+      (when-let* ((timer (bound-and-true-p claude-code-ide--vterm-render-timer)))
+        (cancel-timer timer)
+        (apply (timer--function timer) (timer--args timer))))
+    (ignore-errors
+      (when-let* ((timer (bound-and-true-p vterm--redraw-timer)))
+        (cancel-timer timer)
+        (vterm--delayed-redraw buffer)))
+    (ignore-errors
+      (when (and (bound-and-true-p eat--pending-output-chunks)
+                 (fboundp 'eat--process-output-queue))
+        (eat--process-output-queue buffer)))
+    (ignore-errors
+      (when-let* ((timer (bound-and-true-p ghostel--redraw-timer)))
+        (cancel-timer timer)
+        (setq ghostel--redraw-timer nil)
+        (ghostel--redraw-now buffer)))))
+
+(defun claude-code-ide--move-windows (from to)
+  "Show the buffer TO in each window of the buffer FROM, in all frames.
+Each window keeps its start, its point and its dedicated flag."
+  (let ((size (with-current-buffer to (point-max))))
+    (dolist (window (get-buffer-window-list from nil t))
+      (let ((start (window-start window))
+            (point (window-point window))
+            (dedicated (window-dedicated-p window)))
+        (set-window-dedicated-p window nil)
+        (set-window-buffer window to)
+        (set-window-start window (min start size) t)
+        (set-window-point window (min point size))
+        (set-window-dedicated-p window dedicated)))))
+
+(defun claude-code-ide--keep-stopped-buffer (buffer session)
+  "Keep a read-only copy of BUFFER, the terminal of the stopped SESSION.
+The copy has the text and the faces of BUFFER, its folder, the name
+of BUFFER with the suffix \" [stopped]\", and the windows of BUFFER.
+The text loses the properties that act, such as the keymaps of links.
+The caller kills BUFFER after it, as before, so that the terminal and
+the CLI end.  A copy is a new buffer, because a terminal mode can
+forbid a change of its major mode (vterm does).  Return the copy, or
+nil after an error, which a message reports: the stop goes on.  A
+second call for SESSION returns the copy of the first call."
+  (or (claude-code-ide--stopped-buffer-of session)
+      (let ((copy nil))
+        (condition-case err
+            (let ((position (with-current-buffer buffer (point))))
+              (claude-code-ide--flush-terminal-output buffer)
+              (setq copy (generate-new-buffer (concat (buffer-name buffer) " [stopped]")))
+              (with-current-buffer copy
+                ;; The text of a terminal can be read-only (eat marks it so)
+                (let ((inhibit-read-only t))
+                  (insert-buffer-substring buffer)
+                  (remove-list-of-text-properties
+                   (point-min) (point-max)
+                   '(keymap local-map mouse-face help-echo button category follow-link
+                            field read-only intangible cursor-intangible)))
+                (claude-code-ide-stopped-mode)
+                (setq default-directory (buffer-local-value 'default-directory buffer))
+                (setq-local claude-code-ide--stopped-project
+                            (claude-code-ide-mcp-session-project-dir session))
+                (setq header-line-format
+                      (format "Stopped at %s: the CLI ended.  %s closes this buffer."
+                              (format-time-string "%H:%M")
+                              (substitute-command-keys "\\[kill-buffer]")))
+                (goto-char (min position (point-max))))
+              (claude-code-ide--move-windows buffer copy)
+              (setf (claude-code-ide-mcp-session-stopped-buffer session) copy)
+              copy)
+          (error
+           (message "Cannot keep the buffer of %s: %s"
+                    (claude-code-ide--session-display-name session)
+                    (error-message-string err))
+           (when (buffer-live-p copy)
+             (claude-code-ide--move-windows copy buffer)
+             (let ((kill-buffer-query-functions nil))
+               (kill-buffer copy)))
+           nil)))))
+
+(defun claude-code-ide--drop-stopped-buffer (buffer session)
+  "Undo the copy of BUFFER for SESSION: its terminal did not go.
+For a kill of BUFFER that was refused or quit."
+  (when-let* ((copy (claude-code-ide--stopped-buffer-of session)))
+    (claude-code-ide--move-windows copy buffer)
+    (setf (claude-code-ide-mcp-session-stopped-buffer session) nil)
+    (let ((kill-buffer-query-functions nil))
+      (kill-buffer copy))))
+
+;;;###autoload
+(defun claude-code-ide-kill-stopped-buffers (&optional directory all-projects)
+  "Kill the buffers that stopped instances left in the project DIRECTORY.
+DIRECTORY defaults to the current project.  With a prefix argument
+ALL-PROJECTS, kill those of all projects.  The buffers of running
+instances stay.  Return the number of killed buffers."
+  (interactive (list nil current-prefix-arg))
+  (let* ((directory (and (not all-projects)
+                         (file-name-as-directory
+                          (expand-file-name
+                           (or directory (claude-code-ide--get-working-directory))))))
+         (count 0))
+    (dolist (buffer (buffer-list))
+      (let ((project (buffer-local-value 'claude-code-ide--stopped-project buffer)))
+        (when (and project
+                   (or all-projects
+                       (equal (file-name-as-directory (expand-file-name project)) directory)))
+          (let ((kill-buffer-query-functions nil))
+            (when (kill-buffer buffer)
+              (setq count (1+ count)))))))
+    (when (called-interactively-p 'interactive)
+      (message "Killed %d stopped buffer%s" count (if (= count 1) "" "s")))
+    count))
+
 (defun claude-code-ide--cleanup-session (session &optional buffer-dying)
   "Clean up all state of SESSION when its Claude instance exits.
 Idempotent per session: the sentinel, the terminal's kill-buffer hook
@@ -1542,10 +1711,14 @@ hook signals wrong-type-argument that way)."
     ;; Notify MCP tools server about session end
     (claude-code-ide-mcp-server-session-ended
      (claude-code-ide-mcp-session-session-id session))
-    ;; Kill this session's own terminal buffer.  Never a name lookup: the
-    ;; canonical name could resolve to a sibling instance's buffer.
+    ;; Kill this session's own terminal buffer, after a read-only copy
+    ;; of it (`claude-code-ide-keep-stopped-buffers').  Never a name
+    ;; lookup: the canonical name could resolve to a sibling instance's
+    ;; buffer.
     (let ((buffer (claude-code-ide-mcp-session-buffer session)))
       (when (and buffer (buffer-live-p buffer) (not buffer-dying))
+        (when claude-code-ide-keep-stopped-buffers
+          (claude-code-ide--keep-stopped-buffer buffer session))
         (let ((kill-buffer-hook nil) ; Disable hooks to prevent recursion
               (kill-buffer-query-functions nil)) ; Don't ask for confirmation
           (kill-buffer buffer))
@@ -2212,10 +2385,20 @@ Return non-nil when BUFFER is live."
 
 (defun claude-code-ide--stop-session (session)
   "End SESSION: kill its terminal buffer, or clean it up when it has none.
-The process sentinel and the buffer kill hook clean up the rest."
+With `claude-code-ide-keep-stopped-buffers', a read-only copy of the
+buffer stays.  The process sentinel and the buffer kill hook clean up
+the rest."
   (let ((buffer (claude-code-ide-mcp-session-buffer session)))
     (if (and buffer (buffer-live-p buffer))
-        (kill-buffer buffer)
+        (progn
+          (when claude-code-ide-keep-stopped-buffers
+            (claude-code-ide--keep-stopped-buffer buffer session))
+          (unwind-protect
+              (kill-buffer buffer)
+            ;; A kill that was refused or quit leaves the instance: show
+            ;; its terminal again in place of the copy
+            (when (buffer-live-p buffer)
+              (claude-code-ide--drop-stopped-buffer buffer session))))
       (claude-code-ide--cleanup-session session))))
 
 (defun claude-code-ide--claude-detect (&optional with-version)
@@ -2614,29 +2797,34 @@ spec."
                         nil t)
               ;; Set up terminal keybindings
               (claude-code-ide--setup-terminal-keybindings)
-              ;; Add terminal-specific exit hooks
-              (cond
-               ((eq claude-code-ide-terminal-backend 'vterm)
-                ;; Add vterm exit hook to ensure buffer is killed when process exits
-                ;; vterm runs Claude directly, no shell involved
-                (add-hook 'vterm-exit-functions
-                          (lambda (&rest _)
-                            (when (buffer-live-p buffer)
-                              (kill-buffer buffer)))
-                          nil t))
-               ((eq claude-code-ide-terminal-backend 'eat)
-                ;; eat uses kill-buffer-on-exit variable
-                (setq-local eat-kill-buffer-on-exit t))))
+              ;; The cleanup alone keeps or kills the buffer at the exit
+              ;; (`claude-code-ide-keep-stopped-buffers'), as for ghostel:
+              ;; the sentinel above replaces the one of vterm and of eat,
+              ;; and the exit setting of the backend stays off
+              (when (eq claude-code-ide-terminal-backend 'eat)
+                (setq-local eat-kill-buffer-on-exit nil)))
             ;; Stabilization period for terminal layout initialization
             (sleep-for claude-code-ide-terminal-initialization-delay)
             ;; The CLI can die within the stabilization delay (e.g. it
             ;; failed to exec in the terminal backend's environment), in
-            ;; which case the exit sentinel has already killed the buffer.
-            ;; Displaying the dead buffer would surface only as a cryptic
+            ;; which case the exit sentinel has already cleaned it up: the
+            ;; buffer is gone, or kept with the output of the CLI
+            ;; (`claude-code-ide-keep-stopped-buffers').  Displaying it as
+            ;; a session would surface only as a cryptic
             ;; wrong-type-argument, so fail with a real explanation.
             (unless (and (buffer-live-p buffer) (process-live-p process))
-              (error "%s exited immediately after startup.  Verify that its program (%s) is executable in the %s backend's environment"
-                     display program claude-code-ide-terminal-backend))
+              ;; The copy of the buffer, so that the message names it: the
+              ;; one that the sentinel made, else one made now, which the
+              ;; cleanup of the error then keeps
+              (let ((kept (and claude-code-ide-keep-stopped-buffers
+                               (if (buffer-live-p buffer)
+                                   (claude-code-ide--keep-stopped-buffer buffer session)
+                                 (claude-code-ide--stopped-buffer-of session)))))
+                (error "%s exited immediately after startup.  Verify that its program (%s) is executable in the %s backend's environment%s"
+                       display program claude-code-ide-terminal-backend
+                       (if kept
+                           (format ".  Its output is in the buffer %s" (buffer-name kept))
+                         ""))))
             ;; Display the buffer in a side window
             (claude-code-ide--display-buffer-in-side-window buffer)
             (claude-code-ide-log "%s %sstarted in %s%s%s"
@@ -2670,7 +2858,10 @@ spec."
        ;; orphan a running CLI nothing tracks anymore.
        (unless (and session (claude-code-ide-mcp-session-cleanup-done session))
          (if (and session (claude-code-ide-mcp-session-buffer session))
-             (claude-code-ide--cleanup-session session)
+             ;; A start that failed or was quit leaves no new copy; the
+             ;; copy of a CLI that exited at once is made above already
+             (let ((claude-code-ide-keep-stopped-buffers nil))
+               (claude-code-ide--cleanup-session session))
            (when registered
              (claude-code-ide-mcp-server-session-ended session-id))
            (when session
@@ -2875,10 +3066,9 @@ picks the instance."
     (if (not session)
         (claude-code-ide-log "No Claude Code session is running in this directory")
       (let ((display-name (claude-code-ide--session-display-name session)))
-        ;; Kill the buffer (cleanup will be handled by hooks)
-        ;; The process sentinel will handle cleanup when the process dies
-        (claude-code-ide--stop-session session)
-        (claude-code-ide-log "Stopping Claude Code %s..." display-name)))))
+        (claude-code-ide-log "Stopping Claude Code %s..." display-name)
+        ;; The buffer kill ends the CLI from timers
+        (claude-code-ide--stop-session session)))))
 
 ;;;###autoload
 (defun claude-code-ide-stop-all (&optional all-projects)
@@ -2904,10 +3094,7 @@ With prefix argument ALL-PROJECTS, stop the instances of all projects."
         ;; One instance's teardown error must not strand the rest
         (dolist (session sessions)
           (condition-case err
-              (let ((buffer (claude-code-ide-mcp-session-buffer session)))
-                (if (and buffer (buffer-live-p buffer))
-                    (kill-buffer buffer)
-                  (claude-code-ide--cleanup-session session)))
+              (claude-code-ide--stop-session session)
             (error
              (claude-code-ide-log "Error stopping %s: %s"
                                   (claude-code-ide--session-display-name session)
@@ -3137,27 +3324,33 @@ to tabs that no longer exist are pruned on the way."
 ;;;###autoload
 (defun claude-code-ide-toggle (&optional pick)
   "Toggle the current project's Claude Code windows as a panel.
-When any of the project's instances is visible, hide them all and
-remember the set; otherwise restore the remembered set, falling back
-to the most recently used instance.  With prefix argument PICK,
+When any of the project's instances, or a buffer that a stopped
+instance of it left, is visible, hide them all and remember the set of
+instances; otherwise restore the remembered set, falling back to the
+most recently used instance.  With prefix argument PICK,
 choose a single instance and toggle only its window.
 Tab-bar tabs keep independent window layouts, so hiding and restoring
 apply to the current tab only."
   (interactive "P")
   (let* ((project-dir (claude-code-ide--get-working-directory))
-         (sessions (claude-code-ide-mcp--sessions-for-project project-dir)))
-    (unless sessions
+         (sessions (claude-code-ide-mcp--sessions-for-project project-dir))
+         (stopped (claude-code-ide--stopped-windows project-dir)))
+    (unless (or sessions (and stopped (not pick)))
       (user-error "No Claude Code session for this project"))
     (if pick
         (when-let* ((session (claude-code-ide--read-project-session
                               "Toggle Claude instance: " project-dir)))
           (claude-code-ide--toggle-existing-window session))
       (let ((visible (claude-code-ide--visible-project-sessions project-dir)))
-        (if visible
+        (if (or visible stopped)
             (progn
               (claude-code-ide--hidden-panel-set project-dir visible)
               (dolist (session visible)
                 (claude-code-ide--toggle-existing-window session))
+              ;; The windows of stopped buffers close too; a restore
+              ;; brings back only instances
+              (dolist (window stopped)
+                (ignore-errors (delete-window window)))
               ;; Stay silent for a single window, matching the
               ;; single-instance behavior before panels existed
               (when (cdr visible)
@@ -3222,19 +3415,23 @@ Claude Code buffer."
 ;;;###autoload
 (defun claude-code-ide-toggle-recent ()
   "Toggle visibility of all Claude Code windows in the current tab.
-If any Claude window is visible, hide all of them and remember the
-set.  If none is visible, restore the remembered set, falling back to
+If any Claude window is visible, also one of a buffer that a stopped
+instance left, hide all of them and remember the set of instances.  If none is visible, restore the remembered set, falling back to
 the most recently accessed instance.  Tab-bar tabs keep independent
 window layouts, so each tab hides and restores its own set."
   (interactive)
   (let ((visible (cl-remove-if-not #'claude-code-ide--session-visible-p
-                                   (claude-code-ide-mcp--active-sessions))))
+                                   (claude-code-ide-mcp--active-sessions)))
+        (stopped (claude-code-ide--stopped-windows)))
     (cond
-     ;; Close all visible windows, remembering the set
-     (visible
+     ;; Close all visible windows, remembering the set; the windows of
+     ;; stopped buffers close too, and a restore brings back instances
+     ((or visible stopped)
       (claude-code-ide--hidden-panel-set :all visible)
       (dolist (session visible)
         (claude-code-ide--toggle-existing-window session))
+      (dolist (window stopped)
+        (ignore-errors (delete-window window)))
       (message "Closed all Claude Code windows%s"
                (if (and (fboundp 'tab-bar-tabs)
                         (cdr (tab-bar-tabs)))

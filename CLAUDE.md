@@ -9,7 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This package integrates coding-agent CLIs with Emacs via the Model Context Protocol (MCP). The providers are Claude Code (`claude`, also over the IDE WebSocket protocol) and Codex (`codex`, MCP tools server only).
 
 **Core Files:**
-- `claude-code-ide.el` - Main entry: user commands, session management, terminal buffers, the `claude` provider, the generic start of every provider (`claude-code-ide--start-session`), the CC MCP config file, and the current provider (persisted, toggled from the menu)
+- `claude-code-ide.el` - Main entry: user commands, session management, terminal buffers (kept after a stop: `claude-code-ide-keep-stopped-buffers`), the `claude` provider, the generic start of every provider (`claude-code-ide--start-session`), the CC MCP config file, and the current provider (persisted, toggled from the menu)
 - `claude-code-ide-mcp.el` - WebSocket server, JSON-RPC handling, session state. Its `claude-code-ide-mcp--track-active-buffer` is the only active buffer tracker; it also serves the MCP tools server sessions.
 - `claude-code-ide-mcp-handlers.el` - MCP tool implementations (file ops, ediff, diagnostics), and the dedicated ediff frames with their queue
 
@@ -47,7 +47,7 @@ This package integrates coding-agent CLIs with Emacs via the Model Context Proto
 - `claude-code-ide-transcript-tests.el` - Transcript and handover document tests, with fixtures in `test-fixtures/transcripts/` (made by `make-fixtures.py` there)
 - `claude-code-ide-process-tests.el` - Process tree tests; live tests run with `CLAUDE_CODE_IDE_LIVE_TESTS=1`
 - `claude-code-ide-reload-tests.el` - Reload tests; one test reloads a copy of the package in a new batch Emacs
-- `claude-code-ide-wiring-tests.el` - Tests of the core wiring: no IDE server without the IDE protocol, provider texts, flags per provider, forks, secrets in the debug log, the CC MCP config file, the process-tree calls, the prepare hook, and the provider choice. At load, it points the MCP config folder and the provider file at a temporary folder for the whole run.
+- `claude-code-ide-wiring-tests.el` - Tests of the core wiring: no IDE server without the IDE protocol, provider texts, flags per provider, forks, secrets in the debug log, the CC MCP config file, the process-tree calls, the prepare hook, the provider choice, and the buffers kept after a stop. At load, it points the MCP config folder and the provider file at a temporary folder for the whole run.
 - `claude-code-ide-live-tests.el` - Live tests with the real `claude` and `codex` CLIs: handovers between both providers, recovery after a crash of Emacs, the Codex dialogs in each terminal, and stops without a question. They run only in an own `emacs -Q` daemon with `CLAUDE_CODE_IDE_LIVE_TESTS=1` (docs/live-tests.md); in the batch suite each one skips, and only the unit tests of its helpers run.
 
 **Design documents (docs/):**

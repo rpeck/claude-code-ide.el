@@ -167,7 +167,7 @@ The `claude` provider calls the functions that the package used before. A start 
 | `launch`, `resume` | `claude-code-ide--build-claude-command` and `claude-code-ide--cli-environment`. The arguments are `--resume ID` (for a `resume-id`), then those of `claude-code-ide-cli-args-functions`, then ARGS. |
 | `fork` | `launch` with `--resume ID` and `--fork-session`. |
 | `submit-prompt` | It types the text into the terminal and presses return. |
-| `stop` | It kills the terminal buffer. |
+| `stop` | It kills the terminal buffer, which ends the CLI and its process tree. First a read-only copy of the buffer is made, with " [stopped]" after its name; with `claude-code-ide-keep-stopped-buffers` nil, no copy stays. |
 | `native-id` | The descriptor's native ID, else the file that the CLI keeps in `~/.claude/sessions`. |
 | `status-events` | nil. Claude Code gets its status hooks through the `--settings` argument of the session registry. See `claude-code-ide-session-registry-hook-functions`. |
 | `map-event` | The table `claude-code-ide--claude-event-map`. |
