@@ -1326,15 +1326,24 @@ nil; see `claude-code-ide-process--terminal-process'.  INSTANCE is a
 descriptor or an instance ID.
 
 - The terminal does not run (no live descriptor or buffer): `stopped'.
-- The known terminal process has exited: `stopped', also when the
-  buffer and the descriptor stay a moment longer.
+- The known terminal process has exited, and the buffer runs no other
+  live process now: `stopped', also when the buffer and the descriptor
+  stay a moment longer.
+- The buffer runs another live process now (a new CLI in the same
+  buffer): the exited object proves nothing, and that process decides.
 - The known terminal process runs, or no terminal process is known:
   the CLI may run, and the stop could neither end it nor check it.
   The result is `error' with a reason, never `stopped'."
-  (let ((descriptor (claude-code-ide-process--descriptor instance)))
+  (let* ((descriptor (claude-code-ide-process--descriptor instance))
+         (buffer (and descriptor (claude-code-ide-instance-buffer descriptor)))
+         (current (and (buffer-live-p buffer) (get-buffer-process buffer)))
+         (exited (and (processp process) (not (process-live-p process))
+                      ;; Not when the buffer runs another live process now
+                      (not (and (processp current) (not (eq current process))
+                                (process-live-p current))))))
     (if (and descriptor
              (claude-code-ide-instance-live-p descriptor)
-             (not (and (processp process) (not (process-live-p process)))))
+             (not exited))
         (list :status 'error
               :reason "the process ID of the CLI is unknown, so the stop could not end or check it"
               :strays nil :ended nil :escalated nil)
