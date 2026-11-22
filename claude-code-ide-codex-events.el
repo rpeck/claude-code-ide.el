@@ -2357,6 +2357,9 @@ Just before the question, Emacs looks again:
 - KEY is no longer the key of the hook definitions: check again.
 - The user declined the hooks, or the cache says trusted or disabled:
   end.  A newer cached `untrusted' result replaces RESULT.
+- A RESULT that waited (it has :deferred) and no valid cached result:
+  the config file changed in the meantime, so check again.  A fresh
+  RESULT, which comes straight from a check, is used as it is.
 
 The question counts also after a no or C-g: the check ends with it."
   (let ((cached (claude-code-ide-codex-events--cached-trust key)))
@@ -2369,7 +2372,8 @@ The question counts also after a no or C-g: the check ends with it."
           claude-code-ide-codex-events--offer-running)
       (setq claude-code-ide-codex-events--load-check 'asking)
       (claude-code-ide-codex-events--load-check-later
-       #'claude-code-ide-codex-events--load-check-ask key result))
+       #'claude-code-ide-codex-events--load-check-ask key
+       (if (plist-get result :deferred) result (append (list :deferred t) result))))
      ((not (claude-code-ide-codex-events--display-frame-exists-p))
       (claude-code-ide-codex-events--load-check-wait-for-frame))
      ((not (equal key (claude-code-ide-codex-events--trust-key)))
@@ -2377,6 +2381,8 @@ The question counts also after a no or C-g: the check ends with it."
      ((or (member key claude-code-ide-codex-events--declined)
           (memq (claude-code-ide-codex-events--result-status cached) '(trusted disabled)))
       (claude-code-ide-codex-events--load-check-done))
+     ((and (null cached) (plist-get result :deferred))
+      (claude-code-ide-codex-events--load-check-run))
      (t
       (claude-code-ide-codex-events--load-check-done)
       (condition-case err

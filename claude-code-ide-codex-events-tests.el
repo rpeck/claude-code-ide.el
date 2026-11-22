@@ -3390,6 +3390,42 @@ It uses `idle' of `claude-code-ide-codex-events-tests--with-load-check'."
         (should (equal questions '(t t)))
         (should-not claude-code-ide-codex-events--offer-running)))))
 
+(ert-deftest claude-code-ide-codex-events-test-load-check-deferred-checks-again ()
+  "A deferred question without a valid cached result checks the trust again.
+The config file changed while the question waited (for example, /hooks
+in another terminal trusted the hooks), so the cache has no result, and
+the old untrusted result must not give a question.  A fresh result that
+is still untrusted gives one question, with no loop of checks."
+  ;; Trusted in the meantime: no question
+  (claude-code-ide-codex-events-tests--with-load-check
+    (setq busy t)
+    (claude-code-ide-codex-events--schedule-load-check)
+    (claude-code-ide-codex-events-tests--run-idle)
+    (claude-code-ide-codex-events-tests--run-idle)
+    (should (= checks 1))
+    (should (= asked 0))
+    (cl-letf (((symbol-function 'claude-code-ide-codex-events--start-trust-check)
+               (lambda (key _directory)
+                 (cl-incf checks)
+                 (claude-code-ide-codex-events--check-create
+                  :key key :result (claude-code-ide-codex-events-tests--trusted-result)))))
+      (setq busy nil)
+      (claude-code-ide-codex-events-tests--run-idle))
+    (should (= checks 2))
+    (should (= asked 0))
+    (should (eq claude-code-ide-codex-events--load-check 'done)))
+  ;; Still untrusted: one question after one more check
+  (claude-code-ide-codex-events-tests--with-load-check
+    (setq busy t)
+    (claude-code-ide-codex-events--schedule-load-check)
+    (claude-code-ide-codex-events-tests--run-idle)
+    (claude-code-ide-codex-events-tests--run-idle)
+    (setq busy nil)
+    (claude-code-ide-codex-events-tests--run-idle)
+    (should (= checks 2))
+    (should (= asked 1))
+    (should (eq claude-code-ide-codex-events--load-check 'done))))
+
 (ert-deftest claude-code-ide-codex-events-test-load-check-asks-only-when-still-wanted ()
   "A deferred question checks the option, the tracking, the session and the cache again."
   ;; The option is set to never while the question waits
