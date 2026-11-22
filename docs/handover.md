@@ -92,9 +92,9 @@ Emacs saves each stage in the registry entry of the source **before** the step o
 |---|---|
 | `requested` | The handover is recorded. |
 | `quiescing` | The inbox delivery to the source is held (`claude-code-ide-control-hold`): no queued prompt goes to it from now on. When the inbox sent a prompt to the source whose acknowledgement did not come, the status events are drained, and the stop waits up to `claude-code-ide-handover-ack-wait` (10 s) for it. Wait until the source is idle, failed (for example at a quota limit), or waits for an answer to a question. With `:interrupt`, interrupt it one time. Subagents or background tasks cancel the handover, unless it is forced. After `claude-code-ide-handover-quiesce-timeout` (600 s), the handover is cancelled. |
-| `source-stopped` | `claude-code-ide-process-stop-later` ends the source and its process tree, with the soft end of its provider, and then scans the worktree. |
+| `source-stopped` | `claude-code-ide-process-stop-later` ends the source and its process tree, with the soft end of its provider, and then scans the worktree. The handover goes past this stage only when the source no longer runs in this Emacs (see "The source must end" below), whatever the stop result says. |
 | `document-written` | `claude-code-ide-transcript-handover-document` makes the document. Emacs writes it to `<worktree>/.handover/<id>.md` (mode 0600) and records its hash. Emacs adds `.handover/` to the Git exclude file of the worktree. |
-| `target-started` | The target ID is saved first; while the registry is busy, the start waits. The target starts with the provider's launch, or its fork, with the start prompt (below). Its chain is saved with its own leg pending; while the registry is busy, that save is tried again every second. |
+| `target-started` | Never while the source still runs in this Emacs, also not at a recovery. The target ID is saved first; while the registry is busy, the start waits. The target starts with the provider's launch, or its fork, with the start prompt (below). Its chain is saved with its own leg pending; while the registry is busy, that save is tried again every second. |
 | `target-identified` | The native ID of the target is known: at the start for CC (Emacs chooses it), from the first `SessionStart` for Codex. |
 | `delivered` | A `prompt-submit` event of the target starts with the marker of this handover ID. |
 | `committed` | The final chain of the target is saved. Then the inbox of the source moves to the target, and then the handover is committed. A crash in between moves the inbox again at the recovery; the move is idempotent. |
@@ -155,12 +155,22 @@ Emacs saves each stage in the registry entry of the source **before** the step o
 
 ## Stray processes
 
+### The source must end
+
+- **The live check.** The source counts as running when its descriptor is live and its terminal process runs. The terminal process is the one that a process-tree stop knows (`claude-code-ide-process--terminal-process`: the process of its buffer, else the one that its MCP session keeps). A live descriptor without a known terminal process counts as running, because nothing shows that its CLI ended.
+- **When it runs.** The check runs after each clean scan (also after the stop), before the document step enters `target-started`, and before each start of the target. So a recovery never starts a target next to a live source, for example after the source was restored.
+- **The reasons:**
+  - `source-pid-unknown`: the process-tree stop could not end or check the source CLI, because its process ID is unknown (the stop gives `error` with "the process ID of the CLI is unknown"). The message says that the source CLI may still run.
+  - `source-still-running`: the stop or the scan was clean, but the source still runs. The handover never goes on silently.
+- Both stop the handover at its stage, with its next step kept, until a person chooses `end`, `wait` or `cancel` (the table below).
+
+
 - The stop reports processes that still run in the worktree (`:status strays`).
   - A process that this Emacs runs (`:emacs-process`, for example a language server) does not count.
   - A process of another live instance of this Emacs (`:instance-id`) does not count. Only a forced handover has such an instance. So `end` never signals its processes.
   - A review process (`claude-code-ide-review-process-ids`) does not count. The stop and the scan also leave it out. Its result goes to the target after the commit.
 - Each stray gets the start time of its process right after the scan (`:start`).
-- A handover with strays, a source that survived SIGKILL (`source-did-not-stop`), or a failed scan (`scan-failed`) gets the status `needs-user`.
+- A handover with strays, a source that survived SIGKILL (`source-did-not-stop`), a source that may still run (`source-pid-unknown`, `source-still-running`), or a failed scan (`scan-failed`) gets the status `needs-user`.
   - An interactive handover asks at once. It shows the process ID, the command, and the folder of each stray.
   - A coordinator sees `needs-user` in the status, and Emacs shows a message.
 - `M-x claude-code-ide-handover-resolve` answers. The choices:
@@ -168,6 +178,7 @@ Emacs saves each stage in the registry entry of the source **before** the step o
 | Reason | Choices |
 |---|---|
 | `strays`, `source-did-not-stop` | `end`: SIGTERM, then SIGKILL after `claude-code-ide-handover-stray-wait` (10 s), then scan again. `wait`: scan again after that time. `cancel`. |
+| `source-pid-unknown`, `source-still-running` | `end`: end the source as `claude-code-ide-control-stop` does (the stop of its provider kills its terminal buffer, which ends the CLI), then scan the worktree as usual. `wait`: try the stop again after `claude-code-ide-handover-stray-wait` (a recovery scans again, with its next step). `cancel`. There is no `go`: the handover never goes on while the source may run. |
 | `scan-failed` | `wait` (scan again), `go` (go on without the check), `cancel`. |
 | `no-delivery` | `wait` (look at the transcript, then wait again for the delivery), `cancel` (stop the target). |
 | `target-exited` | `retry` (scan the worktree, then start the target again, with the same instance ID and document), `cancel`. |
