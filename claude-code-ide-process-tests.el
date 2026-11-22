@@ -321,6 +321,25 @@ terminal process that was never known stays `error'."
                 (should (claude-code-ide-tests--wait-until (lambda () later) 5))
                 (should (equal (list provider (plist-get later :status))
                                (list provider 'stopped))))
+              ;; An old pipe exited, and the same buffer runs a new live
+              ;; pipe with an unknown PID: the old object proves nothing
+              (let ((old (make-pipe-process :name "cci-test-old" :buffer buffer :noquery t)))
+                (delete-process old)
+                (let ((new (make-pipe-process :name "cci-test-new" :buffer buffer :noquery t))
+                      (later nil))
+                  (unwind-protect
+                      (progn
+                        (should (eq (get-buffer-process buffer) new))
+                        (should (equal (list provider (plist-get (claude-code-ide-process-stop
+                                                                  instance :process old :scan nil)
+                                                                 :status))
+                                       (list provider 'error)))
+                        (claude-code-ide-process-stop-later
+                         instance :process old :callback (lambda (r) (setq later r)))
+                        (should (claude-code-ide-tests--wait-until (lambda () later) 5))
+                        (should (equal (list provider (plist-get later :status))
+                                       (list provider 'error))))
+                    (delete-process new))))
               ;; No terminal process was ever known: the CLI may run
               (should-not (get-buffer-process buffer))
               (should (equal (list provider (plist-get (claude-code-ide-process-stop instance :scan nil)
