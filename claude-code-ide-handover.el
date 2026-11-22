@@ -225,6 +225,7 @@ Emacs asks you whether to hand over."
   (interactive nil :documentation "Non-nil when a person started it in Emacs.")
   (continue nil :documentation "Non-nil to send the continue prompt to the target at the commit.")
   (continue-sent nil :documentation "Non-nil after the inbox of the target accepted the continue prompt.")
+  (chain-saved nil :documentation "Non-nil after the commit saved the chain of the target.")
   (stage 'requested :documentation "The stage that the run is in.")
   (status 'running :documentation "`running', `needs-user', `committed', `cancelled' or `failed'.")
   (reason nil :documentation "Symbol that says why the status is what it is.")
@@ -341,6 +342,7 @@ while a handover holds the worktree.")
            (cons 'interactive (and (claude-code-ide-handover--run-interactive run) t))
            (cons 'continue (and (claude-code-ide-handover--run-continue run) t))
            (cons 'continue_sent (and (claude-code-ide-handover--run-continue-sent run) t))
+           (cons 'chain_saved (and (claude-code-ide-handover--run-chain-saved run) t))
            ;; The owner of the run: this Emacs
            (cons 'emacs_pid (emacs-pid))
            (cons 'emacs_start_time (claude-code-ide-session-registry--emacs-start-time))
@@ -388,6 +390,7 @@ while a handover holds the worktree.")
      ;; An older record has no field: the old behavior, no prompt
      :continue (eq (alist-get 'continue alist) t)
      :continue-sent (eq (alist-get 'continue_sent alist) t)
+     :chain-saved (eq (alist-get 'chain_saved alist) t)
      :owner (claude-code-ide-session-registry--handover-owner alist)
      :owner-pid (alist-get 'emacs_pid alist)
      :owner-host (alist-get 'host alist)
@@ -1227,7 +1230,17 @@ coordinator sees the status `needs-user', and Emacs shows a message."
              (claude-code-ide-handover--run-id run) text)))
 
 (defun claude-code-ide-handover--choices (run)
-  "Return the choices of a person for RUN, as (KEY ACTION DESCRIPTION)."
+  "Return the choices of a person for RUN, as (KEY ACTION DESCRIPTION).
+After the commit saved the chain of the target, the choices are retry
+and skip for every reason: the chain names the target, so a cancel
+would stop the current instance."
+  (if (claude-code-ide-handover--run-chain-saved run)
+      '((?r retry "finish the commit again (it sends a continue prompt that is due)")
+        (?s skip "finish the handover without the continue prompt"))
+    (claude-code-ide-handover--choices-before-chain run)))
+
+(defun claude-code-ide-handover--choices-before-chain (run)
+  "Return the choices of a person for RUN before the chain of its target is saved."
   (pcase (claude-code-ide-handover--run-reason run)
     ((or 'strays 'source-did-not-stop)
      '((?e end "end them: SIGTERM, then SIGKILL")
@@ -1245,10 +1258,6 @@ coordinator sees the status `needs-user', and Emacs shows a message."
        (?c cancel "cancel the handover")))
     ('registry-entry-missing
      '((?c cancel "cancel the handover")))
-    ;; The chain is committed: a cancel would stop the current instance
-    ('continue-failed
-     '((?r retry "send the continue prompt again")
-       (?s skip "finish the handover without the continue prompt")))
     (_
      '((?r retry "try the stage again")
        (?c cancel "cancel the handover")))))
@@ -1381,7 +1390,17 @@ Interactively, choose the handover and the action."
         ('skip
          (setf (claude-code-ide-handover--run-continue run) nil)
          (claude-code-ide-handover--resume run)
-         (claude-code-ide-handover--commit run))
+         (claude-code-ide-handover--commit run)
+         ;; The record of the source cannot be saved (its entry is
+         ;; gone): end the run in this Emacs, so that skip always works
+         (when (and (claude-code-ide-handover--unfinished-p run)
+                    (eq (claude-code-ide-handover--run-reason run) 'registry-entry-missing))
+           (claude-code-ide-handover--cancel-timers run)
+           (setf (claude-code-ide-handover--run-status run) 'committed
+                 (claude-code-ide-handover--run-reason run) nil)
+           (claude-code-ide-control-release (claude-code-ide-handover--run-source-id run))
+           (message "Handover %s committed in this Emacs; the registry has no entry to save it in"
+                    (claude-code-ide-handover--run-id run))))
         ('cancel
          (if (eq (claude-code-ide-handover--run-continuation run) 'cancel)
              ;; The person leaves the target process running
@@ -1405,9 +1424,10 @@ Interactively, choose the handover and the action."
          (claude-code-ide-handover--after-scan run))
         ('retry
          (cond
-          ;; A committed handover whose continue prompt failed: commit
-          ;; again, which sends the prompt with the same request ID
-          ((eq (claude-code-ide-handover--run-reason run) 'continue-failed)
+          ;; After the chain save (for example a continue prompt that
+          ;; failed): commit again, which sends a prompt that is due
+          ;; with the same request ID
+          ((claude-code-ide-handover--run-chain-saved run)
            (claude-code-ide-handover--resume run)
            (claude-code-ide-handover--commit run))
           ;; A target that runs: take it up again, never a second start
@@ -1489,9 +1509,12 @@ refused; a handover of an Emacs that ended is claimed first."
      ((null run) (user-error "No handover %s" handover-id))
      ((not (claude-code-ide-handover--unfinished-p run))
       (user-error "Handover %s is %s already" handover-id (claude-code-ide-handover--run-status run)))
-     ;; The chain names the target already; a cancel would stop it
-     ((not (claude-code-ide-handover--stage< (claude-code-ide-handover--run-stage run) 'committed))
-      (user-error "Handover %s is committed; it cannot be cancelled" handover-id))
+     ;; The chain names the target already; a cancel would stop it.
+     ;; Before the chain save (for example a missing target entry), a
+     ;; cancel still works
+     ((claude-code-ide-handover--run-chain-saved run)
+      (user-error "Handover %s is committed (the chain names its target); it cannot be cancelled"
+                  handover-id))
      ((and (eq (claude-code-ide-handover--run-status run) 'running)
            (claude-code-ide-handover--live-target run))
       (user-error "The target of handover %s runs already" handover-id))
@@ -1785,32 +1808,55 @@ run waits for a person ends the wait."
 
 (defun claude-code-ide-handover--commit (run)
   "Make the target of RUN the current instance of the chain.
-The final chain of the target is saved first; the inbox of the source
-moves to the target before the commit is final, so that a crash in
-between moves it again at the recovery (the move is idempotent)."
+The steps, each idempotent, so that a recovery or a retry runs them
+again after a crash or a failure:
+1. Enter the stage committed (saved).
+2. Save the final chain of the target, then mark it in the record
+   (`chain-saved', saved).  From here on, the handover cannot be
+   cancelled: the chain names the target.
+3. Move the inbox of the source to the target.
+4. Send the continue prompt, when it is due (see
+   `claude-code-ide-handover--send-continue'); its acceptance is saved
+   at once (`continue-sent').
+5. Finish: the status committed (saved).
+A busy registry runs the step again a moment later."
   (when (claude-code-ide-handover--enter run 'committed)
     (let ((source (claude-code-ide-handover--run-source-id run))
           (target (claude-code-ide-handover--run-target-id run)))
       (if (not (claude-code-ide-handover--save-chain run (claude-code-ide-handover--target-chain run)))
           (when (eq (claude-code-ide-handover--run-status run) 'running)
             (claude-code-ide-handover--busy-registry run))
-        ;; Queued prompts and review results go to the new instance
-        (claude-code-ide-control-move-inbox source target (claude-code-ide-handover--run-id run))
-        ;; Before the final save, so that a crash in between sends it
-        ;; at the recovery; the fixed request ID sends it only once.  A
-        ;; prompt that the inbox does not take keeps the run unfinished
-        (let ((failure (claude-code-ide-handover--send-continue run)))
-          (if failure
-              (claude-code-ide-handover--needs-user
-               run 'continue-failed
-               (format "The handover is committed, but the continue prompt did not reach the inbox of the target %s: %s.  Retry sends it again; skip finishes without it"
-                       target failure))
-            (claude-code-ide-handover--finish run 'committed nil
-                                              (format "%s %s -> %s %s"
-                                                      (claude-code-ide-handover--run-source-provider run)
-                                                      source
-                                                      (claude-code-ide-handover--run-target-provider run)
-                                                      target))))))))
+        (when (claude-code-ide-handover--mark-chain-saved run)
+          ;; Queued prompts and review results go to the new instance
+          (claude-code-ide-control-move-inbox source target (claude-code-ide-handover--run-id run))
+          ;; Before the final save, so that a crash in between sends it
+          ;; at the recovery; the fixed request ID sends it only once.
+          ;; A prompt that the inbox does not take keeps the run
+          ;; unfinished
+          (pcase (claude-code-ide-handover--send-continue run)
+            ('nil
+             (claude-code-ide-handover--finish run 'committed nil
+                                               (format "%s %s -> %s %s"
+                                                       (claude-code-ide-handover--run-source-provider run)
+                                                       source
+                                                       (claude-code-ide-handover--run-target-provider run)
+                                                       target)))
+            ;; The registry was busy: the step runs again soon
+            ('busy nil)
+            (failure
+             (claude-code-ide-handover--needs-user
+              run 'continue-failed
+              (format "The handover is committed, but the continue prompt did not reach the inbox of the target %s: %s.  Retry sends it again; skip finishes without it"
+                      target failure)))))))))
+
+(defun claude-code-ide-handover--mark-chain-saved (run)
+  "Record in RUN that the chain of its target is saved, and save RUN.
+Return non-nil when the registry holds it.  When the registry is busy,
+the step runs again a moment later, as for the stages.  A second call
+saves again, which does no harm."
+  (setf (claude-code-ide-handover--run-chain-saved run) t)
+  (or (claude-code-ide-handover--save run)
+      (claude-code-ide-handover--busy-registry run)))
 
 (defun claude-code-ide-handover--continue-request-id (run)
   "Return the request ID of the continue prompt of RUN."
@@ -1820,9 +1866,11 @@ between moves it again at the recovery (the move is idempotent)."
   "Send the target of RUN the continue prompt, when RUN asks for it.
 Return nil when nothing more is needed: RUN asks for no prompt, its
 record says that the inbox took it already (`continue-sent'), or the
-inbox takes it now, also as a duplicate of the same request.  Else
-return a text that says why it failed: an error of the submit, or a
-refusal of the inbox.  The prompt goes through the inbox of the target
+inbox takes it now, also as a duplicate of the same request; then the
+record is saved with `continue-sent' at once.  Return `busy' when that
+save waits for the registry (the step runs again soon).  Else return
+a text that says why it failed: an error of the submit, or a refusal
+of the inbox.  The prompt goes through the inbox of the target
 with a fixed request ID, so a second call (for example at a recovery)
 sends nothing.  It waits in the inbox until the target is idle."
   (when (and (claude-code-ide-handover--run-continue run)
@@ -1836,9 +1884,14 @@ sends nothing.  It waits in the inbox until the target is idle."
                     (error (list :error (error-message-string err))))))
       (if (memq (plist-get result :result) '(queued delivered unacknowledged))
           (progn
-            ;; The final save of the commit keeps the flag
+            ;; Saved at once, before the final save of the commit, so
+            ;; that a recovery after a crash in between sends nothing
+            ;; again, also after the inbox pruned its done record
             (setf (claude-code-ide-handover--run-continue-sent run) t)
-            nil)
+            (if (claude-code-ide-handover--save run)
+                nil
+              (claude-code-ide-handover--busy-registry run)
+              'busy))
         (or (plist-get result :error)
             (format "the inbox gave %s%s"
                     (or (plist-get result :result) (plist-get result :status) "no result")

@@ -126,7 +126,7 @@ The filter of the connections (`claude-code-ide-mcp-http-server--filter`) reads 
 
 ### Replies
 
-- A notification (a message without `id`) gets `202 Accepted` with no body and no content type. The MCP Streamable HTTP transport requires this, and Codex drops the connection on any other reply.
+- A notification (a message without the member `id`) gets `202 Accepted` with no body and no content type. The MCP Streamable HTTP transport requires this, and Codex drops the connection on any other reply. A request with `"id": null` is not a notification: JSON-RPC 2.0 allows a null id. It gets its normal result or error, with `id` null.
 - A request gets `200` with a JSON-RPC result or error.
 - **JSON values of tool arguments.** The server decodes `false` as `:json-false` (given, and false) and `null` as nil (as if the argument were missing). A tool function must test a boolean argument with a check that reads `:json-false` as false (for example `claude-code-ide-handover--flag`, `claude-code-ide-emacs-tools--true-p`), never with plain `if`. Before, `false` came as `:false` and `null` as `:null`, which are both true values, so `"force": false` acted as true.
 - No reply has a CORS header.

@@ -754,8 +754,10 @@ that is shorter than its Content-Length, or a bad Content-Length, gets
                  (id . ,id)
                  (error . ((code . -32000)
                            (message . ,(format "Forbidden: %s" (plist-get check :reason))))))))
-             ;; A notification (no id field) gets 202 Accepted with no body
-             ((null id)
+             ;; A notification (no id member) gets 202 Accepted with no
+             ;; body.  "id": null is a request: its id is nil here, and
+             ;; the reply writes it as JSON null
+             ((not (assq 'id json-object))
               (claude-code-ide-debug "Received notification: %s" method)
               (claude-code-ide-mcp-http-server--send-empty-response request))
              (t
