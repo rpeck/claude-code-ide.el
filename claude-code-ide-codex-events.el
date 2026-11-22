@@ -79,6 +79,27 @@ the check goes on in the background."
   :type 'number
   :group 'claude-code-ide)
 
+(defcustom claude-code-ide-codex-events-trust-at-load 'ask
+  "Whether Emacs checks the trust of the Codex status hooks after its start.
+Codex runs the status hooks only when the user trusts them.  An
+interactive start, a restore and a handover ask for that trust; a
+start from a coordinator or an agent never asks, and gets only the
+refusal `hooks-not-trusted'.  So Emacs checks it once by itself:
+
+- `ask' (the default): after the start of Emacs, when Emacs is idle,
+  check the trust, and ask once when the hooks are not trusted.  A
+  daemon waits for its first frame on a display.  Nothing happens in
+  batch Emacs, without a Codex CLI, with the status tracking off
+  \(`claude-code-ide-session-status-tracking'), or when the hooks are
+  trusted.  The question waits while the minibuffer is active.  Each
+  Emacs asks at most once; a no counts, and a reload asks no more.
+- `never': no check.  The starts that ask stay the same.
+
+`claude-code-ide-codex-trust-hooks' trusts the hooks at any time."
+  :type '(choice (const :tag "Check after the start, and ask once when not trusted" ask)
+                 (const :tag "Never" never))
+  :group 'claude-code-ide)
+
 (defcustom claude-code-ide-codex-events-startup-grace 3
   "Seconds after a launch before the screen is read for a startup dialog."
   :type 'number
@@ -2137,6 +2158,162 @@ restart."
   (claude-code-ide-codex-events--ask-trust nil t)
   nil)
 
+;;; The trust check after the start of Emacs
+
+;; `claude-code-ide-codex-events-trust-at-load' says whether Emacs
+;; checks the hook trust once by itself.  The load of this file only
+;; schedules the check: it runs from an idle timer after the start of
+;; Emacs, and in a daemon after its first frame on a display.  It uses
+;; the cache, then the background check of the app-server, and asks
+;; through `claude-code-ide-codex-events--offer-trust', as a start does.
+
+(defvar claude-code-ide-codex-events--load-check nil
+  "State of the trust check after the start of Emacs.
+nil before the check is scheduled, `scheduled' while it waits for its
+idle timer, `frame' while a daemon waits for a frame on a display,
+`checking' while the app-server lists the hooks, `asking' while the
+question waits for a free minibuffer, and `done' after it.  The value
+stays at a reload of the file (`defvar'), so a reload checks and asks
+no second time.")
+
+(defconst claude-code-ide-codex-events--load-check-delay 2
+  "Idle seconds before a step of the trust check after the start of Emacs.")
+
+(defun claude-code-ide-codex-events--interactive-session-p ()
+  "Return non-nil when Emacs runs for a user, not in batch."
+  (not noninteractive))
+
+(defun claude-code-ide-codex-events--codex-available-p ()
+  "Return non-nil when the `detect' operation of the Codex provider finds the CLI.
+Without the Codex provider, or without its `detect' operation, there
+is no CLI."
+  (when-let* ((provider (claude-code-ide-get-provider 'codex))
+              ((claude-code-ide-provider-supports-p provider 'detect)))
+    (and (plist-get (ignore-errors (claude-code-ide-provider-call provider 'detect)) :available)
+         t)))
+
+(defun claude-code-ide-codex-events--minibuffer-busy-p ()
+  "Return non-nil while the minibuffer is active."
+  (or (active-minibuffer-window) (> (minibuffer-depth) 0)))
+
+(defun claude-code-ide-codex-events--display-frame-exists-p ()
+  "Return non-nil when a frame on a display exists.
+The initial frame of a daemon is on the terminal \"initial_terminal\"
+and does not count; see `claude-code-ide-codex--display-frame-p' of
+the Codex launch."
+  (and (fboundp 'claude-code-ide-codex--display-frame-p)
+       (cl-some (lambda (frame) (funcall 'claude-code-ide-codex--display-frame-p frame))
+                (frame-list))
+       t))
+
+(defun claude-code-ide-codex-events--load-check-wanted-p ()
+  "Return non-nil when the trust check after the start may run now."
+  (and (eq claude-code-ide-codex-events-trust-at-load 'ask)
+       (claude-code-ide-codex-events--interactive-session-p)
+       claude-code-ide-session-status-tracking
+       t))
+
+(defun claude-code-ide-codex-events--load-check-later (function &rest args)
+  "Call FUNCTION with ARGS at the next idle moment of Emacs."
+  (apply #'run-with-idle-timer claude-code-ide-codex-events--load-check-delay nil function args))
+
+(defun claude-code-ide-codex-events--schedule-load-check ()
+  "Schedule the trust check after the start of Emacs, once in each Emacs.
+The load of this file calls it.  It only schedules: during the start
+of Emacs, at `emacs-startup-hook'; after it, at the next idle moment.
+See `claude-code-ide-codex-events-trust-at-load'."
+  (when (and (null claude-code-ide-codex-events--load-check)
+             (claude-code-ide-codex-events--load-check-wanted-p))
+    (setq claude-code-ide-codex-events--load-check 'scheduled)
+    (if after-init-time
+        (claude-code-ide-codex-events--load-check-later #'claude-code-ide-codex-events--load-check-run)
+      (add-hook 'emacs-startup-hook #'claude-code-ide-codex-events--load-check-after-start))))
+
+(defun claude-code-ide-codex-events--load-check-after-start ()
+  "Run the trust check at the next idle moment after the start of Emacs."
+  (remove-hook 'emacs-startup-hook #'claude-code-ide-codex-events--load-check-after-start)
+  (claude-code-ide-codex-events--load-check-later #'claude-code-ide-codex-events--load-check-run))
+
+(defun claude-code-ide-codex-events--load-check-on-frame ()
+  "Run the trust check after the first frame on a display of a daemon.
+This is a function of `server-after-make-frame-hook'.  A frame on the
+initial terminal changes nothing."
+  (when (claude-code-ide-codex-events--display-frame-exists-p)
+    (remove-hook 'server-after-make-frame-hook #'claude-code-ide-codex-events--load-check-on-frame)
+    (setq claude-code-ide-codex-events--load-check 'scheduled)
+    (claude-code-ide-codex-events--load-check-later #'claude-code-ide-codex-events--load-check-run)))
+
+(defun claude-code-ide-codex-events--load-check-done ()
+  "End the trust check after the start of Emacs for this Emacs."
+  (setq claude-code-ide-codex-events--load-check 'done))
+
+(defun claude-code-ide-codex-events--load-check-run ()
+  "Check the hook trust after the start of Emacs, and ask when needed.
+Without a frame on a display (a daemon), wait for one.  Without a Codex
+CLI, or with trusted, disabled or declined hooks, end.  A cached
+untrusted result asks; else the background check of the app-server
+lists the hooks, without a wait in this function."
+  (cond
+   ((eq claude-code-ide-codex-events--load-check 'done))
+   ((not (claude-code-ide-codex-events--load-check-wanted-p))
+    (claude-code-ide-codex-events--load-check-done))
+   ((not (claude-code-ide-codex-events--display-frame-exists-p))
+    (setq claude-code-ide-codex-events--load-check 'frame)
+    (add-hook 'server-after-make-frame-hook #'claude-code-ide-codex-events--load-check-on-frame))
+   ((not (claude-code-ide-codex-events--codex-available-p))
+    (claude-code-ide-codex-events--load-check-done))
+   (t
+    (let* ((key (claude-code-ide-codex-events--trust-key))
+           (cached (claude-code-ide-codex-events--cached-trust key)))
+      (cond
+       ((member key claude-code-ide-codex-events--declined)
+        (claude-code-ide-codex-events--load-check-done))
+       (cached (claude-code-ide-codex-events--load-check-result cached))
+       (t
+        (setq claude-code-ide-codex-events--load-check 'checking)
+        (claude-code-ide-codex-events--load-check-wait
+         (claude-code-ide-codex-events--start-trust-check key nil)
+         (+ (float-time) claude-code-ide-codex-events--background-limit))))))))
+
+(defun claude-code-ide-codex-events--load-check-wait (check deadline)
+  "Go on with the result of the background CHECK, or look again soon.
+After the float time DEADLINE, end without a question."
+  (let ((result (claude-code-ide-codex-events--check-result check)))
+    (cond
+     (result (claude-code-ide-codex-events--load-check-result result))
+     ((< (float-time) deadline)
+      (run-with-timer 0.5 nil #'claude-code-ide-codex-events--load-check-wait check deadline))
+     (t (claude-code-ide-codex-events--load-check-done)))))
+
+(defun claude-code-ide-codex-events--load-check-result (result)
+  "Ask for the trust when RESULT is `untrusted'; else end the check."
+  (if (eq (claude-code-ide-codex-events--result-status result) 'untrusted)
+      (claude-code-ide-codex-events--load-check-ask result)
+    (claude-code-ide-codex-events--load-check-done)))
+
+(defun claude-code-ide-codex-events--load-check-ask (result)
+  "Ask once for the trust of the hooks in the `untrusted' RESULT.
+While the minibuffer is active, ask at the next idle moment.  No
+question when a start trusted the hooks or the user declined them in
+the meantime.  The question counts also after a no or C-g: the check
+ends with it."
+  (let ((key (claude-code-ide-codex-events--trust-key)))
+    (cond
+     ((eq claude-code-ide-codex-events--load-check 'done))
+     ((or (member key claude-code-ide-codex-events--declined)
+          (eq (claude-code-ide-codex-events--result-status
+               (claude-code-ide-codex-events--cached-trust key))
+              'trusted))
+      (claude-code-ide-codex-events--load-check-done))
+     ((claude-code-ide-codex-events--minibuffer-busy-p)
+      (setq claude-code-ide-codex-events--load-check 'asking)
+      (claude-code-ide-codex-events--load-check-later #'claude-code-ide-codex-events--load-check-ask result))
+     (t
+      (claude-code-ide-codex-events--load-check-done)
+      (condition-case err
+          (claude-code-ide-codex-events--offer-trust result nil)
+        (error (message "Codex hook trust unknown: %s" (error-message-string err))))))))
+
 ;;; Timers
 
 (defun claude-code-ide-codex-events--prune ()
@@ -2197,6 +2374,9 @@ restart."
   (when claude-code-ide-codex-events--watch
     (ignore-errors (file-notify-rm-watch claude-code-ide-codex-events--watch))
     (setq claude-code-ide-codex-events--watch nil)))
+
+;; Only a schedule: the check runs after the start of Emacs
+(claude-code-ide-codex-events--schedule-load-check)
 
 (provide 'claude-code-ide-codex-events)
 

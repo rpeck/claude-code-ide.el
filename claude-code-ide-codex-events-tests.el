@@ -3067,6 +3067,265 @@ answers of `read-multiple-choice', and `asked' counts its calls."
         (claude-code-ide-visit-waiting-session))
       (should (= (length stops) 2)))))
 
+;;; The trust check after the start of Emacs
+
+(defvar claude-code-ide-codex-events-trust-at-load)
+(defvar claude-code-ide-codex-events--load-check)
+(defvar server-after-make-frame-hook)
+
+(defmacro claude-code-ide-codex-events-tests--with-load-check (&rest body)
+  "Run BODY with a fresh trust check after the start, and fakes around it.
+The variables `interactive', `available', `busy' and `display' set
+what the check sees: an interactive Emacs, a Codex CLI, an active
+minibuffer, and a frame of a display.  The trust is not cached, and
+the app-server check answers `untrusted' at once.  `idle' collects the
+functions of idle timers, `frame-hook' the functions added to
+`server-after-make-frame-hook', `asked' counts the questions, and
+`checks' the app-server checks.  `answer' is the reply of the user:
+`yes', `no' or `quit'."
+  (declare (indent 0))
+  `(claude-code-ide-codex-events-tests--with-codex
+     (let ((claude-code-ide-codex-events--load-check nil)
+           (claude-code-ide-codex-events-trust-at-load 'ask)
+           (server-after-make-frame-hook nil)
+           (emacs-startup-hook nil)
+           (interactive t) (available t) (busy nil) (display t)
+           (idle nil) (asked 0) (checks 0) (answer 'no))
+       (clrhash claude-code-ide-codex-events--trust-cache)
+       (cl-letf (((symbol-function 'claude-code-ide-codex-events--interactive-session-p)
+                  (lambda () interactive))
+                 ((symbol-function 'claude-code-ide-codex-events--codex-available-p)
+                  (lambda () available))
+                 ((symbol-function 'claude-code-ide-codex-events--minibuffer-busy-p)
+                  (lambda () busy))
+                 ((symbol-function 'claude-code-ide-codex-events--display-frame-exists-p)
+                  (lambda () display))
+                 ((symbol-function 'run-with-idle-timer)
+                  (lambda (_secs _repeat fn &rest args) (push (cons fn args) idle) 'cci-test-timer))
+                 ((symbol-function 'claude-code-ide-codex-events--start-trust-check)
+                  (lambda (key _directory)
+                    (cl-incf checks)
+                    (claude-code-ide-codex-events--check-create
+                     :key key :result (list :status 'untrusted :hooks '(((key . "cci-test-hook")))))))
+                 ((symbol-function 'claude-code-ide-codex-events--offer-trust)
+                  (lambda (result _directory &optional _server _manual)
+                    (cl-incf asked)
+                    (pcase answer
+                      ('no (cl-pushnew (claude-code-ide-codex-events--trust-key)
+                                       claude-code-ide-codex-events--declined :test #'equal)
+                           result)
+                      ('quit result)
+                      (_ (claude-code-ide-codex-events-tests--trusted-result))))))
+         (ignore interactive available busy display answer)
+         ,@body))))
+
+(defmacro claude-code-ide-codex-events-tests--run-idle ()
+  "Run the functions of the idle timers that the check made, oldest first.
+It uses `idle' of `claude-code-ide-codex-events-tests--with-load-check'."
+  '(let ((due (reverse idle)))
+     (setq idle nil)
+     (dolist (entry due)
+       (apply (car entry) (cdr entry)))))
+
+(ert-deftest claude-code-ide-codex-events-test-load-check-asks-once ()
+  "Untrusted hooks: one question after the start of Emacs, and no second one."
+  (claude-code-ide-codex-events-tests--with-load-check
+    (should (eq (default-value 'claude-code-ide-codex-events-trust-at-load) 'ask))
+    (claude-code-ide-codex-events--schedule-load-check)
+    ;; Not inside the load: an idle timer runs the check
+    (should (= asked 0))
+    (should (= (length idle) 1))
+    (claude-code-ide-codex-events-tests--run-idle)
+    (should (= checks 1))
+    (should (= asked 1))
+    ;; A second trigger in the same Emacs (a reload, or another load): no question
+    (claude-code-ide-codex-events--schedule-load-check)
+    (claude-code-ide-codex-events-tests--run-idle)
+    (should (= asked 1))
+    (should (= checks 1))))
+
+(ert-deftest claude-code-ide-codex-events-test-load-check-yes-and-quit ()
+  "A yes trusts the hooks; C-g counts as the one question of the Emacs too."
+  (claude-code-ide-codex-events-tests--with-load-check
+    (setq answer 'quit)
+    (claude-code-ide-codex-events--schedule-load-check)
+    (claude-code-ide-codex-events-tests--run-idle)
+    (should (= asked 1))
+    (claude-code-ide-codex-events--schedule-load-check)
+    (claude-code-ide-codex-events-tests--run-idle)
+    (should (= asked 1))))
+
+(ert-deftest claude-code-ide-codex-events-test-load-check-batch-and-never ()
+  "Batch Emacs and the option `never' check nothing."
+  (claude-code-ide-codex-events-tests--with-load-check
+    (setq interactive nil)
+    (claude-code-ide-codex-events--schedule-load-check)
+    (should-not idle)
+    (should-not emacs-startup-hook)
+    (should (= checks 0)))
+  (claude-code-ide-codex-events-tests--with-load-check
+    (setq claude-code-ide-codex-events-trust-at-load 'never)
+    (claude-code-ide-codex-events--schedule-load-check)
+    (should-not idle)
+    (should-not emacs-startup-hook)
+    (should (= checks 0)))
+  ;; The option changes after the schedule: the check does nothing
+  (claude-code-ide-codex-events-tests--with-load-check
+    (claude-code-ide-codex-events--schedule-load-check)
+    (setq claude-code-ide-codex-events-trust-at-load 'never)
+    (claude-code-ide-codex-events-tests--run-idle)
+    (should (= checks 0))
+    (should (= asked 0))))
+
+(ert-deftest claude-code-ide-codex-events-test-load-check-no-cli-or-no-tracking ()
+  "No Codex CLI, or the status tracking off: no check and no question."
+  (claude-code-ide-codex-events-tests--with-load-check
+    (setq available nil)
+    (claude-code-ide-codex-events--schedule-load-check)
+    (claude-code-ide-codex-events-tests--run-idle)
+    (should (= checks 0))
+    (should (= asked 0)))
+  (claude-code-ide-codex-events-tests--with-load-check
+    (let ((claude-code-ide-session-status-tracking nil))
+      (claude-code-ide-codex-events--schedule-load-check)
+      (claude-code-ide-codex-events-tests--run-idle)
+      (should (= checks 0))
+      (should (= asked 0)))))
+
+(ert-deftest claude-code-ide-codex-events-test-load-check-cli-from-detect ()
+  "The CLI check is the detect operation of the Codex provider."
+  (let ((claude-code-ide-provider--registry
+         (list (cons 'codex (claude-code-ide-provider-create
+                             :name 'codex
+                             :detect (lambda (&optional version)
+                                       (should-not version)
+                                       (list :available nil :program "codex" :version 'unknown)))))))
+    (should-not (claude-code-ide-codex-events--codex-available-p)))
+  (let ((claude-code-ide-provider--registry
+         (list (cons 'codex (claude-code-ide-provider-create
+                             :name 'codex
+                             :detect (lambda (&optional _) (list :available t :program "codex")))))))
+    (should (claude-code-ide-codex-events--codex-available-p)))
+  ;; No Codex provider
+  (let ((claude-code-ide-provider--registry nil))
+    (should-not (claude-code-ide-codex-events--codex-available-p))))
+
+(ert-deftest claude-code-ide-codex-events-test-load-check-already-trusted ()
+  "Trusted hooks in the cache: no app-server and no question."
+  (claude-code-ide-codex-events-tests--with-load-check
+    (claude-code-ide-codex-events--remember-trust
+     (claude-code-ide-codex-events--trust-key)
+     (claude-code-ide-codex-events-tests--trusted-result))
+    (claude-code-ide-codex-events--schedule-load-check)
+    (claude-code-ide-codex-events-tests--run-idle)
+    (should (= checks 0))
+    (should (= asked 0)))
+  ;; The app-server says trusted: no question
+  (claude-code-ide-codex-events-tests--with-load-check
+    (cl-letf (((symbol-function 'claude-code-ide-codex-events--start-trust-check)
+               (lambda (key _directory)
+                 (cl-incf checks)
+                 (claude-code-ide-codex-events--check-create
+                  :key key :result (claude-code-ide-codex-events-tests--trusted-result)))))
+      (claude-code-ide-codex-events--schedule-load-check)
+      (claude-code-ide-codex-events-tests--run-idle)
+      (should (= checks 1))
+      (should (= asked 0))))
+  ;; A no of an earlier start in this Emacs: no question
+  (claude-code-ide-codex-events-tests--with-load-check
+    (push (claude-code-ide-codex-events--trust-key) claude-code-ide-codex-events--declined)
+    (claude-code-ide-codex-events--schedule-load-check)
+    (claude-code-ide-codex-events-tests--run-idle)
+    (should (= asked 0))))
+
+(ert-deftest claude-code-ide-codex-events-test-load-check-minibuffer ()
+  "An active minibuffer defers the question to the next idle moment."
+  (claude-code-ide-codex-events-tests--with-load-check
+    (setq busy t)
+    (claude-code-ide-codex-events--schedule-load-check)
+    (claude-code-ide-codex-events-tests--run-idle)
+    (should (= asked 0))
+    ;; Still busy: deferred again
+    (should (= (length idle) 1))
+    (claude-code-ide-codex-events-tests--run-idle)
+    (should (= asked 0))
+    (should (= (length idle) 1))
+    ;; Free: the question comes, once
+    (setq busy nil)
+    (claude-code-ide-codex-events-tests--run-idle)
+    (should (= asked 1))
+    (should-not idle)))
+
+(ert-deftest claude-code-ide-codex-events-test-load-check-daemon-waits-for-a-frame ()
+  "A daemon without a frame of a display waits for the first such frame."
+  (claude-code-ide-codex-events-tests--with-load-check
+    (setq display nil)
+    (claude-code-ide-codex-events--schedule-load-check)
+    (claude-code-ide-codex-events-tests--run-idle)
+    (should (= checks 0))
+    (should (= asked 0))
+    (should-not idle)
+    (should (= (length server-after-make-frame-hook) 1))
+    ;; A frame on the initial terminal (no display yet) changes nothing
+    (run-hooks 'server-after-make-frame-hook)
+    (claude-code-ide-codex-events-tests--run-idle)
+    (should (= asked 0))
+    ;; The first frame of a display: the check runs after it, once
+    (setq display t)
+    (run-hooks 'server-after-make-frame-hook)
+    (should-not server-after-make-frame-hook)
+    (claude-code-ide-codex-events-tests--run-idle)
+    (should (= asked 1))
+    (run-hooks 'server-after-make-frame-hook)
+    (claude-code-ide-codex-events-tests--run-idle)
+    (should (= asked 1))))
+
+(ert-deftest claude-code-ide-codex-events-test-load-check-before-the-start ()
+  "A load during the start of Emacs waits for `emacs-startup-hook'."
+  (claude-code-ide-codex-events-tests--with-load-check
+    (let ((after-init-time nil))
+      (claude-code-ide-codex-events--schedule-load-check)
+      (should-not idle)
+      (should (memq #'claude-code-ide-codex-events--load-check-after-start emacs-startup-hook)))
+    (run-hooks 'emacs-startup-hook)
+    (claude-code-ide-codex-events-tests--run-idle)
+    (should (= asked 1))))
+
+(ert-deftest claude-code-ide-codex-events-test-load-check-display-frames ()
+  "A frame of a display counts; the initial frame of a daemon or batch Emacs does not."
+  (should-not (claude-code-ide-codex-events--display-frame-exists-p))
+  (cl-letf (((symbol-function 'claude-code-ide-codex--display-frame-p) #'always))
+    (should (claude-code-ide-codex-events--display-frame-exists-p))))
+
+(ert-deftest claude-code-ide-codex-events-test-load-check-scheduled-at-load ()
+  "Loading the file schedules the check; batch Emacs gets nothing from it."
+  (should noninteractive)
+  (should-not (claude-code-ide-codex-events--interactive-session-p))
+  (with-temp-buffer
+    (insert-file-contents (locate-library "claude-code-ide-codex-events.el" t))
+    (should (search-forward "\n(claude-code-ide-codex-events--schedule-load-check)\n" nil t))))
+
+(ert-deftest claude-code-ide-codex-events-test-load-check-reload ()
+  "A load of the file schedules the check once; a reload in the same Emacs does not."
+  (let ((file (locate-library "claude-code-ide-codex-events"))
+        (idle nil)
+        (claude-code-ide-codex-events-trust-at-load 'ask)
+        (claude-code-ide-session-status-tracking t))
+    (cl-letf (((symbol-function 'run-with-idle-timer)
+               (lambda (_secs _repeat fn &rest args) (push (cons fn args) idle) 'cci-test-timer)))
+      ;; A reload after the check: the state stays, nothing is scheduled
+      (let ((claude-code-ide-codex-events--load-check 'done)
+            (noninteractive nil))
+        (load file nil t)
+        (should (eq claude-code-ide-codex-events--load-check 'done))
+        (should-not idle))
+      ;; The first load in an Emacs for a user: one schedule
+      (let ((claude-code-ide-codex-events--load-check nil)
+            (noninteractive nil))
+        (load file nil t)
+        (should (eq claude-code-ide-codex-events--load-check 'scheduled))
+        (should (equal (mapcar #'car idle) '(claude-code-ide-codex-events--load-check-run)))))))
+
 (provide 'claude-code-ide-codex-events-tests)
 
 ;; Local Variables:
