@@ -1572,6 +1572,55 @@ until the person allows the call and the tool ends."
   (claude-code-ide-live-tests--live
     (claude-code-ide-live-tests--dialogs 'ghostel)))
 
+;;; Handovers in ghostel
+
+(defun claude-code-ide-live-tests--cli-pid (instance-id)
+  "Return the PID of the CLI of INSTANCE-ID that the start recorded.
+The PID must be known and its process must run."
+  (let ((pid (claude-code-ide-instance-pid (claude-code-ide-instance-by-id instance-id))))
+    (claude-code-ide-live-tests--log "%s: the recorded CLI PID is %S" instance-id pid)
+    (should (integerp pid))
+    (should (process-attributes pid))
+    pid))
+
+(defun claude-code-ide-live-tests--wait-gone (pid)
+  "Wait until the process PID has ended; fail the test when it still runs."
+  (should (claude-code-ide-live-tests--wait
+           (lambda () (not (process-attributes pid)))
+           20 (format "the end of the source CLI %d" pid)))
+  (claude-code-ide-live-tests--log "the source CLI %d has ended" pid))
+
+(ert-deftest claude-code-ide-live-test-handover-ghostel-sources-end ()
+  "In ghostel, a handover ends its source CLI: CC -> Codex, then Codex -> CC.
+In the user's Emacs (ghostel 20261111), the descriptor had no PID for
+any ghostel instance: the handover stop found no process, reported
+stopped, and committed while the source CLI ran on."
+  :tags '(:live)
+  (claude-code-ide-live-tests--live
+    (claude-code-ide-live-tests--with-backend 'ghostel
+      (let* ((dir (claude-code-ide-live-tests--trusted-project "projA"))
+             (claude-code-ide-live-tests--assume-hook-trust t)
+             (source (claude-code-ide-live-tests--launch
+                      dir 'claude "cci-test-L8 ghostel: reply with the single word ok")))
+        (claude-code-ide-live-tests--show source)
+        (should (claude-code-ide-live-tests--wait-turn source 0 claude-code-ide-live-tests--turn-limit))
+        ;; CC -> Codex: the CC CLI ends
+        (let* ((cc-pid (claude-code-ide-live-tests--cli-pid source))
+               (status (claude-code-ide-live-tests--hand-over
+                        source 'codex (claude-code-ide-live-tests--request-id "cci-test-L8-to-codex")))
+               (codex (plist-get status :target-id)))
+          (claude-code-ide-live-tests--wait-gone cc-pid)
+          (should-not (claude-code-ide-live-tests--running-p source))
+          (claude-code-ide-live-tests--target-ready status)
+          ;; Codex -> CC: the Codex CLI ends
+          (let* ((codex-pid (claude-code-ide-live-tests--cli-pid codex))
+                 (status-2 (claude-code-ide-live-tests--hand-over
+                            codex 'claude (claude-code-ide-live-tests--request-id "cci-test-L8-to-claude"))))
+            (claude-code-ide-live-tests--wait-gone codex-pid)
+            (should-not (claude-code-ide-live-tests--running-p codex))
+            (claude-code-ide-live-tests--target-ready status-2)
+            (claude-code-ide-live-tests--cli-pid (plist-get status-2 :target-id))))))))
+
 ;;; The stop asks nothing
 
 (defun claude-code-ide-live-tests--stop-asks-nothing (backend provider)
