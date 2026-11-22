@@ -2070,5 +2070,36 @@ Before, false came as :false and null as :null, which are true values."
                       'position))
           (should-not formatted))))))
 
+(ert-deftest claude-code-ide-mcp-routing-test-null-id ()
+  "Only a message without the member id is a notification.
+JSON-RPC 2.0 allows \"id\": null in a request (it only discourages it),
+so such a request gets its normal result or error, with id null."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    ;; No id: a notification, 202 and no body
+    (let ((reply (claude-code-ide-mcp-routing-tests--post
+                  "/mcp/cci-test-cowork"
+                  "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")))
+      (should (equal (plist-get reply :status) 202))
+      (should-not (plist-get reply :body)))
+    ;; id null and a known method: the result, with id null
+    (let* ((reply (claude-code-ide-mcp-routing-tests--post
+                   "/mcp/cci-test-cowork"
+                   "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"initialize\",\"params\":{}}"))
+           (body (plist-get reply :body)))
+      (should (equal (plist-get reply :status) 200))
+      (should (assq 'id body))
+      (should (eq (alist-get 'id body) :null))
+      (should (alist-get 'result body)))
+    ;; id null and an unknown method: the error, with id null
+    (let* ((reply (claude-code-ide-mcp-routing-tests--post
+                   "/mcp/cci-test-cowork"
+                   "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"cci-test/none\"}"))
+           (body (plist-get reply :body)))
+      (should (equal (plist-get reply :status) 200))
+      (should (assq 'id body))
+      (should (eq (alist-get 'id body) :null))
+      (should (equal (alist-get 'code (alist-get 'error body)) -32601)))))
+
 (provide 'claude-code-ide-mcp-routing-tests)
 ;;; claude-code-ide-mcp-routing-tests.el ends here
