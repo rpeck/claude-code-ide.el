@@ -2665,9 +2665,100 @@ skip then ends the run in this Emacs as committed."
           (should (eq (claude-code-ide-handover--run-status run) 'needs-user))
           (should (eq (claude-code-ide-handover--run-reason run) 'registry-entry-missing))
           (should (equal (mapcar #'cadr (claude-code-ide-handover--choices run)) '(retry skip)))
-          ;; Skip ends it in this Emacs
+          ;; Skip while the inbox cannot move: no end, the queued
+          ;; prompts would stay in the source inbox
+          (cl-letf (((symbol-function 'claude-code-ide-control-move-inbox)
+                     (lambda (&rest _) (error "cci-test: the move failed"))))
+            (claude-code-ide-handover-resolve id 'skip))
+          (should (claude-code-ide-handover--unfinished-p run))
+          ;; Skip ends it in this Emacs once the inbox moved
           (claude-code-ide-handover-resolve id 'skip)
           (should (eq (claude-code-ide-handover--run-status run) 'committed)))))))
+
+(ert-deftest claude-code-ide-test-handover-cancel-after-chain-save-crash ()
+  "A crash right after the chain save, before the chain_saved flag: a cancel is refused.
+The target already has its final chain with this handover, so a direct
+cancel must not stop it or archive its entry.  The choices and the
+recovery read the saved chain too."
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (let* ((result (claude-code-ide-handover-session "cci-test-src" 'cci-test-b :continue t))
+           (id (plist-get result :handover-id))
+           target)
+      (claude-code-ide-handover-tests--run-timers)
+      (setq target (plist-get (claude-code-ide-handover-status id) :target-id))
+      ;; The crash comes right after the chain save, before its flag
+      (cl-letf (((symbol-function 'claude-code-ide-handover--mark-chain-saved)
+                 (lambda (&rest _) (throw 'cci-test-crash t))))
+        (should (catch 'cci-test-crash (claude-code-ide-handover-tests--deliver result) nil)))
+      (should-not (alist-get 'chain_saved (claude-code-ide-handover-tests--record "cci-test-src")))
+      (let ((leg (car (last (claude-code-ide-session-registry-entry-legs
+                             (claude-code-ide-session-registry-entry-of target))))))
+        (should (equal (plist-get leg :handover-id) id))
+        (should-not (plist-get leg :pending)))
+      ;; This Emacs ends; the target CLI ends with it
+      (clrhash claude-code-ide-handover--runs)
+      (claude-code-ide-instance-unregister target)
+      (setq claude-code-ide-handover-tests--stops nil)
+      (should-error (claude-code-ide-handover-cancel id) :type 'user-error)
+      (should-not claude-code-ide-handover-tests--stops)
+      (should-not (eq (claude-code-ide-session-registry-entry-state
+                       (claude-code-ide-session-registry-entry-of target))
+                      'archived))
+      (should-not (eq (plist-get (claude-code-ide-handover-status id) :status) 'cancelled))
+      ;; The choices see the saved chain
+      (let ((run (claude-code-ide-handover--find id)))
+        (should (equal (mapcar #'cadr (claude-code-ide-handover--choices run)) '(retry skip))))
+      ;; The recovery finishes the commit
+      (clrhash claude-code-ide-handover--runs)
+      (claude-code-ide-handover-recover)
+      (claude-code-ide-handover-tests--run-timers)
+      (should (eq (plist-get (claude-code-ide-handover-status id) :status) 'committed))
+      (should (equal (claude-code-ide-session-registry-chain-current "cci-test-src") target)))))
+
+(ert-deftest claude-code-ide-test-handover-skip-waits-for-inbox-move ()
+  "Skip turns off only the continue prompt: the run finishes only after the inbox moved.
+A queued prompt of the source must reach the target, so a skip while
+the move fails keeps the handover waiting for a person."
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'working)
+    (should (eq (plist-get (claude-code-ide-control-submit "cci-test-src" "cci-test-one"
+                                                           :request-id "q1")
+                           :result)
+                'queued))
+    (let* ((result (claude-code-ide-handover-session "cci-test-src" 'cci-test-b :force t :continue t))
+           (id (plist-get result :handover-id))
+           target)
+      (claude-code-ide-handover-tests--set-state "cci-test-src" 'idle)
+      (claude-code-ide-handover-tests--run-timers)
+      (setq target (plist-get (claude-code-ide-handover-status id) :target-id))
+      (cl-letf (((symbol-function 'claude-code-ide-control-move-inbox)
+                 (lambda (&rest _) (error "cci-test: the move failed"))))
+        (claude-code-ide-handover-tests--deliver result)
+        (let ((status (claude-code-ide-handover-status id)))
+          (should (eq (plist-get status :status) 'needs-user))
+          (should (eq (plist-get status :reason) 'step-failed))
+          (should (string-match-p "did not move to the target" (plist-get status :message)))
+          (should (eq (plist-get status :stage) 'committed)))
+        ;; Skip while the move still fails: no finish
+        (claude-code-ide-handover-resolve id 'skip)
+        (claude-code-ide-handover-tests--run-timers)
+        (let ((status (claude-code-ide-handover-status id)))
+          (should (eq (plist-get status :status) 'needs-user))
+          (should (eq (plist-get status :reason) 'step-failed))
+          (should (string-match-p "did not move to the target" (plist-get status :message)))
+          (should (string-match-p "cci-test: the move failed" (plist-get status :message))))
+        (should (equal (mapcar #'claude-code-ide-control--record-request-id
+                               (claude-code-ide-control--pending-records "cci-test-src"))
+                       '("q1"))))
+      ;; The move works again: skip finishes, and the prompt is in the target inbox
+      (claude-code-ide-handover-resolve id 'skip)
+      (claude-code-ide-handover-tests--run-timers)
+      (should (eq (plist-get (claude-code-ide-handover-status id) :status) 'committed))
+      (should (equal (mapcar #'claude-code-ide-control--record-request-id
+                             (claude-code-ide-control--pending-records target))
+                     '("q1")))
+      (should-not (claude-code-ide-control--pending-records "cci-test-src")))))
 
 (provide 'claude-code-ide-handover-tests)
 
