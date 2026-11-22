@@ -748,6 +748,52 @@ With PATH-SECRET, the URL path also carries a secret."
         (should (equal (claude-code-ide-instance-pid instance) (process-id child)))
         (should (floatp (claude-code-ide-instance-process-start-time instance)))))))
 
+(defvar ghostel--pid)
+
+(ert-deftest claude-code-ide-test-wiring-ghostel-native-child-pid ()
+  "The descriptor gets the PID of the native child of a newer ghostel.
+ghostel 20261111 keeps the child handle in the process property
+`ghostel--native-child', and gives its PID through
+`ghostel--native-child-pid'; it sets no `ghostel--native-pid'.  The
+start must record the PID for each provider, so that a stop can end
+the CLI."
+  (dolist (provider '(claude codex))
+    (claude-code-ide-wiring-tests--with-clean
+      (let* ((child (start-process "cci-test-native" nil "sleep" "30"))
+             (pipe (make-pipe-process :name "cci-test-pipe" :noquery t)))
+        (push child claude-code-ide-wiring-tests--objects)
+        (push pipe claude-code-ide-wiring-tests--objects)
+        (process-put pipe 'ghostel--native-child 'cci-test-child-handle)
+        (cl-letf (((symbol-function 'ghostel--native-child-pid)
+                   (lambda (handle)
+                     (and (eq handle 'cci-test-child-handle) (process-id child)))))
+          (should (equal (claude-code-ide--process-pid pipe) (process-id child)))
+          (let* ((started (claude-code-ide-wiring-tests--start
+                           (claude-code-ide-wiring-tests--spec :provider provider) :process pipe))
+                 (instance (claude-code-ide-instance-of-session (plist-get started :session))))
+            (should (equal (list provider (claude-code-ide-instance-pid instance))
+                           (list provider (process-id child))))
+            (should (floatp (claude-code-ide-instance-process-start-time instance)))))))))
+
+(ert-deftest claude-code-ide-test-wiring-ghostel-buffer-pid ()
+  "Without a child handle, the buffer-local `ghostel--pid' gives the PID."
+  (claude-code-ide-wiring-tests--with-clean
+    (let* ((buffer (generate-new-buffer " *cci-test-ghostel*"))
+           (pipe (make-pipe-process :name "cci-test-pipe" :buffer buffer :noquery t)))
+      (push pipe claude-code-ide-wiring-tests--objects)
+      (unwind-protect
+          (progn
+            (should-not (claude-code-ide--process-pid pipe))
+            (with-current-buffer buffer (setq-local ghostel--pid 4343))
+            (should (eql (claude-code-ide--process-pid pipe) 4343))
+            ;; A handle whose function fails falls back to the buffer
+            (process-put pipe 'ghostel--native-child 'cci-test-broken)
+            (cl-letf (((symbol-function 'ghostel--native-child-pid)
+                       (lambda (_) (error "cci-test: no child"))))
+              (should (eql (claude-code-ide--process-pid pipe) 4343))))
+        (delete-process pipe)
+        (kill-buffer buffer)))))
+
 (defmacro claude-code-ide-wiring-tests--with-process-stubs (calls &rest body)
   "Run BODY with the process-tree functions stubbed; they push to CALLS."
   (declare (indent 1))

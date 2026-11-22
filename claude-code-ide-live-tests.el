@@ -596,6 +596,26 @@ folder needs no question), else nil."
       'dialog)
      ((string-match-p "Ask Codex to do anything" flat) 'ready))))
 
+(defun claude-code-ide-live-tests--settled-trust-screen (read pause seconds)
+  "Return what the Codex start screen settles on: `dialog', `ready', or nil.
+READ is a function without arguments that returns the screen text.
+Codex can draw its composer first and the folder trust dialog a moment
+later, so a composer counts only when the screen still shows it, and no
+dialog, PAUSE seconds later.  A dialog counts at once.  After SECONDS
+without either, the result is nil."
+  (let ((deadline (+ (float-time) seconds))
+        (result nil))
+    (while (and (not result) (< (float-time) deadline))
+      (pcase (claude-code-ide-live-tests--codex-trust-screen (funcall read))
+        ('dialog (setq result 'dialog))
+        ('ready
+         (when (> pause 0) (accept-process-output nil pause))
+         (pcase (claude-code-ide-live-tests--codex-trust-screen (funcall read))
+           ('dialog (setq result 'dialog))
+           ('ready (setq result 'ready))))
+        (_ (accept-process-output nil 0.2))))
+    result))
+
 (defun claude-code-ide-live-tests--ensure-codex-folder-trust (directory)
   "Make sure that Codex trusts DIRECTORY, or skip the test.
 Codex asks one time for each new repository root, and it saves the
@@ -607,10 +627,10 @@ Codex config.  Without the variable, a folder that gets the question
 skips the test."
   (unless (claude-code-ide-live-tests--codex-trusts-folder-p directory)
     (let* ((id (claude-code-ide-live-tests--launch directory 'codex nil))
-           (seen (claude-code-ide-live-tests--wait
-                  (lambda () (claude-code-ide-live-tests--codex-trust-screen
-                              (claude-code-ide-live-tests--buffer-text id)))
-                  60 "the Codex folder trust dialog or composer")))
+           (seen (claude-code-ide-live-tests--settled-trust-screen
+                  (lambda () (claude-code-ide-live-tests--buffer-text id))
+                  3 60)))
+      (claude-code-ide-live-tests--log "Codex start screen in %s: %S" directory seen)
       (unwind-protect
           (pcase seen
             ('ready (claude-code-ide-live-tests--log "Codex trusts %s already" directory))
@@ -1572,6 +1592,55 @@ until the person allows the call and the tool ends."
   (claude-code-ide-live-tests--live
     (claude-code-ide-live-tests--dialogs 'ghostel)))
 
+;;; Handovers in ghostel
+
+(defun claude-code-ide-live-tests--cli-pid (instance-id)
+  "Return the PID of the CLI of INSTANCE-ID that the start recorded.
+The PID must be known and its process must run."
+  (let ((pid (claude-code-ide-instance-pid (claude-code-ide-instance-by-id instance-id))))
+    (claude-code-ide-live-tests--log "%s: the recorded CLI PID is %S" instance-id pid)
+    (should (integerp pid))
+    (should (process-attributes pid))
+    pid))
+
+(defun claude-code-ide-live-tests--wait-gone (pid)
+  "Wait until the process PID has ended; fail the test when it still runs."
+  (should (claude-code-ide-live-tests--wait
+           (lambda () (not (process-attributes pid)))
+           20 (format "the end of the source CLI %d" pid)))
+  (claude-code-ide-live-tests--log "the source CLI %d has ended" pid))
+
+(ert-deftest claude-code-ide-live-test-handover-ghostel-sources-end ()
+  "In ghostel, a handover ends its source CLI: CC -> Codex, then Codex -> CC.
+In the user's Emacs (ghostel 20261111), the descriptor had no PID for
+any ghostel instance: the handover stop found no process, reported
+stopped, and committed while the source CLI ran on."
+  :tags '(:live)
+  (claude-code-ide-live-tests--live
+    (claude-code-ide-live-tests--with-backend 'ghostel
+      (let* ((dir (claude-code-ide-live-tests--trusted-project "projA"))
+             (claude-code-ide-live-tests--assume-hook-trust t)
+             (source (claude-code-ide-live-tests--launch
+                      dir 'claude "cci-test-L8 ghostel: reply with the single word ok")))
+        (claude-code-ide-live-tests--show source)
+        (should (claude-code-ide-live-tests--wait-turn source 0 claude-code-ide-live-tests--turn-limit))
+        ;; CC -> Codex: the CC CLI ends
+        (let* ((cc-pid (claude-code-ide-live-tests--cli-pid source))
+               (status (claude-code-ide-live-tests--hand-over
+                        source 'codex (claude-code-ide-live-tests--request-id "cci-test-L8-to-codex")))
+               (codex (plist-get status :target-id)))
+          (claude-code-ide-live-tests--wait-gone cc-pid)
+          (should-not (claude-code-ide-live-tests--running-p source))
+          (claude-code-ide-live-tests--target-ready status)
+          ;; Codex -> CC: the Codex CLI ends
+          (let* ((codex-pid (claude-code-ide-live-tests--cli-pid codex))
+                 (status-2 (claude-code-ide-live-tests--hand-over
+                            codex 'claude (claude-code-ide-live-tests--request-id "cci-test-L8-to-claude"))))
+            (claude-code-ide-live-tests--wait-gone codex-pid)
+            (should-not (claude-code-ide-live-tests--running-p codex))
+            (claude-code-ide-live-tests--target-ready status-2)
+            (claude-code-ide-live-tests--cli-pid (plist-get status-2 :target-id))))))))
+
 ;;; The stop asks nothing
 
 (defun claude-code-ide-live-tests--stop-asks-nothing (backend provider)
@@ -2013,6 +2082,27 @@ The package sets CLAUDE_CODE_SSE_PORT itself, so that one stays."
       ;; The temporary folder of macOS is a link (/var -> /private/var)
       (should (claude-code-ide-live-tests--claude-trusts-folder-p project))
       (should (claude-code-ide-live-tests--codex-trusts-folder-p project)))))
+
+(ert-deftest claude-code-ide-live-tests-test-settled-trust-screen ()
+  "The composer counts as trusted only when no trust dialog follows it.
+Codex 0.164 can draw its composer first and the folder trust dialog a
+moment later: a live run took that first screen for trusted, and the
+handover target then waited on the dialog."
+  (let* ((texts nil)
+         (read (lambda () (or (pop texts) ""))))
+    ;; The composer, then the dialog: the dialog wins
+    (setq texts (list "› Ask Codex to do anything"
+                      "Trust this folder? › 1. Trust and continue  Your trust decision will be saved"))
+    (should (eq (claude-code-ide-live-tests--settled-trust-screen read 0 5) 'dialog))
+    ;; The composer twice: trusted
+    (setq texts (list "› Ask Codex to do anything" "› Ask Codex to do anything"))
+    (should (eq (claude-code-ide-live-tests--settled-trust-screen read 0 5) 'ready))
+    ;; The dialog at once
+    (setq texts (list "Trust and continue"))
+    (should (eq (claude-code-ide-live-tests--settled-trust-screen read 0 5) 'dialog))
+    ;; Nothing in time
+    (setq texts nil)
+    (should-not (claude-code-ide-live-tests--settled-trust-screen read 0 0.5))))
 
 (ert-deftest claude-code-ide-live-tests-test-trust-screens ()
   "A trust check sees the dialog, or the CLI at its prompt, which counts as trusted."

@@ -183,6 +183,171 @@ The default is provider `claude', pid 100 and ID cci-test-process."
           (should (eql (claude-code-ide-process--process-pid pipe) 4242)))
       (delete-process pipe))))
 
+(defvar ghostel--pid)
+(declare-function claude-code-ide--process-pid "claude-code-ide" (process))
+
+(ert-deftest claude-code-ide-test-process-ghostel-native-child-pid ()
+  "A newer ghostel gives the PID through its child handle, or the buffer.
+ghostel 20261111 keeps the handle in the process property
+`ghostel--native-child', and its PID comes from
+`ghostel--native-child-pid'.  It also sets the buffer-local
+`ghostel--pid' of the terminal buffer."
+  (let* ((buffer (generate-new-buffer " *cci-test-ghostel*"))
+         (pipe (make-pipe-process :name "cci-test-ghostel-pipe" :buffer buffer :noquery t)))
+    (unwind-protect
+        (progn
+          (process-put pipe 'ghostel--native-child 'cci-test-handle)
+          (cl-letf (((symbol-function 'ghostel--native-child-pid)
+                     (lambda (handle) (and (eq handle 'cci-test-handle) 4242))))
+            (should (eql (claude-code-ide-process--process-pid pipe) 4242)))
+          ;; The buffer-local PID when the handle gives nothing
+          (with-current-buffer buffer (setq-local ghostel--pid 4343))
+          (cl-letf (((symbol-function 'ghostel--native-child-pid)
+                     (lambda (_) (error "cci-test: no child"))))
+            (should (eql (claude-code-ide-process--process-pid pipe) 4343))))
+      (delete-process pipe)
+      (kill-buffer buffer))))
+
+(defun claude-code-ide-process-tests--ghostel-instance (provider buffer)
+  "Return a live descriptor of PROVIDER whose terminal BUFFER is a ghostel pipe.
+The descriptor has no PID, as a start that could not read it leaves."
+  (claude-code-ide-instance-register
+   (claude-code-ide-instance-create
+    :id (format "cci-test-ghostel-%s" provider) :provider provider
+    :buffer buffer
+    :project-root "/nonexistent/cci-test-proj" :worktree "/nonexistent/cci-test-proj")))
+
+(ert-deftest claude-code-ide-test-process-ghostel-track-and-stop ()
+  "A ghostel CLI of each provider is tracked, and its stop ends it.
+The live user Emacs had PID unknown for every ghostel instance, so a
+stop found no process and still said stopped.  The start records the
+PID and the start time in the descriptor, as `claude-code-ide--start-session'
+does with `claude-code-ide--process-pid'; a ghostel pipe alone cannot
+prove the start time of its child."
+  (dolist (provider '(claude codex))
+    (claude-code-ide-process-tests--with-table
+        (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100))
+      (let* ((claude-code-ide-instance--all nil)
+             (buffer (generate-new-buffer " *cci-test-ghostel*"))
+             (pipe (make-pipe-process :name "cci-test-ghostel-pipe" :buffer buffer :noquery t))
+             (instance (claude-code-ide-process-tests--ghostel-instance provider buffer)))
+        (unwind-protect
+            (progn
+              (process-put pipe 'ghostel--native-child 'cci-test-handle)
+              (cl-letf (((symbol-function 'ghostel--native-child-pid)
+                         (lambda (handle) (and (eq handle 'cci-test-handle) 100))))
+                ;; What the start records
+                (setf (claude-code-ide-instance-pid instance) (claude-code-ide--process-pid pipe)
+                      (claude-code-ide-instance-process-start-time instance)
+                      claude-code-ide-process-tests--start)
+                (should (equal (list provider (claude-code-ide-instance-pid instance))
+                               (list provider 100)))
+                (should (eql (claude-code-ide-process-track instance pipe) 100))
+                (add-hook 'claude-code-ide-process-tests--reactions
+                          (claude-code-ide-process-tests--cli-exits-on 'SIGHUP))
+                (let ((result (claude-code-ide-process-stop instance :scan nil)))
+                  (should (equal (list provider (plist-get result :status))
+                                 (list provider 'stopped))))
+                (should-not (claude-code-ide-process-tests--find 100))))
+          (delete-process pipe)
+          (kill-buffer buffer))))))
+
+(ert-deftest claude-code-ide-test-process-stop-live-cli-without-pid ()
+  "A stop of a live terminal whose CLI has no known PID is no success.
+Nothing can be signalled or checked, so the result is `error' with a
+reason, never `stopped'.  This holds for each provider, and for the
+stop from timers, which the handover uses."
+  (dolist (provider '(claude codex))
+    (claude-code-ide-process-tests--with-table nil
+      (let* ((claude-code-ide-instance--all nil)
+             (buffer (generate-new-buffer " *cci-test-ghostel*"))
+             (pipe (make-pipe-process :name "cci-test-ghostel-pipe" :buffer buffer :noquery t))
+             (instance (claude-code-ide-process-tests--ghostel-instance provider buffer))
+             (later nil))
+        (unwind-protect
+            (progn
+              (should (claude-code-ide-instance-live-p instance))
+              (let ((result (claude-code-ide-process-stop instance)))
+                (should (equal (list provider (plist-get result :status))
+                               (list provider 'error)))
+                (should (string-match-p "process ID" (plist-get result :reason))))
+              (claude-code-ide-process-stop-later instance :callback (lambda (r) (setq later r)))
+              (should (claude-code-ide-tests--wait-until (lambda () later) 5))
+              (should (eq (plist-get later :status) 'error))
+              (should-not claude-code-ide-process-tests--signals))
+          (delete-process pipe)
+          (kill-buffer buffer))))))
+
+(declare-function make-claude-code-ide-mcp-session "claude-code-ide-mcp" (&rest args))
+
+(ert-deftest claude-code-ide-test-process-stop-exited-cli-without-pid ()
+  "A stop with an unknown PID reports stopped once the terminal process has exited.
+The buffer and the descriptor stay after the CLI exits, so
+`claude-code-ide-instance-live-p' still says live; the stop must decide
+by the terminal process that it knows.  An exited process gives
+`stopped', in the stop that waits and in the stop from timers.  A
+terminal process that was never known stays `error'."
+  (dolist (provider '(claude codex))
+    (claude-code-ide-process-tests--with-table nil
+      (let* ((claude-code-ide-instance--all nil)
+             (buffer (generate-new-buffer " *cci-test-ghostel*"))
+             (instance (claude-code-ide-process-tests--ghostel-instance provider buffer)))
+        (unwind-protect
+            (progn
+              ;; The process that the stop gets has exited
+              (let ((pipe (make-pipe-process :name "cci-test-exited" :buffer buffer :noquery t)))
+                (delete-process pipe)
+                (should (claude-code-ide-instance-live-p instance))
+                (should (equal (list provider (plist-get (claude-code-ide-process-stop
+                                                          instance :process pipe :scan nil)
+                                                         :status))
+                               (list provider 'stopped))))
+              ;; The session keeps the exited process of the terminal
+              (let ((pipe (make-pipe-process :name "cci-test-exited" :buffer buffer :noquery t)))
+                (setf (claude-code-ide-instance-session instance)
+                      (make-claude-code-ide-mcp-session :buffer buffer :process pipe))
+                (delete-process pipe)
+                (should (equal (list provider (plist-get (claude-code-ide-process-stop
+                                                          instance :scan nil)
+                                                         :status))
+                               (list provider 'stopped)))
+                (setf (claude-code-ide-instance-session instance) nil))
+              ;; The process exits between the start of the stop from
+              ;; timers and its result
+              (let ((pipe (make-pipe-process :name "cci-test-exits" :buffer buffer :noquery t))
+                    (later nil))
+                (claude-code-ide-process-stop-later instance :callback (lambda (r) (setq later r)))
+                (delete-process pipe)
+                (should (claude-code-ide-tests--wait-until (lambda () later) 5))
+                (should (equal (list provider (plist-get later :status))
+                               (list provider 'stopped))))
+              ;; An old pipe exited, and the same buffer runs a new live
+              ;; pipe with an unknown PID: the old object proves nothing
+              (let ((old (make-pipe-process :name "cci-test-old" :buffer buffer :noquery t)))
+                (delete-process old)
+                (let ((new (make-pipe-process :name "cci-test-new" :buffer buffer :noquery t))
+                      (later nil))
+                  (unwind-protect
+                      (progn
+                        (should (eq (get-buffer-process buffer) new))
+                        (should (equal (list provider (plist-get (claude-code-ide-process-stop
+                                                                  instance :process old :scan nil)
+                                                                 :status))
+                                       (list provider 'error)))
+                        (claude-code-ide-process-stop-later
+                         instance :process old :callback (lambda (r) (setq later r)))
+                        (should (claude-code-ide-tests--wait-until (lambda () later) 5))
+                        (should (equal (list provider (plist-get later :status))
+                                       (list provider 'error))))
+                    (delete-process new))))
+              ;; No terminal process was ever known: the CLI may run
+              (should-not (get-buffer-process buffer))
+              (should (equal (list provider (plist-get (claude-code-ide-process-stop instance :scan nil)
+                                                       :status))
+                             (list provider 'error)))
+              (should-not claude-code-ide-process-tests--signals))
+          (kill-buffer buffer))))))
+
 ;;; Records
 
 (ert-deftest claude-code-ide-test-process-parent-chain ()
