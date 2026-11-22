@@ -1966,5 +1966,140 @@ refused and closed; a pipelined request gets its normal reply."
           (should (string-prefix-p "HTTP/1.1 202" (car result)))
           (should-not (string-match-p "Parse error" (car result))))))))
 
+;;; JSON false and null in tool arguments
+
+(defun claude-code-ide-mcp-routing-tests--call-raw (tool arguments-json)
+  "Call TOOL through the cowork session with the raw JSON text ARGUMENTS-JSON.
+The body goes as text, so the server's own JSON parse decodes it.
+Return the reply plist."
+  (claude-code-ide-mcp-routing-tests--post
+   "/mcp/cci-test-cowork"
+   (format "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"%s\",\"arguments\":%s}}"
+           tool arguments-json)))
+
+(ert-deftest claude-code-ide-mcp-routing-test-json-false-and-null ()
+  "Through the real parse, a JSON false reaches a tool as :json-false, a null as nil.
+Before, false came as :false and null as :null, which are true values."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (let ((seen 'none))
+      (claude-code-ide-make-tool :function (lambda (&optional flag text on)
+                                             (setq seen (list flag text on))
+                                             "cci-test ok")
+                                 :name "cci_test_raw" :description "cci-test"
+                                 :args '((:name "flag" :type boolean :optional t)
+                                         (:name "text" :type string :optional t)
+                                         (:name "on" :type boolean :optional t)))
+      (let ((reply (claude-code-ide-mcp-routing-tests--call-raw
+                    "cci_test_raw" "{\"flag\":false,\"text\":null,\"on\":true}")))
+        (should (equal (plist-get reply :status) 200)))
+      (should (equal seen '(:json-false nil t))))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-handover-tool-false ()
+  "The handover tool reads JSON false as false, and a null optional argument as missing.
+`\"force\": false' must never skip the safety checks, and
+`\"continue\": false' must keep the target waiting."
+  (require 'claude-code-ide-handover)
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    (let* ((spec (cl-find "claude-code-ide-control-handover" claude-code-ide-control--extra-tool-specs
+                          :key (lambda (s) (plist-get s :name)) :test #'equal))
+           (calls nil))
+      ;; The arguments of the real tool, without the coordinator scope
+      (claude-code-ide-make-tool :function #'claude-code-ide-handover--mcp-handover
+                                 :name "cci_test_handover" :description "cci-test"
+                                 :args (plist-get spec :args))
+      (cl-letf (((symbol-function 'claude-code-ide-control-call)
+                 (lambda (&rest args) (push args calls) (list :status 'running))))
+        (should (equal (plist-get (claude-code-ide-mcp-routing-tests--call-raw
+                                   "cci_test_handover"
+                                   (concat "{\"instance_id\":\"cci-test-src\",\"target_provider\":\"codex\","
+                                           "\"force\":false,\"interrupt\":false,\"continue\":false,"
+                                           "\"context\":null,\"request_id\":null,\"method\":null}"))
+                                  :status)
+                       200))
+        (should (equal (plist-get (claude-code-ide-mcp-routing-tests--call-raw
+                                   "cci_test_handover"
+                                   (concat "{\"instance_id\":\"cci-test-src\",\"target_provider\":\"codex\","
+                                           "\"force\":true,\"interrupt\":true,\"continue\":true}"))
+                                  :status)
+                       200))
+        (should (equal (plist-get (claude-code-ide-mcp-routing-tests--call-raw
+                                   "cci_test_handover"
+                                   "{\"instance_id\":\"cci-test-src\",\"target_provider\":\"codex\",\"continue\":null}")
+                                  :status)
+                       200))
+        (let* ((calls (reverse calls))
+               (false (nthcdr 3 (nth 0 calls)))
+               (true (nthcdr 3 (nth 1 calls)))
+               (null (nthcdr 3 (nth 2 calls))))
+          (should (= (length calls) 3))
+          (should-not (plist-get false :force))
+          (should-not (plist-get false :interrupt))
+          (should (plist-member false :continue))
+          (should-not (plist-get false :continue))
+          (should-not (plist-get false :context))
+          (should-not (plist-get false :request-id))
+          (should (eq (plist-get false :method) 'fresh))
+          (should (eq (plist-get true :force) t))
+          (should (eq (plist-get true :interrupt) t))
+          (should (eq (plist-get true :continue) t))
+          ;; A null continue counts as not given
+          (should-not (plist-member null :continue)))))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-treesit-info-false ()
+  "The tree-sitter tool reads :json-false (and :false) as false for its flags."
+  (let ((formatted nil))
+    (cl-letf (((symbol-function 'claude-code-ide-mcp-server-get-session-context)
+               (lambda (&rest _) (list :project-dir default-directory)))
+              ((symbol-function 'treesit-available-p) (lambda () t))
+              ((symbol-function 'find-buffer-visiting) (lambda (&rest _) (current-buffer)))
+              ((symbol-function 'treesit-parser-list) (lambda (&rest _) '(cci-test-parser)))
+              ((symbol-function 'treesit-parser-root-node) (lambda (_parser) 'cci-test-root))
+              ((symbol-function 'claude-code-ide-mcp-treesit--format-tree)
+               (lambda (&rest _) (setq formatted t) "cci-test tree"))
+              ((symbol-function 'treesit-node-at)
+               (lambda (&rest _) (throw 'cci-test-node-at 'position))))
+      (with-temp-buffer
+        (should (equal (claude-code-ide-mcp-treesit-info "/tmp/cci-test.el" nil nil t)
+                       "cci-test tree"))
+        (setq formatted nil)
+        (dolist (false '(:json-false :false))
+          (should (eq (catch 'cci-test-node-at
+                        (claude-code-ide-mcp-treesit-info "/tmp/cci-test.el" nil nil false))
+                      'position))
+          (should-not formatted))))))
+
+(ert-deftest claude-code-ide-mcp-routing-test-null-id ()
+  "Only a message without the member id is a notification.
+JSON-RPC 2.0 allows \"id\": null in a request (it only discourages it),
+so such a request gets its normal result or error, with id null."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-server-register-session "cci-test-cowork" cci-test-dir nil)
+    ;; No id: a notification, 202 and no body
+    (let ((reply (claude-code-ide-mcp-routing-tests--post
+                  "/mcp/cci-test-cowork"
+                  "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")))
+      (should (equal (plist-get reply :status) 202))
+      (should-not (plist-get reply :body)))
+    ;; id null and a known method: the result, with id null
+    (let* ((reply (claude-code-ide-mcp-routing-tests--post
+                   "/mcp/cci-test-cowork"
+                   "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"initialize\",\"params\":{}}"))
+           (body (plist-get reply :body)))
+      (should (equal (plist-get reply :status) 200))
+      (should (assq 'id body))
+      (should (eq (alist-get 'id body) :null))
+      (should (alist-get 'result body)))
+    ;; id null and an unknown method: the error, with id null
+    (let* ((reply (claude-code-ide-mcp-routing-tests--post
+                   "/mcp/cci-test-cowork"
+                   "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"cci-test/none\"}"))
+           (body (plist-get reply :body)))
+      (should (equal (plist-get reply :status) 200))
+      (should (assq 'id body))
+      (should (eq (alist-get 'id body) :null))
+      (should (equal (alist-get 'code (alist-get 'error body)) -32601)))))
+
 (provide 'claude-code-ide-mcp-routing-tests)
 ;;; claude-code-ide-mcp-routing-tests.el ends here

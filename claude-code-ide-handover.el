@@ -145,6 +145,31 @@ A target with a saved conversation is resumed in both cases."
                  (const :tag "Resume as before, then ask a person" ask))
   :group 'claude-code-ide-handover)
 
+(defcustom claude-code-ide-handover-continue 'ask
+  "Whether the target goes on with the task after a handover commits.
+The target reads its document, writes its state summary and replies
+ready.  With a yes, the commit then sends it one more prompt: go on
+with the task of its state summary now.  The prompt goes through the
+inbox of the target, with the request ID handover-continue:ID, so it
+waits until the target is idle and goes out at most once.
+- `ask': the interactive handover (\[claude-code-ide-handover], or H in
+  the status buffer) asks once, with its other questions: y (yes, this
+  time), n (no, this time), a (always, saved), v (never, saved).  A
+  call from Lisp or a coordinator never asks, and counts as `always'.
+- `always': send the prompt.
+- `never': send nothing; the target waits for your next prompt.
+The key :continue of `claude-code-ide-handover-session' wins over this
+option."
+  :type '(choice (const :tag "Ask at an interactive handover" ask)
+                 (const :tag "Always go on" always)
+                 (const :tag "Never go on" never))
+  :group 'claude-code-ide-handover)
+
+(defconst claude-code-ide-handover--continue-prompt
+  "The handover is complete. Go on now with the task that your state summary describes, from its next step. Do not wait for another prompt."
+  "The prompt that tells a handover target to go on after the commit.
+See `claude-code-ide-handover-continue'.")
+
 (defcustom claude-code-ide-handover-delivery-timeout 600
   "Seconds that a started target has to get its handover document.
 Without the delivery in that time, the handover needs a person, who
@@ -198,6 +223,10 @@ Emacs asks you whether to hand over."
   (interrupt nil :documentation "Non-nil to interrupt a busy source.")
   (force nil :documentation "Non-nil to go on while subagents or tasks run.")
   (interactive nil :documentation "Non-nil when a person started it in Emacs.")
+  (continue nil :documentation "Non-nil to send the continue prompt to the target at the commit.")
+  (continue-sent nil :documentation "Non-nil after the inbox of the target accepted the continue prompt.")
+  (chain-saved nil :documentation "Non-nil after the commit saved the chain of the target.")
+  (missing-entry nil :documentation "`source' or `target': the registry entry that a save missed, or nil.")
   (stage 'requested :documentation "The stage that the run is in.")
   (status 'running :documentation "`running', `needs-user', `committed', `cancelled' or `failed'.")
   (reason nil :documentation "Symbol that says why the status is what it is.")
@@ -312,6 +341,9 @@ while a handover holds the worktree.")
              (cons 'strays (vconcat (mapcar #'claude-code-ide-handover--stray-to-alist
                                             (claude-code-ide-handover--run-strays run)))))
            (cons 'interactive (and (claude-code-ide-handover--run-interactive run) t))
+           (cons 'continue (and (claude-code-ide-handover--run-continue run) t))
+           (cons 'continue_sent (and (claude-code-ide-handover--run-continue-sent run) t))
+           (cons 'chain_saved (and (claude-code-ide-handover--run-chain-saved run) t))
            ;; The owner of the run: this Emacs
            (cons 'emacs_pid (emacs-pid))
            (cons 'emacs_start_time (claude-code-ide-session-registry--emacs-start-time))
@@ -356,6 +388,10 @@ while a handover holds the worktree.")
      :chain (claude-code-ide-session-registry-entry-legs entry)
      :strays (mapcar #'claude-code-ide-handover--stray-from-alist (alist-get 'strays alist))
      :interactive (alist-get 'interactive alist)
+     ;; An older record has no field: the old behavior, no prompt
+     :continue (eq (alist-get 'continue alist) t)
+     :continue-sent (eq (alist-get 'continue_sent alist) t)
+     :chain-saved (eq (alist-get 'chain_saved alist) t)
      :owner (claude-code-ide-session-registry--handover-owner alist)
      :owner-pid (alist-get 'emacs_pid alist)
      :owner-host (alist-get 'host alist)
@@ -387,6 +423,7 @@ DROP is as for `claude-code-ide-session-registry-save-handover'."
           (claude-code-ide-handover--to-alist run)
           drop)
     (:missing
+     (setf (claude-code-ide-handover--run-missing-entry run) 'source)
      (claude-code-ide-handover--entry-missing
       run (format "The session registry has no entry of the source %s"
                   (claude-code-ide-handover--run-source-id run)))
@@ -400,9 +437,13 @@ A missing target entry makes RUN need a person, as for
   (pcase (claude-code-ide-session-registry-save-chain
           (claude-code-ide-handover--run-target-id run) legs)
     (:missing
+     (setf (claude-code-ide-handover--run-missing-entry run) 'target)
      (claude-code-ide-handover--entry-missing
       run (format "The session registry has no entry of the target %s"
                   (claude-code-ide-handover--run-target-id run)))
+     ;; The source entry is there: its record says needs-user too, so
+     ;; that a restart shows the same state as this Emacs
+     (claude-code-ide-handover--save run)
      nil)
     (result result)))
 
@@ -453,6 +494,7 @@ document after a crash still has the context."
          :target-id (claude-code-ide-handover--run-target-id run)
          :target-provider (claude-code-ide-handover--run-target-provider run)
          :method (claude-code-ide-handover--run-method run)
+         :continue (claude-code-ide-handover--run-continue run)
          :reason (claude-code-ide-handover--run-reason run)
          :message (claude-code-ide-handover--run-message run)
          :document (claude-code-ide-handover--run-document run)
@@ -750,7 +792,8 @@ The checks run before anything of the source changes:
 
 (cl-defun claude-code-ide-handover-session (instance-id target-provider
                                                         &key (method 'fresh) context interrupt
-                                                        force request-id interactive)
+                                                        force request-id interactive
+                                                        (continue nil continue-given))
   "Hand the work of INSTANCE-ID to a new conversation of TARGET-PROVIDER.
 TARGET-PROVIDER is a provider name, such as `codex'.  The keys:
 
@@ -768,6 +811,10 @@ TARGET-PROVIDER is a provider name, such as `codex'.  The keys:
 - INTERACTIVE: non-nil when a person asks in Emacs; then Emacs asks
   that person about stray processes.  A coordinator call gets the
   status `needs-user' instead.
+- CONTINUE: t to send the target the continue prompt after the commit,
+  nil to send nothing.  Without the key, `claude-code-ide-handover-continue'
+  decides, and its value `ask' counts as `always': this function never
+  asks.  The interactive question is in `claude-code-ide-handover'.
 
 The handover runs from timers and returns at once.  The result is the
 plist of `claude-code-ide-handover-status', or an error result
@@ -836,14 +883,19 @@ plist of `claude-code-ide-handover-status', or an error result
          (t
           (claude-code-ide-handover--begin
            instance target-provider method fork-id context interrupt force request-id
-           interactive chain))))))))
+           interactive chain
+           (if continue-given
+               (and continue t)
+             (not (eq claude-code-ide-handover-continue 'never)))))))))))
 
 (defun claude-code-ide-handover--begin (instance target-provider method fork-id context
-                                                 interrupt force request-id interactive chain)
+                                                 interrupt force request-id interactive chain
+                                                 continue)
   "Create and save the run of a handover of INSTANCE, and schedule its first step.
 TARGET-PROVIDER, METHOD, FORK-ID, CONTEXT, INTERRUPT, FORCE,
 REQUEST-ID, INTERACTIVE and CHAIN are as for
-`claude-code-ide-handover-session'.  Return the result."
+`claude-code-ide-handover-session'.  CONTINUE non-nil sends the
+continue prompt at the commit.  Return the result."
   (let* ((session (claude-code-ide-instance-session instance))
          (directory (claude-code-ide-known-or-nil (claude-code-ide-instance-project-root instance)))
          (run (claude-code-ide-handover--run-create
@@ -858,6 +910,7 @@ REQUEST-ID, INTERACTIVE and CHAIN are as for
                :interrupt interrupt
                :force force
                :interactive interactive
+               :continue continue
                :worktree (claude-code-ide-handover--directory-key directory)
                :directory directory
                :instance-name (and session (claude-code-ide-mcp-session-instance-name session))
@@ -1183,7 +1236,17 @@ coordinator sees the status `needs-user', and Emacs shows a message."
              (claude-code-ide-handover--run-id run) text)))
 
 (defun claude-code-ide-handover--choices (run)
-  "Return the choices of a person for RUN, as (KEY ACTION DESCRIPTION)."
+  "Return the choices of a person for RUN, as (KEY ACTION DESCRIPTION).
+After the commit saved the chain of the target, the choices are retry
+and skip for every reason: the chain names the target, so a cancel
+would stop the current instance."
+  (if (claude-code-ide-handover--sync-chain-saved run)
+      '((?r retry "finish the commit again (it sends a continue prompt that is due)")
+        (?s skip "finish the handover without the continue prompt"))
+    (claude-code-ide-handover--choices-before-chain run)))
+
+(defun claude-code-ide-handover--choices-before-chain (run)
+  "Return the choices of a person for RUN before the chain of its target is saved."
   (pcase (claude-code-ide-handover--run-reason run)
     ((or 'strays 'source-did-not-stop)
      '((?e end "end them: SIGTERM, then SIGKILL")
@@ -1277,7 +1340,8 @@ THEN, when given, runs first, with the strays of RUN."
   "Set RUN running again, without a reason, and save it."
   (setf (claude-code-ide-handover--run-status run) 'running
         (claude-code-ide-handover--run-reason run) nil
-        (claude-code-ide-handover--run-message run) nil)
+        (claude-code-ide-handover--run-message run) nil
+        (claude-code-ide-handover--run-missing-entry run) nil)
   (claude-code-ide-handover--save run))
 
 (defun claude-code-ide-handover--adopt (handover-id)
@@ -1312,6 +1376,7 @@ ACTION is one of the choices that the handover offers:
 - `go': go on although the process check failed.
 - `retry': run the stage again; a target that runs is taken up again,
   and a target that ended starts again after a scan of the worktree.
+- `skip': finish a committed handover without its continue prompt.
 - `cancel': cancel the handover; see `claude-code-ide-handover-cancel'.
 A handover that this Emacs does not run is taken over first (see
 `claude-code-ide-handover--adopt'; another live Emacs needs a yes).
@@ -1329,6 +1394,37 @@ Interactively, choose the handover and the action."
                                    (claude-code-ide-handover--choices run)))
         (user-error "Handover %s cannot %s now" handover-id action))
       (pcase action
+        ('skip
+         ;; Only the continue prompt goes; every other step of the
+         ;; commit runs as for retry
+         (setf (claude-code-ide-handover--run-continue run) nil)
+         (claude-code-ide-handover--resume run)
+         (claude-code-ide-handover--guarded run #'claude-code-ide-handover--commit run)
+         ;; The record of the source cannot be saved (its entry is
+         ;; gone): end the run in this Emacs, but only after the inbox
+         ;; of the source moved to the target.  A missing target entry
+         ;; stays a needs-user that the record holds too
+         (when (and (claude-code-ide-handover--unfinished-p run)
+                    (eq (claude-code-ide-handover--run-reason run) 'registry-entry-missing)
+                    (eq (claude-code-ide-handover--run-missing-entry run) 'source))
+           (condition-case err
+               (progn
+                 (claude-code-ide-control-move-inbox (claude-code-ide-handover--run-source-id run)
+                                                     (claude-code-ide-handover--run-target-id run)
+                                                     (claude-code-ide-handover--run-id run))
+                 (claude-code-ide-handover--cancel-timers run)
+                 (setf (claude-code-ide-handover--run-status run) 'committed
+                       (claude-code-ide-handover--run-reason run) nil)
+                 (claude-code-ide-control-release (claude-code-ide-handover--run-source-id run))
+                 (message "Handover %s committed in this Emacs; the registry has no entry to save it in"
+                          (claude-code-ide-handover--run-id run)))
+             (error
+              ;; The registry cannot hold the text; keep it in this Emacs
+              (setf (claude-code-ide-handover--run-message run)
+                    (format "The registry has no entry of the source, and the inbox of the source did not move to the target: %s.  Skip again after the move can work"
+                            (error-message-string err)))
+              (message "Handover %s needs you: %s" (claude-code-ide-handover--run-id run)
+                       (claude-code-ide-handover--run-message run))))))
         ('cancel
          (if (eq (claude-code-ide-handover--run-continuation run) 'cancel)
              ;; The person leaves the target process running
@@ -1352,6 +1448,12 @@ Interactively, choose the handover and the action."
          (claude-code-ide-handover--after-scan run))
         ('retry
          (cond
+          ;; After the chain save (for example a continue prompt that
+          ;; failed): commit again, which sends a prompt that is due
+          ;; with the same request ID
+          ((claude-code-ide-handover--sync-chain-saved run)
+           (claude-code-ide-handover--resume run)
+           (claude-code-ide-handover--guarded run #'claude-code-ide-handover--commit run))
           ;; A target that runs: take it up again, never a second start
           ((and (not (claude-code-ide-handover--stage< (claude-code-ide-handover--run-stage run)
                                                        'target-started))
@@ -1431,6 +1533,12 @@ refused; a handover of an Emacs that ended is claimed first."
      ((null run) (user-error "No handover %s" handover-id))
      ((not (claude-code-ide-handover--unfinished-p run))
       (user-error "Handover %s is %s already" handover-id (claude-code-ide-handover--run-status run)))
+     ;; The chain names the target already; a cancel would stop it.
+     ;; Before the chain save (for example a missing target entry), a
+     ;; cancel still works
+     ((claude-code-ide-handover--sync-chain-saved run)
+      (user-error "Handover %s is committed (the chain names its target); it cannot be cancelled"
+                  handover-id))
      ((and (eq (claude-code-ide-handover--run-status run) 'running)
            (claude-code-ide-handover--live-target run))
       (user-error "The target of handover %s runs already" handover-id))
@@ -1724,23 +1832,133 @@ run waits for a person ends the wait."
 
 (defun claude-code-ide-handover--commit (run)
   "Make the target of RUN the current instance of the chain.
-The final chain of the target is saved first; the inbox of the source
-moves to the target before the commit is final, so that a crash in
-between moves it again at the recovery (the move is idempotent)."
+The steps, each idempotent, so that a recovery or a retry runs them
+again after a crash or a failure:
+1. Enter the stage committed (saved).
+2. Save the final chain of the target, then mark it in the record
+   (`chain-saved', saved).  From here on, the handover cannot be
+   cancelled: the chain names the target.
+3. Move the inbox of the source to the target.
+4. Send the continue prompt, when it is due (see
+   `claude-code-ide-handover--send-continue'); its acceptance is saved
+   at once (`continue-sent').
+5. Finish: the status committed (saved).
+A busy registry runs the step again a moment later."
   (when (claude-code-ide-handover--enter run 'committed)
     (let ((source (claude-code-ide-handover--run-source-id run))
           (target (claude-code-ide-handover--run-target-id run)))
       (if (not (claude-code-ide-handover--save-chain run (claude-code-ide-handover--target-chain run)))
           (when (eq (claude-code-ide-handover--run-status run) 'running)
             (claude-code-ide-handover--busy-registry run))
-        ;; Queued prompts and review results go to the new instance
+        (when (and (claude-code-ide-handover--mark-chain-saved run)
+                   ;; Queued prompts and review results go to the new
+                   ;; instance; the run never finishes without them
+                   (claude-code-ide-handover--move-inbox run source target))
+          ;; Before the final save, so that a crash in between sends it
+          ;; at the recovery; the fixed request ID sends it only once.
+          ;; A prompt that the inbox does not take keeps the run
+          ;; unfinished
+          (pcase (claude-code-ide-handover--send-continue run)
+            ('nil
+             (claude-code-ide-handover--finish run 'committed nil
+                                               (format "%s %s -> %s %s"
+                                                       (claude-code-ide-handover--run-source-provider run)
+                                                       source
+                                                       (claude-code-ide-handover--run-target-provider run)
+                                                       target)))
+            ;; The registry was busy: the step runs again soon
+            ('busy nil)
+            (failure
+             (claude-code-ide-handover--needs-user
+              run 'continue-failed
+              (format "The handover is committed, but the continue prompt did not reach the inbox of the target %s: %s.  Retry sends it again; skip finishes without it"
+                      target failure)))))))))
+
+(defun claude-code-ide-handover--sync-chain-saved (run)
+  "Set the `chain-saved' mark of RUN from the saved chain of its target.
+The chain save of the target and the save of the mark in the source
+record are two writes; a crash between them leaves the mark off, while
+the target has its final chain already.  So the mark is also on when
+the chain of the target has a leg of this handover that is not
+pending.  The cancel, the choices and the recovery call this first.
+Return the mark."
+  (or (claude-code-ide-handover--run-chain-saved run)
+      (when-let* ((target (claude-code-ide-handover--run-target-id run))
+                  (entry (ignore-errors (claude-code-ide-session-registry-entry-of target)))
+                  ((cl-some (lambda (leg)
+                              (and (equal (plist-get leg :handover-id)
+                                          (claude-code-ide-handover--run-id run))
+                                   (not (plist-get leg :pending))))
+                            (claude-code-ide-session-registry-entry-legs entry))))
+        (setf (claude-code-ide-handover--run-chain-saved run) t))))
+
+(defun claude-code-ide-handover--mark-chain-saved (run)
+  "Record in RUN that the chain of its target is saved, and save RUN.
+Return non-nil when the registry holds it.  When the registry is busy,
+the step runs again a moment later, as for the stages.  A second call
+saves again, which does no harm."
+  (setf (claude-code-ide-handover--run-chain-saved run) t)
+  (or (claude-code-ide-handover--save run)
+      (claude-code-ide-handover--busy-registry run)))
+
+(defun claude-code-ide-handover--move-inbox (run source target)
+  "Move the inbox of SOURCE to TARGET for RUN.  Return non-nil when it moved.
+A failure gives `needs-user' with the reason `step-failed', and a
+message that names the move: the queued prompts and review results of
+the source must reach the target, so the run does not finish without
+the move.  The move is
+idempotent, so retry and skip simply move again."
+  (condition-case err
+      (progn
         (claude-code-ide-control-move-inbox source target (claude-code-ide-handover--run-id run))
-        (claude-code-ide-handover--finish run 'committed nil
-                                          (format "%s %s -> %s %s"
-                                                  (claude-code-ide-handover--run-source-provider run)
-                                                  source
-                                                  (claude-code-ide-handover--run-target-provider run)
-                                                  target))))))
+        t)
+    (error
+     (claude-code-ide-handover--needs-user
+      run 'step-failed
+      (format "Stage committed failed: the inbox of the source %s did not move to the target %s: %s.  Retry or skip moves it again; the handover finishes only after the move"
+              source target (error-message-string err)))
+     nil)))
+
+(defun claude-code-ide-handover--continue-request-id (run)
+  "Return the request ID of the continue prompt of RUN."
+  (concat "handover-continue:" (claude-code-ide-handover--run-id run)))
+
+(defun claude-code-ide-handover--send-continue (run)
+  "Send the target of RUN the continue prompt, when RUN asks for it.
+Return nil when nothing more is needed: RUN asks for no prompt, its
+record says that the inbox took it already (`continue-sent'), or the
+inbox takes it now, also as a duplicate of the same request; then the
+record is saved with `continue-sent' at once.  Return `busy' when that
+save waits for the registry (the step runs again soon).  Else return
+a text that says why it failed: an error of the submit, or a refusal
+of the inbox.  The prompt goes through the inbox of the target
+with a fixed request ID, so a second call (for example at a recovery)
+sends nothing.  It waits in the inbox until the target is idle."
+  (when (and (claude-code-ide-handover--run-continue run)
+             (not (claude-code-ide-handover--run-continue-sent run)))
+    (let ((result (condition-case err
+                      (claude-code-ide-control-submit
+                       (claude-code-ide-handover--run-target-id run)
+                       claude-code-ide-handover--continue-prompt
+                       :request-id (claude-code-ide-handover--continue-request-id run)
+                       :queue t)
+                    (error (list :error (error-message-string err))))))
+      (if (memq (plist-get result :result) '(queued delivered unacknowledged))
+          (progn
+            ;; Saved at once, before the final save of the commit, so
+            ;; that a recovery after a crash in between sends nothing
+            ;; again, also after the inbox pruned its done record
+            (setf (claude-code-ide-handover--run-continue-sent run) t)
+            (if (claude-code-ide-handover--save run)
+                nil
+              (claude-code-ide-handover--busy-registry run)
+              'busy))
+        (or (plist-get result :error)
+            (format "the inbox gave %s%s"
+                    (or (plist-get result :result) (plist-get result :status) "no result")
+                    (if (plist-get result :reason)
+                        (format " (%s)" (plist-get result :reason))
+                      "")))))))
 
 (defun claude-code-ide-handover--run-of-target (instance-id)
   "Return the unfinished run of this Emacs whose target is INSTANCE-ID, or nil."
@@ -1917,6 +2135,7 @@ person about stray processes."
 
 (defun claude-code-ide-handover--recover-claimed (run interactive)
   "Continue RUN, which this Emacs claimed; INTERACTIVE as for the recovery."
+  (claude-code-ide-handover--sync-chain-saved run)
   (progn
     (puthash (claude-code-ide-handover--run-id run) run claude-code-ide-handover--runs)
     (setf (claude-code-ide-handover--run-status run) 'running
@@ -2011,6 +2230,32 @@ See `claude-code-ide-handover-recover-at-start'."
   (when-let* ((session (ignore-errors (claude-code-ide--buffer-session))))
     (claude-code-ide-instance-of-session session)))
 
+(defun claude-code-ide-handover--read-continue ()
+  "Return `yes' or `no': whether the target goes on after the commit.
+See `claude-code-ide-handover-continue'.  With `ask', ask once: y and
+n hold for this handover; a and v also save `always' or `never' with
+`customize-save-variable'.  When the save fails, the value holds in
+this Emacs."
+  (pcase claude-code-ide-handover-continue
+    ('always 'yes)
+    ('never 'no)
+    (_
+     (let* ((answer (car (read-multiple-choice
+                          "After the handover, should the target go on with the task? "
+                          '((?y "yes" "go on, this time")
+                            (?n "no" "wait for my prompt, this time")
+                            (?a "always" "always go on; save this")
+                            (?v "never" "never go on; save this")))))
+            (save (pcase answer (?a 'always) (?v 'never))))
+       (when save
+         (condition-case err
+             (customize-save-variable 'claude-code-ide-handover-continue save)
+           (error
+            (setq claude-code-ide-handover-continue save)
+            (message "claude-code-ide-handover-continue is %s in this Emacs; the save failed: %s"
+                     save (error-message-string err)))))
+       (if (memq answer '(?y ?a)) 'yes 'no)))))
+
 (defun claude-code-ide-handover--read-args (&optional instance-id)
   "Read the arguments of `claude-code-ide-handover'.
 INSTANCE-ID, when given, is the source; else it is the instance of the
@@ -2058,22 +2303,31 @@ current buffer, or one that you choose."
                                 ""))))))
     (when (and (memq (plist-get state :state) '(waiting-for-task disconnected)) (not force))
       (user-error "Handover not started"))
-    (list (claude-code-ide-instance-id instance) target method context interrupt force)))
+    (list (claude-code-ide-instance-id instance) target method context interrupt force
+          ;; The last question: whether the target goes on after the commit
+          (claude-code-ide-handover--read-continue))))
 
 ;;;###autoload
-(defun claude-code-ide-handover (instance-id target-provider &optional method context interrupt force)
+(defun claude-code-ide-handover (instance-id target-provider &optional method context interrupt force
+                                             continue)
   "Hand the work of INSTANCE-ID to a new conversation of TARGET-PROVIDER.
 METHOD is `fresh' or `fork', CONTEXT optional text for the target,
 INTERRUPT non-nil to interrupt a busy source, and FORCE non-nil to go
 on while its subagents or background tasks run, or while its state is
-unknown.  Interactively, the source is the instance of the current
-buffer, else one that you choose, and Emacs asks for the rest.  Emacs
-asks you about stray processes after the stop.  See
-`claude-code-ide-handover-session'."
+unknown.  CONTINUE is `yes' or `no': whether the target goes on with
+the task after the commit; nil leaves it to
+`claude-code-ide-handover-continue', where `ask' counts as `always'.
+Interactively, the source is the instance of the current buffer, else
+one that you choose, and Emacs asks for the rest, also CONTINUE when
+the option is `ask'.  Emacs asks you about stray processes after the
+stop.  See `claude-code-ide-handover-session'."
   (interactive (claude-code-ide-handover--read-args))
-  (let ((result (claude-code-ide-handover-session
-                 instance-id target-provider :method (or method 'fresh) :context context
-                 :interrupt interrupt :force force :interactive t)))
+  (let ((result (apply #'claude-code-ide-handover-session
+                       instance-id target-provider :method (or method 'fresh) :context context
+                       :interrupt interrupt :force force :interactive t
+                       (pcase continue
+                         ('yes (list :continue t))
+                         ('no (list :continue nil))))))
     (if (eq (plist-get result :status) 'error)
         (user-error "Handover refused: %s%s" (plist-get result :reason)
                     (if (plist-get result :message) (concat ": " (plist-get result :message)) ""))
@@ -2152,21 +2406,28 @@ TARGET-PROVIDER, METHOD and REASON are the tool arguments."
 ;;; The control operation and the coordinator tools
 
 (defun claude-code-ide-handover--flag (value)
-  "Return non-nil when the MCP argument VALUE is true."
-  (and value (not (eq value :json-false)) (not (member value '("false" "" "no" "0"))) t))
+  "Return non-nil when the MCP argument VALUE is true.
+The MCP server decodes JSON false as `:json-false'; `:false' (the
+default of `json-parse-string') and the texts false, no, 0 and the
+empty text count as false too."
+  (and value (not (memq value '(:json-false :false)))
+       (not (member value '("false" "" "no" "0"))) t))
 
 (defun claude-code-ide-handover--mcp-handover (instance-id target-provider &optional method context
-                                                           interrupt force request-id)
+                                                           interrupt force request-id continue)
   "MCP tool: hand INSTANCE-ID over to TARGET-PROVIDER.
-METHOD, CONTEXT, INTERRUPT, FORCE and REQUEST-ID are the tool arguments."
+METHOD, CONTEXT, INTERRUPT, FORCE, REQUEST-ID and CONTINUE are the tool
+arguments.  CONTINUE goes to the handover only when the call gives it."
   (claude-code-ide-control-json
-   (claude-code-ide-control-call
-    'handover instance-id target-provider
-    :method (if (and (stringp method) (string= method "fork")) 'fork 'fresh)
-    :context (unless (claude-code-ide-control-blank-p context) context)
-    :interrupt (claude-code-ide-handover--flag interrupt)
-    :force (claude-code-ide-handover--flag force)
-    :request-id (unless (claude-code-ide-control-blank-p request-id) request-id))))
+   (apply #'claude-code-ide-control-call
+          'handover instance-id target-provider
+          :method (if (and (stringp method) (string= method "fork")) 'fork 'fresh)
+          :context (unless (claude-code-ide-control-blank-p context) context)
+          :interrupt (claude-code-ide-handover--flag interrupt)
+          :force (claude-code-ide-handover--flag force)
+          :request-id (unless (claude-code-ide-control-blank-p request-id) request-id)
+          (unless (null continue)
+            (list :continue (claude-code-ide-handover--flag continue))))))
 
 (defun claude-code-ide-handover--mcp-status (handover-id)
   "MCP tool: return the result of the handover HANDOVER-ID (or request ID)."
@@ -2189,7 +2450,9 @@ METHOD, CONTEXT, INTERRUPT, FORCE and REQUEST-ID are the tool arguments."
              '(:name "force" :type boolean :optional t
                      :description "Hand over while subagents or background tasks run.")
              '(:name "request_id" :type string :optional t
-                     :description "ID that makes the request idempotent.")))
+                     :description "ID that makes the request idempotent.")
+             '(:name "continue" :type boolean :optional t
+                     :description "After the commit, tell the target to go on with the task of its state summary (true), or let it wait for a prompt (false). Default: the user's option claude-code-ide-handover-continue; its value ask counts as true here.")))
 
 (claude-code-ide-control-define-tool
  :name "claude-code-ide-control-handover-status"

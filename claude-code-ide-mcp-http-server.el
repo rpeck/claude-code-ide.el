@@ -732,7 +732,11 @@ that is shorter than its Content-Length, or a bad Content-Length, gets
                  ;; The check of the head in the filter is the authority
                  (check (claude-code-ide-mcp-http-server--request-check
                          request url-session-id (cdr parts) headers))
-                 (json-object (json-parse-string body :object-type 'alist))
+                 ;; JSON false is :json-false (given, and false), and null
+                 ;; is nil (as if not given); the default :false and :null
+                 ;; are true values, so a false flag of a tool acted as true
+                 (json-object (json-parse-string body :object-type 'alist
+                                                 :false-object :json-false :null-object nil))
                  (method (alist-get 'method json-object))
                  (params (alist-get 'params json-object)))
             (setq id (alist-get 'id json-object))
@@ -750,8 +754,10 @@ that is shorter than its Content-Length, or a bad Content-Length, gets
                  (id . ,id)
                  (error . ((code . -32000)
                            (message . ,(format "Forbidden: %s" (plist-get check :reason))))))))
-             ;; A notification (no id field) gets 202 Accepted with no body
-             ((null id)
+             ;; A notification (no id member) gets 202 Accepted with no
+             ;; body.  "id": null is a request: its id is nil here, and
+             ;; the reply writes it as JSON null
+             ((not (assq 'id json-object))
               (claude-code-ide-debug "Received notification: %s" method)
               (claude-code-ide-mcp-http-server--send-empty-response request))
              (t

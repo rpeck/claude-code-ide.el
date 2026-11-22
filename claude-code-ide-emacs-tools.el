@@ -294,13 +294,25 @@ LINE is 1-based, COLUMN is 0-based (Emacs convention)."
     (move-to-column column)
     (point)))
 
+(defun claude-code-ide-emacs-tools--true-p (value)
+  "Return non-nil when the MCP boolean argument VALUE is true.
+The MCP server decodes JSON false as `:json-false', which is a non-nil
+Lisp value; `:false' (the default of `json-parse-string') counts as
+false too."
+  (and value (not (memq value '(:json-false :false))) t))
+
 (defun claude-code-ide-mcp-treesit-info (file-path &optional line column whole_file include_ancestors include_children)
   "Get tree-sitter parse tree information for FILE-PATH.
 Optional LINE and COLUMN specify the position (1-based line, 0-based column).
 If WHOLE_FILE is non-nil, show the entire file's syntax tree.
 If neither position is specified, defaults to current cursor position (point).
 If INCLUDE_ANCESTORS is non-nil, include parent node hierarchy.
-If INCLUDE_CHILDREN is non-nil, include child nodes."
+If INCLUDE_CHILDREN is non-nil, include child nodes.
+A JSON false of the three flags counts as nil; see
+`claude-code-ide-emacs-tools--true-p'."
+  (setq whole_file (claude-code-ide-emacs-tools--true-p whole_file)
+        include_ancestors (claude-code-ide-emacs-tools--true-p include_ancestors)
+        include_children (claude-code-ide-emacs-tools--true-p include_children))
   (if (not file-path)
       (error "file_path parameter is required")
     (claude-code-ide-mcp-server-with-session-context nil
