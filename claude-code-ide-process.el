@@ -454,12 +454,32 @@ CLI.  X can be any process, also Emacs itself."
   (gethash (claude-code-ide-process--instance-id instance)
            claude-code-ide-process--tracks))
 
+(declare-function ghostel--native-child-pid "ghostel-module" (child))
+
+(defun claude-code-ide-process--ghostel-pid (process)
+  "Return the PID of the ghostel native child behind the pipe PROCESS, or nil.
+The ghostel versions keep it in different places:
+- up to 20261104: the process property `ghostel--native-pid';
+- from 20261111: the child handle in the process property
+  `ghostel--native-child', whose PID `ghostel--native-child-pid'
+  gives;
+- both: the buffer-local `ghostel--pid' of the terminal buffer."
+  (let ((pid (or (process-get process 'ghostel--native-pid)
+                 (when-let* ((child (process-get process 'ghostel--native-child))
+                             ((fboundp 'ghostel--native-child-pid)))
+                   (ignore-errors (ghostel--native-child-pid child)))
+                 (when-let* ((buffer (process-buffer process))
+                             ((buffer-live-p buffer))
+                             ((local-variable-p 'ghostel--pid buffer)))
+                   (buffer-local-value 'ghostel--pid buffer)))))
+    (and (integerp pid) (> pid 0) pid)))
+
 (defun claude-code-ide-process--process-pid (process)
   "Return the process ID of the CLI of PROCESS, or nil.
-The ghostel backend gives a pipe that stands for its native child; the
-pipe holds the process ID of the child."
+The ghostel backend gives a pipe that stands for its native child;
+see `claude-code-ide-process--ghostel-pid'."
   (when (processp process)
-    (or (process-get process 'ghostel--native-pid)
+    (or (claude-code-ide-process--ghostel-pid process)
         (process-id process))))
 
 (defun claude-code-ide-process--root-alive-p (track &optional snapshot)
@@ -1275,9 +1295,20 @@ After `timeout' or `error', keep TRACK, so that a later stop can use it."
       (when (eq (gethash id claude-code-ide-process--tracks) track)
         (claude-code-ide-process-untrack id)))))
 
-(defun claude-code-ide-process--empty-result ()
-  "Return the stop result for an instance without a known process."
-  (list :status 'stopped :strays nil :ended nil :escalated nil))
+(defun claude-code-ide-process--empty-result (&optional instance)
+  "Return the stop result for INSTANCE, which has no known process ID.
+When the terminal of INSTANCE still runs, its CLI runs too, and the
+stop could neither end it nor check it: the result is `error' with a
+reason, never `stopped'.  Else nothing runs, and the result is
+`stopped'.  INSTANCE is a descriptor or an instance ID."
+  (let ((descriptor (if (claude-code-ide-instance-p instance)
+                        instance
+                      (and instance (claude-code-ide-instance-by-id instance)))))
+    (if (and descriptor (claude-code-ide-instance-live-p descriptor))
+        (list :status 'error
+              :reason "the process ID of the CLI is unknown, so the stop could not end or check it"
+              :strays nil :ended nil :escalated nil)
+      (list :status 'stopped :strays nil :ended nil :escalated nil))))
 
 (defun claude-code-ide-process--merge-track (old new)
   "Copy the records of OLD into NEW, and return NEW."
@@ -1342,7 +1373,7 @@ TRACKS has the track of each instance or nil; RESULTS is a list of
                (cons (claude-code-ide-process--instance-id instance)
                      (if track
                          (cdr (assq track results))
-                       (claude-code-ide-process--empty-result))))
+                       (claude-code-ide-process--empty-result instance))))
              instances tracks))
 
 ;;;###autoload

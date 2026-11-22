@@ -2387,14 +2387,29 @@ SPEC describes the start, and PROGRAM is the CLI that ran."
                   (claude-code-ide-provider-display-name provider)))
     (plist-get detected :program)))
 
+(declare-function ghostel--native-child-pid "ghostel-module" (child))
+
 (defun claude-code-ide--process-pid (process)
   "Return the PID of the CLI that PROCESS runs, or nil.
-For the ghostel backend, PROCESS is a pipe, and the CLI is the native
-child whose PID ghostel keeps in the process property
-`ghostel--native-pid'."
-  (and (processp process)
-       (or (process-get process 'ghostel--native-pid)
-           (process-id process))))
+For the ghostel backend, PROCESS is a pipe, and the CLI is its native
+child.  ghostel keeps the PID of the child in different places:
+- up to 20261104: the process property `ghostel--native-pid';
+- from 20261111: the child handle in the process property
+  `ghostel--native-child', whose PID `ghostel--native-child-pid'
+  gives;
+- both: the buffer-local `ghostel--pid' of the terminal buffer.
+Else the PID is that of PROCESS."
+  (when (processp process)
+    (let ((pid (or (process-get process 'ghostel--native-pid)
+                   (when-let* ((child (process-get process 'ghostel--native-child))
+                               ((fboundp 'ghostel--native-child-pid)))
+                     (ignore-errors (ghostel--native-child-pid child)))
+                   (when-let* ((buffer (process-buffer process))
+                               ((buffer-live-p buffer))
+                               ((local-variable-p 'ghostel--pid buffer)))
+                     (buffer-local-value 'ghostel--pid buffer))
+                   (process-id process))))
+      (and (integerp pid) (> pid 0) pid))))
 
 (defun claude-code-ide--start-session (&optional continue resume spec interactive)
   "Start a new Claude Code instance for the current project.
