@@ -99,9 +99,13 @@ target that the recovery at the start of Emacs started."
   (expand-file-name name (claude-code-ide-live-tests--root)))
 
 (defun claude-code-ide-live-tests--log (format-string &rest args)
-  "Append a line made of FORMAT-STRING and ARGS to log.txt of the live folder."
+  "Append a line made of FORMAT-STRING and ARGS to log.txt of the live folder.
+Only a live run (`claude-code-ide-live-tests--live-p') writes the file;
+elsewhere, for example in a unit test of a helper, the line goes only
+to *Messages*."
   (let ((line (concat (format-time-string "%FT%T ") (apply #'format format-string args) "\n")))
-    (write-region line nil (claude-code-ide-live-tests--path "log.txt") t 'silent)
+    (when (claude-code-ide-live-tests--live-p)
+      (write-region line nil (claude-code-ide-live-tests--path "log.txt") t 'silent))
     (message "%s" (string-trim-right line))))
 
 ;;; Setup
@@ -1819,6 +1823,24 @@ and the command to remove it by hand."
                  (lambda (_root) (user-error "cci-test"))))
         (should-error (claude-code-ide-live-tests--claim-root root) :type 'user-error))
       (should-not (file-exists-p lock)))))
+
+(ert-deftest claude-code-ide-live-tests-test-log-only-live ()
+  "Outside a live run, the log writes no file; the line goes only to *Messages*.
+A unit test of a helper that logs must not write to the live folder of
+the repository, which also need not exist."
+  (let* ((root (make-temp-file "cci-test-live-log-" t))
+         (process-environment (cons (concat "CLAUDE_CODE_IDE_LIVE_DIR=" root)
+                                    process-environment)))
+    (unwind-protect
+        (progn
+          (claude-code-ide-live-tests--log "cci-test %s" "line")
+          (should-not (file-exists-p (expand-file-name "log.txt" root)))
+          ;; A live folder that does not exist gives no error either
+          (let ((process-environment (cons (concat "CLAUDE_CODE_IDE_LIVE_DIR="
+                                                   (expand-file-name "missing" root))
+                                           process-environment)))
+            (claude-code-ide-live-tests--log "cci-test %s" "line")))
+      (delete-directory root t))))
 
 (ert-deftest claude-code-ide-live-tests-test-approval-names-tool ()
   "The person in a test allows only the tool that the test expects."
