@@ -173,7 +173,8 @@ Set to nil when cache needs to be invalidated.")
   active-diffs     ; Hash table of active diffs
   original-tab     ; Original tab-bar tab where Claude was opened
   cli-pid          ; PID of the connected CLI process
-  auth-token)      ; Token a client must present to connect, or nil
+  auth-token       ; Token a client must present to connect, or nil
+  stopped-buffer)  ; Read-only copy of the terminal that the stop left
 
 (defun claude-code-ide-mcp--get-buffer-project ()
   "Get the project directory for the current buffer.

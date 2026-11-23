@@ -8,7 +8,8 @@
 ;; no IDE server for a CLI without the IDE protocol, provider texts,
 ;; flags and model of each provider, forks, secrets in the debug log,
 ;; the MCP config file of Claude Code, the process tree calls, the
-;; prepare hook, and the provider choice of the commands and the menu.
+;; prepare hook, the provider choice of the commands and the menu, and
+;; the terminal buffers that stay after a stop.
 ;; The file is loaded by claude-code-ide-tests.el, after its mocks.
 ;; All projects and conversation IDs are synthetic.
 ;;
@@ -29,10 +30,20 @@
 
 (declare-function claude-code-ide-tests--make-session "claude-code-ide-tests")
 (declare-function claude-code-ide-tests--clear-processes "claude-code-ide-tests")
+(declare-function claude-code-ide-tests--wait-until "claude-code-ide-tests")
 
 ;; Options of files that may not be loaded; the tests bind them
 (defvar claude-code-ide-process-quit-timeout)
 (defvar claude-code-ide-debug-buffer)
+(defvar eat-kill-buffer-on-exit)
+(defvar claude-code-ide-tests--stopped-copies)
+(defvar claude-code-ide-control--held)
+(defvar ghostel--pending-redraw)
+
+(declare-function claude-code-ide-control-hold "claude-code-ide-control" (instance-id))
+(declare-function claude-code-ide-control-held-p "claude-code-ide-control" (instance-id))
+(declare-function claude-code-ide-tests--isolate-run "claude-code-ide-tests" (run &rest args))
+(declare-function claude-code-ide-tests--record-stopped-copy "claude-code-ide-tests" (copy))
 
 ;; The MCP config folder and the provider file of a test run are in
 ;; the folder of the run; see `claude-code-ide-tests--isolate-run'.
@@ -814,10 +825,12 @@ the CLI."
      ,@body))
 
 (ert-deftest claude-code-ide-test-wiring-cleanup-stop-cases ()
-  "The cleanup stops a live CLI, stops it later in the kill hook, forgets a dead one."
+  "The cleanup stops a live CLI, stops it later in the kill hook, forgets a dead one.
+This is the cleanup with `claude-code-ide-keep-stopped-buffers' nil."
   (claude-code-ide-wiring-tests--with-clean
     (let ((calls nil)
-          (kill-buffer-query-functions nil))
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers nil))
       (claude-code-ide-wiring-tests--with-process-stubs calls
         ;; A live CLI: the stop, with the process, before the buffer goes
         (let* ((started (claude-code-ide-wiring-tests--start (claude-code-ide-wiring-tests--spec)))
@@ -848,7 +861,8 @@ the CLI."
 (ert-deftest claude-code-ide-test-wiring-cleanup-stop-error ()
   "An error of the process stop does not stop the cleanup."
   (claude-code-ide-wiring-tests--with-clean
-    (let ((calls nil))
+    (let ((calls nil)
+          (claude-code-ide-keep-stopped-buffers nil))
       (claude-code-ide-wiring-tests--with-process-stubs calls
         (cl-letf (((symbol-function 'claude-code-ide-process-stop)
                    (lambda (&rest _) (error "cci-test stop failed"))))
@@ -1152,6 +1166,1065 @@ The order holds also after the files are evaluated again."
         (let ((status (claude-code-ide--session-status)))
           (should (string-prefix-p "Provider for new instances: Codex\nproj" status))
           (should (string-match-p "port -" status)))))))
+
+;;; Stopped buffers
+
+(defun claude-code-ide-wiring-tests--stopped-start (&rest spec-args)
+  "Start an instance with SPEC-ARGS, and return the plist of the start.
+The plist also has :name, the name of the terminal buffer at the start."
+  (let ((started (claude-code-ide-wiring-tests--start
+                  (apply #'claude-code-ide-wiring-tests--spec spec-args))))
+    (append started (list :name (buffer-name (plist-get started :buffer))))))
+
+(defun claude-code-ide-wiring-tests--kept (name)
+  "Return the read-only buffer that the stop of the terminal NAME left, or nil."
+  (let ((buffer (get-buffer (concat name " [stopped]"))))
+    (and buffer
+         (with-current-buffer buffer
+           (and (derived-mode-p 'claude-code-ide-stopped-mode)
+                buffer-read-only
+                (string-prefix-p "Stopped at " header-line-format)))
+         buffer)))
+
+(ert-deftest claude-code-ide-test-wiring-keep-stopped-buffers-default ()
+  "By default, a stopped instance keeps its terminal buffer."
+  (should (eq t (eval (car (get 'claude-code-ide-keep-stopped-buffers 'standard-value)) t))))
+
+(ert-deftest claude-code-ide-test-wiring-cleanup-keeps-buffer ()
+  "The cleanup leaves a read-only copy of the terminal, and kills the terminal as before."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (session (plist-get started :session))
+               (instance (claude-code-ide-instance-of-session session))
+               (buffer (plist-get started :buffer))
+               (name (plist-get started :name)))
+          (with-current-buffer buffer
+            (setq default-directory "/tmp/cci-test-wiring/proj/")
+            (insert "cci-test last screen"))
+          (setq claude-code-ide--last-accessed-buffer buffer)
+          (claude-code-ide--cleanup-session session)
+          ;; The stop is the one of before
+          (should (equal (car calls)
+                         (list 'stop instance (list :process (plist-get started :process) :scan nil))))
+          (should-not (process-live-p (plist-get started :process)))
+          (should-not (claude-code-ide-instance-of-session session))
+          (should-not (buffer-live-p buffer))
+          ;; The copy has the text, the folder, and the project, and no session
+          (let ((kept (claude-code-ide-wiring-tests--kept name)))
+            (should kept)
+            (should-not (get-buffer name))
+            (should-not (claude-code-ide--session-buffer-p kept))
+            (should (equal (claude-code-ide--claude-buffer-project kept)
+                           (claude-code-ide-mcp-session-project-dir session)))
+            (should (eq kept (claude-code-ide--stopped-buffer-of session)))
+            (should-not (eq claude-code-ide--last-accessed-buffer kept))
+            (with-current-buffer kept
+              (should (equal (buffer-string) "cci-test last screen"))
+              (should (equal default-directory "/tmp/cci-test-wiring/proj/")))))))))
+
+(ert-deftest claude-code-ide-test-wiring-keep-stopped-buffer-once ()
+  "A second keep of a session returns the copy of the first one."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (session (plist-get started :session))
+               (buffer (plist-get started :buffer))
+               (first (claude-code-ide--keep-stopped-buffer buffer session)))
+          (should (bufferp first))
+          (should (eq first (claude-code-ide--keep-stopped-buffer buffer session)))
+          (should (eq first (claude-code-ide--stopped-buffer-of session)))
+          (should-not (get-buffer (concat (plist-get started :name) " [stopped]<2>"))))))))
+
+(ert-deftest claude-code-ide-test-wiring-stopped-buffer-drops-actions ()
+  "The copy keeps the faces of the text, and drops the properties that act."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (map (make-sparse-keymap)))
+          (with-current-buffer (plist-get started :buffer)
+            (insert (propertize "link" 'face 'bold 'keymap map 'mouse-face 'highlight
+                                'help-echo "open" 'read-only t
+                                'modification-hooks (list #'ignore)
+                                'cursor-sensor-functions (list #'ignore)
+                                'pointer 'hand)))
+          (claude-code-ide--cleanup-session (plist-get started :session))
+          (with-current-buffer (claude-code-ide-wiring-tests--kept (plist-get started :name))
+            (should (eq 'bold (get-text-property 1 'face)))
+            (should-not (get-text-property 1 'keymap))
+            (should-not (get-text-property 1 'mouse-face))
+            (should-not (get-text-property 1 'help-echo))
+            (should-not (get-text-property 1 'read-only))
+            (should-not (get-text-property 1 'modification-hooks))
+            (should-not (get-text-property 1 'cursor-sensor-functions))
+            (should-not (get-text-property 1 'pointer))))))))
+
+(ert-deftest claude-code-ide-test-wiring-stopped-buffer-error-goes-on ()
+  "An error in the copy leaves no copy, and the stop goes on."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t)
+          (claude-code-ide-stopped-mode-hook
+           (list (lambda () (error "cci-test hook failed")))))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (session (plist-get started :session)))
+          (cl-letf (((symbol-function 'message) #'ignore))
+            (claude-code-ide--cleanup-session session))
+          (should-not (buffer-live-p (plist-get started :buffer)))
+          (should-not (claude-code-ide-instance-of-session session))
+          (should-not (claude-code-ide--stopped-buffer-of session))
+          (should-not (get-buffer (concat (plist-get started :name) " [stopped]"))))))))
+
+(ert-deftest claude-code-ide-test-wiring-stopped-buffer-refused-kill ()
+  "A refused kill of the terminal drops the copy, and the terminal shows again.
+Only a stop without the process file kills the buffer at once."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (session (plist-get started :session))
+               (buffer (plist-get started :buffer)))
+          (cl-letf (((symbol-function 'claude-code-ide-process-stop-later) nil))
+            (save-window-excursion
+              (let ((window (display-buffer-in-side-window buffer '((side . right))))
+                    (kill-buffer-query-functions (list (lambda () nil))))
+                (claude-code-ide--stop-session session)
+                (should (buffer-live-p buffer))
+                (should (eq (window-buffer window) buffer))
+                (should-not (claude-code-ide--stopped-buffer-of session))
+                (should-not (get-buffer (concat (plist-get started :name) " [stopped]")))
+                (should-not (claude-code-ide-mcp-session-cleanup-done session))))))))))
+
+(ert-deftest claude-code-ide-test-wiring-quit-keeps-no-buffer ()
+  "The quit of Emacs leaves no copy, also from the sentinels of its wait."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t)
+          (claude-code-ide-process-quit-timeout 1.5))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((a (claude-code-ide-wiring-tests--stopped-start))
+               (b (claude-code-ide-wiring-tests--stopped-start :instance-name "b")))
+          ;; The wait of the quit ends a CLI, and its sentinel cleans up
+          (cl-letf (((symbol-function 'claude-code-ide-process-stop-many)
+                     (lambda (&rest _)
+                       (delete-process (plist-get a :process))
+                       (accept-process-output nil 0.05))))
+            (claude-code-ide--cleanup-all-sessions))
+          (dolist (started (list a b))
+            (should (claude-code-ide-mcp-session-cleanup-done (plist-get started :session)))
+            (should-not (claude-code-ide--stopped-buffer-of (plist-get started :session)))
+            (should-not (get-buffer (concat (plist-get started :name) " [stopped]")))))))))
+
+(ert-deftest claude-code-ide-test-wiring-aborted-start-keeps-no-buffer ()
+  "A start that fails after its terminal exists leaves no copy."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t)
+          (name nil))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (should-error
+         (claude-code-ide-wiring-tests--start
+          (claude-code-ide-wiring-tests--spec)
+          :call (lambda ()
+                  (cl-letf (((symbol-function 'claude-code-ide--display-buffer-in-side-window)
+                             (lambda (buffer)
+                               (setq name (buffer-name buffer))
+                               (error "cci-test display failed"))))
+                    (claude-code-ide--start-session
+                     nil nil (claude-code-ide-wiring-tests--spec))))))
+        (should name)
+        (should-not (get-buffer name))
+        (should-not (get-buffer (concat name " [stopped]")))))))
+
+(ert-deftest claude-code-ide-test-wiring-toggle-hides-stopped-windows ()
+  "The toggle commands close the windows of stopped buffers too."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (dir (claude-code-ide-mcp-session-project-dir (plist-get started :session))))
+          (claude-code-ide--cleanup-session (plist-get started :session))
+          (let ((kept (claude-code-ide-wiring-tests--kept (plist-get started :name))))
+            (save-window-excursion
+              ;; The project has no instance now, only the stopped buffer
+              (let ((window (display-buffer-in-side-window kept '((side . right)))))
+                (cl-letf (((symbol-function 'claude-code-ide--get-working-directory)
+                           (lambda () dir)))
+                  (claude-code-ide-toggle))
+                (should-not (window-live-p window)))
+              (let ((window (display-buffer-in-side-window kept '((side . right)))))
+                (cl-letf (((symbol-function 'message) #'ignore))
+                  (claude-code-ide-toggle-recent))
+                (should-not (window-live-p window))))))))))
+
+(ert-deftest claude-code-ide-test-wiring-stopped-buffer-has-no-terminal-keys ()
+  "A kept buffer has the keys of its own mode, not those of the terminal."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (buffer (plist-get started :buffer)))
+          (with-current-buffer buffer
+            (local-set-key (kbd "C-<escape>") #'claude-code-ide-send-escape))
+          (claude-code-ide--cleanup-session (plist-get started :session))
+          (with-current-buffer (claude-code-ide-wiring-tests--kept (plist-get started :name))
+            (should (eq (current-local-map) claude-code-ide-stopped-mode-map))
+            (should-not (eq (key-binding (kbd "C-<escape>")) #'claude-code-ide-send-escape))))))))
+
+(ert-deftest claude-code-ide-test-wiring-cleanup-kills-buffer-when-off ()
+  "With `claude-code-ide-keep-stopped-buffers' nil, the cleanup leaves no copy."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers nil))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (session (plist-get started :session)))
+          (claude-code-ide--cleanup-session session)
+          (should-not (buffer-live-p (plist-get started :buffer)))
+          (should-not (claude-code-ide--stopped-buffer-of session))
+          (should-not (get-buffer (concat (plist-get started :name) " [stopped]"))))))))
+
+(ert-deftest claude-code-ide-test-wiring-cli-exit-keeps-buffer ()
+  "A CLI that ends by itself leaves a copy, through the sentinel."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (session (plist-get started :session))
+               (instance (claude-code-ide-instance-of-session session)))
+          (delete-process (plist-get started :process))
+          (should (claude-code-ide-tests--wait-until
+                   (lambda () (claude-code-ide-mcp-session-cleanup-done session))))
+          (should (equal (car calls) (list 'untrack instance)))
+          (should-not (buffer-live-p (plist-get started :buffer)))
+          (should (claude-code-ide-wiring-tests--kept (plist-get started :name))))))))
+
+(ert-deftest claude-code-ide-test-wiring-buffer-kill-still-kills ()
+  "A kill of the terminal buffer of a running instance ends it, and leaves no copy."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (session (plist-get started :session))
+               (instance (claude-code-ide-instance-of-session session))
+               (buffer (plist-get started :buffer)))
+          (kill-buffer buffer)
+          (should (claude-code-ide-mcp-session-cleanup-done session))
+          (should-not (buffer-live-p buffer))
+          (should-not (claude-code-ide--stopped-buffer-of session))
+          (should (equal (car calls)
+                         (list 'stop-later instance
+                               (list :process (plist-get started :process) :scan nil)))))))))
+
+(ert-deftest claude-code-ide-test-wiring-stop-session-keeps-buffer ()
+  "The stop ends the CLI softly first; its exit leaves the copy, with all output."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let ((claude-code-ide-keep-stopped-buffers t))
+          (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+                 (session (plist-get started :session))
+                 (instance (claude-code-ide-instance-of-session session))
+                 (buffer (plist-get started :buffer))
+                 (process (plist-get started :process)))
+            (should (claude-code-ide--claude-stop instance))
+            ;; The soft end of the provider, from timers; the buffer stays
+            ;; a terminal of its session until the CLI exits
+            (let ((call (car calls)))
+              (should (eq 'stop-later (nth 0 call)))
+              (should (eq instance (nth 1 call)))
+              (should (eq process (plist-get (nth 2 call) :process)))
+              (should (plist-member (nth 2 call) :soft-end))
+              (should-not (plist-get (nth 2 call) :soft-end))
+              (should (functionp (plist-get (nth 2 call) :callback))))
+            (should (eq session (claude-code-ide--buffer-session buffer)))
+            (should (claude-code-ide-instance-of-session session))
+            (should-not (claude-code-ide--stopped-buffer-of session))
+            ;; A second stop while the first one runs starts no other stop
+            (claude-code-ide--stop-session session)
+            (should (= 1 (cl-count 'stop-later (mapcar #'car calls))))
+            ;; The output after the soft end is in the copy
+            (with-current-buffer buffer (insert "cci-test last words"))
+            (delete-process process)
+            (should (claude-code-ide-tests--wait-until
+                     (lambda () (claude-code-ide-mcp-session-cleanup-done session))))
+            (should-not (buffer-live-p buffer))
+            (should-not (claude-code-ide-instance-of-session session))
+            (with-current-buffer (claude-code-ide-wiring-tests--kept (plist-get started :name))
+              (should (string-match-p "cci-test last words" (buffer-string))))))
+        (let ((claude-code-ide-keep-stopped-buffers nil))
+          (let* ((started (claude-code-ide-wiring-tests--stopped-start :instance-name "off"))
+                 (session (plist-get started :session)))
+            (claude-code-ide--stop-session session)
+            (should-not (buffer-live-p (plist-get started :buffer)))
+            (should-not (claude-code-ide--stopped-buffer-of session))))))))
+
+(ert-deftest claude-code-ide-test-wiring-stop-all-keeps-buffers ()
+  "`claude-code-ide-stop-all' leaves a copy of each buffer, as each other stop does."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((a (claude-code-ide-wiring-tests--stopped-start))
+               (b (claude-code-ide-wiring-tests--stopped-start :instance-name "b")))
+          (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
+                    ((symbol-function 'claude-code-ide-log) #'ignore))
+            (claude-code-ide-stop-all t))
+          (should (equal '(stop-later stop-later) (mapcar #'car calls)))
+          (dolist (started (list a b))
+            (delete-process (plist-get started :process)))
+          (dolist (started (list a b))
+            (should (claude-code-ide-tests--wait-until
+                     (lambda () (claude-code-ide-mcp-session-cleanup-done (plist-get started :session)))))
+            (should (claude-code-ide--stopped-buffer-of (plist-get started :session)))))))))
+
+(ert-deftest claude-code-ide-test-wiring-stopped-buffer-names ()
+  "Two stopped buffers of one name get two names; the old name is free."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((first (claude-code-ide-wiring-tests--stopped-start))
+               (name (plist-get first :name)))
+          (claude-code-ide--cleanup-session (plist-get first :session))
+          ;; A second buffer of the same name, as a new start makes it
+          (let ((second (claude-code-ide-wiring-tests--stopped-start :instance-name "two")))
+            (with-current-buffer (plist-get second :buffer) (rename-buffer name))
+            (claude-code-ide--cleanup-session (plist-get second :session))
+            (let ((one (claude-code-ide--stopped-buffer-of (plist-get first :session)))
+                  (two (claude-code-ide--stopped-buffer-of (plist-get second :session))))
+              (should (buffer-live-p one))
+              (should (buffer-live-p two))
+              (should-not (equal (buffer-name one) (buffer-name two))))
+            (should-not (get-buffer name))))))))
+
+(ert-deftest claude-code-ide-test-wiring-stopped-buffer-takes-windows ()
+  "The copy takes the windows of the terminal, and keeps their dedicated flag."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (buffer (plist-get started :buffer)))
+          (save-window-excursion
+            (let ((window (display-buffer-in-side-window buffer '((side . right)))))
+              (set-window-dedicated-p window t)
+              (claude-code-ide--cleanup-session (plist-get started :session))
+              (should (window-live-p window))
+              (should (eq (window-buffer window)
+                          (claude-code-ide-wiring-tests--kept (plist-get started :name))))
+              (should (eq t (window-dedicated-p window))))))))))
+
+(ert-deftest claude-code-ide-test-wiring-failed-start-names-kept-buffer ()
+  "A CLI that ends at once after its start leaves its output in a named buffer."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t)
+          (dead (start-process "cci-test-dead" nil "true")))
+      (push dead claude-code-ide-wiring-tests--objects)
+      (should (claude-code-ide-tests--wait-until (lambda () (not (process-live-p dead)))))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let ((err (should-error (claude-code-ide-wiring-tests--start
+                                  (claude-code-ide-wiring-tests--spec) :process dead))))
+          (should (string-match "Its output is in the buffer \\(.*\\)\\'"
+                                (error-message-string err)))
+          (let ((buffer (get-buffer (match-string 1 (error-message-string err)))))
+            (should (buffer-live-p buffer))
+            (should (eq (buffer-local-value 'major-mode buffer) 'claude-code-ide-stopped-mode))))))))
+
+(ert-deftest claude-code-ide-test-wiring-stopped-buffer-side-windows ()
+  "The project scope and a new tab treat a kept buffer as a buffer of its project."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (dir (claude-code-ide-mcp-session-project-dir (plist-get started :session))))
+          (claude-code-ide--cleanup-session (plist-get started :session))
+          (let ((kept (claude-code-ide-wiring-tests--kept (plist-get started :name))))
+            (save-window-excursion
+              ;; Another project: its scope removes the side window
+              (let ((window (display-buffer-in-side-window kept '((side . right)))))
+                (should (window-live-p window))
+                (claude-code-ide--hide-foreign-side-windows "/tmp/cci-test-wiring/other/")
+                (should-not (window-live-p window)))
+              ;; Its own project: the window stays
+              (let ((window (display-buffer-in-side-window kept '((side . right)))))
+                (claude-code-ide--hide-foreign-side-windows dir)
+                (should (window-live-p window))
+                ;; A new tab removes it, as a window of a running instance
+                (claude-code-ide--strip-new-tab-claude-windows)
+                (should-not (window-live-p window))))))))))
+
+(ert-deftest claude-code-ide-test-wiring-kill-stopped-buffers ()
+  "`claude-code-ide-kill-stopped-buffers' kills the stopped buffers of a project."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((here (claude-code-ide-wiring-tests--stopped-start))
+               (running (claude-code-ide-wiring-tests--stopped-start :instance-name "run"))
+               (other (claude-code-ide-wiring-tests--start
+                       (claude-code-ide-start-spec-create :directory "/tmp/cci-test-wiring/other/")))
+               (dir (claude-code-ide-mcp-session-project-dir (plist-get here :session))))
+          (claude-code-ide--cleanup-session (plist-get here :session))
+          (claude-code-ide--cleanup-session (plist-get other :session))
+          (let ((here-kept (claude-code-ide--stopped-buffer-of (plist-get here :session)))
+                (other-kept (claude-code-ide--stopped-buffer-of (plist-get other :session))))
+            ;; Only the stopped buffers of the project go; a running one stays
+            (should (= 1 (claude-code-ide-kill-stopped-buffers dir)))
+            (should-not (buffer-live-p here-kept))
+            (should (buffer-live-p (plist-get running :buffer)))
+            (should (buffer-live-p other-kept))
+            ;; All projects, among the buffers of this test only, so that
+            ;; a run in a working Emacs kills none of its stopped buffers
+            (cl-letf (((symbol-function 'buffer-list)
+                       (let ((mine (list other-kept (plist-get running :buffer))))
+                         (lambda (&rest _) mine))))
+              (should (= 1 (claude-code-ide-kill-stopped-buffers nil t))))
+            (should-not (buffer-live-p other-kept))
+            (should (buffer-live-p (plist-get running :buffer)))))))))
+
+(ert-deftest claude-code-ide-test-wiring-stopped-buffer-flushes-output ()
+  "The copy has the output that the backends and the render queue had not drawn."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (drawn nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (buffer (plist-get started :buffer))
+               (draw (lambda (text)
+                       (lambda (&rest _)
+                         (push text drawn)
+                         (with-current-buffer buffer
+                           (let ((inhibit-read-only t))
+                             (goto-char (point-max))
+                             (insert text)))))))
+          (with-current-buffer buffer
+            ;; Each backend has output that waits for a timer
+            (set (make-local-variable 'claude-code-ide--vterm-render-flush)
+                 (funcall draw "queue;"))
+            (set (make-local-variable 'vterm--redraw-timer) (run-at-time 3600 nil #'ignore))
+            (set (make-local-variable 'eat--pending-output-chunks) (list "chunk"))
+            (set (make-local-variable 'ghostel--redraw-timer) (run-at-time 3600 nil #'ignore)))
+          (cl-letf (((symbol-function 'vterm--delayed-redraw) (funcall draw "vterm;"))
+                    ((symbol-function 'eat--process-output-queue) (funcall draw "eat;"))
+                    ((symbol-function 'ghostel--redraw-now) (funcall draw "ghostel;")))
+            (claude-code-ide--cleanup-session (plist-get started :session)))
+          (should (equal (reverse drawn) '("queue;" "vterm;" "eat;" "ghostel;")))
+          (with-current-buffer (claude-code-ide-wiring-tests--kept (plist-get started :name))
+            (should (equal (buffer-string) "queue;vterm;eat;ghostel;"))))))))
+
+(ert-deftest claude-code-ide-test-wiring-stopped-buffer-flush-error-goes-on ()
+  "An error of a backend in the flush still leaves a copy."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let ((started (claude-code-ide-wiring-tests--stopped-start)))
+          (with-current-buffer (plist-get started :buffer)
+            (set (make-local-variable 'vterm--redraw-timer) (run-at-time 3600 nil #'ignore)))
+          (cl-letf (((symbol-function 'vterm--delayed-redraw)
+                     (lambda (&rest _) (error "cci-test redraw failed"))))
+            (claude-code-ide--cleanup-session (plist-get started :session)))
+          (should (claude-code-ide-wiring-tests--kept (plist-get started :name))))))))
+
+(ert-deftest claude-code-ide-test-wiring-stopped-buffer-revert ()
+  "A revert of a kept buffer gives a message, not an error."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (said nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let ((started (claude-code-ide-wiring-tests--stopped-start)))
+          (claude-code-ide--cleanup-session (plist-get started :session))
+          (with-current-buffer (claude-code-ide-wiring-tests--kept (plist-get started :name))
+            (should (eq (key-binding (kbd "g")) #'revert-buffer))
+            (cl-letf (((symbol-function 'message)
+                       (lambda (format-string &rest args)
+                         (setq said (apply #'format format-string args)))))
+              (revert-buffer))
+            (should (string-match-p "stopped instance" said))))))))
+
+(ert-deftest claude-code-ide-test-wiring-stopped-buffer-other-mode ()
+  "A kept buffer in another major mode stays a buffer of its project."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (dir (claude-code-ide-mcp-session-project-dir (plist-get started :session))))
+          (claude-code-ide--cleanup-session (plist-get started :session))
+          (let ((kept (claude-code-ide-wiring-tests--kept (plist-get started :name))))
+            (with-current-buffer kept
+              (text-mode)
+              (should (equal claude-code-ide--stopped-project dir)))
+            (should (= 1 (claude-code-ide-kill-stopped-buffers dir)))
+            (should-not (buffer-live-p kept))))))))
+
+(ert-deftest claude-code-ide-test-wiring-kill-stopped-buffers-message ()
+  "The kill command reports its count when it is called interactively."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (said nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (dir (claude-code-ide-mcp-session-project-dir (plist-get started :session))))
+          (claude-code-ide--cleanup-session (plist-get started :session))
+          (cl-letf (((symbol-function 'claude-code-ide--get-working-directory) (lambda () dir))
+                    ((symbol-function 'message)
+                     (lambda (format-string &rest args)
+                       (setq said (apply #'format format-string args)))))
+            (call-interactively #'claude-code-ide-kill-stopped-buffers))
+          (should (equal said "Killed 1 stopped buffer"))
+          (should-not (claude-code-ide--stopped-buffer-of (plist-get started :session))))))))
+
+(ert-deftest claude-code-ide-test-wiring-toggle-without-instances ()
+  "The toggle refuses without an instance, and the pick without one too."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (dir (claude-code-ide-mcp-session-project-dir (plist-get started :session))))
+          (claude-code-ide--cleanup-session (plist-get started :session))
+          (cl-letf (((symbol-function 'claude-code-ide--get-working-directory) (lambda () dir)))
+            (save-window-excursion
+              ;; No instance and no visible stopped buffer
+              (delete-other-windows)
+              (switch-to-buffer (get-buffer-create "*scratch*"))
+              (should-error (claude-code-ide-toggle) :type 'user-error)
+              ;; A visible stopped buffer: the pick still needs an instance
+              (display-buffer-in-side-window
+               (claude-code-ide-wiring-tests--kept (plist-get started :name)) '((side . right)))
+              (should-error (claude-code-ide-toggle t) :type 'user-error))))))))
+
+(ert-deftest claude-code-ide-test-wiring-eat-exit-setting-off ()
+  "An eat terminal gets no kill at its exit from eat; the cleanup decides."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (started nil))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (setq started
+              (claude-code-ide-wiring-tests--start
+               (claude-code-ide-wiring-tests--spec)
+               :call (lambda ()
+                       (let ((claude-code-ide-terminal-backend 'eat))
+                         (claude-code-ide--start-session
+                          nil nil (claude-code-ide-wiring-tests--spec))))))
+        (with-current-buffer (plist-get started :buffer)
+          (should (local-variable-p 'eat-kill-buffer-on-exit))
+          (should-not eat-kill-buffer-on-exit))))))
+
+(ert-deftest claude-code-ide-test-wiring-stop-message-first ()
+  "`claude-code-ide-stop' reports the stop before it stops."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (order nil)
+          (kill-buffer-query-functions nil))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let ((started (claude-code-ide-wiring-tests--stopped-start)))
+          (cl-letf (((symbol-function 'claude-code-ide--resolve-session)
+                     (lambda (&rest _) (plist-get started :session)))
+                    ((symbol-function 'claude-code-ide-log)
+                     (lambda (&rest _) (push 'log order)))
+                    ((symbol-function 'claude-code-ide--stop-session)
+                     (lambda (_session) (push 'stop order))))
+            (claude-code-ide-stop))
+          (should (equal (reverse order) '(log stop))))))))
+
+(ert-deftest claude-code-ide-test-wiring-failed-start-without-keep ()
+  "With the option nil, a CLI that ends at once leaves no copy, and the message names none."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers nil)
+          (dead (start-process "cci-test-dead" nil "true")))
+      (push dead claude-code-ide-wiring-tests--objects)
+      (should (claude-code-ide-tests--wait-until (lambda () (not (process-live-p dead)))))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let ((err (should-error (claude-code-ide-wiring-tests--start
+                                  (claude-code-ide-wiring-tests--spec) :process dead))))
+          (should (string-match-p "exited immediately" (error-message-string err)))
+          (should-not (string-match-p "Its output" (error-message-string err)))
+          (should-not (cl-find-if (lambda (b)
+                                    (string-suffix-p " [stopped]" (buffer-name b)))
+                                  claude-code-ide-tests--stopped-copies)))))))
+
+(ert-deftest claude-code-ide-test-wiring-claude-buffer-project ()
+  "The project of a terminal buffer comes from its session, of a kept buffer from its marker."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (session (plist-get started :session))
+               (dir (claude-code-ide-mcp-session-project-dir session)))
+          (should (equal (claude-code-ide--claude-buffer-project (plist-get started :buffer)) dir))
+          (with-temp-buffer
+            (should-not (claude-code-ide--claude-buffer-project (current-buffer))))
+          (claude-code-ide--cleanup-session session)
+          (should-not (claude-code-ide--claude-buffer-project (plist-get started :buffer)))
+          (should (equal (claude-code-ide--claude-buffer-project
+                          (claude-code-ide--stopped-buffer-of session))
+                         dir))
+          ;; A drop without a copy does nothing
+          (setf (claude-code-ide-mcp-session-stopped-buffer session) nil)
+          (should-not (claude-code-ide--drop-stopped-buffer (plist-get started :buffer) session)))))))
+
+(ert-deftest claude-code-ide-test-wiring-soft-stop-end-without-exit ()
+  "When the stop ends and the CLI still runs, the stop kills the terminal, with a copy."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (session (plist-get started :session)))
+          (claude-code-ide--stop-session session)
+          (funcall (plist-get (nth 2 (car calls)) :callback) '(:status timeout))
+          (should (claude-code-ide-mcp-session-cleanup-done session))
+          (should-not (buffer-live-p (plist-get started :buffer)))
+          (should (claude-code-ide-wiring-tests--kept (plist-get started :name))))))))
+
+(ert-deftest claude-code-ide-test-wiring-stop-without-process-file-kills ()
+  "Without the process file, the stop makes the copy, and kills the terminal at once."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (session (plist-get started :session)))
+          (cl-letf (((symbol-function 'claude-code-ide-process-stop-later) nil)
+                    ((symbol-function 'claude-code-ide-process-stop) nil))
+            (claude-code-ide--stop-session session))
+          (should (claude-code-ide-mcp-session-cleanup-done session))
+          (should-not (buffer-live-p (plist-get started :buffer)))
+          (should (claude-code-ide-wiring-tests--kept (plist-get started :name))))))))
+
+(ert-deftest claude-code-ide-test-wiring-vterm-queue-after-exit ()
+  "The queued vterm output reaches the terminal also after the exit of its process."
+  (let ((buffer (generate-new-buffer "*cci-test-queue*"))
+        (process nil)
+        (drawn nil)
+        (claude-code-ide-vterm-anti-flicker t)
+        (claude-code-ide-vterm-render-delay 3600))
+    (unwind-protect
+        (progn
+          (setq process (start-process "cci-test-queue" buffer "sleep" "30"))
+          (set-process-query-on-exit-flag process nil)
+          (with-current-buffer buffer
+            (setq-local claude-code-ide--session 'cci-test-session))
+          ;; A full redraw goes to the queue
+          (claude-code-ide--vterm-smart-renderer
+           (lambda (proc data) (push (list proc data) drawn))
+           process "\033[2A\033[Kone\033[2A\033[Ktwo")
+          (should-not drawn)
+          ;; The process exits: Emacs removes it before its sentinel runs
+          (delete-process process)
+          (should-not (get-buffer-process buffer))
+          (claude-code-ide--flush-terminal-output buffer)
+          (should (equal drawn (list (list process "\033[2A\033[Kone\033[2A\033[Ktwo"))))
+          (with-current-buffer buffer
+            (should-not claude-code-ide--vterm-render-queue)
+            (should-not claude-code-ide--vterm-render-timer)))
+      (when (process-live-p process) (delete-process process))
+      (let ((kill-buffer-query-functions nil)) (kill-buffer buffer)))))
+
+(ert-deftest claude-code-ide-test-wiring-stopped-buffer-old-session-layout ()
+  "A session of the layout before the copy slot gets no copy, and its stop goes on."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (session (plist-get started :session))
+               (size (length (cl-struct-slot-info 'claude-code-ide-mcp-session)))
+               (old (apply #'record (aref session 0)
+                           (cl-loop for i from 1 below (1- size) collect (aref session i)))))
+          ;; As after a reload: the running session has the old layout
+          (should-error (claude-code-ide-mcp-session-stopped-buffer old))
+          (cl-letf (((symbol-function 'message) #'ignore))
+            (should-not (claude-code-ide--keep-stopped-buffer (plist-get started :buffer) old))
+            (should-not (claude-code-ide--stopped-buffer-of old))))))))
+
+(ert-deftest claude-code-ide-test-wiring-stopped-buffer-keeps-its-slot ()
+  "A visible copy keeps its side-window slot; a new instance takes the next one."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (session (plist-get started :session))
+               (dir (claude-code-ide-mcp-session-project-dir session)))
+          (setf (claude-code-ide-mcp-session-window-slot session) 0)
+          (save-window-excursion
+            (display-buffer-in-side-window (plist-get started :buffer) '((side . right) (slot . 0)))
+            (claude-code-ide--cleanup-session session)
+            (should (get-buffer-window (claude-code-ide--stopped-buffer-of session)))
+            (let ((claude-code-ide-side-window-scope 'project))
+              (should (= 1 (claude-code-ide--assign-window-slot dir))))
+            (let ((claude-code-ide-side-window-scope 'all))
+              (should (= 1 (claude-code-ide--assign-window-slot dir))))
+            ;; A copy that no window shows frees its slot
+            (delete-window (get-buffer-window (claude-code-ide--stopped-buffer-of session)))
+            (let ((claude-code-ide-side-window-scope 'project))
+              (should (= 0 (claude-code-ide--assign-window-slot dir))))))))))
+
+(ert-deftest claude-code-ide-test-wiring-stopped-buffer-keeps-tab-hook ()
+  "After the last stop, a copy keeps the hook that cleans up new tabs."
+  (skip-unless (boundp 'tab-bar-tab-post-open-functions))
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (tab-bar-tab-post-open-functions nil))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let ((claude-code-ide-keep-stopped-buffers t)
+              (started (claude-code-ide-wiring-tests--stopped-start)))
+          (add-hook 'tab-bar-tab-post-open-functions #'claude-code-ide--strip-new-tab-claude-windows)
+          (claude-code-ide--cleanup-session (plist-get started :session))
+          (should (memq #'claude-code-ide--strip-new-tab-claude-windows
+                        tab-bar-tab-post-open-functions)))
+        ;; Without a copy, the last stop removes it, as before.  The
+        ;; buffers of this stop only, so that the copy above, and those
+        ;; of a working Emacs, stay
+        (let ((claude-code-ide-keep-stopped-buffers nil)
+              (started (claude-code-ide-wiring-tests--stopped-start :instance-name "two")))
+          (add-hook 'tab-bar-tab-post-open-functions #'claude-code-ide--strip-new-tab-claude-windows)
+          (cl-letf (((symbol-function 'buffer-list)
+                     (let ((mine (list (plist-get started :buffer))))
+                       (lambda (&rest _) mine))))
+            (claude-code-ide--cleanup-session (plist-get started :session)))
+          (should-not (memq #'claude-code-ide--strip-new-tab-claude-windows
+                            tab-bar-tab-post-open-functions)))))))
+
+(ert-deftest claude-code-ide-test-wiring-stopped-buffer-flush-error-logged ()
+  "A failed flush step goes to the debug log."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t)
+          (claude-code-ide-debug t)
+          (claude-code-ide-debug-buffer " *cci-test-flush-debug*"))
+      (unwind-protect
+          (claude-code-ide-wiring-tests--with-process-stubs calls
+            (let ((started (claude-code-ide-wiring-tests--stopped-start)))
+              (with-current-buffer (plist-get started :buffer)
+                (set (make-local-variable 'vterm--redraw-timer) (run-at-time 3600 nil #'ignore)))
+              (cl-letf (((symbol-function 'vterm--delayed-redraw)
+                         (lambda (&rest _) (error "cci-test redraw failed")))
+                        ((symbol-function 'claude-code-ide-debug)
+                         ;; The test loader replaces the macro with a function
+                         ;; that drops the text; compiled code has the macro
+                         (if (macrop 'claude-code-ide-debug)
+                             (symbol-function 'claude-code-ide-debug)
+                           (lambda (format-string &rest args)
+                             (with-current-buffer (get-buffer-create claude-code-ide-debug-buffer)
+                               (goto-char (point-max))
+                               (insert (apply #'format format-string args) "\n"))))))
+                (claude-code-ide--cleanup-session (plist-get started :session)))
+              (should (string-match-p "cci-test redraw failed"
+                                      (with-current-buffer (get-buffer-create claude-code-ide-debug-buffer)
+                                        (buffer-string))))
+              (should (claude-code-ide-wiring-tests--kept (plist-get started :name)))))
+        (when (get-buffer claude-code-ide-debug-buffer)
+          (kill-buffer claude-code-ide-debug-buffer))))))
+
+(ert-deftest claude-code-ide-test-wiring-soft-stop-has-a-limit ()
+  "A soft stop whose CLI does not exit in time kills the terminal, with a copy."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (timers nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (session (plist-get started :session)))
+          (cl-letf (((symbol-function 'run-at-time)
+                     (lambda (time _repeat function &rest args)
+                       (push (list time function args) timers))))
+            (claude-code-ide--stop-session session))
+          ;; The stop job never ends here; the limit is one timer
+          (should (eq 'stop-later (car (car calls))))
+          (should (= 1 (length timers)))
+          (should (<= (nth 0 (car timers)) 10))
+          (should-not (claude-code-ide-mcp-session-cleanup-done session))
+          (apply (nth 1 (car timers)) (nth 2 (car timers)))
+          (should (claude-code-ide-mcp-session-cleanup-done session))
+          (should-not (buffer-live-p (plist-get started :buffer)))
+          (should (claude-code-ide-wiring-tests--kept (plist-get started :name))))))))
+
+(ert-deftest claude-code-ide-test-wiring-soft-stop-undone-by-refused-kill ()
+  "A refused kill at the end of a soft stop undoes the stop: a later stop works.
+A second stop while the first one runs logs that the instance is already stopping."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (timers nil)
+          (logs nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (session (plist-get started :session))
+               (buffer (plist-get started :buffer))
+               (process (plist-get started :process)))
+          (cl-letf (((symbol-function 'run-at-time)
+                     (lambda (time _repeat function &rest args)
+                       (push (list time function args) timers)
+                       'cci-test-timer))
+                    ((symbol-function 'claude-code-ide-log)
+                     (lambda (format-string &rest args)
+                       (push (apply #'format format-string args) logs))))
+            (claude-code-ide--stop-session session)
+            (claude-code-ide--stop-session session)
+            (should (= 1 (cl-count 'stop-later (mapcar #'car calls))))
+            (should (cl-some (lambda (text) (string-match-p "already stopping" text)) logs))
+            ;; The limit comes; the kill of the terminal is refused
+            (let ((kill-buffer-query-functions (list (lambda () nil))))
+              (apply (nth 1 (car timers)) (nth 2 (car timers))))
+            (should (buffer-live-p buffer))
+            (should-not (claude-code-ide-mcp-session-cleanup-done session))
+            (should-not (process-get process 'claude-code-ide--stopping))
+            ;; The end of the stop job does not ask again
+            (let ((kill-buffer-query-functions
+                   (list (lambda () (error "cci-test asked again")))))
+              (funcall (plist-get (nth 2 (car calls)) :callback) '(:status timeout)))
+            ;; A new stop starts a new soft stop
+            (claude-code-ide--stop-session session)
+            (should (= 2 (cl-count 'stop-later (mapcar #'car calls))))))))))
+
+(ert-deftest claude-code-ide-test-wiring-soft-stop-job-error ()
+  "An error of the stop job falls back to the kill of the terminal, with a copy."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (session (plist-get started :session)))
+          (cl-letf (((symbol-function 'claude-code-ide-process-stop-later)
+                     (lambda (&rest _) (error "cci-test stop job failed")))
+                    ((symbol-function 'message) #'ignore))
+            (claude-code-ide--stop-session session))
+          (should (claude-code-ide-mcp-session-cleanup-done session))
+          (should-not (buffer-live-p (plist-get started :buffer)))
+          (should (claude-code-ide-wiring-tests--kept (plist-get started :name))))))))
+
+(ert-deftest claude-code-ide-test-wiring-soft-stop-reports-killed ()
+  "A CLI that exits during a soft stop ends as `killed', without its exit message."
+  (claude-code-ide-wiring-tests--with-clean
+    (let* ((calls nil)
+           (reasons nil)
+           (exit-messages nil)
+           (kill-buffer-query-functions nil)
+           (claude-code-ide-keep-stopped-buffers t)
+           (claude-code-ide-session-end-functions
+            (list (lambda (_session reason) (push reason reasons))))
+           (process-connection-type nil)
+           (process (start-process "cci-test-exit-3" nil "sh" "-c" "read x; exit 3"))
+           (provider-call (symbol-function 'claude-code-ide-provider-call)))
+      (set-process-query-on-exit-flag process nil)
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (cl-letf (((symbol-function 'claude-code-ide-provider-call)
+                   (lambda (provider operation &rest args)
+                     (if (eq operation 'exit-message)
+                         (progn (push (car args) exit-messages) "cci-test exit message")
+                       (apply provider-call provider operation args)))))
+          (let* ((started (claude-code-ide-wiring-tests--start
+                           (claude-code-ide-wiring-tests--spec) :process process))
+                 (session (plist-get started :session)))
+            (claude-code-ide--stop-session session)
+            ;; The CLI exits with an error after its soft end
+            (process-send-eof process)
+            (should (claude-code-ide-tests--wait-until
+                     (lambda () (claude-code-ide-mcp-session-cleanup-done session))))
+            (should (equal reasons '(killed)))
+            (should-not exit-messages)))))))
+
+(ert-deftest claude-code-ide-test-wiring-soft-stop-holds-inbox ()
+  "A soft stop holds the inbox delivery until the CLI exits, or the stop is undone.
+A hold of another owner, such as a handover, stays."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (timers nil)
+          (claude-code-ide-control--held nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        ;; The CLI exits: the hold ends
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (session (plist-get started :session))
+               (id (claude-code-ide-instance-id (claude-code-ide-instance-of-session session)))
+               (kill-buffer-query-functions nil))
+          (claude-code-ide--stop-session session)
+          (should (claude-code-ide-control-held-p id))
+          (delete-process (plist-get started :process))
+          (should (claude-code-ide-tests--wait-until
+                   (lambda () (claude-code-ide-mcp-session-cleanup-done session))))
+          (should-not (claude-code-ide-control-held-p id)))
+        ;; A refused kill undoes the stop: the hold ends
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start :instance-name "refused"))
+               (session (plist-get started :session))
+               (id (claude-code-ide-instance-id (claude-code-ide-instance-of-session session))))
+          (cl-letf (((symbol-function 'run-at-time)
+                     (lambda (time _repeat function &rest args)
+                       (push (list time function args) timers)
+                       'cci-test-timer)))
+            (claude-code-ide--stop-session session)
+            (should (claude-code-ide-control-held-p id))
+            (let ((kill-buffer-query-functions (list (lambda () nil))))
+              (apply (nth 1 (car timers)) (nth 2 (car timers))))
+            (should-not (claude-code-ide-mcp-session-cleanup-done session))
+            (should-not (claude-code-ide-control-held-p id))))
+        ;; The hold of a handover stays after the stop
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start :instance-name "handover"))
+               (session (plist-get started :session))
+               (id (claude-code-ide-instance-id (claude-code-ide-instance-of-session session)))
+               (kill-buffer-query-functions nil))
+          (claude-code-ide-control-hold id)
+          (claude-code-ide--stop-session session)
+          (delete-process (plist-get started :process))
+          (should (claude-code-ide-tests--wait-until
+                   (lambda () (claude-code-ide-mcp-session-cleanup-done session))))
+          (should (claude-code-ide-control-held-p id)))))))
+
+(ert-deftest claude-code-ide-test-wiring-stopped-buffer-tab-hook-every-path ()
+  "A copy keeps the hook that cleans up new tabs, also when the copy comes first.
+That is the kill of the terminal, and a CLI that exits within the start delay."
+  (skip-unless (boundp 'tab-bar-tab-post-open-functions))
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t)
+          (tab-bar-tab-post-open-functions nil))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        ;; The stop without the process file kills the terminal after a copy
+        (let ((started (claude-code-ide-wiring-tests--stopped-start)))
+          (add-hook 'tab-bar-tab-post-open-functions #'claude-code-ide--strip-new-tab-claude-windows)
+          (cl-letf (((symbol-function 'claude-code-ide-process-stop-later) nil))
+            (claude-code-ide--stop-session (plist-get started :session)))
+          (should (claude-code-ide-wiring-tests--kept (plist-get started :name)))
+          (should (memq #'claude-code-ide--strip-new-tab-claude-windows
+                        tab-bar-tab-post-open-functions)))
+        ;; A CLI that exits within the start delay
+        (claude-code-ide-tests--clear-processes)
+        (setq tab-bar-tab-post-open-functions nil)
+        (let ((dead (start-process "cci-test-dead" nil "true")))
+          (push dead claude-code-ide-wiring-tests--objects)
+          (should (claude-code-ide-tests--wait-until (lambda () (not (process-live-p dead)))))
+          (add-hook 'tab-bar-tab-post-open-functions #'claude-code-ide--strip-new-tab-claude-windows)
+          (should-error (claude-code-ide-wiring-tests--start
+                         (claude-code-ide-wiring-tests--spec) :process dead))
+          (should (memq #'claude-code-ide--strip-new-tab-claude-windows
+                        tab-bar-tab-post-open-functions)))))))
+
+(ert-deftest claude-code-ide-test-wiring-stopped-buffer-ghostel-hidden ()
+  "The header of a copy of a ghostel terminal with output not drawn says so."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (dolist (case '((t . t) (nil . nil)))
+          (let* ((started (claude-code-ide-wiring-tests--stopped-start
+                           :instance-name (if (car case) "hidden" "drawn")))
+                 (session (plist-get started :session)))
+            (with-current-buffer (plist-get started :buffer)
+              (setq major-mode 'ghostel-mode)
+              (set (make-local-variable 'ghostel--pending-redraw) (car case)))
+            (claude-code-ide--cleanup-session session)
+            (with-current-buffer (claude-code-ide--stopped-buffer-of session)
+              (should (string-prefix-p "Stopped at " header-line-format))
+              (should (eq (cdr case)
+                          (and (string-match-p "incomplete" header-line-format) t))))))))))
+
+(ert-deftest claude-code-ide-test-wiring-stopped-buffer-slot-to-its-heir ()
+  "A new instance that replaces the copy of an instance takes its slot and window.
+The target of a handover binds `claude-code-ide--replace-copy-of' to its source."
+  (claude-code-ide-wiring-tests--with-clean
+    (let ((calls nil)
+          (kill-buffer-query-functions nil)
+          (claude-code-ide-keep-stopped-buffers t))
+      (claude-code-ide-wiring-tests--with-process-stubs calls
+        (let* ((started (claude-code-ide-wiring-tests--stopped-start))
+               (session (plist-get started :session))
+               (id (claude-code-ide-instance-id (claude-code-ide-instance-of-session session)))
+               (dir (claude-code-ide-mcp-session-project-dir session))
+               (heir (generate-new-buffer "*cci-test-heir*")))
+          (push heir claude-code-ide-wiring-tests--objects)
+          (setf (claude-code-ide-mcp-session-window-slot session) 2)
+          (save-window-excursion
+            (display-buffer-in-side-window (plist-get started :buffer) '((side . right) (slot . 2)))
+            (claude-code-ide--cleanup-session session)
+            (let ((window (get-buffer-window (claude-code-ide--stopped-buffer-of session))))
+              (should window)
+              (dolist (scope '(project all))
+                (let ((claude-code-ide-side-window-scope scope))
+                  ;; Another instance keeps off the slot of the copy
+                  (should (= 0 (claude-code-ide--assign-window-slot dir)))
+                  (let ((claude-code-ide--replace-copy-of "cci-test-other"))
+                    (should (= 0 (claude-code-ide--assign-window-slot dir))))
+                  ;; The heir takes it, but not in another project
+                  (let ((claude-code-ide--replace-copy-of id))
+                    (should (= 2 (claude-code-ide--assign-window-slot dir)))
+                    (should-not (= 2 (claude-code-ide--assign-window-slot
+                                      "/tmp/cci-test-wiring/other/"))))))
+              ;; The side window of that slot then shows the heir
+              (display-buffer-in-side-window heir '((side . right) (slot . 2)))
+              (should (eq heir (window-buffer window))))))))))
+
+(ert-deftest claude-code-ide-test-tests-advice-only-in-run ()
+  "The test run records the copies only while it runs."
+  (let ((function #'claude-code-ide-tests--record-stopped-copy))
+    (should (advice-member-p function 'claude-code-ide--keep-stopped-buffer))
+    (unwind-protect
+        (let ((inside nil))
+          (advice-remove 'claude-code-ide--keep-stopped-buffer function)
+          (claude-code-ide-tests--isolate-run
+           (lambda () (setq inside (advice-member-p function 'claude-code-ide--keep-stopped-buffer))))
+          (should inside)
+          (should-not (advice-member-p function 'claude-code-ide--keep-stopped-buffer)))
+      (advice-add 'claude-code-ide--keep-stopped-buffer :filter-return function))))
 
 (provide 'claude-code-ide-wiring-tests)
 

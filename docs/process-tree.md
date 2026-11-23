@@ -177,6 +177,7 @@ The orchestrator adds these calls. Each call checks `fboundp`, so the package wo
 
 - **Load point:** `(claude-code-ide--require-optional 'claude-code-ide-process)` with the other load points.
 - **Launch:** `(claude-code-ide-process-track instance process)` right after the start records the process ID of the instance.
+- **`claude-code-ide--stop-session`** (the `stop` operation), with `claude-code-ide-keep-stopped-buffers`: `claude-code-ide-process-stop-later` with `:soft-end nil` (the soft end of the provider), `:scan nil`, and a callback. The buffer stays the terminal until the CLI exits; then the cleanup of the sentinel makes the read-only copy and kills the buffer. When the callback comes, or after `claude-code-ide-process-stop-timeout` plus one second (6 s by default), and the CLI still runs, the stop kills the buffer after a copy. Without the option, the stop kills the buffer at once.
 - **`claude-code-ide--cleanup-session`:** before the buffer kill:
   - The CLI ended by itself: `claude-code-ide-process-untrack`. What it left running was its own choice, for example "Move to background and exit".
   - Called from `kill-buffer-hook` (BUFFER-DYING): `claude-code-ide-process-stop-later` with `:scan nil`.

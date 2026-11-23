@@ -1801,7 +1801,9 @@ registry is busy, the start waits."
   (if (not (claude-code-ide-handover--save run))
       (claude-code-ide-handover--busy-registry run)
     (let ((prompt (claude-code-ide-handover-start-prompt run))
-          (claude-code-ide-handover--allowed (claude-code-ide-handover--run-id run)))
+          (claude-code-ide-handover--allowed (claude-code-ide-handover--run-id run))
+          ;; The target takes the window of the copy of its source
+          (claude-code-ide--replace-copy-of (claude-code-ide-handover--run-source-id run)))
       (condition-case err
           (claude-code-ide--start-session nil nil (claude-code-ide-handover--start-spec run prompt))
         ((error quit)
