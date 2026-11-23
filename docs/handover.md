@@ -190,10 +190,11 @@ The user may have typed a prompt into the source without sending it. The stop wo
     - A sent prompt with `❯` above the box, and the status lines under it, are no part of it.
     - **The IDE context chip** that Claude Code puts in front of the draft, such as `[⧉ In foo.el]` for the file that is open in Emacs, is not the user's text. It is left out, and kept as information (`draft_context`; the note "(written while foo.el was open)").
   - **Codex:** the text of the composer. The reader finds the bottom of the composer first:
-    - The last row of the screen is the footer row (the model and the folder), with an empty row above it.
-    - The composer starts at the last row above it that starts with `›`. Every row up to the empty row belongs to it, also its empty rows.
+    - The last row of the screen is the footer row only with positive evidence: it must match a regexp of `claude-code-ide-handover-codex-footer-regexps`. The defaults are the form of Codex 0.164 (the model, the reasoning effort, and ` · ` with the folder, as in `GPT-5.6-Terra low · ~`) and the hint rows `? for shortcuts`, `esc to interrupt`, `N% context left` and `⏎ send`. A new footer of a new Codex version needs only a new regexp.
+    - The composer starts at the last row above it that starts with `›`. Every row up to the footer belongs to it, also its empty rows.
     - The wrapped and new lines of the composer are indented. A row at the left edge between the `›` row and the footer is part of the conversation, so that `›` row is a sent request: the read is unsure, and it does not search further back.
-    - Without the empty row and the footer row under it, the read is unsure.
+    - Without a footer row, the read is unsure, and the whole region from the `›` row to the last row (that row too) is the raw text. So a short screen such as `›`, an empty row, and `  Keep this draft` is maybe a draft, not an empty composer.
+    - **A completion popup** gives unsure, with the composer row alone as the raw text. The reader knows a slash-command popup by its structure: a composer row of one word that starts with `/` (such as `› /re`), with an indented suggestion row under it (such as `/review  Review current changes`), or the control row of the popup (`↑/↓ navigate · … · esc to close`) at the end.
   - **Dialogs.** A dialog on the screen gives unsure, for both CLIs. The reader knows a dialog by its structure, not by the text of a choice:
     - the selection marker (`❯` or `›`) on a numbered choice row;
     - another numbered row in its list;
@@ -493,6 +494,7 @@ The handover fields are in schema version 4, in its own file (`claude-code-ide-s
 | `claude-code-ide-handover-continue` | `ask` | Whether the target goes on with the task after the commit: `ask` (the interactive handover asks y/n/a/v; a coordinator or Lisp call counts as `always`), `always`, or `never` (the target waits for your prompt). See "The target goes on". |
 | `claude-code-ide-handover-unsent-draft` | `ask` | What the handover does with an unsent prompt in the input box of the source: `ask`, `carry`, `drop` or `refuse`. See "An unsent draft". |
 | `claude-code-ide-handover-draft-placeholders` | (list) | Regexps of the placeholder texts of an empty input box, which are no draft. |
+| `claude-code-ide-handover-codex-footer-regexps` | (list) | Regexps of the footer row under the Codex composer. The last row of a Codex screen is the footer only when it matches one; else the read is unsure (maybe a draft). |
 | `claude-code-ide-handover-unsaved-target` | `fresh` | What the recovery does with an identified target that never saved its conversation: `fresh` starts it fresh with the same IDs and document, `ask` resumes it as before and then asks a person (`target-exited`). See "An unsaved target". |
 | `claude-code-ide-handover-enable-request-tool` | t | Give the agents the tool `request_handover`. |
 

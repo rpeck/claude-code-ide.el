@@ -5123,6 +5123,51 @@ The footer row under the composer shows the model and the folder.")
                                  "› cci-test first paragraph\n  wrapped\n\n  cci-test second paragraph\n"))
                  '(:status draft :text "cci-test first paragraph wrapped\n\ncci-test second paragraph"))))
 
+(ert-deftest claude-code-ide-test-handover-read-draft-codex-no-footer ()
+  "A Codex row counts as the footer only when it has the form of a footer.
+Without that evidence the read is unsure, and the whole region, its
+last row too, is the raw text."
+  ;; A short screen: an empty composer row, then a row of text
+  (should (equal (claude-code-ide-handover--read-draft 'codex "›\n\n  cci-test keep this draft\n")
+                 '(:status unsure :why "no footer row under the composer of Codex"
+                           :raw "cci-test keep this draft")))
+  ;; Several paragraphs and no footer: all of them are in the raw text
+  (should (equal (claude-code-ide-handover--read-draft
+                  'codex (concat "• cci-test reply\n\n› cci-test first paragraph\n\n"
+                                 "  cci-test second paragraph\n\n  cci-test third paragraph\n"))
+                 (list :status 'unsure :why "no footer row under the composer of Codex"
+                       :raw (concat "cci-test first paragraph\n\ncci-test second paragraph\n\n"
+                                    "cci-test third paragraph"))))
+  ;; The footer forms: the model, the effort and the folder; hint rows
+  (dolist (footer '("GPT-5.6-Terra low · ~" "cci-test-model xhigh · ~/cci-test-proj"
+                    "? for shortcuts" "esc to interrupt" "100% context left"))
+    (should (equal (list footer (claude-code-ide-handover--read-draft
+                                 'codex (format "› cci-test one\n\n  cci-test two\n\n  %s\n" footer)))
+                   (list footer '(:status draft :text "cci-test one\n\ncci-test two")))))
+  ;; The forms are an option: a new footer of Codex needs no code change
+  (let ((screen "› cci-test one\n\n  cci-test-new-footer 42\n"))
+    (should (eq (plist-get (claude-code-ide-handover--read-draft 'codex screen) :status) 'unsure))
+    (let ((claude-code-ide-handover-codex-footer-regexps '("\\`cci-test-new-footer [0-9]+\\'")))
+      (should (equal (claude-code-ide-handover--read-draft 'codex screen)
+                     '(:status draft :text "cci-test one"))))))
+
+(ert-deftest claude-code-ide-test-handover-read-draft-codex-popup ()
+  "An open slash-command popup of Codex is no draft: unsure, with the composer row as raw text."
+  (dolist (control '("\n  ↑/↓ navigate · enter to select · esc to close\n" "\n"))
+    (let ((result (claude-code-ide-handover--read-draft
+                   'codex (concat "› cci-test older request\n\n• cci-test reply\n\n"
+                                  "› /re\n"
+                                  "  /review  Review current changes\n"
+                                  "  /resume  Resume a conversation\n"
+                                  control))))
+      (should (equal (list control result)
+                     (list control '(:status unsure :why "a completion popup of Codex on the screen"
+                                             :raw "/re"))))))
+  ;; A draft whose row starts with a path is no popup
+  (should (equal (claude-code-ide-handover--read-draft
+                  'codex "› /cci-test-dir is the folder\n  /tmp/cci-test is the file\n\n  ? for shortcuts\n")
+                 '(:status draft :text "/cci-test-dir is the folder /tmp/cci-test is the file"))))
+
 (ert-deftest claude-code-ide-test-handover-read-draft-dialog-forms ()
   "The captured Codex dialogs give unsure: with a control row, or with the choices at the end.
 A Claude Code dialog whose choices end the screen gives unsure too."

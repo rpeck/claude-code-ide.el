@@ -196,6 +196,24 @@ read sees no draft when the whole input matches one of them."
   :type '(repeat regexp)
   :group 'claude-code-ide-handover)
 
+(defcustom claude-code-ide-handover-codex-footer-regexps
+  '("\\`[[:alnum:]][[:alnum:]._/:-]* \\(?:minimal\\|low\\|medium\\|high\\|xhigh\\) · "
+    "\\`\\? for shortcuts"
+    "\\besc to interrupt\\b"
+    "\\b[0-9]+% context left"
+    "\\`⏎ send\\b")
+  "Regexps of the footer row under the Codex composer.
+The screen read of an unsent draft counts the last row of a Codex
+screen as the footer only when it matches one of them (without the
+spaces at its ends; case counts).  The first one is the form of Codex
+0.164: the model, the reasoning effort, and \" · \" with the folder,
+as in \"GPT-5.6-Terra low · ~\".  The others are hint rows.  Without a
+match, the read is unsure, and the text of the composer region is
+shown as maybe a draft.  Add a regexp when a new Codex version shows
+another footer."
+  :type '(repeat regexp)
+  :group 'claude-code-ide-handover)
+
 (defcustom claude-code-ide-handover-continue 'ask
   "Whether the target goes on with the task after a handover commits.
 The target reads its document, writes its state summary and replies
@@ -1534,35 +1552,73 @@ unsure read of a box with text gives that text as :raw."
       (or (match-string 1 row) "")
     (substring row 1)))
 
+(defun claude-code-ide-handover--codex-footer-p (row)
+  "Return non-nil when ROW has the form of the footer row of the Codex composer.
+See `claude-code-ide-handover-codex-footer-regexps'."
+  (let ((case-fold-search nil)
+        (text (string-trim row)))
+    (cl-some (lambda (regexp) (string-match-p regexp text))
+             claude-code-ide-handover-codex-footer-regexps)))
+
+(defconst claude-code-ide-handover--codex-popup-control
+  "\\(?:\\besc to close\\b\\|↑/↓ navigate\\)"
+  "Regexp of the control row of a completion popup of Codex (case is ignored).")
+
+(defun claude-code-ide-handover--codex-popup-p (rows)
+  "Return non-nil when ROWS, the composer region of Codex, show a completion popup.
+The first row is the composer row.  A slash-command popup is known by
+its structure: a composer row of one word that starts with /, and under
+it an indented suggestion row such as \"/review  Review current
+changes\".  The control row of a popup at the end (such as ↑/↓ navigate
+· enter to select · esc to close) counts too."
+  (let ((first (claude-code-ide-handover--codex-first-row (car rows)))
+        (next (and (cdr rows) (string-trim (cadr rows))))
+        (end (car (last rows)))
+        (case-fold-search t))
+    (or (and (string-match-p "\\`/[^ ]*\\'" first)
+             next
+             (string-match-p "\\`/[[:alnum:]_:-]+\\(?:  .*\\)?\\'" next))
+        (and (cdr rows)
+             (string-match-p claude-code-ide-handover--codex-popup-control end)))))
+
 (defun claude-code-ide-handover--read-codex-draft (lines)
   "Return the unsent draft in the Codex composer of the screen LINES.
 The bottom of the composer is found first: the last row of the screen
-is the footer row (the model and the folder), with an empty row above
-it.  The composer starts at the last row above it that starts with ›,
-and every row up to the empty row belongs to it, also its empty rows
-\(paragraphs).  Its wrapped and new lines are indented, so a row at the
-left edge between them is a sent request of the conversation: unsure,
-and no search further back.  A dialog on the screen gives unsure.  An
-unsure read of a composer with text gives that text as :raw."
+is the footer row only when it has the form of a footer
+\(`claude-code-ide-handover-codex-footer-regexps').  The composer starts
+at the last row above it that starts with ›, and every row up to the
+footer belongs to it, also its empty rows (paragraphs).  Its wrapped
+and new lines are indented, so a row at the left edge between them is
+a sent request of the conversation: unsure, and no search further
+back.  A dialog on the screen gives unsure.  A completion popup gives
+unsure, with the composer row alone as :raw.  Without a footer row, the
+read is unsure, with the whole region (its last row too) as :raw."
   (let* ((last (claude-code-ide-handover--last-text-row lines))
          (start (and last (cl-loop for index downfrom last to 0
-                                   when (string-prefix-p "›" (nth index lines)) return index))))
+                                   when (string-prefix-p "›" (nth index lines)) return index)))
+         (footer (and start (< start last)
+                      (claude-code-ide-handover--codex-footer-p (nth last lines))))
+         ;; The end of the composer region, after its last row
+         (end (and start (if footer last (1+ last))))
+         (rows (and start (cl-subseq lines start end))))
     (cond
      ((claude-code-ide-handover--dialog-p lines "›")
       (claude-code-ide-handover--unsure "a dialog of Codex on the screen"))
      ((null start)
       (claude-code-ide-handover--unsure "no composer of Codex on the screen"))
-     ((not (claude-code-ide-handover--indented-p (cl-subseq lines (min (1+ start) last) last)))
+     ((not (claude-code-ide-handover--indented-p (cdr rows)))
       (claude-code-ide-handover--unsure "the last › row of the screen is not the composer of Codex"))
-     ((or (= start last) (not (string-empty-p (nth (1- last) lines))))
+     ((claude-code-ide-handover--codex-popup-p rows)
+      (claude-code-ide-handover--unsure
+       "a completion popup of Codex on the screen"
+       (list (claude-code-ide-handover--codex-first-row (car rows)))))
+     ((not footer)
       (claude-code-ide-handover--unsure
        "no footer row under the composer of Codex"
-       (cons (claude-code-ide-handover--codex-first-row (nth start lines))
-             (cl-subseq lines (1+ start) (1+ last)))))
+       (cons (claude-code-ide-handover--codex-first-row (car rows)) (cdr rows))))
      (t
       (claude-code-ide-handover--draft-result
-       (cons (claude-code-ide-handover--codex-first-row (nth start lines))
-             (cl-subseq lines (1+ start) last)))))))
+       (cons (claude-code-ide-handover--codex-first-row (car rows)) (cdr rows)))))))
 
 (defun claude-code-ide-handover--read-draft (provider text)
   "Return the unsent draft that the terminal screen TEXT of PROVIDER shows.
