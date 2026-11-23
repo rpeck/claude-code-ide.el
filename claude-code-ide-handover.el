@@ -58,6 +58,7 @@
 
 (declare-function claude-code-ide-process-stop-later "claude-code-ide-process" (instance &rest args))
 (declare-function claude-code-ide-process-worktree-strays "claude-code-ide-process" (worktree &optional exclude))
+(declare-function claude-code-ide-process--terminal-process "claude-code-ide-process" (instance process))
 (declare-function claude-code-ide-transcript-handover-document "claude-code-ide-transcript" (&rest args))
 (declare-function claude-code-ide-transcript-instance-leg "claude-code-ide-transcript" (instance))
 (declare-function claude-code-ide-transcript-document-id "claude-code-ide-transcript" (text))
@@ -1187,6 +1188,40 @@ alone too, and so is a process of another live instance (see
                       run #'claude-code-ide-handover--after-stop run result)))
       (claude-code-ide-handover--after-stop run (claude-code-ide-handover--scan run)))))
 
+(defconst claude-code-ide-handover--pid-unknown-regexp "process ID of the CLI is unknown"
+  "Text of the stop result of a live terminal whose CLI process ID is unknown.
+`claude-code-ide-process--empty-result' gives it as the :reason of an
+`error' result.")
+
+(defun claude-code-ide-handover--source-live-p (run)
+  "Return non-nil when the source of RUN still runs in this Emacs.
+The source runs when its descriptor is live and its terminal process
+runs; the terminal process is the one that a process-tree stop knows
+\(`claude-code-ide-process--terminal-process').  A live descriptor
+without a known terminal process counts as running, because nothing
+shows that its CLI ended.  The handover never goes past source-stopped,
+and never starts a target, while this is non-nil."
+  (when-let* ((instance (claude-code-ide-instance-by-id
+                         (claude-code-ide-handover--run-source-id run)))
+              ((claude-code-ide-instance-live-p instance)))
+    (let ((process (and (fboundp 'claude-code-ide-process--terminal-process)
+                        (claude-code-ide-process--terminal-process instance nil))))
+      (if (processp process) (process-live-p process) t))))
+
+(defun claude-code-ide-handover--source-still-running (run)
+  "Make RUN need a person, because its source still runs; return nil."
+  (claude-code-ide-handover--needs-user
+   run 'source-still-running
+   (format "The source %s still runs in this Emacs, so the handover does not go on; end it (kill its terminal buffer), wait, or cancel"
+           (claude-code-ide-handover--run-source-id run)))
+  nil)
+
+(defun claude-code-ide-handover--source-gone-p (run)
+  "Return non-nil when the source of RUN does not run; else make RUN need a person.
+See `claude-code-ide-handover--source-live-p'."
+  (or (not (claude-code-ide-handover--source-live-p run))
+      (claude-code-ide-handover--source-still-running run)))
+
 (defun claude-code-ide-handover--scan (run)
   "Scan the worktree of RUN for stray processes.
 Return a result plist like that of `claude-code-ide-process-stop'."
@@ -1203,6 +1238,14 @@ The continuation of RUN says what comes next: start the target, resume
 it, or end a cancel.  Without one, the source stopped, and the
 document comes next."
   (let ((next (claude-code-ide-handover--run-continuation run)))
+    (if (and (not (eq next 'cancel))
+             (not (claude-code-ide-handover--source-gone-p run)))
+        nil
+      (claude-code-ide-handover--after-scan-1 run next))))
+
+(defun claude-code-ide-handover--after-scan-1 (run next)
+  "Do NEXT, the continuation of RUN, after a clean scan; see `--after-scan'."
+  (progn
     (setf (claude-code-ide-handover--run-continuation run) nil)
     (if (null next)
         (claude-code-ide-handover--source-stopped run)
@@ -1248,6 +1291,14 @@ reaches only that process."
         ('timeout
          (claude-code-ide-handover--needs-user
           run 'source-did-not-stop "The source or its processes survived SIGKILL" strays))
+        ((and 'error (guard (string-match-p claude-code-ide-handover--pid-unknown-regexp
+                                            (format "%s" (plist-get result :reason)))))
+         (claude-code-ide-handover--needs-user
+          run 'source-pid-unknown
+          (format "The stop could not end or check the source %s, because the process ID of its CLI is unknown: the source CLI may still run.  End it (kill its terminal buffer), wait, or cancel"
+                  (claude-code-ide-handover--run-source-id run))))
+        ((guard (claude-code-ide-handover--source-live-p run))
+         (claude-code-ide-handover--source-still-running run))
         (_
          (claude-code-ide-handover--needs-user
           run 'scan-failed (format "The process check failed: %s" (plist-get result :reason))))))))
@@ -1297,6 +1348,10 @@ would stop the current instance."
     ((or 'strays 'source-did-not-stop)
      '((?e end "end them: SIGTERM, then SIGKILL")
        (?w wait "wait, then check again")
+       (?c cancel "cancel the handover")))
+    ((or 'source-pid-unknown 'source-still-running)
+     '((?e end "end the source: kill its terminal buffer, then check the worktree")
+       (?w wait "wait, then try the step again")
        (?c cancel "cancel the handover")))
     ('scan-failed
      '((?w wait "check again")
@@ -1358,13 +1413,14 @@ An unknown start time, at the scan or now, never matches."
     (when (claude-code-ide-handover--stray-alive-p stray)
       (ignore-errors (signal-process (plist-get stray :pid) signal)))))
 
-(defun claude-code-ide-handover--rescan (run &optional then)
+(defun claude-code-ide-handover--rescan (run &optional then seconds)
   "Scan the worktree of RUN again after `claude-code-ide-handover-stray-wait'.
-THEN, when given, runs first, with the strays of RUN."
+THEN, when given, runs first, with the strays of RUN.  SECONDS, when
+given, is the wait in place of `claude-code-ide-handover-stray-wait'."
   (setf (claude-code-ide-handover--run-status run) 'running)
   (claude-code-ide-handover--save run)
   (setf (claude-code-ide-handover--run-timer run)
-        (run-at-time claude-code-ide-handover-stray-wait nil
+        (run-at-time (or seconds claude-code-ide-handover-stray-wait) nil
                      (lambda ()
                        (claude-code-ide-handover--guarded
                         run (lambda ()
@@ -1479,6 +1535,30 @@ Interactively, choose the handover and the action."
              ;; The person leaves the target process running
              (claude-code-ide-handover--cancel-now run)
            (claude-code-ide-handover-cancel handover-id)))
+        ((and 'wait (guard (memq (claude-code-ide-handover--run-reason run)
+                                 '(source-pid-unknown source-still-running))))
+         ;; Try the stop again later; a recovery scans again, with its
+         ;; continuation
+         (if (claude-code-ide-handover--run-continuation run)
+             (claude-code-ide-handover--rescan run)
+           (claude-code-ide-handover--resume run)
+           (claude-code-ide-handover--schedule run claude-code-ide-handover-stray-wait)))
+        ((and 'end (guard (memq (claude-code-ide-handover--run-reason run)
+                                '(source-pid-unknown source-still-running))))
+         ;; As `claude-code-ide-control-stop': the stop of the provider
+         ;; kills the terminal buffer, which ends the CLI.  With the
+         ;; kept buffers, the CLI ends softly from timers, so the scan
+         ;; waits at least until the limit of that soft stop
+         (let ((stop (claude-code-ide-control-stop (claude-code-ide-handover--run-source-id run))))
+           (when (eq (plist-get stop :status) 'error)
+             (message "Handover %s: the stop of the source gave %s"
+                      (claude-code-ide-handover--run-id run)
+                      (or (plist-get stop :message) (plist-get stop :reason)))))
+         (claude-code-ide-handover--rescan
+          run nil (max claude-code-ide-handover-stray-wait
+                       (if (fboundp 'claude-code-ide--soft-stop-limit)
+                           (claude-code-ide--soft-stop-limit)
+                         0))))
         ('wait
          (if (eq (claude-code-ide-handover--run-reason run) 'no-delivery)
              (progn
@@ -1565,10 +1645,14 @@ shows it to a person first (see `claude-code-ide-handover-cancel')."
     (claude-code-ide-handover--drop-target run))
   (claude-code-ide-handover--finish
    run 'cancelled 'user-cancelled
-   (if (claude-code-ide-handover--stage< (claude-code-ide-handover--run-stage run)
-                                         'source-stopped)
-       "the source stays current"
-     "the source is stopped; M-x claude-code-ide-reopen-session starts it again"))
+   (cond
+    ((claude-code-ide-handover--stage< (claude-code-ide-handover--run-stage run)
+                                       'source-stopped)
+     "the source stays current")
+    ;; The stop could not end it, or it runs again after a restore
+    ((claude-code-ide-handover--source-live-p run)
+     "the source still runs in this Emacs, and stays current")
+    (t "the source is stopped; M-x claude-code-ide-reopen-session starts it again")))
   (claude-code-ide-handover--result run))
 
 (defun claude-code-ide-handover-cancel (handover-id)
@@ -1680,7 +1764,8 @@ nil when WORKTREE is not in Git."
       (claude-code-ide-handover--write-file file text)
       (setf (claude-code-ide-handover--run-document run) file
             (claude-code-ide-handover--run-document-hash run) (secure-hash 'sha256 text)))
-    (when (claude-code-ide-handover--enter run 'target-started)
+    (when (and (claude-code-ide-handover--source-gone-p run)
+               (claude-code-ide-handover--enter run 'target-started))
       (claude-code-ide-handover--start-target run))))
 
 (defun claude-code-ide-handover--document (run)
@@ -1797,7 +1882,13 @@ from a plain restore."
 (defun claude-code-ide-handover--start-target (run)
   "Start the target of RUN with the pointer to the document as its first prompt.
 The target ID is saved in the registry before the start; while the
-registry is busy, the start waits."
+registry is busy, the start waits.  A source that still runs in this
+Emacs stops the start: see `claude-code-ide-handover--source-gone-p'."
+  (when (claude-code-ide-handover--source-gone-p run)
+    (claude-code-ide-handover--start-target-1 run)))
+
+(defun claude-code-ide-handover--start-target-1 (run)
+  "Start the target of RUN; see `claude-code-ide-handover--start-target'."
   (unless (claude-code-ide-handover--run-target-id run)
     (setf (claude-code-ide-handover--run-target-id run) (claude-code-ide-instance-new-id)))
   (if (not (claude-code-ide-handover--save run))

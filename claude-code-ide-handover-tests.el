@@ -3002,6 +3002,187 @@ its processes."
                   :handover-id "cci-test-h1" :session-server nil)))
         (should (equal (claude-code-ide-transcript-document-original-task doc)
                        "cci-test-original: add mean_of to stats.py."))))))
+;;; The source must end before the handover goes on
+
+(defconst claude-code-ide-handover-tests--pid-unknown
+  '(:status error :reason "the process ID of the CLI is unknown, so the stop could not end or check it"
+            :strays nil :ended nil :escalated nil)
+  "The stop result of a live terminal whose CLI process ID is unknown.")
+
+(defmacro claude-code-ide-handover-tests--with-live-stop (result &rest body)
+  "Run BODY with a process-tree stop that gives RESULT and leaves the source live.
+The stop calls are counted in `stop-calls'."
+  (declare (indent 1))
+  `(let ((stop-calls 0))
+     (cl-letf (((symbol-function 'claude-code-ide-process-stop-later)
+                (lambda (_instance &rest args)
+                  (setq stop-calls (1+ stop-calls))
+                  (funcall (plist-get args :callback) ,result))))
+       ,@body)))
+
+(defun claude-code-ide-handover-tests--ending-provider-stop (name)
+  "Make the stop of the stub provider NAME end the instance, as a buffer kill does."
+  (setf (claude-code-ide-provider-stop (claude-code-ide-get-provider name))
+        (lambda (instance)
+          (push (claude-code-ide-instance-id instance) claude-code-ide-handover-tests--stops)
+          (claude-code-ide-instance-unregister (claude-code-ide-instance-id instance))
+          t)))
+
+(ert-deftest claude-code-ide-test-handover-source-pid-unknown ()
+  "A stop that cannot end or check the source CLI (its PID is unknown) needs a person.
+The reason says that the source may still run; the choices are end, wait
+and cancel; nothing goes past source-stopped."
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (claude-code-ide-handover-tests--with-live-stop claude-code-ide-handover-tests--pid-unknown
+      (let* ((id (plist-get (claude-code-ide-handover-session "cci-test-src" 'cci-test-b) :handover-id)))
+        (claude-code-ide-handover-tests--run-timers)
+        (let ((status (claude-code-ide-handover-status id)))
+          (should (eq (plist-get status :status) 'needs-user))
+          (should (eq (plist-get status :reason) 'source-pid-unknown))
+          (should (eq (plist-get status :stage) 'source-stopped))
+          (should (string-match-p "may still run" (plist-get status :message))))
+        (should (equal (mapcar #'cadr (claude-code-ide-handover--choices
+                                       (gethash id claude-code-ide-handover--runs)))
+                       '(end wait cancel)))
+        (should-not claude-code-ide-handover-tests--starts)
+        (should (claude-code-ide-instance-by-id "cci-test-src"))))))
+
+(ert-deftest claude-code-ide-test-handover-source-still-running-after-stop ()
+  "A stop that says stopped while the source instance still runs is no stop.
+The handover needs a person with the reason source-still-running and
+never writes the document or starts the target."
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (claude-code-ide-handover-tests--with-live-stop '(:status stopped :strays nil)
+      (let* ((id (plist-get (claude-code-ide-handover-session "cci-test-src" 'cci-test-b) :handover-id)))
+        (claude-code-ide-handover-tests--run-timers)
+        (let ((status (claude-code-ide-handover-status id)))
+          (should (eq (plist-get status :status) 'needs-user))
+          (should (eq (plist-get status :reason) 'source-still-running))
+          (should (eq (plist-get status :stage) 'source-stopped))
+          (should-not (plist-get status :document)))
+        (should (equal (mapcar #'cadr (claude-code-ide-handover--choices
+                                       (gethash id claude-code-ide-handover--runs)))
+                       '(end wait cancel)))
+        (should-not claude-code-ide-handover-tests--starts)))))
+
+(ert-deftest claude-code-ide-test-handover-source-alive-choices ()
+  "End kills the source as the control stop does and goes on; wait stops again; cancel cancels."
+  (dolist (choice '(end wait cancel))
+    (claude-code-ide-handover-tests--with
+      (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+      (claude-code-ide-handover-tests--ending-provider-stop 'cci-test-a)
+      (let ((result-of-stop claude-code-ide-handover-tests--pid-unknown)
+            (stop-calls 0)
+            id)
+        (cl-letf (((symbol-function 'claude-code-ide-process-stop-later)
+                   (lambda (_instance &rest args)
+                     (setq stop-calls (1+ stop-calls))
+                     (funcall (plist-get args :callback) result-of-stop))))
+          (setq id (plist-get (claude-code-ide-handover-session "cci-test-src" 'cci-test-b) :handover-id))
+          (claude-code-ide-handover-tests--run-timers)
+          (should (eq (plist-get (claude-code-ide-handover-status id) :reason) 'source-pid-unknown))
+          (should (= stop-calls 1))
+          (pcase choice
+            ('end
+             (claude-code-ide-handover-resolve id 'end)
+             (claude-code-ide-handover-tests--run-timers)
+             ;; The provider stop ended the source, then the scan ran
+             (should (member "cci-test-src" claude-code-ide-handover-tests--stops))
+             (should-not (claude-code-ide-instance-by-id "cci-test-src"))
+             (should (= (length claude-code-ide-handover-tests--starts) 1))
+             (should (eq (plist-get (claude-code-ide-handover-status id) :stage) 'target-started)))
+            ('wait
+             ;; The next stop still cannot end it: a person again
+             (claude-code-ide-handover-resolve id 'wait)
+             (claude-code-ide-handover-tests--run-timers)
+             (should (= stop-calls 2))
+             (should (eq (plist-get (claude-code-ide-handover-status id) :reason) 'source-pid-unknown))
+             (should-not claude-code-ide-handover-tests--starts)
+             ;; Then the CLI ends, and the stop after the wait goes on
+             (claude-code-ide-instance-unregister "cci-test-src")
+             (setq result-of-stop '(:status stopped :strays nil))
+             (claude-code-ide-handover-resolve id 'wait)
+             (claude-code-ide-handover-tests--run-timers)
+             (should (= (length claude-code-ide-handover-tests--starts) 1)))
+            ('cancel
+             (claude-code-ide-handover-resolve id 'cancel)
+             (claude-code-ide-handover-tests--run-timers)
+             (should (eq (plist-get (claude-code-ide-handover-status id) :status) 'cancelled))
+             (should-not claude-code-ide-handover-tests--starts))))))))
+
+(ert-deftest claude-code-ide-test-handover-source-alive-cancel-message ()
+  "A cancel while the source still runs never says that the source is stopped."
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (claude-code-ide-handover-tests--with-live-stop claude-code-ide-handover-tests--pid-unknown
+      (let ((id (plist-get (claude-code-ide-handover-session "cci-test-src" 'cci-test-b) :handover-id)))
+        (claude-code-ide-handover-tests--run-timers)
+        (should (eq (plist-get (claude-code-ide-handover-status id) :reason) 'source-pid-unknown))
+        (claude-code-ide-handover-resolve id 'cancel)
+        (let ((message (plist-get (claude-code-ide-handover-status id) :message)))
+          (should (eq (plist-get (claude-code-ide-handover-status id) :status) 'cancelled))
+          (should-not (string-match-p "source is stopped" message))
+          (should (string-match-p "still runs" message)))))))
+
+(ert-deftest claude-code-ide-test-handover-source-alive-end-waits-for-soft-stop ()
+  "After end, the rescan waits at least as long as the soft stop of the source.
+A shorter wait finds the source still live, and asks again."
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (claude-code-ide-handover-tests--with-live-stop claude-code-ide-handover-tests--pid-unknown
+      (let ((id (plist-get (claude-code-ide-handover-session "cci-test-src" 'cci-test-b) :handover-id))
+            (delays nil)
+            (original (symbol-function 'run-at-time)))
+        (claude-code-ide-handover-tests--run-timers)
+        (cl-letf (((symbol-function 'claude-code-ide--soft-stop-limit) (lambda () 7))
+                  ((symbol-function 'claude-code-ide-control-stop) (lambda (_id) '(:status ok)))
+                  ((symbol-function 'run-at-time)
+                   (lambda (time &rest args)
+                     (push time delays)
+                     (apply original time args))))
+          (let ((claude-code-ide-handover-stray-wait 2))
+            (claude-code-ide-handover-resolve id 'end)))
+        (should (member 7 delays))))))
+
+(ert-deftest claude-code-ide-test-handover-recovery-live-source ()
+  "A recovery never starts a target next to a live source.
+The source runs again in this Emacs (for example after a restore), so
+the recovery needs a person; end stops the source, and then the target
+starts."
+  (dolist (stage '(document-written target-started))
+    (claude-code-ide-handover-tests--with
+      (let ((id (claude-code-ide-handover-tests--interrupted stage)))
+        ;; The source runs again
+        (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a
+                                             (claude-code-ide-handover-tests--worktree) 'idle)
+        (claude-code-ide-handover-tests--ending-provider-stop 'cci-test-a)
+        (claude-code-ide-handover-recover)
+        (claude-code-ide-handover-tests--run-timers)
+        (let ((status (claude-code-ide-handover-status id)))
+          (should (eq (plist-get status :status) 'needs-user))
+          (should (eq (plist-get status :reason) 'source-still-running)))
+        (should-not claude-code-ide-handover-tests--starts)
+        (claude-code-ide-handover-resolve id 'end)
+        (claude-code-ide-handover-tests--run-timers)
+        (should-not (claude-code-ide-instance-by-id "cci-test-src"))
+        (should (= (length claude-code-ide-handover-tests--starts) 1))
+        (should (equal (claude-code-ide-start-spec-instance-id (car claude-code-ide-handover-tests--starts))
+                       (plist-get (claude-code-ide-handover-status id) :target-id)))))))
+
+(ert-deftest claude-code-ide-test-handover-normal-stop-unchanged ()
+  "A stop that ends the source goes on as before, with no question."
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (let* ((result (claude-code-ide-handover-session "cci-test-src" 'cci-test-b))
+           (id (plist-get result :handover-id)))
+      (claude-code-ide-handover-tests--run-timers)
+      (should (equal claude-code-ide-handover-tests--stops '("cci-test-src")))
+      (should (eq (plist-get (claude-code-ide-handover-status id) :status) 'running))
+      (should (eq (plist-get (claude-code-ide-handover-status id) :stage) 'target-started))
+      (claude-code-ide-handover-tests--deliver result)
+      (should (eq (plist-get (claude-code-ide-handover-status id) :status) 'committed)))))
 
 (provide 'claude-code-ide-handover-tests)
 
