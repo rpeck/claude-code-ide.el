@@ -241,7 +241,8 @@ Events with another session ID come from a nested session.")
 state is `failed/quota-limit'.")
   (detail "" :type string)
   (since 0.0 :type float :documentation "Time the phase started.")
-  (registered 0.0 :type float)
+  (registered 0.0 :type float
+              :documentation "Time when the trust was settled, just before Codex spawns.")
   (last-event nil :documentation "Time of the last event, or nil before the first.")
   (tools (make-hash-table :test 'equal)
          :documentation "(AGENT-ID . TOOL-USE-ID) -> (SEQ NAME INPUT).")
@@ -418,6 +419,12 @@ see `claude-code-ide-codex-events--settle-trust'.  INTERACTIVE is the
         (puthash id launch claude-code-ide-codex-events--launches)
         (claude-code-ide-codex-events--ensure-timers)
         (claude-code-ide-codex-events--settle-trust launch instance interactive)
+        ;; Codex spawns after the trust is settled, and an interactive
+        ;; start can wait for the trust question: the startup grace
+        ;; counts from now
+        (let ((spawn (float-time)))
+          (setf (claude-code-ide-codex-events--launch-registered launch) spawn
+                (claude-code-ide-codex-events--launch-since launch) spawn))
         launch)))
 
 (defun claude-code-ide-codex-events--track-safely (instance &optional interactive)
@@ -525,6 +532,18 @@ AGENT nil is the main agent."
   (claude-code-ide-codex-events--remove-blockers
    launch (lambda (blocker)
             (equal (car-safe (claude-code-ide-codex-events--blocker-tool blocker)) agent))))
+
+(defun claude-code-ide-codex-events--forget-subagents (launch)
+  "Remove the subagents of LAUNCH, with their tools in flight and blockers."
+  (let ((tools (claude-code-ide-codex-events--launch-tools launch)))
+    (maphash (lambda (key _value)
+               (when (car key)
+                 (remhash key tools)))
+             tools))
+  (claude-code-ide-codex-events--remove-blockers
+   launch (lambda (blocker)
+            (car-safe (claude-code-ide-codex-events--blocker-tool blocker))))
+  (clrhash (claude-code-ide-codex-events--launch-subagents launch)))
 
 (defun claude-code-ide-codex-events--input-matches-p (request-input tool-input)
   "Return non-nil when REQUEST-INPUT of a PermissionRequest fits TOOL-INPUT.
@@ -676,6 +695,11 @@ for the user too."
     (when main
       ;; A screen read is valid until the next event of the main agent
       (setf (claude-code-ide-codex-events--launch-dialog launch) nil))
+    (when (and agent (member event '("PreToolUse" "PermissionRequest" "PostToolUse" "PostModelRequest")))
+      ;; A subagent works: a new prompt of the main agent may have ended its record
+      (let ((subagents (claude-code-ide-codex-events--launch-subagents launch)))
+        (unless (gethash agent subagents)
+          (puthash agent now subagents))))
     (pcase event
       ("SessionStart"
        (clrhash (claude-code-ide-codex-events--launch-tools launch))
@@ -685,6 +709,10 @@ for the user too."
        (claude-code-ide-codex-events--set-phase launch 'idle "Ready" now))
       ("UserPromptSubmit"
        (claude-code-ide-codex-events--forget-agent launch nil)
+       (when main
+         ;; A new turn: a subagent whose SubagentStop was lost must not
+         ;; wait on forever.  One that runs on shows at its next event.
+         (claude-code-ide-codex-events--forget-subagents launch))
        (setf (claude-code-ide-codex-events--launch-failure launch) nil)
        (claude-code-ide-codex-events--set-phase launch 'working "Working" now))
       ("PreToolUse"
@@ -789,7 +817,12 @@ reports the state."
          (since (claude-code-ide-codex-events--launch-since launch))
          (detail (claude-code-ide-codex-events--launch-detail launch))
          (dialog (claude-code-ide-codex-events--launch-dialog launch))
-         (blocker (car (claude-code-ide-codex-events--launch-blockers launch)))
+         (blockers (claude-code-ide-codex-events--launch-blockers launch))
+         ;; Each blocker counts, in the order of the rules: any open
+         ;; question, then an approval that no read found answered
+         (question (cl-find 'question blockers :key #'claude-code-ide-codex-events--blocker-kind))
+         (blocker (or (cl-find-if-not #'claude-code-ide-codex-events--blocker-answered blockers)
+                      (car blockers)))
          (subagents (claude-code-ide-codex-events--launch-subagents launch))
          (registered (claude-code-ide-codex-events--launch-registered launch))
          (problem (claude-code-ide-codex-events--trust-problem launch)))
@@ -800,9 +833,9 @@ reports the state."
                       ((or 'quota-limit 'not-included) 'quota-limit)
                       (_ 'error))
             since nil detail))
-     ((and blocker (eq (claude-code-ide-codex-events--blocker-kind blocker) 'question))
-      (list 'waiting-for-user 'question (claude-code-ide-codex-events--blocker-since blocker)
-            nil (claude-code-ide-codex-events--blocker-detail blocker)))
+     (question
+      (list 'waiting-for-user 'question (claude-code-ide-codex-events--blocker-since question)
+            nil (claude-code-ide-codex-events--blocker-detail question)))
      (blocker
       (let ((answered (claude-code-ide-codex-events--blocker-answered blocker))
             (start (claude-code-ide-codex-events--blocker-since blocker))
@@ -1171,6 +1204,28 @@ that the hooks are missing; the caller adds that."
            (plist-get entry :turn)
            (claude-code-ide-codex-events--launch-start instance launch entry)))))))
 
+(defun claude-code-ide-codex-events--silent-turn (instance launch now)
+  "Return the time of a turn of LAUNCH that gave no hook event, or nil.
+LAUNCH of INSTANCE has hooks.  Codex sends SessionStart with the first
+prompt, so a turn in the rollout file of the conversation after the
+start of the launch, with no event at all, shows that the hooks do not
+report.  The turn must be older than
+`claude-code-ide-codex-events-startup-grace' seconds at NOW, because
+its events can come a moment later.  Only a known conversation (a
+resume or a continue) has a rollout file before its first event."
+  (when-let* (((null (claude-code-ide-codex-events--launch-last-event launch)))
+              (native (claude-code-ide-known-or-nil (claude-code-ide-instance-native-id instance)))
+              (file (claude-code-ide-codex-events--rollout-file instance)))
+    (let* ((entry (claude-code-ide-codex-events--rollout-read
+                   (claude-code-ide-codex-events--rollout-entry instance native) file))
+           (time (plist-get (plist-get entry :turn) :time)))
+      (and (eq (plist-get entry :owner) 'yes)
+           (numberp time)
+           ;; The time has whole seconds
+           (>= (+ time 1.0) (claude-code-ide-codex-events--launch-registered launch))
+           (> (- now time) claude-code-ide-codex-events-startup-grace)
+           time))))
+
 ;;; The state of an instance
 
 (defun claude-code-ide-codex-events--launch-state (launch now source)
@@ -1192,7 +1247,12 @@ See `claude-code-ide-codex-events--state-and-detail'."
   (let ((launch (claude-code-ide-codex-events--launch-of instance)))
     (cond
      ((and launch (claude-code-ide-codex-events--launch-hooks launch))
-      (claude-code-ide-codex-events--launch-state launch now 'hooks))
+      (let ((silent (claude-code-ide-codex-events--silent-turn instance launch now)))
+        (if silent
+            (cons (append (claude-code-ide-instance-make-state 'disconnected 'no-signal silent)
+                          (list :source 'hooks))
+                  "No hook event, but the rollout file shows a turn: the status hooks do not report")
+          (claude-code-ide-codex-events--launch-state launch now 'hooks))))
      ((and launch (assq (claude-code-ide-codex-events--launch-dialog launch)
                         claude-code-ide-codex-events--dialog-details))
       (claude-code-ide-codex-events--launch-state launch now 'screen))
@@ -1211,7 +1271,9 @@ See `claude-code-ide-codex-events--state-and-detail'."
   "Return (STATE . DETAIL) of the Codex INSTANCE at NOW.
 STATE is a common state plist.  Its :source tells what gave it:
 
-- A launch with status hooks: the hooks (`hooks').
+- A launch with status hooks: the hooks (`hooks').  A launch with
+  hooks whose rollout file shows a turn, but no event came, is
+  `disconnected/no-signal' (`claude-code-ide-codex-events--silent-turn').
 - A launch without hooks whose screen shows a dialog: the screen
   (`screen').
 - Else the rollout file of the conversation (`rollout'), when one is
@@ -1988,6 +2050,28 @@ the same record that /hooks in the Codex terminal writes."
                           . ((trusted_hash . ,(alist-get 'currentHash hook))))))))
            hooks)))
 
+(defvar use-short-answers)
+
+(defun claude-code-ide-codex-events--typed-yes-p (prompt)
+  "Ask PROMPT and return non-nil only after a typed \"yes\".
+One key never answers: `use-short-answers' is nil for the question,
+and when `yes-or-no-p' is an alias of `y-or-n-p' (for example after
+\(fset \\='yes-or-no-p \\='y-or-n-p)), the minibuffer reads the word
+itself.  C-g quits."
+  (let ((use-short-answers nil))
+    (if (not (eq (indirect-function 'yes-or-no-p) (indirect-function 'y-or-n-p)))
+        (yes-or-no-p prompt)
+      (let ((answer nil))
+        (while (not (member answer '("yes" "no")))
+          (when answer
+            (ding)
+            (message "Please answer yes or no.")
+            (sit-for 2))
+          (setq answer (downcase (string-trim (or (read-from-minibuffer
+                                                   (concat prompt "(yes or no) "))
+                                                  "")))))
+        (equal answer "yes")))))
+
 (defun claude-code-ide-codex-events--describe-hooks (hooks)
   "Return a text that lists HOOKS with their command and trust."
   (mapconcat (lambda (hook)
@@ -2020,8 +2104,9 @@ the same record that /hooks in the Codex terminal writes."
   "Offer the trust of the hooks in the `untrusted' RESULT; return the result.
 RESULT comes from `hooks/list' in DIRECTORY; it is used as it is, so
 nothing lists the hooks again before the question.  The hooks that
-Codex does not run are shown in *Codex status hooks*, and
-`yes-or-no-p' asks.  After a yes, their trust goes to the Codex config
+Codex does not run are shown in *Codex status hooks*, and the question
+needs a typed yes (`claude-code-ide-codex-events--typed-yes-p').  After
+a yes, their trust goes to the Codex config
 file through the app-server (`config/batchWrite'), as /hooks in a
 Codex terminal writes it, and `hooks/list' in DIRECTORY checks it.
 Never without the yes.  A no puts the hook definitions in
@@ -2065,7 +2150,7 @@ the result plist is returned, also for an error."
           (progn
             (claude-code-ide-codex-events--show-hooks untrusted disabled)
             (let* ((yes (condition-case nil
-                            (yes-or-no-p
+                            (claude-code-ide-codex-events--typed-yes-p
                              (format "Codex runs status hooks only when trusted.  Trust these %d hook commands in %s? "
                                      (length untrusted)
                                      (abbreviate-file-name (claude-code-ide-transcript--codex-config-file))))
@@ -2175,7 +2260,7 @@ once, with no app-server."
 Codex runs a hook only after the user trusts it.  An interactive Codex
 start offers the trust by itself; this command trusts the hooks later,
 also after a no.  It lists the hooks with the Codex app-server, shows
-the commands that Codex does not run yet, and after `yes-or-no-p'
+the commands that Codex does not run yet, and after a typed yes
 writes their trust to the Codex config file through the app-server, as
 /hooks in a Codex terminal does.  A hook that /hooks disabled stays
 disabled.  The instances that run already get status only after a
@@ -2328,14 +2413,20 @@ the app-server lists the hooks, without a wait in this function."
          key (claude-code-ide-codex-events--start-trust-check key nil)
          (+ (float-time) claude-code-ide-codex-events--background-limit))))))))
 
-(defun claude-code-ide-codex-events--load-check-wait (key check deadline)
+(defun claude-code-ide-codex-events--load-check-wait (key check deadline &optional polled)
   "Go on with the result of the background CHECK of KEY, or look again soon.
-After the float time DEADLINE, end without a question."
+After the float time DEADLINE, end without a question.  POLLED non-nil
+means that a plain timer runs this call, which can run while the user
+types: then the result goes on at the next idle moment, so that a key
+of the user never answers the question."
   (let ((result (claude-code-ide-codex-events--check-result check)))
     (cond
+     ((and result polled)
+      (claude-code-ide-codex-events--load-check-later
+       #'claude-code-ide-codex-events--load-check-result key result))
      (result (claude-code-ide-codex-events--load-check-result key result))
      ((< (float-time) deadline)
-      (run-with-timer 0.5 nil #'claude-code-ide-codex-events--load-check-wait key check deadline))
+      (run-with-timer 0.5 nil #'claude-code-ide-codex-events--load-check-wait key check deadline t))
      (t (claude-code-ide-codex-events--load-check-done)))))
 
 (defun claude-code-ide-codex-events--load-check-result (key result)
