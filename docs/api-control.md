@@ -28,7 +28,7 @@ This document describes the control operations of claude-code-ide.el, the prompt
 | `inspect-instance` | `(claude-code-ide-control-inspect-instance INSTANCE-ID)` | The details of one running instance. |
 | `launch` | `(claude-code-ide-control-launch &key DIRECTORY PROVIDER NAME PROMPT ROLE EXTRA-FLAGS)` | `(:status ok :instance-id ID ...)`. |
 | `resume` | `(claude-code-ide-control-resume INSTANCE-ID &key PROMPT DIRECTORY NATIVE-ID PROVIDER)` | The same as `launch`. |
-| `submit-prompt` | `(claude-code-ide-control-submit INSTANCE-ID TEXT &key REQUEST-ID QUEUE GENERATION)` | `(:destination :request-id :result :reason ...)`. |
+| `submit-prompt` | `(claude-code-ide-control-submit INSTANCE-ID TEXT &key REQUEST-ID QUEUE GENERATION KEY DEFER)` | `(:destination :request-id :result :reason ...)`. |
 | `stop` | `(claude-code-ide-control-stop INSTANCE-ID &key GENERATION)` | `(:status ok :instance-id ID :result stopped)`. |
 | `handover` | `(claude-code-ide-handover-session INSTANCE-ID TARGET-PROVIDER &key METHOD CONTEXT INTERRUPT FORCE ALLOW-OTHERS REQUEST-ID INTERACTIVE CONTINUE BATCH-NEXT)` | Defined by `claude-code-ide-handover.el`; see [handover.md](handover.md). It returns at once. ALLOW-OTHERS t allows the other sessions of this Emacs in the worktree; a list of IDs allows only those. CONTINUE t or nil decides whether the target gets the continue prompt after the commit; without it, `claude-code-ide-handover-continue` decides, with `ask` as `always`. |
 | `track-review` | Phase 3 (`feat/review-tracking`) | Unavailable until that file defines it. |
@@ -70,7 +70,7 @@ This document describes the control operations of claude-code-ide.el, the prompt
 - `:extra-flags` replaces `claude-code-ide-cli-extra-flags` for this start. The MCP tool does not have this argument.
 - The operation makes the instance ID before the start, and the start uses it. So the result always names the instance that started.
 - The result has `:instance-id`, `:provider`, `:generation`, `:display-name`, and `:native-id`.
-- Error reasons: `no-directory`, `unknown-provider`, `handover-running` (a handover holds the worktree; the result has its `:handover-id`: poll `claude-code-ide-handover-status`, and launch again after its end), `start-failed` (with the message of the start).
+- Error reasons: `no-directory`, `unknown-provider`, `handover-running` (a handover holds the worktree; the result has its `:handover-id`: poll `claude-code-ide-handover-status`, and launch again after its end), `start-failed` (with the message of the start), `mailbox-needs-mcp-server` (the mailbox mode is on, and the MCP tools server is off or does not start; see [mailbox.md](mailbox.md)).
 
 ### resume
 
@@ -79,7 +79,7 @@ This document describes the control operations of claude-code-ide.el, the prompt
 - Without a registry entry, the caller gives `:directory` and `:native-id`, and optionally `:provider`.
 - `:prompt` is the first message after the resume.
 - With `:native-id` and no registry entry: when another live instance of this Emacs runs that native ID, nothing starts. The reason is `native-id-running`, and `:message` names that instance.
-- Error reasons: `invalid-instance-id`, `already-running`, `archived`, `unknown-instance`, `no-directory`, `unknown-provider`, `native-id-running`, `handover-running` (as for `launch`), `start-failed`.
+- Error reasons: `invalid-instance-id`, `already-running`, `archived`, `unknown-instance`, `no-directory`, `unknown-provider`, `native-id-running`, `handover-running` (as for `launch`), `start-failed`, `mailbox-needs-mcp-server`.
 
 ### stop
 
@@ -93,12 +93,14 @@ This document describes the control operations of claude-code-ide.el, the prompt
 ## submit-prompt
 
 ```elisp
-(claude-code-ide-control-submit INSTANCE-ID TEXT &key REQUEST-ID QUEUE)
+(claude-code-ide-control-submit INSTANCE-ID TEXT &key REQUEST-ID QUEUE GENERATION KEY DEFER)
 ```
 
 - **REQUEST-ID** is a string or a number that the caller chooses. A number becomes its decimal text. nil makes a new UUID. The result gives it.
 - **TEXT** goes out with LF line ends: each CR LF and each lone CR becomes LF before the send.
 - **GENERATION** is optional: the launch generation that the caller saw. When the last launch of the instance has another generation, a new request is `rejected` with the reason `generation-changed`. A known request ID is still a duplicate.
+- **KEY** is optional: a string that the record keeps in the field `key`. A handover never changes it, also when it gives the moved record a new request ID. `claude-code-ide-control-find-key-in-chain` finds a record by its key. The mailbox uses it ([mailbox.md](mailbox.md)).
+- **DEFER** non-nil: a prompt that the rules send at once is queued with the reason `deferred` instead, and a timer with no delay sends it. So the call itself never sends. Use it inside a process filter, such as an MCP tool: the send of Claude Code calls `sit-for`, which can run the output of other processes there. The other rules do not change.
 - **QUEUE** says what happens when the instance cannot take the text now:
 
 | QUEUE | Effect |
@@ -135,6 +137,7 @@ This document describes the control operations of claude-code-ide.el, the prompt
 | `failed/quota-limit`, `failed/exit-code`, `failed/error` | rejected, or queued with QUEUE t | The instance failed. |
 | `stopped` | rejected, or queued with QUEUE t | The instance does not run, and the session registry marks it closed or archived. |
 | `earlier-prompts-pending` | queued or rejected | The instance is idle, but older prompts wait. They go first. |
+| `deferred` | queued | The instance is idle, and DEFER is non-nil: a timer sends the prompt in a moment. |
 | `send-failed` | queued | The provider did not send the prompt. It waits for the next try. A `codex queue` command that ends with `:outcome failed` also puts the prompt back with this reason. A `timeout` does not, because Codex can have the prompt. |
 | `guessed-idle` | queued or rejected | The idle state is a guess (`:guess t`), and the provider types the prompt into the terminal. See "Rules for each state". |
 | `generation-changed` | rejected | GENERATION is not the last launch of the instance. |
@@ -209,7 +212,7 @@ The state comes from `claude-code-ide-instance-state`.
 - **Reload.** Loading the package reads no inbox file. The index fills from disk at the first use of each instance, so the inbox survives a reload of the package and a restart of Emacs.
 - **Old Emacs.** The files are read with the native JSON parser when Emacs has one, else with json.el.
 - `claude-code-ide-control-inbox-directory-of (INSTANCE-ID)` returns the folder.
-- `(claude-code-ide-control-move-inbox FROM TO &optional HANDOVER-ID)` moves the pending prompts of FROM to TO at a handover (plan §4.8). Each keeps its request ID; see the reason `handed-over`. When TO has another record with that ID, the copy gets the ID `handover:HANDOVER-ID:ID`, and when TO has that ID too, `handover:HANDOVER-ID:ID:2`, then `:3`, and so on. The fields `moved_from` and `moved_to` record the mapping, and `note` says when a moved prompt may have reached FROM.
+- `(claude-code-ide-control-move-inbox FROM TO &optional HANDOVER-ID)` moves the pending prompts of FROM to TO at a handover (plan §4.8). Each keeps its request ID and its `key`; see the reason `handed-over`. When TO has another record with that ID, the copy gets the ID `handover:HANDOVER-ID:ID`, and when TO has that ID too, `handover:HANDOVER-ID:ID:2`, then `:3`, and so on. The fields `moved_from` and `moved_to` record the mapping, and `note` says when a moved prompt may have reached FROM.
 - After a committed handover, a submit to the old instance goes to the current instance of its chain (`claude-code-ide-session-registry-chain-current`), and `:destination` names it.
 - `(claude-code-ide-control-hold INSTANCE-ID)` and `(claude-code-ide-control-release INSTANCE-ID)` hold and release the delivery to an instance; `claude-code-ide-control-held-p` tells. A held instance gets no prompt, also when it is idle. The release delivers the queued prompts.
 - The inbox writes its files with `claude-code-ide-control-write-json-file` and cleans `done/` with `claude-code-ide-control-prune-folder`. See "Helpers for other files".
@@ -232,7 +235,8 @@ The state comes from `claude-code-ide-instance-state`.
   "sent_generation": 2,
   "sent_guess": false,
   "delivered_at": null,
-  "requested_by": null
+  "requested_by": null,
+  "key": null
 }
 ```
 
@@ -252,6 +256,7 @@ The state comes from `claude-code-ide-instance-state`.
 | `requested_by` | The instance ID of the MCP request, from `claude-code-ide-mcp-request-instance-id`, or null. |
 | `moved_from`, `moved_to` | `INSTANCE:REQUEST-ID` of the record that a handover moved here, or that this record moved to; or null. |
 | `note` | Text for people, for example that a moved prompt may have reached the old instance; or null. |
+| `key` | The KEY of the submit, or null. A move copies it unchanged. A file without the field (from before the field) reads as null; the version stays 1, because the field only adds data. |
 
 
 ## MCP coordinator tools
@@ -301,6 +306,11 @@ Other files of the package, such as `claude-code-ide-review.el`, use these publi
 | `claude-code-ide-control-write-json-file` | `(FILE DATA)` | Writes DATA, a value for `json-encode`, to FILE atomically: a temporary file (mode 0600) in the same folder (mode 0700), renamed over FILE. |
 | `claude-code-ide-control-prune-folder` | `(DIR DAYS &optional REGEXP)` | Deletes the files of DIR whose names match REGEXP (default: the inbox file names) and that are older than DAYS. |
 | `claude-code-ide-control-prune-file` | `(FILE DAYS)` | Deletes FILE when it is older than DAYS, and returns non-nil then. A missing file gives nil. `prune-folder` uses it for each file. |
+| `claude-code-ide-control-chain-current` | `(INSTANCE-ID)` | The current instance of the handover chain of INSTANCE-ID, while `claude-code-ide-session-registry-mode` is on; else INSTANCE-ID. A submit sends to it. |
+| `claude-code-ide-control-pending-keys` | `(INSTANCE-ID)` | The keys of the pending records of `claude-code-ide-control-refresh`, oldest first. A record without a key is left out. |
+| `claude-code-ide-control-find-key-in-chain` | `(INSTANCE-ID KEY)` | The submit result of the record with KEY in the inboxes of the chain of INSTANCE-ID (`claude-code-ide-session-registry-chain-ids`), newest instance first, pending and final; or nil. Each inbox is refreshed first (`claude-code-ide-control-refresh`), as for a submit, so an overdue sent record gives `unacknowledged`. A record that is `rejected` with the reason `handed-over` counts only when no other record has KEY: the copy of a handover wins. The final records of each inbox are read one time; after that, each write of a final record with a key updates a table in memory. |
+| `claude-code-ide-control-blank-text-p` | `(TEXT)` | Non-nil when TEXT is not a string, or has only white space. A submit rejects such a text with `empty-text`. |
+| `claude-code-ide-control-clean-text` | `(TEXT)` | TEXT with CR LF and CR as LF, TAB as four spaces, and without the other C0 controls, DEL, the C1 controls and the bidi controls (U+202A to U+202E, U+2066 to U+2069). Only the mailbox frame uses it; the other prompts, and their text hash, do not change. |
 
 All the internal names (`claude-code-ide-control--NAME`) of these helpers are gone. Every file and test calls the public names.
 

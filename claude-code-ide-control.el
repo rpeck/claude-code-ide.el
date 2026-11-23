@@ -230,6 +230,10 @@ STAGE)."
               'handover-running instance-id
               (apply #'claude-code-ide-control-held-message (cdr err)))
              (list :handover-id (nth 1 err))))
+    ;; The mailbox mode refuses a start without the MCP tools server
+    (claude-code-ide-mailbox-needs-mcp-server
+     (claude-code-ide-control--error 'mailbox-needs-mcp-server instance-id
+                                     (error-message-string err)))
     ((error quit)
      (claude-code-ide-control--error 'start-failed instance-id
                                      (error-message-string err)))))
@@ -407,7 +411,8 @@ The prompts in its inbox stay there."
   (requested-by nil :documentation "Instance ID of the MCP request, or nil.")
   (moved-from nil :documentation "INSTANCE:REQUEST-ID of the record that a handover moved here, or nil.")
   (moved-to nil :documentation "INSTANCE:REQUEST-ID of the record that a handover moved this one to, or nil.")
-  (note nil :documentation "Text for people about the record, or nil."))
+  (note nil :documentation "Text for people about the record, or nil.")
+  (key nil :documentation "Caller's key of the request, or nil; a handover never changes it."))
 
 (defconst claude-code-ide-control--record-fields
   '((request_id . request-id) (instance_id . instance-id) (seq . seq)
@@ -415,7 +420,7 @@ The prompts in its inbox stay there."
     (created_at . created-at) (updated_at . updated-at) (sent_at . sent-at)
     (sent_generation . sent-generation) (sent_guess . sent-guess)
     (delivered_at . delivered-at) (requested_by . requested-by)
-    (moved_from . moved-from) (moved_to . moved-to) (note . note))
+    (moved_from . moved-from) (moved_to . moved-to) (note . note) (key . key))
   "JSON key and struct slot of each field of an inbox file.")
 
 (defconst claude-code-ide-control--symbol-slots '(result reason)
@@ -429,6 +434,12 @@ The prompts in its inbox stay there."
 The key is the inbox folder of an instance.  The first use of a folder
 reads its files; after that, the writes of this file keep the index
 current, and the events read no files.")
+
+(defvar claude-code-ide-control--done-keys (make-hash-table :test 'equal)
+  "The final records with a key of each done folder.
+The key is a done folder, and the value a hash table from the key of
+a record to its files.  The first use of a folder reads its files;
+after that, each write of a final record with a key updates it.")
 
 (defun claude-code-ide-control-now ()
   "Return the current time as an ISO 8601 string in UTC."
@@ -474,6 +485,23 @@ With DONE, return its file in the done folder."
 (defun claude-code-ide-control--line-ends (text)
   "Return TEXT with each CR LF and each lone CR replaced by LF."
   (replace-regexp-in-string "\r\n?" "\n" text))
+
+(defun claude-code-ide-control-clean-text (text)
+  "Return TEXT without the characters that act as keys or hide text.
+CR LF and a lone CR become LF, and TAB becomes four spaces: in the
+Claude Code terminal, TAB is a key.  The other C0 controls (all but
+LF), DEL, the C1 controls and the bidi controls (U+202A to U+202E,
+U+2066 to U+2069) go.  Only the mailbox frame uses it; every other
+prompt keeps its text, and so its hash."
+  (replace-regexp-in-string
+   "[\0-\b\v-\x1f\x7f\u0080-\u009f\u202a-\u202e\u2066-\u2069]" ""
+   (replace-regexp-in-string "\t" "    " (claude-code-ide-control--line-ends text) t t)
+   t t))
+
+(defun claude-code-ide-control-blank-text-p (text)
+  "Return non-nil when TEXT is no prompt: not a string, or only white space.
+A submit rejects such a text with the reason `empty-text'."
+  (not (and (stringp text) (not (string-empty-p (string-trim text))))))
 
 (defun claude-code-ide-control--normalize (text)
   "Return TEXT as the acknowledgement compares it.
@@ -616,8 +644,12 @@ file is deleted, so that an interrupted move loses nothing."
     (if (claude-code-ide-control--final-p record)
         (progn
           (setf (claude-code-ide-control--record-text record) nil)
-          (claude-code-ide-control--write-file
-           (claude-code-ide-control--record-file instance-id request-id t) record)
+          (let ((final (claude-code-ide-control--record-file instance-id request-id t)))
+            (claude-code-ide-control--write-file final record)
+            (when-let* ((key (claude-code-ide-control--record-key record))
+                        (table (gethash (claude-code-ide-control--done-directory instance-id)
+                                        claude-code-ide-control--done-keys)))
+              (cl-pushnew final (gethash key table) :test #'equal)))
           (when (file-exists-p file)
             (delete-file file))
           (puthash (claude-code-ide-control-inbox-directory-of instance-id) others
@@ -642,6 +674,53 @@ PENDING, when given, is the list of the pending records of INSTANCE-ID."
                                  (claude-code-ide-control--read-record file))))
           (and (equal (claude-code-ide-control--record-request-id record) request-id)
                record)))))
+
+(defun claude-code-ide-control--done-key-table (instance-id)
+  "Return the table from record key to final record files of INSTANCE-ID."
+  (let ((dir (claude-code-ide-control--done-directory instance-id)))
+    (or (gethash dir claude-code-ide-control--done-keys)
+        (let ((table (make-hash-table :test 'equal)))
+          (when (file-directory-p dir)
+            (dolist (file (directory-files dir t "\\`[0-9a-f]+\\.json\\'" t))
+              (when-let* ((record (claude-code-ide-control--read-record file))
+                          (key (claude-code-ide-control--record-key record)))
+                (push file (gethash key table)))))
+          (puthash dir table claude-code-ide-control--done-keys)))))
+
+(defun claude-code-ide-control--records-with-key (instance-id key)
+  "Return the pending and the final records of INSTANCE-ID whose key is KEY.
+The overdue sent records become final first, as for a submit."
+  (cl-remove-if-not
+   (lambda (record) (equal (claude-code-ide-control--record-key record) key))
+   (append (claude-code-ide-control-refresh instance-id)
+           (delq nil (mapcar #'claude-code-ide-control--read-record
+                             (gethash key (claude-code-ide-control--done-key-table instance-id)))))))
+
+(defun claude-code-ide-control-find-key-in-chain (instance-id key)
+  "Return the submit result of the record with KEY, or nil.
+The record is in the inbox of an instance of the chain of INSTANCE-ID:
+`claude-code-ide-session-registry-chain-ids' while
+`claude-code-ide-session-registry-mode' is on, else INSTANCE-ID alone.
+The inbox of each instance is searched, newest first, for a pending or
+a final record whose key is KEY.  The result is that of the first one
+that is not `rejected' with the reason `handed-over': the copy that a
+handover made survives.  When only such moved records exist, the
+result is that of the one in the newest inbox."
+  (let ((ids (reverse (or (and (bound-and-true-p claude-code-ide-session-registry-mode)
+                               (ignore-errors (claude-code-ide-session-registry-chain-ids instance-id)))
+                          (list instance-id))))
+        (found nil)
+        (moved nil))
+    (while (and ids (not found))
+      (let ((id (pop ids)))
+        (when (claude-code-ide-control-valid-id-p id)
+          (dolist (record (claude-code-ide-control--records-with-key id key))
+            (if (and (eq (claude-code-ide-control--record-result record) 'rejected)
+                     (eq (claude-code-ide-control--record-reason record) 'handed-over))
+                (unless moved (setq moved record))
+              (unless found (setq found record)))))))
+    (when-let* ((record (or found moved)))
+      (claude-code-ide-control--result record))))
 
 (defun claude-code-ide-control--record-summary (record)
   "Return the plist of RECORD without its text."
@@ -835,6 +914,13 @@ pending records, oldest first."
           (claude-code-ide-control--finish record 'unacknowledged 'no-acknowledgement)))
       (claude-code-ide-control--pending-records instance-id))))
 
+(defun claude-code-ide-control-pending-keys (instance-id)
+  "Return the keys of the pending records of INSTANCE-ID, oldest first.
+The records are those of `claude-code-ide-control-refresh'; a record
+without a key is left out."
+  (delq nil (mapcar #'claude-code-ide-control--record-key
+                    (claude-code-ide-control-refresh instance-id))))
+
 (defun claude-code-ide-control--provider-can-submit-p (instance)
   "Return nil when the provider of the descriptor INSTANCE has no submit-prompt.
 A nil INSTANCE (one that does not run) gives t: its provider decides later."
@@ -843,7 +929,7 @@ A nil INSTANCE (one that does not run) gives t: its provider decides later."
         (and provider (claude-code-ide-provider-supports-p provider 'submit-prompt)))))
 
 (cl-defun claude-code-ide-control-submit (instance-id text &key request-id (queue nil queue-given)
-                                                      generation)
+                                                      generation key defer)
   "Submit the prompt TEXT to the instance INSTANCE-ID through its inbox.
 REQUEST-ID is a string or a number that the caller chooses; nil makes
 a new one.  A second request with the same REQUEST-ID returns the
@@ -857,6 +943,16 @@ GENERATION, when given, is the launch generation of INSTANCE-ID that
 the caller saw.  When the last launch of INSTANCE-ID has another
 generation, a new request is rejected with the reason
 `generation-changed', and no inbox file is made.
+
+KEY, when given, is a string that the record keeps, also when a
+handover moves it under another request ID; see
+`claude-code-ide-control-find-key-in-chain'.
+
+DEFER non-nil queues a prompt that the rules send at once, with the
+reason `deferred', and sends it from a timer without delay.  So the
+call never sends: use it in a process filter, such as an MCP tool,
+where the send of a terminal provider (`sit-for') can run other
+process output.
 
 After a committed handover of INSTANCE-ID, the prompt goes to the
 current instance of its chain; see
@@ -878,7 +974,7 @@ Return a plist with :destination (the instance that gets TEXT),
                       (t 'never)))
          (given-id instance-id))
     (when (claude-code-ide-control-valid-id-p instance-id)
-      (setq instance-id (claude-code-ide-control--chain-current instance-id)))
+      (setq instance-id (claude-code-ide-control-chain-current instance-id)))
     (if (not (claude-code-ide-control-valid-id-p instance-id))
         (claude-code-ide-control--rejected instance-id request-id 'invalid-instance-id)
       (let* ((pending (claude-code-ide-control-refresh instance-id))
@@ -887,16 +983,16 @@ Return a plist with :destination (the instance that gets TEXT),
          (known (claude-code-ide-control--result known t))
          ((claude-code-ide-control--generation-changed-p given-id generation)
           (claude-code-ide-control--rejected instance-id request-id 'generation-changed))
-         ((not (and (stringp text) (not (string-empty-p (string-trim text)))))
+         ((claude-code-ide-control-blank-text-p text)
           (claude-code-ide-control--rejected instance-id request-id 'empty-text))
          (t
           (let ((state (claude-code-ide-control-state-of instance-id)))
             (if (null state)
                 (claude-code-ide-control--rejected instance-id request-id 'unknown-instance)
               (claude-code-ide-control--submit-new
-               instance-id text request-id queue state pending)))))))))
+               instance-id text request-id queue state pending key defer)))))))))
 
-(defun claude-code-ide-control--chain-current (instance-id)
+(defun claude-code-ide-control-chain-current (instance-id)
   "Return the current instance of the handover chain of INSTANCE-ID.
 After a committed handover, a prompt for the old instance goes to the
 new one.  Without a chain, or without the registry, it is INSTANCE-ID."
@@ -907,10 +1003,12 @@ new one.  Without a chain, or without the registry, it is INSTANCE-ID."
              (and (claude-code-ide-control-valid-id-p current) current)))
       instance-id))
 
-(defun claude-code-ide-control--submit-new (instance-id text request-id queue state pending)
+(defun claude-code-ide-control--submit-new (instance-id text request-id queue state pending
+                                                        &optional key defer)
   "Record and handle a new request REQUEST-ID with TEXT for INSTANCE-ID.
 QUEUE is `auto', `always' or `never', STATE the state for the rules,
-and PENDING the pending records of INSTANCE-ID."
+PENDING the pending records of INSTANCE-ID, KEY the key of the record,
+and DEFER non-nil sends from a timer what the rules send at once."
   (let* ((decision (claude-code-ide-control-decide state queue))
          (action (car decision))
          (reason (cdr decision))
@@ -939,6 +1037,8 @@ and PENDING the pending records of INSTANCE-ID."
       (if (eq queue 'never)
           (setq action 'reject reason 'earlier-prompts-pending)
         (setq action 'queue reason 'earlier-prompts-pending))))
+    (when (and defer (eq action 'deliver))
+      (setq action 'queue reason 'deferred))
     (let ((record (claude-code-ide-control--record-create
                    :request-id request-id
                    :instance-id instance-id
@@ -948,11 +1048,14 @@ and PENDING the pending records of INSTANCE-ID."
                    :result (if (eq action 'reject) 'rejected 'queued)
                    :reason reason
                    :created-at (claude-code-ide-control-now)
-                   :requested-by (claude-code-ide-control--requester))))
+                   :requested-by (claude-code-ide-control--requester)
+                   :key key)))
       (claude-code-ide-control--write-record record)
       (pcase action
         ('deliver (claude-code-ide-control--send record (plist-get state :guess)))
-        ('queue (claude-code-ide-control--start-timer)))
+        ('queue (claude-code-ide-control--start-timer)
+                (when (eq reason 'deferred)
+                  (claude-code-ide-control--schedule-delivery instance-id))))
       (claude-code-ide-control--result record))))
 
 (defvar claude-code-ide-control--pending-sends (make-hash-table :test 'eq :weakness 'key)
@@ -1095,6 +1198,7 @@ has already:
 - The copy keeps the request ID.  When TO has another record with that
   ID, the copy gets the ID \"handover:HANDOVER-ID:ID\" instead (FROM
   when HANDOVER-ID is nil); no record is dropped.
+- The copy keeps the key of the record (`key'), also under a new ID.
 - The copy records where it came from (`moved_from': FROM:ID), and the
   record of FROM where it went (`moved_to': TO:NEW-ID).  The record of
   FROM then becomes final: `rejected' with the reason `handed-over'.
@@ -1126,6 +1230,7 @@ copies, oldest first."
               :created-at (claude-code-ide-control--record-created-at record)
               :requested-by (claude-code-ide-control--record-requested-by record)
               :moved-from (concat from ":" request-id)
+              :key (claude-code-ide-control--record-key record)
               :note (when sent
                       (format "Sent to %s at %s without an acknowledgement; it may have reached that instance before the handover"
                               from sent))))
@@ -1462,12 +1567,7 @@ The tool always carries :scope coordinator."
 
 (defun claude-code-ide-control-remove-mcp-tools ()
   "Remove the coordinator tools from the MCP tools."
-  (let ((names (claude-code-ide-control--tool-names)))
-    (setq claude-code-ide-mcp-server-tools
-          (cl-remove-if (lambda (tool)
-                          (and (consp tool) (keywordp (car tool))
-                               (member (plist-get tool :name) names)))
-                        claude-code-ide-mcp-server-tools))))
+  (claude-code-ide-mcp-server-remove-tools (claude-code-ide-control--tool-names)))
 
 (defun claude-code-ide-control-setup-mcp-tools (&optional force)
   "Add the control operations to the MCP tools, as coordinator tools.

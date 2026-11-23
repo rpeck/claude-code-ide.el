@@ -37,6 +37,7 @@ This fork adds a second coding agent and tools to manage many agent sessions:
 - Menus in the menu bar for the commands and the running sessions (see [[*The menu bar][The menu bar]])
 - A read-only copy of the terminal buffer after a stop (see [[*Stopping Instances][Stopping Instances]])
 - Control operations and MCP tools for coordinator agents, and tracked external reviews
+- A mailbox: agent sessions of one Emacs send messages to each other (see [[*Mailbox][Mailbox]])
 
 ** Emacs Tool Integration
 
@@ -1130,6 +1131,41 @@ Later, the quota of Claude Code is free again:
 - Options: =claude-code-ide-review-directory=, =claude-code-ide-review-check-interval=, =claude-code-ide-review-retry-seconds=, =claude-code-ide-review-max-result-chars=, =claude-code-ide-review-done-days=, =claude-code-ide-review-format-function=.
 - See [[file:docs/review.md][docs/review.md]].
 
+** Mailbox
+
+The mailbox lets an agent session send a message to another agent session of the same Emacs. Each provider can send and receive. The receiver gets the message as a prompt when it is idle, through its inbox (see [[*Control for Coordinators][Control for Coordinators]]).
+
+*Turn it on:*
+
+- =M-x claude-code-ide-mailbox-mode=, or =(claude-code-ide-mailbox-mode 1)= in your init file. The mode is off by default.
+- Turn the mode on before the sessions start. A session approves the tools only when it starts. A session that started before the mode asks for an approval at each call, until its next start. The mode shows a warning with the number of such sessions.
+- The tools need the MCP tools server: set =claude-code-ide-enable-mcp-server= to =t=. While the mode is on and the server is off, a new session does not start without the tools:
+  - A session that you start asks "Enable it now?". Yes turns the server on for this Emacs, and the session starts. No stops the start.
+  - A coordinator launch, a restore, or a handover target does not start. The result names the reason =mailbox-needs-mcp-server=.
+  - The sessions that run are not changed.
+- The mode also turns on =claude-code-ide-session-registry-mode=.
+- With =claude-code-ide-mcp-allowed-tools= at =auto= (the default), the tools need no approval. With a list, add =mcp__emacs-tools__claude-code-ide-send-message= and =mcp__emacs-tools__claude-code-ide-list-peers= to it.
+
+*The tools:*
+
+- =claude-code-ide-list-peers= lists the other sessions of this Emacs that can get a message: instance ID, name, provider, role, and state.
+- =claude-code-ide-send-message= sends a message to an instance ID, with a summary of one line. Emacs adds the name and the ID of the sender; the sender cannot change them. A =request_id= makes a retry safe: a second call with the same ID sends nothing and returns the current result, also after a handover.
+- A message names its sender first. It tells the receiver that the text comes from a colleague, not from the user, and ranks below the user and the permissions of the session.
+
+*Limits:*
+
+- A summary has at most 200 characters, and a message at most 16,000. The mailbox never cuts a message.
+- At most 10 messages wait for one receiver (=claude-code-ide-mailbox-max-pending=).
+- From one sender to one receiver: 30 messages in one hour (=claude-code-ide-mailbox-pair-budget=), and 200 messages in total (=claude-code-ide-mailbox-pair-total=). A handover of the sender or the receiver does not refill these budgets.
+  - The hourly budget refills with time.
+  - Only =M-x claude-code-ide-mailbox-reset-budgets=, or a restart of Emacs, refills the total budget.
+- =claude-code-ide-mailbox-receivers=: a list of roles and instance IDs that can get messages. An ID also names the sessions that a handover made from it. nil (the default) means all sessions.
+- Only sessions of this Emacs can get a message. A message to a stopped session waits until the session starts again.
+
+*Warning:* the message text is advice to the receiver, not a security limit. A receiver with broad permissions can act on a harmful message. Turn the mode on only when you trust each session of this Emacs.
+
+See [[file:docs/mailbox.md][docs/mailbox.md]].
+
 ** Creating Custom MCP Tools
 
 You can expose your own Emacs functions to Claude through the MCP tools system. This allows Claude to interact with specialized Emacs features, custom commands, or domain-specific functionality.
@@ -1183,16 +1219,16 @@ The =claude-code-ide-mcp-server-with-session-context= macro ensures your tool ex
 
 Each file name starts with =claude-code-ide=. The table shows the part after it.
 
-| Group        | Files                                                                                      | Purpose                                                                      |
-|--------------+--------------------------------------------------------------------------------------------+------------------------------------------------------------------------------|
-| Core         | (main file), =-provider=, =-instance=, =-debug=, =-reload=                                 | User commands, terminals, providers, instance descriptors, debug log, reload |
-| MCP          | =-mcp=, =-mcp-handlers=, =-mcp-server=, =-mcp-http-server=, =-emacs-tools=, =-diagnostics= | IDE WebSocket server, MCP tools server, Emacs tools, diagnostics             |
-| Codex        | =-codex=, =-codex-events=                                                                  | The Codex provider, and its status hooks and states                          |
-| Sessions     | =-session-registry=, =-session-status=                                                     | Registry and restore, status buffer                                          |
-| Coordination | =-control=, =-handover=, =-transcript=, =-process=, =-review=                              | Control operations, handover, transcript readers, process trees, reviews     |
-| UI           | =-transient=, =-menu-bar=                                                                  | Transient menu, menu bar                                                     |
+| Group        | Files                                                                                      | Purpose                                                                           |
+|--------------+--------------------------------------------------------------------------------------------+-----------------------------------------------------------------------------------|
+| Core         | (main file), =-provider=, =-instance=, =-debug=, =-reload=                                 | User commands, terminals, providers, instance descriptors, debug log, reload      |
+| MCP          | =-mcp=, =-mcp-handlers=, =-mcp-server=, =-mcp-http-server=, =-emacs-tools=, =-diagnostics= | IDE WebSocket server, MCP tools server, Emacs tools, diagnostics                  |
+| Codex        | =-codex=, =-codex-events=                                                                  | The Codex provider, and its status hooks and states                               |
+| Sessions     | =-session-registry=, =-session-status=                                                     | Registry and restore, status buffer                                               |
+| Coordination | =-control=, =-handover=, =-transcript=, =-process=, =-review=, =-mailbox=                  | Control operations, handover, transcript readers, process trees, reviews, mailbox |
+| UI           | =-transient=, =-menu-bar=                                                                  | Transient menu, menu bar                                                          |
 
-- The main file loads =-process=, =-codex=, =-control=, =-transcript=, =-handover=, =-review= and =-menu-bar= as optional files. A missing file is skipped. An error in a file gives a warning.
+- The main file loads =-process=, =-codex=, =-control=, =-transcript=, =-handover=, =-review=, =-mailbox= and =-menu-bar= as optional files. A missing file is skipped. An error in a file gives a warning.
 - =-codex-events= loads together with =-session-status=.
 - The design documents are in [[file:docs/][docs/]].
 

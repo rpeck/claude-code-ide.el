@@ -196,6 +196,7 @@ BODY can use `worktree', the folder of a Git repository."
           (claude-code-ide-control--timer nil)
           (claude-code-ide-control--scheduled nil)
           (claude-code-ide-control--index (make-hash-table :test 'equal))
+          (claude-code-ide-control--done-keys (make-hash-table :test 'equal))
           (claude-code-ide-control--warned-providers nil)
           (claude-code-ide-control-delivered-functions nil)
           (claude-code-ide-control--held nil)
@@ -3015,7 +3016,7 @@ stop proved it: :own)."
   (claude-code-ide-handover-tests--with
     (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
     (claude-code-ide-handover-tests--registry-add "cci-test-far" 'cci-test-a worktree)
-    (cl-letf (((symbol-function 'claude-code-ide-session-registry--other-emacs-p)
+    (cl-letf (((symbol-function 'claude-code-ide-session-registry-other-emacs-p)
                (lambda (entry &rest _)
                  (equal (claude-code-ide-session-registry-entry-key entry) "cci-test-far"))))
       (let ((refused (claude-code-ide-handover-session "cci-test-src" 'cci-test-b)))
@@ -3610,7 +3611,7 @@ Only :force goes past it."
   (claude-code-ide-handover-tests--with
     (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
     (claude-code-ide-handover-tests--registry-add "cci-test-far" 'cci-test-a worktree :emacs-pid 4711)
-    (cl-letf (((symbol-function 'claude-code-ide-session-registry--other-emacs-p)
+    (cl-letf (((symbol-function 'claude-code-ide-session-registry-other-emacs-p)
                (lambda (entry &rest _)
                  (equal (claude-code-ide-session-registry-entry-key entry) "cci-test-far"))))
       (let ((refused (claude-code-ide-handover-session "cci-test-src" 'cci-test-b :allow-others t)))
@@ -3691,7 +3692,7 @@ Only :force goes past it."
         (should-not questions))
       (claude-code-ide-handover-cancel id))
     (claude-code-ide-handover-tests--registry-add "cci-test-far" 'cci-test-a worktree :emacs-pid 4711)
-    (cl-letf (((symbol-function 'claude-code-ide-session-registry--other-emacs-p)
+    (cl-letf (((symbol-function 'claude-code-ide-session-registry-other-emacs-p)
                (lambda (entry &rest _)
                  (equal (claude-code-ide-session-registry-entry-key entry) "cci-test-far"))))
       (claude-code-ide-handover-tests--with-questions nil

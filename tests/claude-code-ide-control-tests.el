@@ -72,6 +72,7 @@ are those of the test."
           (claude-code-ide-control--timer nil)
           (claude-code-ide-control--scheduled nil)
           (claude-code-ide-control--index (make-hash-table :test 'equal))
+          (claude-code-ide-control--done-keys (make-hash-table :test 'equal))
           (claude-code-ide-control--warned-providers nil)
           (claude-code-ide-control-delivered-functions nil)
           (claude-code-ide-instance--all nil)
@@ -882,7 +883,8 @@ A `timeout' stays sent: Codex may have stored it."
                                                claude-code-ide-control--state-of
                                                claude-code-ide-control--json
                                                claude-code-ide-control--blank-p
-                                               claude-code-ide-control--registry-entry))
+                                               claude-code-ide-control--registry-entry
+                                               claude-code-ide-control--chain-current))
     (should-not (fboundp name)))
   (should (functionp (indirect-function 'claude-code-ide-control-registry-entry))))
 
@@ -1010,6 +1012,129 @@ A `timeout' stays sent: Codex may have stored it."
       ;; A second move moves nothing again
       (should-not (claude-code-ide-control-move-inbox "cci-test-from" "cci-test-to" "cci-test-h"))
       (should (= (length (claude-code-ide-control--pending-records "cci-test-to")) 3)))))
+
+;;; The key of a record
+
+(ert-deftest claude-code-ide-test-control-key-survives-move ()
+  "A move keeps the key on the copy, also under a new request ID.
+A record file without a key reads as nil, and a submit without :key
+stores nil."
+  (claude-code-ide-tests--with-control
+    (claude-code-ide-tests--control-add "cci-test-from" "proj" 'working)
+    (claude-code-ide-tests--control-add "cci-test-to" "proj" 'working)
+    (claude-code-ide-control-submit "cci-test-from" "cci-test-k1" :request-id "q1" :key "cci-test-key-1")
+    (claude-code-ide-control-submit "cci-test-from" "cci-test-k2" :request-id "q2" :key "cci-test-key-2")
+    (claude-code-ide-control-submit "cci-test-to" "cci-test-own" :request-id "q2")
+    (should-not (claude-code-ide-control--record-key
+                 (claude-code-ide-control--find-record "cci-test-to" "q2")))
+    (should (equal (claude-code-ide-control-move-inbox "cci-test-from" "cci-test-to" "cci-test-h")
+                   '("q1" "handover:cci-test-h:q2")))
+    (should (equal (claude-code-ide-control--record-key
+                    (claude-code-ide-control--find-record "cci-test-to" "q1"))
+                   "cci-test-key-1"))
+    (should (equal (claude-code-ide-control--record-key
+                    (claude-code-ide-control--find-record "cci-test-to" "handover:cci-test-h:q2"))
+                   "cci-test-key-2"))
+    ;; The key is in the file, and survives a read from disk
+    (clrhash claude-code-ide-control--index)
+    (should (equal (claude-code-ide-control--record-key
+                    (claude-code-ide-control--find-record "cci-test-to" "q1"))
+                   "cci-test-key-1"))
+    ;; A file of an older version of the code has no key
+    (let ((file (claude-code-ide-control--record-file "cci-test-to" "q1")))
+      (claude-code-ide-control-write-json-file
+       file (cl-remove 'key (claude-code-ide-control--record-to-alist
+                             (claude-code-ide-control--read-record file))
+                       :key #'car))
+      (clrhash claude-code-ide-control--index)
+      (should (claude-code-ide-control--find-record "cci-test-to" "q1"))
+      (should-not (claude-code-ide-control--record-key
+                   (claude-code-ide-control--find-record "cci-test-to" "q1"))))))
+
+(defvar claude-code-ide-session-registry-mode)
+
+(ert-deftest claude-code-ide-test-control-find-key-in-chain ()
+  "The helper finds a key in an earlier leg and in the current leg, pending and final.
+It returns the copy, not the `handed-over' record; an unknown key gives nil."
+  (claude-code-ide-tests--with-control
+    (let ((claude-code-ide-session-registry-mode t)
+          (chain '("cci-test-b" "cci-test-c")))
+      (cl-letf (((symbol-function 'claude-code-ide-session-registry-chain-ids)
+                 (lambda (_id) chain))
+                ((symbol-function 'claude-code-ide-session-registry-chain-current) #'ignore))
+        (claude-code-ide-tests--control-add "cci-test-b" "proj" 'working)
+        (claude-code-ide-tests--control-add "cci-test-c" "proj" 'working)
+        (cl-flet ((find (key) (claude-code-ide-control-find-key-in-chain "cci-test-c" key))
+                  (deliver (id text key)
+                    (claude-code-ide-tests--control-set-state id 'idle)
+                    (claude-code-ide-control-submit id text :key key)
+                    (claude-code-ide-tests--control-event id 'prompt-submit `((prompt . ,text)))
+                    (claude-code-ide-tests--control-set-state id 'working)))
+          (deliver "cci-test-b" "cci-test-k2" "k2")
+          (claude-code-ide-control-submit "cci-test-b" "cci-test-k1" :request-id "r1" :key "k1")
+          (should-not (find "k3"))
+          (claude-code-ide-control-move-inbox "cci-test-b" "cci-test-c" "cci-test-h")
+          ;; The copy, not the handed-over record
+          (let ((copy (find "k1")))
+            (should (equal (plist-get copy :destination) "cci-test-c"))
+            (should (eq (plist-get copy :result) 'queued))
+            (should (eq (plist-get copy :reason) 'handed-over)))
+          ;; A final record of an earlier leg
+          (should (equal (plist-get (find "k2") :destination) "cci-test-b"))
+          (should (eq (plist-get (find "k2") :result) 'delivered))
+          ;; Final records of the current leg, written after the first look
+          (claude-code-ide-tests--control-set-state "cci-test-c" 'idle)
+          (claude-code-ide-control-deliver-pending "cci-test-c")
+          (claude-code-ide-tests--control-event "cci-test-c" 'prompt-submit '((prompt . "cci-test-k1")))
+          (should (eq (plist-get (find "k1") :result) 'delivered))
+          (deliver "cci-test-c" "cci-test-k3" "k3")
+          (should (eq (plist-get (find "k3") :result) 'delivered))
+          (should (equal (plist-get (find "k3") :destination) "cci-test-c"))
+          ;; A pending record of an earlier leg
+          (claude-code-ide-control-submit "cci-test-b" "cci-test-k4" :request-id "r4" :key "k4")
+          (should (equal (plist-get (find "k4") :request-id) "r4"))
+          (should-not (find "cci-test-unknown"))
+          ;; Without the copy, the handed-over record is the result
+          (setq chain '("cci-test-b"))
+          (let ((old (find "k1")))
+            (should (equal (plist-get old :destination) "cci-test-b"))
+            (should (eq (plist-get old :reason) 'handed-over))))))))
+
+;;; Deferred sends
+
+(ert-deftest claude-code-ide-test-control-defer-key ()
+  ":defer t queues a prompt for an idle instance and sends it from a timer.
+Without the key, an idle instance gets the prompt at once."
+  (claude-code-ide-tests--with-control
+    (let ((timers nil))
+      (cl-letf (((symbol-function 'run-at-time)
+                 (lambda (_time _repeat fn &rest args) (push (cons fn args) timers) nil)))
+        (claude-code-ide-tests--control-add "cci-test-a" "proj" 'idle)
+        (let ((result (claude-code-ide-control-submit "cci-test-a" "cci-test-later"
+                                                      :request-id "d1" :defer t)))
+          (should (eq (plist-get result :result) 'queued))
+          (should (eq (plist-get result :reason) 'deferred))
+          (should-not (plist-get result :sent-at)))
+        (should-not claude-code-ide-tests--control-sent)
+        (should (= (length timers) 1))
+        (let ((timer (pop timers)))
+          (apply (car timer) (cdr timer)))
+        (should (equal claude-code-ide-tests--control-sent '(("cci-test-a" "cci-test-later"))))
+        (should (eq (plist-get (claude-code-ide-control-request-status "cci-test-a" "d1") :reason)
+                    'awaiting-acknowledgement))
+        ;; :defer changes only an immediate send: a busy instance queues as before
+        (claude-code-ide-tests--control-set-state "cci-test-a" 'working)
+        (should (eq (plist-get (claude-code-ide-control-submit "cci-test-a" "x" :request-id "d2"
+                                                               :defer t)
+                               :reason)
+                    'working))
+        ;; Without the key, the send is at once
+        (claude-code-ide-tests--control-add "cci-test-b" "proj" 'idle)
+        (setq timers nil)
+        (should (plist-get (claude-code-ide-control-submit "cci-test-b" "cci-test-now" :request-id "n1")
+                           :sent-at))
+        (should (equal (car claude-code-ide-tests--control-sent) '("cci-test-b" "cci-test-now")))
+        (should-not timers)))))
 
 (provide 'claude-code-ide-control-tests)
 

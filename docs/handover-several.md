@@ -50,7 +50,7 @@ Each rule has one owner function. The design calls these functions and adds no s
 |---|---|
 | The worktree of a folder | `claude-code-ide-handover--directory-key` (through `claude-code-ide--worktree-root`) |
 | The other writers in a worktree | `claude-code-ide-handover--other-writers`, from `claude-code-ide-handover--other-instances`, `claude-code-ide-handover--other-sessions` and `claude-code-ide-handover--other-emacs-entries`. Changed in the implementation: the combination of the three is `claude-code-ide-handover--writers (KEY EXCLUDE)`; `--other-writers` and `--run-writers` call it. |
-| A live registry entry of another Emacs | `claude-code-ide-session-registry--other-emacs-p` |
+| A live registry entry of another Emacs | `claude-code-ide-session-registry-other-emacs-p` |
 | One unfinished handover per worktree | `claude-code-ide-handover--holding-run` |
 | No start in a held worktree | `claude-code-ide-handover--guard-start` (an `:around` advice of `claude-code-ide--start-session`) |
 | The strays that count | `claude-code-ide-handover--relevant-strays` |
@@ -384,7 +384,7 @@ Before you write a file that another session can also write, and before you reve
 | `claude-code-ide-test-handover-other-instances-no` | After `n`: `user-error`, no handover record in the registry, and no question after this one. |
 | `claude-code-ide-test-handover-prefix-skips-other-question` | With `current-prefix-arg` `(4)`, the question does not come, and the handover runs. (Issue test 2.) |
 | `claude-code-ide-test-handover-checks-before-questions` | A worktree that a handover holds, and a worktree with a live entry of another Emacs: `--read-args` and `--read-batch-args` signal `user-error` before any question stub is called. |
-| `claude-code-ide-test-handover-other-emacs-refused` | A live entry of another Emacs in the worktree (`claude-code-ide-session-registry--other-emacs-p` stubbed): `other-instance` with `:allow-others t`; the handover runs with `:force t`. |
+| `claude-code-ide-test-handover-other-emacs-refused` | A live entry of another Emacs in the worktree (`claude-code-ide-session-registry-other-emacs-p` stubbed): `other-instance` with `:allow-others t`; the handover runs with `:force t`. |
 | `claude-code-ide-test-handover-writer-lines` | One line for an instance of this Emacs with `failed/quota-limit`, one for an MCP session without a descriptor (`claude-code-ide-handover-tests--session`), and one for a registry entry of another Emacs, with its Emacs PID. |
 | `claude-code-ide-test-handover-allow-others-keeps-busy` | `:allow-others t`: a source in `waiting-for-task` is refused with `busy`. A source that reaches `waiting-for-task` in the quiescing is cancelled with `busy`, and the stop does not run. |
 | `claude-code-ide-test-handover-request-asks-about-others` | `claude-code-ide-handover--offer-request` with another instance in the worktree asks both questions. Yes to both starts the handover; `n` to the second starts nothing. |
