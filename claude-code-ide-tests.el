@@ -425,14 +425,20 @@ A real block longer than its limit fails the test."
   (should-not claude-code-ide-control-inbox-directory)
   (should-not claude-code-ide-review-directory))
 
-;; Load every claude-code-ide-*-tests.el file of this folder, in name
-;; order, so that a branch adds its tests without an edit here.  The
-;; files load after the mocks above and use the helpers below, which
-;; they reach at run time.
-(let ((directory (file-name-directory (or load-file-name buffer-file-name))))
-  (dolist (file (directory-files directory nil "\\`claude-code-ide-.+-tests\\.el\\'"))
-    (require (intern (file-name-sans-extension file))
-             (expand-file-name file directory))))
+;; Load every claude-code-ide-*-tests.el file of this folder and of its
+;; tests/ folder, in name order, so that a branch adds its tests without
+;; an edit here.  The files load after the mocks above and use the
+;; helpers below, which they reach at run time.  The tests/ folder goes
+;; on `load-path', so that a test file can require another one.
+(let* ((directory (file-name-directory (or load-file-name buffer-file-name)))
+       (tests (expand-file-name "tests" directory)))
+  (when (file-directory-p tests)
+    (add-to-list 'load-path tests))
+  (dolist (dir (list directory tests))
+    (when (file-directory-p dir)
+      (dolist (file (directory-files dir nil "\\`claude-code-ide-.+-tests\\.el\\'"))
+        (require (intern (file-name-sans-extension file))
+                 (expand-file-name file dir))))))
 
 ;;; Test Helper Functions
 

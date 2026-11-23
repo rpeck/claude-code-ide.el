@@ -56,15 +56,16 @@ NO_TRAMPOLINES="(setq native-comp-enable-subr-trampolines nil)"
 # dependencies: websocket, transient (recent releases depend on
 # cond-let and llama), vterm, and web-server (the MCP tests that use the
 # real web-server package run when it is found, and are skipped
-# otherwise)
-LOAD_PATH=(-L .)
+# otherwise).  tests/ holds the test files, and a test file can
+# require another one
+LOAD_PATH=(-L . -L tests)
 add_emacs_packages emacs-websocket transient cond-let llama emacs-libvterm web-server
 
 # STEP 1: Compile all elisp files
 echo "=== Running byte-compilation check ===" >&2
 "$EMACS" -batch "${LOAD_PATH[@]}" \
     --eval "(setq byte-compile-warnings '(not free-vars unresolved))" \
-    -f batch-byte-compile *.el
+    -f batch-byte-compile *.el tests/*.el
 COMPILE_EXIT_CODE=$?
 
 if [ $COMPILE_EXIT_CODE -eq 0 ]; then
@@ -86,7 +87,7 @@ if [ $COMPILE_EXIT_CODE -eq 0 ] && [ "$WITH_NATIVE_COMPILE" = true ]; then
     if [ "$NATIVE_COMPILE_AVAILABLE" = true ]; then
         echo "" >&2
         echo "=== Running native-compilation check ===" >&2
-        "$EMACS" -batch "${LOAD_PATH[@]}" -f batch-native-compile *.el
+        "$EMACS" -batch "${LOAD_PATH[@]}" -f batch-native-compile *.el tests/*.el
         NATIVE_COMPILE_EXIT_CODE=$?
 
         if [ $NATIVE_COMPILE_EXIT_CODE -eq 0 ]; then
@@ -147,7 +148,7 @@ fi
 # STEP 4: Clean up .elc and .eln files to avoid stale bytecode
 echo "" >&2
 echo "Cleaning up .elc and .eln files..." >&2
-rm -f *.elc
+rm -f *.elc tests/*.elc
 # Native compiled files might be in a subdirectory
 find . -name "*.eln" -type f -delete 2>/dev/null || true
 

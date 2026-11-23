@@ -6,7 +6,7 @@ This document describes how a request finds its instance, how the server checks 
 
 - Code: `claude-code-ide-mcp-server.el` (sessions, secrets, context, scopes) and `claude-code-ide-mcp-http-server.el` (HTTP).
 - Tools: `claude-code-ide-emacs-tools.el`.
-- Tests: `claude-code-ide-mcp-routing-tests.el`.
+- Tests: `tests/claude-code-ide-mcp-routing-tests.el`.
   - The tests mock web-server, except the tests named `…-web-server-…`. Those run only when the web-server package is on the `load-path`, and they are skipped otherwise. `./scripts/compile-and-test.sh` adds the newest `~/.emacs.d/elpa/web-server-*` folder when there is one.
 - Instances and providers: [session-schema.md](session-schema.md) and [providers.md](providers.md).
 

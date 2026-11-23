@@ -196,4 +196,4 @@ The `claude` provider calls the functions that the package used before. A start 
 
 5. To give a state for the instances of the provider, add a function to `claude-code-ide-instance-state-functions`. See [session-schema.md](session-schema.md).
 6. Put the values that the frozen descriptor does not have in the descriptor's properties. Use keys that start with the name of your file, for example `:codex-secret`.
-7. Write ERT tests in `claude-code-ide-<area>-tests.el`. `claude-code-ide-tests.el` loads every such file.
+7. Write ERT tests in `tests/claude-code-ide-<area>-tests.el`. `claude-code-ide-tests.el` loads every such file.

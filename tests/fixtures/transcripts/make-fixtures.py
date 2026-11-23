@@ -1,6 +1,6 @@
 import json, os, sys
 # Write the synthetic transcript fixtures of claude-code-ide-transcript-tests.el.
-# Usage: python3 test-fixtures/transcripts/make-fixtures.py test-fixtures/transcripts
+# Usage: python3 tests/fixtures/transcripts/make-fixtures.py tests/fixtures/transcripts
 # All text is made up and uses the cci-test- prefix.  The record shapes
 # follow CC 2.1 transcripts and Codex 0.164 rollouts.
 out = sys.argv[1]

@@ -19,7 +19,7 @@
 (declare-function format-elisp-run "format-elisp" (files))
 
 (defconst claude-code-ide-format-tests--script
-  (expand-file-name "scripts/format-elisp.el"
+  (expand-file-name "../scripts/format-elisp.el"
                     (file-name-directory (or load-file-name buffer-file-name)))
   "The formatter that the tests load.")
 
@@ -164,6 +164,29 @@ The other files of the run are still formatted."
                                 (buffer-string))))
           (should (time-equal-p '(0 0) (file-attribute-modification-time
                                         (file-attributes file)))))
+      (delete-directory dir t))))
+
+(ert-deftest claude-code-ide-format-test-rules-of-tests-folder ()
+  "The indent rules also come from the Elisp files of the tests/ folder.
+A test file there formats with a macro of another test file there."
+  (load claude-code-ide-format-tests--script nil t)
+  (let ((dir (file-name-as-directory (make-temp-file "cci-test-format-" t))))
+    (unwind-protect
+        (let* ((tests (expand-file-name "tests" dir))
+               (file (expand-file-name "b-tests.el" tests)))
+          (make-directory tests)
+          (claude-code-ide-format-tests--write
+           (expand-file-name "a-tests.el" tests)
+           (concat "(defmacro cci-test-format-with (x &rest body)\n"
+                   "  (declare (indent 1))\n  `(progn ,x ,@body))\n"))
+          (claude-code-ide-format-tests--write file "(cci-test-format-with 1\n(foo))\n")
+          (let ((default-directory dir))
+            (format-elisp-run (list file)))
+          (should (equal "(cci-test-format-with 1\n  (foo))\n"
+                         (with-temp-buffer
+                           (insert-file-contents file)
+                           (buffer-string)))))
+      (put 'cci-test-format-with 'lisp-indent-function nil)
       (delete-directory dir t))))
 
 (provide 'claude-code-ide-format-tests)

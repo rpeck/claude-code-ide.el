@@ -3,9 +3,9 @@
 The live tests start the real `claude` and `codex` CLIs in real Emacs terminals.
 They check what the unit tests cannot: the handover between real conversations, and the dialogs of the Codex terminal.
 
-- Code: `claude-code-ide-live-tests.el`.
+- Code: `tests/claude-code-ide-live-tests.el`.
 - The handover: [handover.md](handover.md). Codex: [codex.md](codex.md).
-- The process tests have their own live tests in `claude-code-ide-process-tests.el`. They run in batch Emacs.
+- The process tests have their own live tests in `tests/claude-code-ide-process-tests.el`. They run in batch Emacs.
 
 ## When they run
 
@@ -56,7 +56,7 @@ env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOI
     -L ~/.emacs.d/elpa/web-server-<version> -L ~/.emacs.d/elpa/transient-<version> \
     -L ~/.emacs.d/elpa/cond-let-<version> -L ~/.emacs.d/elpa/llama-<version> \
     -L ~/.emacs.d/elpa/compat-<version> \
-    -l claude-code-ide-live-tests.el --eval '(claude-code-ide-live-tests-setup)'
+    -l tests/claude-code-ide-live-tests.el --eval '(claude-code-ide-live-tests-setup)'
 ```
 
 - **The environment of the CLIs.** The setup adds `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CLAUDECODE`, `CLAUDE_CODE_CHILD_SESSION`, and `CLAUDE_CODE_ENTRYPOINT` to `claude-code-ide-cli-environment-unset`, so the Claude Code CLI never gets them. It also turns on `claude-code-ide-codex-remove-openai-api-key`.
@@ -80,7 +80,7 @@ emacsclient -s cci-live -e '(claude-code-ide-live-tests-run "handover-chain" "/a
 
 ## The live folder
 
-`claude-code-ide-live-tests-setup` points the package at the live folder: `CLAUDE_CODE_IDE_LIVE_DIR`, default `tmp/live/` next to the test file. `tmp/` is in `.gitignore`.
+`claude-code-ide-live-tests-setup` points the package at the live folder: `CLAUDE_CODE_IDE_LIVE_DIR`, default `tmp/live/` of the repository. `tmp/` is in `.gitignore`.
 
 - The folder (mode 0700) holds the registry, the report folder with the hook scripts and the events, the inbox, the MCP config files, the coordinator credential, the provider file, the IDE lock files (through an advice of `claude-code-ide-mcp--lockfile-directory`), and the test projects.
 - The test projects are Git repositories: `projA`, `projB`, `projC`, and `dialogs-untrusted-<backend>`.

@@ -122,15 +122,18 @@ non-nil when FILE changed."
 (defun format-elisp-run (files)
   "Format FILES, and return the files that could not be formatted.
 The indent rules come from the Elisp files in `default-directory' (the
-project root) and from FILES.  A file that cannot be read or formatted
-gets a message, and the other files are still formatted.  A file that
-is not a regular readable file (such as a lock file) is skipped, and
-is no failure."
+project root), in its tests/ folder, and from FILES.  A file that
+cannot be read or formatted gets a message, and the other files are
+still formatted.  A file that is not a regular readable file (such as
+a lock file) is skipped, and is no failure."
   ;; A transient whose dependencies are missing signals an error
   (ignore-errors (require 'transient nil t))
   (format-elisp-set-rules
-   (delete-dups (append (directory-files default-directory t "\\.el\\'")
-                        (mapcar #'expand-file-name files))))
+   (let ((tests (expand-file-name "tests" default-directory)))
+     (delete-dups (append (directory-files default-directory t "\\.el\\'")
+                          (and (file-directory-p tests)
+                               (directory-files tests t "\\.el\\'"))
+                          (mapcar #'expand-file-name files)))))
   (let ((failed nil))
     (dolist (file files)
       (if (not (format-elisp--file-p file))

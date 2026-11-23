@@ -4,7 +4,7 @@ The `codex` provider runs the Codex CLI in an Emacs terminal.
 This document describes how Emacs starts Codex, and how it sends prompts to Codex.
 
 - Code: `claude-code-ide-codex.el`.
-- Tests: `claude-code-ide-codex-tests.el`.
+- Tests: `tests/claude-code-ide-codex-tests.el`.
 - The provider interface: [providers.md](providers.md).
 - Verified with Codex 0.164.0.
 

@@ -6,7 +6,7 @@
 
 ;; Tests for claude-code-ide-transcript.el: the CC and Codex readers,
 ;; the workspace state from Git, and the handover document.  The
-;; transcripts in test-fixtures/transcripts/ are synthetic, and all
+;; transcripts in tests/fixtures/transcripts/ are synthetic, and all
 ;; their text starts with cci-test.  Git repositories are made in
 ;; temporary folders, with the global and system Git configuration
 ;; turned off.  claude-code-ide-tests.el loads this file.
@@ -19,7 +19,7 @@
 (require 'claude-code-ide-transcript)
 
 (defconst claude-code-ide-transcript-tests--fixtures
-  (expand-file-name "test-fixtures/transcripts/"
+  (expand-file-name "fixtures/transcripts/"
                     (file-name-directory (or load-file-name buffer-file-name)))
   "Folder of the synthetic transcripts.")
 

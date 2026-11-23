@@ -4,7 +4,7 @@ A coordinator is a program or an agent session that controls other instances.
 This document describes the control operations of claude-code-ide.el, the prompt inbox, and the MCP coordinator tools.
 
 - Code: `claude-code-ide-control.el`.
-- Tests: `claude-code-ide-control-tests.el`.
+- Tests: `tests/claude-code-ide-control-tests.el`.
 - Instances, events, and states: [session-schema.md](session-schema.md).
 - Providers: [providers.md](providers.md).
 

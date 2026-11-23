@@ -5,7 +5,7 @@ The first prompt of the new conversation is the handover document.
 This document describes how Emacs reads the transcripts and writes the handover document.
 
 - Code: `claude-code-ide-transcript.el`.
-- Tests: `claude-code-ide-transcript-tests.el`, with the synthetic transcripts in `test-fixtures/transcripts/`.
+- Tests: `tests/claude-code-ide-transcript-tests.el`, with the synthetic transcripts in `tests/fixtures/transcripts/`.
 - Instances and providers: [session-schema.md](session-schema.md) and [providers.md](providers.md).
 
 ## Turns
