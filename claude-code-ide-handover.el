@@ -149,6 +149,73 @@ A target with a saved conversation is resumed in both cases."
                  (const :tag "Resume as before, then ask a person" ask))
   :group 'claude-code-ide-handover)
 
+(defcustom claude-code-ide-handover-unsent-draft 'ask
+  "What a handover does with an unsent prompt in the input box of the source.
+Before the stop, when the source is idle, the handover reads its
+terminal screen (`claude-code-ide-handover--source-draft').  A text in
+the input box of Claude Code, or in the composer of Codex, that the user
+did not send would be lost by the stop.
+- `ask': an interactive handover shows the draft and asks before the
+  stop: carry it to the target, drop it, or cancel (the source keeps
+  running with its draft).  A coordinator call gets the status
+  needs-user with the reason `unsent-draft' and the draft in its
+  status, with the same choices through
+  `claude-code-ide-handover-resolve'.
+- `carry': put the draft in the handover document, as the user's next
+  request after the state summary of the target.
+- `drop': go on without it.  The handover record keeps its text.
+- `refuse': cancel the handover; the source keeps running with it.
+A screen read that is unsure (for example a box without the prompt
+marker) counts as no draft, and the record says that the check was
+unsure.  But when the input box or the composer that the read found
+has text that is not a placeholder, `ask' asks about that raw text,
+labelled as maybe a draft (a coordinator call gets needs-user with the
+reason `unsent-draft'); the other values go on as with no draft, and
+the record keeps the raw text (draft_raw)."
+  :type '(choice (const :tag "Ask" ask)
+                 (const :tag "Carry it to the target" carry)
+                 (const :tag "Drop it (the record keeps it)" drop)
+                 (const :tag "Refuse the handover" refuse))
+  :group 'claude-code-ide-handover)
+
+(defcustom claude-code-ide-handover-draft-placeholders
+  '("\\`Try \"[^\"]*\"\\'"
+    "\\`Ask Codex to do anything\\'"
+    "\\`Explain this codebase\\'"
+    "\\`Summarize recent commits\\'"
+    "\\`Implement {feature}\\'"
+    "\\`Find and fix a bug in @filename\\'"
+    "\\`Write tests for @filename\\'"
+    "\\`Improve documentation in @filename\\'"
+    "\\`Run /review on my current changes\\'"
+    "\\`Use /skills to list available skills\\'")
+  "Regexps of the placeholder texts of an empty input box.
+Claude Code shows a suggestion such as Try \"fix lint errors\", and
+Codex shows a suggestion such as Ask Codex to do anything.  A screen
+read sees no draft when the whole input matches one of them."
+  :type '(repeat regexp)
+  :group 'claude-code-ide-handover)
+
+(defcustom claude-code-ide-handover-codex-footer-regexps
+  '("\\`[[:alnum:]][[:alnum:]._/:-]* \\(?:minimal\\|low\\|medium\\|high\\|xhigh\\) · [^ ].*\\'")
+  "Regexps of the footer row under the Codex composer.
+The screen read of an unsent draft counts the last row of a Codex
+screen as the footer only when one of them matches the whole row
+\(without the spaces at its ends; case counts).  An entry must match a
+whole footer layout, from \\=\\` to \\=\\': a match of a part of the row
+does not count, so that a row of the user's text with a footer phrase
+stays in the draft.  The default is the form of Codex 0.164: the
+model, the reasoning effort, and \" · \" with the folder, as in
+\"GPT-5.6-Terra low · ~\".  A hint row such as \"? for shortcuts\" or
+\"100% context left\" counts only on the row next to that form
+\(`claude-code-ide-handover--codex-footer-hints'), because a user can
+type it.  Without a footer, the read is unsure, and the text of the
+composer region is shown as maybe a draft.  Add a regexp when a new
+Codex version shows another footer; an entry that the user can type
+as a row of a draft can hide that row."
+  :type '(repeat regexp)
+  :group 'claude-code-ide-handover)
+
 (defcustom claude-code-ide-handover-continue 'ask
   "Whether the target goes on with the task after a handover commits.
 The target reads its document, writes its state summary and replies
@@ -228,6 +295,12 @@ Emacs asks you whether to hand over."
   (force nil :documentation "Non-nil to go on while subagents or tasks run.")
   (interactive nil :documentation "Non-nil when a person started it in Emacs.")
   (continue nil :documentation "Non-nil to send the continue prompt to the target at the commit.")
+  (draft nil :documentation "The unsent prompt that the screen of the source showed, or nil.")
+  (draft-decision nil :documentation "`none', `unsure', `carry' or `drop', or nil before the check.")
+  (draft-unsure nil :documentation "Why the draft check was unsure, or nil.")
+  (draft-context nil :documentation "The IDE context chip of the draft, such as \"In foo.el\", or nil.")
+  (draft-raw nil :documentation "The raw text of the input region of an unsure screen read, or nil.")
+  (draft-maybe nil :documentation "Non-nil when the draft is the raw text of an unsure read (maybe a draft).")
   (continue-sent nil :documentation "Non-nil after the inbox of the target accepted the continue prompt.")
   (chain-saved nil :documentation "Non-nil after the commit saved the chain of the target.")
   (missing-entry nil :documentation "`source' or `target': the registry entry that a save missed, or nil.")
@@ -362,6 +435,13 @@ while a handover holds the worktree.")
                                             (claude-code-ide-handover--run-strays run)))))
            (cons 'interactive (and (claude-code-ide-handover--run-interactive run) t))
            (cons 'continue (and (claude-code-ide-handover--run-continue run) t))
+           (cons 'draft_text (claude-code-ide-handover--run-draft run))
+           (cons 'draft_decision (claude-code-ide-handover--name
+                                  (claude-code-ide-handover--run-draft-decision run)))
+           (cons 'draft_unsure (claude-code-ide-handover--run-draft-unsure run))
+           (cons 'draft_context (claude-code-ide-handover--run-draft-context run))
+           (cons 'draft_raw (claude-code-ide-handover--run-draft-raw run))
+           (cons 'draft_maybe (and (claude-code-ide-handover--run-draft-maybe run) t))
            (cons 'continue_sent (and (claude-code-ide-handover--run-continue-sent run) t))
            (cons 'chain_saved (and (claude-code-ide-handover--run-chain-saved run) t))
            ;; The owner of the run: this Emacs
@@ -410,6 +490,12 @@ while a handover holds the worktree.")
      :interactive (alist-get 'interactive alist)
      ;; An older record has no field: the old behavior, no prompt
      :continue (eq (alist-get 'continue alist) t)
+     :draft (alist-get 'draft_text alist)
+     :draft-decision (claude-code-ide-handover--symbol (alist-get 'draft_decision alist))
+     :draft-unsure (alist-get 'draft_unsure alist)
+     :draft-context (alist-get 'draft_context alist)
+     :draft-raw (alist-get 'draft_raw alist)
+     :draft-maybe (eq (alist-get 'draft_maybe alist) t)
      :continue-sent (eq (alist-get 'continue_sent alist) t)
      :chain-saved (eq (alist-get 'chain_saved alist) t)
      :owner (claude-code-ide-session-registry--handover-owner alist)
@@ -516,6 +602,11 @@ document after a crash still has the context."
          :target-provider (claude-code-ide-handover--run-target-provider run)
          :method (claude-code-ide-handover--run-method run)
          :continue (claude-code-ide-handover--run-continue run)
+         :draft (claude-code-ide-handover--run-draft run)
+         :draft-decision (claude-code-ide-handover--run-draft-decision run)
+         :draft-context (claude-code-ide-handover--run-draft-context run)
+         :draft-raw (claude-code-ide-handover--run-draft-raw run)
+         :draft-maybe (claude-code-ide-handover--run-draft-maybe run)
          :reason (claude-code-ide-handover--run-reason run)
          :message (claude-code-ide-handover--run-message run)
          :document (claude-code-ide-handover--run-document run)
@@ -1242,6 +1333,583 @@ counts."
                     (claude-code-ide-control--pending-records source))
            (< (float-time) (claude-code-ide-handover--run-ack-deadline run))))))
 
+(declare-function claude-code-ide-codex--screen-text "claude-code-ide-codex" (buffer))
+
+(defun claude-code-ide-handover--screen-text (buffer)
+  "Return the text of the terminal screen of BUFFER.
+The screen read of the Codex dialogs (`claude-code-ide-codex--screen-text')
+knows the size of the terminal of each backend (vterm, eat, ghostel);
+without it, the screen is the last 50 lines of BUFFER."
+  (if (fboundp 'claude-code-ide-codex--screen-text)
+      (claude-code-ide-codex--screen-text buffer)
+    (with-current-buffer buffer
+      (save-excursion
+        (goto-char (point-max))
+        (forward-line -49)
+        (buffer-substring-no-properties (line-beginning-position) (point-max))))))
+
+(defun claude-code-ide-handover--screen-lines (text)
+  "Return the lines of the screen TEXT, without trailing spaces.
+A no-break space counts as a space, and a carriage return is dropped,
+so the screens of the backends read alike."
+  (mapcar (lambda (line) (string-trim-right line))
+          (split-string (replace-regexp-in-string
+                         "\r" "" (replace-regexp-in-string " " " " text))
+                        "\n")))
+
+(defun claude-code-ide-handover--placeholder-p (text)
+  "Return non-nil when TEXT is a placeholder of an empty input box.
+See `claude-code-ide-handover-draft-placeholders'."
+  (let ((case-fold-search nil))
+    (cl-some (lambda (regexp) (string-match-p regexp text))
+             claude-code-ide-handover-draft-placeholders)))
+
+(defun claude-code-ide-handover--draft-text (lines)
+  "Return the text of the input LINES (strings).
+An empty row ends a paragraph, and the paragraphs join with an empty
+line.  The rows of a paragraph join with one space: a terminal screen
+cannot tell a soft wrap at its width from a new line that the user
+typed, and the indents of the wraps differ."
+  (let ((paragraphs nil)
+        (rows nil))
+    (dolist (line (append lines '("")))
+      (let ((row (string-trim line)))
+        (cond
+         ((not (string-empty-p row)) (push row rows))
+         (rows
+          (push (replace-regexp-in-string "[ \t]+" " " (string-join (nreverse rows) " "))
+                paragraphs)
+          (setq rows nil)))))
+    (string-join (nreverse paragraphs) "\n\n")))
+
+(defun claude-code-ide-handover--draft-result (lines &optional ide-context)
+  "Return the draft result of the input LINES (strings, already stripped).
+See `claude-code-ide-handover--draft-text' for the join.  IDE-CONTEXT
+is the text of the IDE context chip in front of the draft, or nil; a
+draft keeps it as :ide-context."
+  (let ((text (claude-code-ide-handover--draft-text lines)))
+    (cond
+     ((string-empty-p text) (list :status 'none))
+     ((claude-code-ide-handover--placeholder-p text) (list :status 'none))
+     (t (append (list :status 'draft :text text)
+                (and ide-context (list :ide-context ide-context)))))))
+
+(defun claude-code-ide-handover--raw-text (lines)
+  "Return the raw text of the input region LINES, for a question, or nil.
+Each row loses the spaces at its ends, and the empty rows at the start
+and at the end go.  The raw text is always the whole region.  An empty
+region gives nil, and so does a region whose whole text is a
+placeholder (`claude-code-ide-handover--placeholder-p')."
+  (let* ((rows (mapcar #'string-trim lines))
+         (rows (cl-loop for tail on rows
+                        unless (string-empty-p (car tail)) return tail))
+         (rows (reverse (cl-loop for tail on (reverse rows)
+                                 unless (string-empty-p (car tail)) return tail))))
+    (when (and rows (not (claude-code-ide-handover--placeholder-p
+                          (claude-code-ide-handover--draft-text rows))))
+      (string-join rows "\n"))))
+
+(defun claude-code-ide-handover--unsure (why &optional lines)
+  "Return the unsure result with the reason WHY.
+LINES are the rows of the input region that the read found but could
+not read, or nil; their raw text, if any, is :raw."
+  (let ((raw (and lines (claude-code-ide-handover--raw-text lines))))
+    (append (list :status 'unsure :why why)
+            (and raw (list :raw raw)))))
+
+(defconst claude-code-ide-handover--dialog-control
+  (let ((part (concat "\\(?:press \\)?\\(?:enter\\|esc\\|tab\\|↑/↓\\|option [0-9]+/[0-9]+\\)"
+                      "\\(?: to [[:alpha:]]+\\(?: [[:alpha:]]+\\)?\\| [[:alpha:]]+\\)?")))
+    (concat "\\`" part "\\(?:\\(?: · \\| | \\| or \\)" part "\\)*\\'"))
+  "Regexp of a whole control row of a dialog or a popup (case is ignored).
+The row is made of keys and their actions only, such as Esc to cancel,
+Enter to select · ↑/↓ to navigate · Esc to cancel, Press enter to
+confirm or esc to cancel, enter continue · esc quit, and option 1/2 |
+enter to submit | esc.  A row of prose that has such words in it is no
+control row.")
+
+(defun claude-code-ide-handover--control-row-p (row)
+  "Return non-nil when ROW is a whole control row of a dialog or a popup.
+See `claude-code-ide-handover--dialog-control'."
+  (let ((case-fold-search t))
+    (string-match-p claude-code-ide-handover--dialog-control (string-trim row))))
+
+(defun claude-code-ide-handover--last-text-row (lines)
+  "Return the index of the last row of LINES that is not empty, or nil."
+  (cl-loop for index downfrom (1- (length lines)) to 0
+           unless (string-empty-p (nth index lines)) return index))
+
+(defun claude-code-ide-handover--dialog-p (lines marker)
+  "Return non-nil when the screen LINES end in a dialog with the selection MARKER.
+A dialog is known by its structure, not by the text of a choice: the
+MARKER on a numbered choice row, another numbered row in its list, and
+at the bottom of the screen the control row of the dialog (see
+`claude-code-ide-handover--control-row-p') or the choice list itself.
+A draft that starts with "1. " is no dialog: under the input box or
+the composer, the bottom rows are the status lines or the footer row of
+the CLI.  The value is `control' when the control row is at the bottom
+\(sure evidence), or `list' when only the choice list is: a numbered
+draft without its footer looks the same, so the reader keeps its text."
+  (let* ((case-fold-search t)
+         (selected (concat "\\`[ \t]*" marker " ?[0-9]+\\. "))
+         (last (claude-code-ide-handover--last-text-row lines))
+         (row (and last (cl-loop for index downfrom last to 0
+                                 when (string-match-p selected (nth index lines))
+                                 return index))))
+    (when row
+      (let ((start (cl-loop for index downfrom row to 0
+                            while (> index 0)
+                            until (string-empty-p (nth (1- index) lines))
+                            finally return index))
+            ;; The list ends at an empty row or at a box rule
+            (end (cl-loop for index from row to last
+                          while (and (< index last)
+                                     (not (string-empty-p (nth (1+ index) lines)))
+                                     (not (string-match-p "\\`[╭╰]?─\\{8,\\}" (nth (1+ index) lines))))
+                          finally return index)))
+        (and (cl-loop for index from start to last
+                      thereis (and (/= index row)
+                                   (string-match-p "\\`[ \t]+[0-9]+\\. " (nth index lines))))
+             (cond
+              ((claude-code-ide-handover--control-row-p (nth last lines)) 'control)
+              ((= end last) 'list)))))))
+
+(defun claude-code-ide-handover--draft-note (ide-context)
+  "Return the note about the IDE-CONTEXT chip of a draft, or nil without one.
+Claude Code shows a chip such as [⧉ In foo.el] for the file that is
+open in Emacs.  It is not the user's text, so the draft leaves it out;
+the note keeps it as information."
+  (when (and (stringp ide-context) (not (string-empty-p ide-context)))
+    (if (string-match "\\`In \\(.+\\)\\'" ide-context)
+        (format "(written while %s was open)" (match-string 1 ide-context))
+      (format "(IDE context when it was written: %s)" ide-context))))
+
+(defun claude-code-ide-handover--claude-box (lines)
+  "Return (TOP . BOTTOM), the rows of the rules of the Claude Code input box.
+LINES are the rows of the screen; the result is nil without a rule.
+The box is found by its geometry, not by the last two rule lines:
+- The bottom rule is the last rule at the left edge of the screen; the
+  rows under it are the status lines.
+- The top rule is the rule at the left edge above it: a full rule, or
+  one with the session title (\"──── my title ─\"); in the older box,
+  ╭─...─╮ over ╰─...─╯.  TOP is nil when it is not on the screen.
+The rows of a draft never start at the left edge (Claude Code indents
+its wrapped and new lines, and the older box has │ in front), so a
+divider line in the draft is no rule of the box."
+  (when-let* ((bottom (cl-loop for index downfrom (1- (length lines)) to 0
+                               when (string-match-p "\\`[╭╰]?─\\{8,\\}" (nth index lines))
+                               return index))
+              ((not (string-prefix-p "╭" (nth bottom lines)))))
+    (let ((top-rule (if (string-prefix-p "╰" (nth bottom lines)) "\\`╭─\\{8,\\}" "\\`─\\{8,\\}")))
+      (cons (cl-loop for index downfrom (1- bottom) to 0
+                     when (string-match-p top-rule (nth index lines)) return index)
+            bottom))))
+
+(defun claude-code-ide-handover--indented-p (rows)
+  "Return non-nil when no row of ROWS has text at the left edge.
+The wrapped and new lines of an input are indented; a row at the left
+edge belongs to the conversation."
+  (not (cl-some (lambda (row) (string-match-p "\\`[^ \t]" row)) rows)))
+
+(defun claude-code-ide-handover--claude-box-rows (lines box)
+  "Return the rows of LINES inside the Claude Code input BOX, a (TOP . BOTTOM).
+Only the older box (its top rule starts with ╭) has the side borders │,
+so only its rows lose them: the │ and its space at the left edge, and
+the │ at the right edge only in the column of the ╮ of the top rule.  A
+│ of the user's text stays."
+  (let* ((top (nth (car box) lines))
+         (old (string-prefix-p "╭" top))
+         (width (string-width top)))
+    (mapcar (lambda (line)
+              (if (not old)
+                  line
+                (let ((row (if (and (= (string-width line) width)
+                                    (string-suffix-p "│" line))
+                               (substring line 0 -1)
+                             line)))
+                  (replace-regexp-in-string "\\`│ ?" "" row))))
+            (cl-subseq lines (1+ (car box)) (cdr box)))))
+
+(defun claude-code-ide-handover--read-claude-draft (lines)
+  "Return the unsent draft in the Claude Code input box of the screen LINES.
+The box is between its top and bottom rules
+\(`claude-code-ide-handover--claude-box').  Its first line starts with
+the prompt marker ❯ (or > in the older box).  An IDE context chip such
+as [⧉ In foo.el] after the marker is left out of the text, and kept as
+:ide-context.  A sent prompt with ❯ above the box, and the status lines
+under it, are no part of it.  A dialog without an input box gives
+unsure.  The safety rule: a misread may cost a question, but it never
+loses text.  So an unsure read of a box with text gives the whole box
+as :raw; a dialog seen together with an input box is such a case."
+  (let ((box (claude-code-ide-handover--claude-box lines)))
+    (cond
+     ((and box (car box))
+      (let* ((content (claude-code-ide-handover--claude-box-rows lines box))
+             (first (car content))
+             ;; Read the match data at once: later calls change it
+             (input (and first (string-match "\\`[ \t]*[❯>][ \t]?\\(.*\\)\\'" first)
+                         (match-string 1 first)))
+             (chip-end (and input (string-match "\\`\\[⧉ \\([^]]*\\)\\] ?" input)
+                            (match-end 0)))
+             (chip (and chip-end (string-trim (match-string 1 input)))))
+        (cond
+         ((not input)
+          (claude-code-ide-handover--unsure
+           "no prompt marker in the input box of Claude Code" content))
+         ((claude-code-ide-handover--dialog-p lines "❯")
+          ;; Claude Code shows a dialog in place of the box: the two
+          ;; together are no sure read
+          (claude-code-ide-handover--unsure
+           "an input box and a dialog of Claude Code on the screen"
+           (cons input (cdr content))))
+         (t
+          (claude-code-ide-handover--draft-result
+           (cons (if chip-end (substring input chip-end) input) (cdr content))
+           chip)))))
+     ((claude-code-ide-handover--dialog-p lines "❯")
+      (claude-code-ide-handover--unsure "a dialog of Claude Code on the screen"))
+     ((null box)
+      (claude-code-ide-handover--unsure "no input box of Claude Code on the screen"))
+     (t
+      ;; A long draft: the top of the box is above the screen.  Its
+      ;; visible rows go from the last ❯ row, when no row of the
+      ;; conversation is between.
+      (let* ((bottom (cdr box))
+             (start (cl-loop for index downfrom (1- bottom) to 0
+                             when (string-match-p "\\`❯" (nth index lines)) return index))
+             (rows (and start (cl-subseq lines start bottom))))
+        (claude-code-ide-handover--unsure
+         "the top of the input box of Claude Code is not on the screen"
+         (and rows (claude-code-ide-handover--indented-p (cdr rows))
+              (cons (substring (car rows) 1) (cdr rows)))))))))
+
+(defun claude-code-ide-handover--codex-first-row (row)
+  "Return the text of the composer ROW after its prompt marker ›."
+  (if (string-match "\\`›\\(?: \\(.*\\)\\)?\\'" row)
+      (or (match-string 1 row) "")
+    (substring row 1)))
+
+(defconst claude-code-ide-handover--codex-footer-hints
+  '("\\`\\? for shortcuts\\'" "\\`esc to interrupt\\'" "\\`[0-9]+% context left\\'"
+    "\\`⏎ send\\(?: +[^ ].*\\)?\\'")
+  "Regexps of whole hint rows of the Codex footer.
+A hint row counts as a part of the footer only on the row next to a
+footer row of `claude-code-ide-handover-codex-footer-regexps'.  Alone,
+it can be a row of the user's text.")
+
+(defun claude-code-ide-handover--whole-row-p (regexps row)
+  "Return non-nil when a regexp of REGEXPS matches the whole ROW.
+The spaces at the ends of ROW do not count, and case does."
+  (let ((case-fold-search nil)
+        (text (string-trim row)))
+    (cl-some (lambda (regexp)
+               (and (string-match regexp text)
+                    (= (match-beginning 0) 0)
+                    (= (match-end 0) (length text))))
+             regexps)))
+
+(defun claude-code-ide-handover--codex-footer-size (lines start last)
+  "Return how many rows at the end of the Codex screen LINES are the footer.
+START is the last › row and LAST the last row with text.  The footer is
+a row of `claude-code-ide-handover-codex-footer-regexps' at the end,
+with a hint row (`claude-code-ide-handover--codex-footer-hints') next to
+it: 0, 1 or 2."
+  (let ((footer-p (lambda (index)
+                    (claude-code-ide-handover--whole-row-p
+                     claude-code-ide-handover-codex-footer-regexps (nth index lines))))
+        (hint-p (lambda (index)
+                  (claude-code-ide-handover--whole-row-p
+                   claude-code-ide-handover--codex-footer-hints (nth index lines)))))
+    (cond
+     ((<= last start) 0)
+     ((funcall footer-p last)
+      (if (and (< start (1- last)) (funcall hint-p (1- last))) 2 1))
+     ((and (< start (1- last)) (funcall hint-p last) (funcall footer-p (1- last))) 2)
+     (t 0))))
+
+(defconst claude-code-ide-handover--codex-popup-label
+  "(the completion popup of Codex under the composer:)"
+  "The label of the popup rows in the raw text of a Codex screen read.")
+
+(defun claude-code-ide-handover--codex-popup-row (rows)
+  "Return the index in ROWS of the first row of a completion popup, or nil.
+ROWS are the composer region of Codex; the first one is the composer
+row.  A popup is known only by strong evidence: a suggestion row with a
+description (an indented \"/name\", two or more spaces, and text, as in
+\"/review  Review current changes\"), or the control row of a popup at
+the end (such as ↑/↓ navigate · enter to select · esc to close).  A
+bare /word row, such as an absolute path, is the user's text."
+  (let ((case-fold-search t))
+    (or (cl-loop for row in (cdr rows) for index from 1
+                 when (string-match-p "\\`[ \t]+/[[:alnum:]_:-]+  +[^ \t]" row)
+                 return index)
+        (and (cdr rows)
+             (claude-code-ide-handover--control-row-p (car (last rows)))
+             (1- (length rows))))))
+
+(defun claude-code-ide-handover--read-codex-draft (lines)
+  "Return the unsent draft in the Codex composer of the screen LINES.
+The bottom of the composer is found first: the rows at the end of the
+screen are the footer only when they are a whole footer
+\(`claude-code-ide-handover--codex-footer-size').  The composer starts
+at the last row above it that starts with ›, and every row up to the
+footer belongs to it, also its empty rows (paragraphs).  Its wrapped
+and new lines are indented, so a row at the left edge between them is
+a sent request of the conversation: unsure.
+
+A misread may cost a question, but it never loses text: an unsure read
+of a region with text gives the whole region as :raw.  A dialog gives
+its rows from the last › row; a completion popup gives the composer
+rows, then the popup rows under a label.  The final guard of
+`claude-code-ide-handover--read-draft' checks this for every result."
+  (let* ((last (claude-code-ide-handover--last-text-row lines))
+         (start (and last (cl-loop for index downfrom last to 0
+                                   when (string-prefix-p "›" (nth index lines)) return index)))
+         (size (if start (claude-code-ide-handover--codex-footer-size lines start last) 0))
+         ;; The end of the composer region, after its last row
+         (end (and start (- (1+ last) size)))
+         (rows (and start (cl-subseq lines start end)))
+         (all (and start (cons (claude-code-ide-handover--codex-first-row (nth start lines))
+                               (cl-subseq lines (1+ start) (1+ last)))))
+         (region (and rows (claude-code-ide-handover--indented-p (cdr rows))
+                      (cons (claude-code-ide-handover--codex-first-row (car rows)) (cdr rows))))
+         (dialog (claude-code-ide-handover--dialog-p lines "›"))
+         (popup (and region (claude-code-ide-handover--codex-popup-row region))))
+    (cond
+     ((eq dialog 'control)
+      (claude-code-ide-handover--unsure "a dialog of Codex on the screen" all))
+     (dialog
+      (claude-code-ide-handover--unsure "a choice list of Codex at the bottom of the screen" all))
+     ((null start)
+      (claude-code-ide-handover--unsure "no composer of Codex on the screen"))
+     ((null region)
+      (claude-code-ide-handover--unsure "the last › row of the screen is not the composer of Codex" all))
+     (popup
+      (claude-code-ide-handover--unsure
+       "a completion popup of Codex on the screen"
+       (append (cl-subseq region 0 popup)
+               (list "" claude-code-ide-handover--codex-popup-label)
+               (nthcdr popup region))))
+     ((= size 0)
+      (claude-code-ide-handover--unsure "no footer row under the composer of Codex" region))
+     (t
+      (claude-code-ide-handover--draft-result region)))))
+
+;;; The final guard: a misread never loses text
+
+(defconst claude-code-ide-handover--codex-footer-label
+  "(the footer of Codex:)"
+  "The label of the footer rows in the raw text of a Codex screen read.")
+
+(defun claude-code-ide-handover--claude-first-row (row)
+  "Return the text of the first row ROW of a Claude Code box.
+The prompt marker and an IDE context chip are left out."
+  (let ((text (if (string-match "\\`[ \t]*[❯>][ \t]?\\(.*\\)\\'" row)
+                  (match-string 1 row)
+                row)))
+    (if (string-match "\\`\\[⧉ [^]]*\\] ?" text)
+        (substring text (match-end 0))
+      text)))
+
+(defun claude-code-ide-handover--claude-region (lines)
+  "Return the candidate input region of the Claude Code screen LINES, or nil.
+The value is (ROWS . 0).  ROWS are:
+- the rows of the input box when it is sure (its top and bottom rules);
+- with the top rule above the screen, the rows from the last ❯ row to
+  the bottom rule;
+- with the top rule and the ❯ row both above the screen (a long draft),
+  the rows above the bottom rule, up to the top of the screen or to a
+  rule above;
+- with a dialog on the screen, or a ❯ row with rows of the conversation
+  under it, the rows after the last rule.
+The first row of a box loses its marker and its IDE context chip."
+  (let ((box (claude-code-ide-handover--claude-box lines))
+        (rule-p (lambda (line) (string-match-p "\\`[╭╰]?─\\{8,\\}" line))))
+    (if (and box (car box))
+        (let ((rows (claude-code-ide-handover--claude-box-rows lines box)))
+          (and rows (cons (cons (claude-code-ide-handover--claude-first-row (car rows)) (cdr rows)) 0)))
+      (let* ((bottom (cdr box))
+             (start (and bottom (cl-loop for index downfrom (1- bottom) to 0
+                                         when (string-match-p "\\`❯" (nth index lines))
+                                         return index)))
+             (rows (and start (cl-subseq lines start bottom))))
+        (cond
+         ((and rows (claude-code-ide-handover--indented-p (cdr rows)))
+          (cons (cons (claude-code-ide-handover--claude-first-row (car rows)) (cdr rows)) 0))
+         ((and bottom (not start) (not (claude-code-ide-handover--dialog-p lines "❯")))
+          ;; A clipped box: everything above its bottom rule
+          (let ((above (cl-loop for index downfrom (1- bottom) to 0
+                                when (funcall rule-p (nth index lines)) return index)))
+            (cons (cl-subseq lines (if above (1+ above) 0) bottom) 0)))
+         (t
+          (when-let* ((rule (cl-loop for index downfrom (1- (length lines)) to 0
+                                     when (funcall rule-p (nth index lines)) return index)))
+            (cons (nthcdr (1+ rule) lines) 0))))))))
+
+(defun claude-code-ide-handover--codex-region (lines)
+  "Return the candidate input region of the Codex screen LINES, or nil.
+The value is (ROWS . FOOTER): ROWS are every row from the last › row
+to the last row with text, the first one without its marker.  FOOTER
+is 1 when the last row is surely the footer, else 0.  This rule is the
+guard's own, independent of the reader, and minimal: at most the last
+row, and only when a regexp of
+`claude-code-ide-handover-codex-footer-regexps' matches the whole row.
+A hint row next to it is text that the guard keeps."
+  (let* ((last (claude-code-ide-handover--last-text-row lines))
+         (start (and last (cl-loop for index downfrom last to 0
+                                   when (string-prefix-p "›" (nth index lines)) return index))))
+    (when start
+      (cons (cons (claude-code-ide-handover--codex-first-row (nth start lines))
+                  (cl-subseq lines (1+ start) (1+ last)))
+            (if (and (< start last)
+                     (claude-code-ide-handover--whole-row-p
+                      claude-code-ide-handover-codex-footer-regexps (nth last lines)))
+                1
+              0)))))
+
+(defun claude-code-ide-handover--keeps-rows-p (text rows)
+  "Return non-nil when TEXT has each of ROWS, in their order.
+White space counts as one space.  Each row must come after the one
+before it, so two equal rows need two copies, and rows in another
+order do not match."
+  (let* ((flat (lambda (string)
+                 (string-trim (replace-regexp-in-string "[ \t\n]+" " " string))))
+         (whole (funcall flat text))
+         (from 0))
+    (cl-every (lambda (row)
+                (let* ((part (funcall flat row))
+                       (at (string-search part whole from)))
+                  (when at
+                    (setq from (+ at (length part))))))
+              rows)))
+
+(defun claude-code-ide-handover--guard-draft (result region)
+  "Return RESULT of a screen read, made safe against the input REGION.
+REGION is (ROWS . FOOTER), from `claude-code-ide-handover--claude-region'
+or `claude-code-ide-handover--codex-region', or nil.  The rule: a
+misread may cost a question, but it never loses text.  When RESULT is
+none, unsure without :raw, or a text that misses a row of the region
+that is not empty and not a placeholder, the value is unsure with the
+whole region as :raw.  The rows that are surely the footer are
+labelled in it, never left out.  A raw text of the reader that the
+region does not hold stays in front."
+  (let* ((rows (car region))
+         (size (or (cdr region) 0))
+         (body (butlast rows size))
+         (needed (cl-remove-if (lambda (row)
+                                 (let ((text (string-trim row)))
+                                   (or (string-empty-p text)
+                                       (claude-code-ide-handover--placeholder-p text))))
+                               body))
+         (status (plist-get result :status))
+         (text (pcase status
+                 ('draft (plist-get result :text))
+                 ('unsure (plist-get result :raw)))))
+    (if (or (null needed)
+            (and text (claude-code-ide-handover--keeps-rows-p text needed)))
+        result
+      (let* ((footer (and (> size 0) (last rows size)))
+             (region-raw (string-join
+                          (delq nil (list (claude-code-ide-handover--raw-text body)
+                                          (and footer
+                                               (concat claude-code-ide-handover--codex-footer-label "\n"
+                                                       (claude-code-ide-handover--raw-text footer)))))
+                          "\n\n"))
+             (old (plist-get result :raw)))
+        (list :status 'unsure
+              :why (pcase status
+                     ('unsure (plist-get result :why))
+                     ('draft "the screen read missed rows of the input region")
+                     (_ "the screen read found no draft, but the input region has text"))
+              :raw (if (and old (not (claude-code-ide-handover--keeps-rows-p
+                                      region-raw (split-string old "\n" t))))
+                       (concat old "\n\n(the whole input region of the screen:)\n" region-raw)
+                     region-raw))))))
+
+(defun claude-code-ide-handover--read-draft (provider text)
+  "Return the unsent draft that the terminal screen TEXT of PROVIDER shows.
+The result is (:status draft :text TEXT), (:status none), or (:status
+unsure :why WHY) when the screen cannot be read: an unknown screen, or a
+provider without a reader.  An unsure result has :raw, the text of the
+input region, when that region has text.  A final guard
+\(`claude-code-ide-handover--guard-draft') checks the result of each
+reader against the input region, found on its own: a misread may cost a
+question, but it never loses text."
+  (let ((lines (claude-code-ide-handover--screen-lines text)))
+    (pcase provider
+      ('claude (claude-code-ide-handover--guard-draft
+                (claude-code-ide-handover--read-claude-draft lines)
+                (claude-code-ide-handover--claude-region lines)))
+      ('codex (claude-code-ide-handover--guard-draft
+               (claude-code-ide-handover--read-codex-draft lines)
+               (claude-code-ide-handover--codex-region lines)))
+      (_ (list :status 'unsure :why (format "no screen reader for the provider %s" provider))))))
+
+(defun claude-code-ide-handover--source-draft (run)
+  "Return the unsent draft of the source of RUN, from its terminal screen.
+See `claude-code-ide-handover--read-draft'.  A source without a live
+terminal buffer gives unsure."
+  (let* ((instance (claude-code-ide-instance-by-id (claude-code-ide-handover--run-source-id run)))
+         (buffer (and instance (claude-code-ide-instance-buffer instance))))
+    (if (not (buffer-live-p buffer))
+        (list :status 'unsure :why "the source has no terminal buffer")
+      (condition-case err
+          (claude-code-ide-handover--read-draft
+           (claude-code-ide-instance-provider instance)
+           (claude-code-ide-handover--screen-text buffer))
+        (error (list :status 'unsure :why (error-message-string err)))))))
+
+(defun claude-code-ide-handover--draft-cleared-p (run)
+  "Return non-nil when the stop of the source of RUN may go on, as for its draft.
+The first call reads the screen of the source; then
+`claude-code-ide-handover-unsent-draft' decides.  A decision is kept
+in the run, so the next call goes on at once.  With `ask', RUN needs a
+person (the reason `unsent-draft'); with `refuse', it is cancelled.  An
+unsure read goes on, except with `ask' when it has raw text of the
+input region: then RUN needs a person, with that text as maybe a draft."
+  (or (claude-code-ide-handover--run-draft-decision run)
+      (let ((result (claude-code-ide-handover--source-draft run)))
+        (pcase (plist-get result :status)
+          ('draft
+           (setf (claude-code-ide-handover--run-draft run) (plist-get result :text)
+                 (claude-code-ide-handover--run-draft-context run) (plist-get result :ide-context))
+           (pcase claude-code-ide-handover-unsent-draft
+             ((or 'carry 'drop)
+              (setf (claude-code-ide-handover--run-draft-decision run)
+                    claude-code-ide-handover-unsent-draft)
+              t)
+             ('refuse
+              (claude-code-ide-handover--finish
+               run 'cancelled 'unsent-draft
+               "The source has an unsent prompt in its input box; the handover is refused, and the source keeps running with it")
+              nil)
+             (_
+              (claude-code-ide-handover--needs-user
+               run 'unsent-draft
+               "The source has an unsent prompt in its input box.  Carry it to the target, drop it (the record keeps it), or cancel (the source keeps running with it)")
+              nil)))
+          ('none
+           (setf (claude-code-ide-handover--run-draft-decision run) 'none)
+           t)
+          (_
+           (let ((raw (plist-get result :raw))
+                 (why (plist-get result :why)))
+             (setf (claude-code-ide-handover--run-draft-unsure run) why
+                   (claude-code-ide-handover--run-draft-raw run) raw)
+             (if (and raw (not (memq claude-code-ide-handover-unsent-draft '(carry drop refuse))))
+                 ;; With `ask', text in the input region that the read
+                 ;; could not read is maybe a draft: a person decides
+                 (progn
+                   (setf (claude-code-ide-handover--run-draft run) raw
+                         (claude-code-ide-handover--run-draft-maybe run) t)
+                   (claude-code-ide-handover--needs-user
+                    run 'unsent-draft
+                    (format "The input box of the source has text that is maybe a draft (the screen read was unsure: %s).  Carry it to the target, drop it (the record keeps it), or cancel (the source keeps running with it)"
+                            why))
+                   nil)
+               (setf (claude-code-ide-handover--run-draft-decision run) 'unsure)
+               t)))))))
+
 (defun claude-code-ide-handover--quiesce (run)
   "Wait until the source of RUN is quiet, then go to the stop.
 The inbox delivery to the source is held from now on, so that no
@@ -1269,11 +1937,12 @@ and the source stays current."
           (claude-code-ide-handover--quiet-state-p state)
           (and (claude-code-ide-handover--run-force run)
                (claude-code-ide-handover--busy-state-p state)))
-      (when instance
-        (setf (claude-code-ide-handover--run-source-leg run)
-              (claude-code-ide-handover--source-leg instance)))
-      (when (claude-code-ide-handover--enter run 'source-stopped)
-        (claude-code-ide-handover--stop run)))
+      (when (or (not live) (claude-code-ide-handover--draft-cleared-p run))
+        (when instance
+          (setf (claude-code-ide-handover--run-source-leg run)
+                (claude-code-ide-handover--source-leg instance)))
+        (when (claude-code-ide-handover--enter run 'source-stopped)
+          (claude-code-ide-handover--stop run))))
      ((claude-code-ide-handover--busy-state-p state)
       (claude-code-ide-handover--finish
        run 'cancelled 'busy "Subagents or background tasks run in the source; it stays current"))
@@ -1609,6 +2278,10 @@ would stop the current instance."
        (?c cancel "cancel the handover")))
     ('registry-entry-missing
      '((?c cancel "cancel the handover")))
+    ('unsent-draft
+     '((?t carry "carry it to the target, as your next request")
+       (?d drop "drop it; the handover record keeps its text")
+       (?c cancel "cancel; the source keeps running with its draft")))
     (_
      '((?r retry "try the stage again")
        (?c cancel "cancel the handover")))))
@@ -1633,10 +2306,23 @@ A stray in UNKNOWN gets the note \"owner unknown\"."
                     (format "Handover %s: %s%s\nWhat now? "
                             (claude-code-ide-handover--run-id run)
                             (claude-code-ide-handover--run-message run)
-                            (if strays
-                                (concat ":\n" (claude-code-ide-handover--describe-strays
-                                               strays (claude-code-ide-handover--unknown-strays run strays)))
-                              ""))
+                            (cond
+                             (strays
+                              (concat ":\n" (claude-code-ide-handover--describe-strays
+                                             strays (claude-code-ide-handover--unknown-strays run strays))))
+                             ((eq (claude-code-ide-handover--run-reason run) 'unsent-draft)
+                              (concat (if (claude-code-ide-handover--run-draft-maybe run)
+                                          "\nThe raw text of the input box (maybe a draft):\n"
+                                        "\nThe unsent prompt:\n")
+                                      (mapconcat (lambda (line) (concat "  " line))
+                                                 (split-string (or (claude-code-ide-handover--run-draft run) "")
+                                                               "\n")
+                                                 "\n")
+                                      (if-let* ((note (claude-code-ide-handover--draft-note
+                                                       (claude-code-ide-handover--run-draft-context run))))
+                                          (concat "\n  " note)
+                                        "")))
+                             (t "")))
                     (mapcar (lambda (choice)
                               (list (nth 0 choice) (symbol-name (nth 1 choice)) (nth 2 choice)))
                             choices))))
@@ -1726,6 +2412,8 @@ ACTION is one of the choices that the handover offers:
 - `retry': run the stage again; a target that runs is taken up again,
   and a target that ended starts again after a scan of the worktree.
 - `skip': finish a committed handover without its continue prompt.
+- `carry', `drop': carry the unsent draft of the source to the target, or
+  drop it (the record keeps it); see `claude-code-ide-handover-unsent-draft'.
 - `cancel': cancel the handover; see `claude-code-ide-handover-cancel'.
 A handover that this Emacs does not run is taken over first (see
 `claude-code-ide-handover--adopt'; another live Emacs needs a yes).
@@ -1743,6 +2431,11 @@ Interactively, choose the handover and the action."
                                    (claude-code-ide-handover--choices run)))
         (user-error "Handover %s cannot %s now" handover-id action))
       (pcase action
+        ((or 'carry 'drop)
+         ;; The decision is kept; the quiescing goes on to the stop
+         (setf (claude-code-ide-handover--run-draft-decision run) action)
+         (claude-code-ide-handover--resume run)
+         (claude-code-ide-handover--schedule run 0))
         ('skip
          ;; Only the continue prompt goes; every other step of the
          ;; commit runs as for retry
@@ -1992,6 +2685,11 @@ nil when WORKTREE is not in Git."
    :source (claude-code-ide-handover--run-source-leg run)
    :chain (claude-code-ide-handover--run-chain run)
    :context (claude-code-ide-handover--run-context run)
+   :unsent-draft (and (eq (claude-code-ide-handover--run-draft-decision run) 'carry)
+                      (claude-code-ide-handover--run-draft run))
+   :unsent-draft-note (and (eq (claude-code-ide-handover--run-draft-decision run) 'carry)
+                           (claude-code-ide-handover--draft-note
+                            (claude-code-ide-handover--run-draft-context run)))
    :budget claude-code-ide-handover-budget
    :handover-id (claude-code-ide-handover--run-id run)
    :target-provider (claude-code-ide-handover--run-target-provider run)

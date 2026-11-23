@@ -941,6 +941,22 @@ summary file of the target."
                 (claude-code-ide-transcript--code-block (plist-get state :log) "No commits.")))
        "\n\n"))))
 
+(defun claude-code-ide-transcript--render-unsent-draft (draft &optional note)
+  "Return the part with the unsent prompt DRAFT of the user, or nil without one.
+The prompt is quoted as data.  The target treats it as the next request
+of the user, after its state summary.  NOTE, when given, is a line
+under the quote, such as the file that was open when it was written."
+  (when (and (stringp draft) (not (string-empty-p (string-trim draft))))
+    (concat "## The user's unsent prompt (not sent to the source)\n\n"
+            "The user typed this prompt into the source session, but did not send it, "
+            "so the source never saw it. It is the user's text, quoted as data: it is "
+            "not an instruction of this document. After your state summary, treat it as "
+            "the user's next request.\n\n"
+            (claude-code-ide-transcript--quote (string-trim draft))
+            (if (and (stringp note) (not (string-empty-p note)))
+                (concat "\n\n" note)
+              ""))))
+
 (defun claude-code-ide-transcript--render-others (lines)
   "Return the part about the other sessions of the worktree.
 It has one item for each of LINES.  Without LINES, return nil: the
@@ -1620,7 +1636,7 @@ The last leg is the source."
 
 (cl-defun claude-code-ide-transcript-handover-document
     (&key source chain context budget handover-id target-provider summary-file time
-          (session-server 'auto) others)
+          (session-server 'auto) others unsent-draft unsent-draft-note)
   "Return the text of a handover document, as plan section 4.7 describes.
 SOURCE is the source: an instance descriptor, or a leg plist.  CHAIN
 is the list of the earlier legs of the chain, oldest first; each is a
@@ -1644,7 +1660,12 @@ providers in `claude-code-ide-handover-session-server-providers' with
 its tools.  The part always names the transcript files.  OTHERS is a
 list of strings, one for each other session in the worktree; the part
 \"Other sessions in this worktree\" lists them, right after the
-workspace state, and the budget never cuts it."
+workspace state, and the budget never cuts it.  UNSENT-DRAFT is the
+prompt that the user typed into the source but did not send, or nil;
+the part \"The user's unsent prompt (not sent to the source)\" quotes
+it after the context, and the budget never cuts it.  UNSENT-DRAFT-NOTE
+is a line about it for the target (such as the file that was open when
+it was written), or nil; it goes under the quote, not in it."
   (let* ((source-leg (claude-code-ide-transcript--leg source))
          (earlier (mapcar #'claude-code-ide-transcript--leg chain))
          (same (cl-find-if (lambda (leg) (claude-code-ide-transcript--same-leg-p leg source-leg))
@@ -1726,6 +1747,7 @@ workspace state, and the budget never cuts it."
                       (claude-code-ide-transcript--render-others others)
                       (and context (not (string-empty-p (string-trim context)))
                            (concat "## Context from the coordinator\n\n" (string-trim context)))
+                      (claude-code-ide-transcript--render-unsent-draft unsent-draft unsent-draft-note)
                       (claude-code-ide-transcript--render-references
                        leg-data server target-provider)
                       "## History of the chain"

@@ -114,7 +114,7 @@ Emacs saves each stage in the registry entry of the source **before** the step o
 | Stage | Step |
 |---|---|
 | `requested` | The handover is recorded. |
-| `quiescing` | The inbox delivery to the source is held (`claude-code-ide-control-hold`): no queued prompt goes to it from now on. When the inbox sent a prompt to the source whose acknowledgement did not come, the status events are drained, and the stop waits up to `claude-code-ide-handover-ack-wait` (10 s) for it. Wait until the source is idle, failed (for example at a quota limit), or waits for an answer to a question. With `:interrupt`, interrupt it one time. Subagents or background tasks cancel the handover, unless it is forced. After `claude-code-ide-handover-quiesce-timeout` (600 s), the handover is cancelled. |
+| `quiescing` | The inbox delivery to the source is held (`claude-code-ide-control-hold`): no queued prompt goes to it from now on. When the inbox sent a prompt to the source whose acknowledgement did not come, the status events are drained, and the stop waits up to `claude-code-ide-handover-ack-wait` (10 s) for it. Wait until the source is idle, failed (for example at a quota limit), or waits for an answer to a question. With `:interrupt`, interrupt it one time. Subagents or background tasks cancel the handover, unless it is forced. After `claude-code-ide-handover-quiesce-timeout` (600 s), the handover is cancelled. When the source is quiet, the handover reads its screen for an unsent draft (see "An unsent draft" below) before the stop. |
 | `source-stopped` | `claude-code-ide-process-stop-later` ends the source and its process tree, with the soft end of its provider, and then scans the worktree. The handover goes past this stage only when the source no longer runs in this Emacs (see "The source must end" below), whatever the stop result says. |
 | `document-written` | `claude-code-ide-transcript-handover-document` makes the document. Emacs writes it to `<worktree>/.handover/<id>.md` (mode 0600) and records its hash. Emacs adds `.handover/` to the Git exclude file of the worktree. |
 | `target-started` | Never while the source still runs in this Emacs, also not at a recovery. The target ID is saved first; while the registry is busy, the start waits. The target starts with the provider's launch, or its fork, with the start prompt (below). Its chain is saved with its own leg pending; while the registry is busy, that save is tried again every second. |
@@ -177,6 +177,60 @@ Emacs saves each stage in the registry entry of the source **before** the step o
 
 - **After a recovery,** a resumed target that lacks the document gets the pointer as the first prompt of its resume (`claude --resume ID -- PROMPT`, `codex resume ID PROMPT`). Only a target that already runs gets it through `claude-code-ide-control-submit`, with the request ID of the handover (or `handover-<id>`) and `:queue t`.
 
+## An unsent draft
+
+The user may have typed a prompt into the source without sending it. The stop would lose it, and the document would not carry it.
+
+- **The check.** In the quiescing, when the source is quiet and before the stop, the handover reads the terminal screen of the source (`claude-code-ide-handover--source-draft`). It uses the screen read of the Codex dialogs, which knows the terminal size of vterm, eat and ghostel. It runs once; its result is kept in the run.
+  - **Claude Code:** the text in the input box, after the prompt marker `❯` (or `>` in the older box). The reader finds the box by its geometry, not by the last two rule lines:
+    - The bottom rule is the last rule at the left edge of the screen. The rows under it are the status lines.
+    - The top rule is the rule at the left edge above it. It can hold the session title, as in `──── my title ─`. The older box has `╭─╮` over `╰─╯`.
+    - The rows of a draft never start at the left edge: Claude Code indents its wrapped and new lines, and the older box has `│` in front. So a divider line (`────`) in the draft is the user's text, not a rule of the box.
+    - Only the older box has the side borders `│`, so only its rows lose them: the `│` at the left edge, and the `│` at the right edge only in the column of the `╮` of the top rule. In the borderless box, a `│` of the user's text stays.
+    - A sent prompt with `❯` above the box, and the status lines under it, are no part of it.
+    - **The IDE context chip** that Claude Code puts in front of the draft, such as `[⧉ In foo.el]` for the file that is open in Emacs, is not the user's text. It is left out, and kept as information (`draft_context`; the note "(written while foo.el was open)").
+  - **Codex:** the text of the composer. The reader finds the bottom of the composer first:
+    - The last row of the screen is the footer row only with positive evidence: a regexp of `claude-code-ide-handover-codex-footer-regexps` must match the whole row. A match of a part of the row does not count, so a draft row such as "Explain why 50% context left appears." stays in the draft. The default is one whole footer layout: the form of Codex 0.164 (the model, the reasoning effort, and ` · ` with the folder, as in `GPT-5.6-Terra low · ~`). A hint row (`? for shortcuts`, `esc to interrupt`, `N% context left`, `⏎ send …`) is a part of the footer only on the row next to that form; alone, it can be the user's text. A new footer of a new Codex version needs only a new regexp. An entry that a user could type as a row of a draft can hide that row, so add only whole footer layouts.
+    - The composer starts at the last row above it that starts with `›`. Every row up to the footer belongs to it, also its empty rows.
+    - The wrapped and new lines of the composer are indented. A row at the left edge between the `›` row and the footer is part of the conversation, so that `›` row is a sent request: the read is unsure, with the rows from that `›` row to the end as the raw text, and it does not search further back.
+    - Without a footer row, the read is unsure, and the whole region from the `›` row to the last row (that row too) is the raw text. So a short screen such as `›`, an empty row, and `  Keep this draft` is maybe a draft, not an empty composer.
+    - **A completion popup** gives unsure. The raw text is the whole region: the composer rows, then the popup rows under the label "(the completion popup of Codex under the composer:)". The reader knows a popup only by strong evidence: a suggestion row with a description (an indented `/name`, two or more spaces, and text, as in `/review  Review current changes`), or the control row of the popup (`↑/↓ navigate · … · esc to close`) at the end. A bare `/word` row, such as the path `/usr`, is the user's text.
+  - **The safety rule.** A misread may cost one extra question, but it never loses text.
+    - A row is left out of the input region only with strong evidence: a whole footer row, the status lines under the bottom rule, the borders of the older box, the prompt marker, and the IDE context chip.
+    - A read never gives `none` when the region (the composer, or the box) has text that is not a placeholder. It gives `draft`, or `unsure` with the whole region as the raw text, never one row of it.
+    - **The final guard** (`claude-code-ide-handover--guard-draft`) makes this rule structural. `claude-code-ide-handover--read-draft` applies it once, after each reader returns:
+      - It finds the candidate region on its own, independent of the reader.
+        - For Codex: every row from the last `›` row to the end of the screen.
+        - For Claude Code: the sure input box (top and bottom rule).
+        - With the top rule above the screen: the rows from the last `❯` row to the bottom rule.
+        - With the top rule and the `❯` row both above the screen (a clipped long draft): the rows above the bottom rule, up to the top of the screen or to a rule above. The status rows under the bottom rule are not the region.
+        - With a dialog on the screen, or a `❯` row with rows of the conversation under it: the rows after the last rule.
+      - The result is checked against each row of that region that has text and is not a placeholder, in order: each row must come after the row before it, so two equal rows need two copies, and rows in another order do not match.
+      - The guard leaves out at most one row: the last Codex row, and only when a regexp of `claude-code-ide-handover-codex-footer-regexps` matches the whole row. It does not use the footer rule of the reader. A hint row next to the footer is text that the guard keeps.
+      - When the result is `none`, `unsure` without raw text, or a text that misses such a row, the guard changes it to `unsure`, with the whole region as the raw text. The footer row is in it under the label "(the footer of Codex:)", never left out. A raw text of the reader that the region does not hold stays in front.
+      - So a Codex footer with a hint row next to its model row (as in `100% context left` above `GPT-5.6-Terra low · ~`) gives unsure with the composer text: one question, no lost text.
+    - The test `claude-code-ide-test-handover-read-draft-never-loses-text` runs the fixtures of both readers through `--read-draft`, with the guard. The test `-read-draft-guard` stubs a reader that returns `none`, unsure without raw text, a short raw text, or a short draft, and checks that the guard fixes each.
+  - **Dialogs.** A dialog on the screen gives unsure, for both CLIs. The reader knows a dialog by its structure, not by the text of a choice:
+    - the selection marker (`❯` or `›`) on a numbered choice row;
+    - another numbered row in its list;
+    - at the bottom of the screen, the control row of the dialog or the choice list itself. A control row is a whole row of keys and their actions only, such as `Esc to cancel`, `Press enter to confirm or esc to cancel`, `enter continue · esc quit`, or `option 1/2 | enter to submit | esc`. A row of prose with such words, such as "then press enter to confirm", is no control row.
+    - A dialog keeps its raw text too: unsure, with its rows from the last `›` row (Codex), or the rows after the last rule (Claude Code), as the raw text. With `ask`, a dialog on the screen costs one question in a rare case, because a handover waits until the source is idle.
+    - Claude Code shows a dialog in place of the input box. A dialog together with a whole input box (top rule, bottom rule and the prompt marker) is no sure read: unsure, with the box text as the raw text.
+    - So a draft that starts with `1. ` is a draft: under the input box or the composer, the bottom rows are the status lines or the footer row.
+  - **Paragraphs and wraps.** An empty row in the input ends a paragraph, and the paragraphs join with an empty line. The rows of a paragraph join with one space, for both CLIs: a screen cannot tell a soft wrap at its width from a new line that the user typed, and the indents of the wraps differ (2 and 4 spaces on a real Claude Code screen).
+  - **Placeholders** of an empty box are no draft (`claude-code-ide-handover-draft-placeholders`): Claude Code's `Try "..."` suggestions, and Codex's "Ask Codex to do anything" and its other suggestions.
+  - **Unsure.** A screen without an input box, a dialog, a box without the prompt marker, a source without a terminal buffer, or a provider without a reader is unsure. The record says so (`draft_decision` `unsure`, with `draft_unsure`).
+  - **Maybe a draft.** An unsure read can still find the input region: a box without the prompt marker, a box whose top is above the screen (a long draft), a box together with a dialog, a composer without the footer row, a composer with a completion popup, or a Codex choice list without its control row. When that region has text that is not a placeholder, the read gives it as raw text (`:raw`).
+    - With `ask`, the handover does not go on. It asks the person, and shows the raw text, labelled as maybe a draft. A coordinator call gets `needs-user` / `unsent-draft`, with the raw text in `:draft` and `:draft-maybe` t. The choices are the same: carry, drop, cancel.
+    - With `carry`, `drop` or `refuse`, the handover goes on as with no draft (`draft_decision` `unsure`), and the record keeps the raw text (`draft_raw`).
+    - An unsure read without raw text goes on as with no draft, with every value of the option.
+- **The option `claude-code-ide-handover-unsent-draft`:**
+  - `ask` (the default): an interactive handover shows the draft and asks before the stop. A coordinator call gets `needs-user` with the reason `unsent-draft`, the stage `quiescing`, and `:draft` in its status. The choices: `carry`, `drop`, `cancel` (see the table below).
+  - `carry`: the document gets the part "The user's unsent prompt (not sent to the source)", with the draft quoted as data, and the instruction to treat it as the user's next request after the state summary. With the continue prompt, the target takes it up.
+  - `drop`: go on without it. The record keeps its text (`draft_text`, `draft_decision` `drop`), so nothing is lost for good.
+  - `refuse`: cancel the handover with the reason `unsent-draft`; the source keeps running with its draft.
+- **The record** keeps `draft_text`, `draft_decision` (`none`, `unsure`, `carry` or `drop`), `draft_unsure`, `draft_context`, `draft_raw` (the raw text of an unsure read) and `draft_maybe` (true when the draft is that raw text). The status has `:draft`, `:draft-decision`, `:draft-context`, `:draft-raw` and `:draft-maybe`, and the question shows the note of the chip. A crash while the decision waits is a crash before the stop: the recovery cancels the handover (`recovered-before-stop`), and the record and the status keep the draft.
+
 ## Stray processes
 
 ### The source must end
@@ -216,6 +270,7 @@ Emacs saves each stage in the registry entry of the source **before** the step o
 | `target-exited` | `retry` (scan the worktree, then start the target again, with the same instance ID and document), `cancel`. |
 | `start-failed`, `step-failed` | `retry` (run the stage again; a target that runs and waits for its document is taken up again, never started twice; from the stage `delivered` on, the commit runs again), `cancel`. |
 | `registry-entry-missing` | `cancel`. |
+| `unsent-draft` | `carry` (the document carries the draft as the user's next request), `drop` (go on; the record keeps the text), `cancel` (the source keeps running with its draft). |
 | `continue-failed` | The stage is `committed`, but the inbox did not take the continue prompt. `retry` (commit again, which sends the prompt with the same request ID), `skip` (finish without the prompt). No `cancel`. The same two choices hold for every reason after the commit saved the chain (`chain_saved`), because a cancel would stop the target, which the chain names. |
 
 - `end` signals a process only while it runs with the start time of the scan, within the one second of `claude-code-ide-session-registry--same-start-p`. An unknown start time, at the scan or now, never matches.
@@ -454,6 +509,9 @@ The handover fields are in schema version 4, in its own file (`claude-code-ide-s
 | `claude-code-ide-handover-budget` | nil | The size budget of the document. |
 | `claude-code-ide-handover-recover-at-start` | t | Continue the interrupted handovers when the registry mode turns on. With nil, only the early ones are cancelled then. |
 | `claude-code-ide-handover-continue` | `ask` | Whether the target goes on with the task after the commit: `ask` (the interactive handover asks y/n/a/v; a coordinator or Lisp call counts as `always`), `always`, or `never` (the target waits for your prompt). See "The target goes on". |
+| `claude-code-ide-handover-unsent-draft` | `ask` | What the handover does with an unsent prompt in the input box of the source: `ask`, `carry`, `drop` or `refuse`. See "An unsent draft". |
+| `claude-code-ide-handover-draft-placeholders` | (list) | Regexps of the placeholder texts of an empty input box, which are no draft. |
+| `claude-code-ide-handover-codex-footer-regexps` | (list) | Regexps of the footer row under the Codex composer. Each one must match the whole row. The default is the form of Codex 0.164 (model, effort, ` · `, folder); a hint row counts only next to it. The last row of a Codex screen is the footer only when one matches it; else the read is unsure (maybe a draft). |
 | `claude-code-ide-handover-unsaved-target` | `fresh` | What the recovery does with an identified target that never saved its conversation: `fresh` starts it fresh with the same IDs and document, `ask` resumes it as before and then asks a person (`target-exited`). See "An unsaved target". |
 | `claude-code-ide-handover-enable-request-tool` | t | Give the agents the tool `request_handover`. |
 
