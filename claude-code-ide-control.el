@@ -257,15 +257,37 @@ is on, because otherwise its file is not kept up to date."
       (claude-code-ide-session-registry--find
        (claude-code-ide-session-registry--entries) instance-id))))
 
+(defun claude-code-ide-control--native-id-of (instance)
+  "Return the native conversation ID of the descriptor INSTANCE, or nil."
+  (let ((id (ignore-errors
+              (claude-code-ide-provider-call
+               (claude-code-ide-instance-provider instance) 'native-id instance))))
+    (if (stringp id)
+        id
+      (let ((slot (claude-code-ide-known-or-nil (claude-code-ide-instance-native-id instance))))
+        (and (stringp slot) slot)))))
+
+(defun claude-code-ide-control--native-id-runner (native-id instance-id)
+  "Return a live instance other than INSTANCE-ID that runs NATIVE-ID, or nil."
+  (cl-find-if (lambda (instance)
+                (and (not (equal (claude-code-ide-instance-id instance) instance-id))
+                     (claude-code-ide-instance-live-p instance)
+                     (equal (claude-code-ide-control--native-id-of instance) native-id)))
+              (claude-code-ide-instances)))
+
 (cl-defun claude-code-ide-control-resume (instance-id &key prompt directory native-id provider)
   "Start the instance INSTANCE-ID again and resume its conversation.
 The session registry gives the directory, the provider and the native
 ID of the instance.  Without a registry entry, DIRECTORY, NATIVE-ID
-and PROVIDER give them.  PROMPT is the first message.  The instance
-keeps its instance ID and gets the next launch generation.  The result
-is that of `claude-code-ide-control-launch'."
-  (let ((entry (and (claude-code-ide-control-valid-id-p instance-id)
-                    (claude-code-ide-control-registry-entry instance-id))))
+and PROVIDER give them; when another live instance of this Emacs runs
+NATIVE-ID, the result is an error with the reason `native-id-running'.
+PROMPT is the first message.  The instance keeps its instance ID and
+gets the next launch generation.  The result is that of
+`claude-code-ide-control-launch'."
+  (let* ((entry (and (claude-code-ide-control-valid-id-p instance-id)
+                     (claude-code-ide-control-registry-entry instance-id)))
+         (runner (and (not entry) (stringp native-id)
+                      (claude-code-ide-control--native-id-runner native-id instance-id))))
     (cond
      ((not (claude-code-ide-control-valid-id-p instance-id))
       (claude-code-ide-control--error 'invalid-instance-id instance-id))
@@ -287,6 +309,11 @@ is that of `claude-code-ide-control-launch'."
      ((and provider (not (claude-code-ide-get-provider provider)))
       (claude-code-ide-control--error 'unknown-provider instance-id
                                       (format "No provider named %s" provider)))
+     (runner
+      (claude-code-ide-control--error
+       'native-id-running instance-id
+       (format "The instance %s runs the conversation %s"
+               (claude-code-ide-instance-id runner) native-id)))
      (t
       (claude-code-ide-control--start
        instance-id
@@ -301,17 +328,39 @@ is that of `claude-code-ide-control-launch'."
            :instance-id instance-id
            :last-generation (claude-code-ide-instance-current-generation instance-id)))))))))
 
-(defun claude-code-ide-control-stop (instance-id)
+(defun claude-code-ide-control--current-generation (instance-id)
+  "Return the generation of the last launch of INSTANCE-ID, or nil.
+This Emacs knows it after a launch; else the session registry gives it."
+  (or (claude-code-ide-instance-current-generation instance-id)
+      (when-let* ((entry (claude-code-ide-control-registry-entry instance-id)))
+        (claude-code-ide-session-registry-entry-generation entry))))
+
+(defun claude-code-ide-control--generation-changed-p (instance-id generation)
+  "Return non-nil when GENERATION is given and is not that of INSTANCE-ID.
+The generation of INSTANCE-ID is that of its last launch."
+  (and generation
+       (not (eql generation (claude-code-ide-control--current-generation instance-id)))))
+
+(cl-defun claude-code-ide-control-stop (instance-id &key generation)
   "End the instance INSTANCE-ID with the stop operation of its provider.
+GENERATION, when given, is the launch generation that the caller saw:
+when INSTANCE-ID runs another launch now, nothing stops, and the
+result is an error with the reason `generation-changed'.
 The result is (:status ok :instance-id ID :result stopped), the
 unavailable result when the provider cannot stop, or an error result.
 The prompts in its inbox stay there."
   (if-let* ((instance (claude-code-ide-instance-by-id instance-id)))
-      (let ((result (condition-case err
-                        (claude-code-ide-provider-call
-                         (claude-code-ide-instance-provider instance) 'stop instance)
-                      (error (claude-code-ide-control--error
-                              'stop-failed instance-id (error-message-string err))))))
+      (let ((result (if (and generation
+                             (not (eql generation (claude-code-ide-instance-generation instance))))
+                        (claude-code-ide-control--error
+                         'generation-changed instance-id
+                         (format "The instance runs launch generation %s, not %s"
+                                 (claude-code-ide-instance-generation instance) generation))
+                      (condition-case err
+                          (claude-code-ide-provider-call
+                           (claude-code-ide-instance-provider instance) 'stop instance)
+                        (error (claude-code-ide-control--error
+                                'stop-failed instance-id (error-message-string err)))))))
         (cond
          ((claude-code-ide-provider-unavailable-p result) result)
          ((eq (plist-get result :status) 'error) result)
@@ -645,6 +694,23 @@ of its dialogs.  A failed or stopped instance rejects, unless QUEUE is
      ((and (memq name '(failed stopped)) (not (eq queue 'always))) (cons 'reject reason))
      (t (cons 'queue reason)))))
 
+(defvar claude-code-ide-control-guess-safe-providers '(codex)
+  "Providers whose submit-prompt never types into the terminal.
+An idle state that is a guess (:guess t) can be a dialog that no event
+reports.  Typed text and Return could answer that dialog, so the inbox
+sends to a guessed idle instance only when its provider is in this
+list.  The `codex' provider uses `codex queue', which Codex delivers
+only when the conversation is idle.  Claude Code types the prompt.")
+
+(defun claude-code-ide-control--guess-blocks-p (instance state)
+  "Return non-nil when the guessed idle STATE of INSTANCE must not get a prompt.
+See `claude-code-ide-control-guess-safe-providers'."
+  (and (eq (plist-get state :state) 'idle)
+       (plist-get state :guess)
+       (not (and instance
+                 (memq (claude-code-ide-instance-provider instance)
+                       claude-code-ide-control-guess-safe-providers)))))
+
 (defun claude-code-ide-control--failed-state (entry)
   "Return the `failed' state of the failed registry ENTRY.
 The reason is `exit-code' when the CLI exited with an error code, else
@@ -760,7 +826,8 @@ A nil INSTANCE (one that does not run) gives t: its provider decides later."
       (let ((provider (claude-code-ide-get-provider (claude-code-ide-instance-provider instance))))
         (and provider (claude-code-ide-provider-supports-p provider 'submit-prompt)))))
 
-(cl-defun claude-code-ide-control-submit (instance-id text &key request-id (queue nil queue-given))
+(cl-defun claude-code-ide-control-submit (instance-id text &key request-id (queue nil queue-given)
+                                                      generation)
   "Submit the prompt TEXT to the instance INSTANCE-ID through its inbox.
 REQUEST-ID is a string or a number that the caller chooses; nil makes
 a new one.  A second request with the same REQUEST-ID returns the
@@ -769,6 +836,11 @@ result of the first one, with :duplicate t, and sends nothing.
 QUEUE says what happens when the instance cannot take TEXT now:
 without the key, the rules of each state apply (queue, but reject a
 failed or stopped instance); t always queues; nil rejects.
+
+GENERATION, when given, is the launch generation of INSTANCE-ID that
+the caller saw.  When the last launch of INSTANCE-ID has another
+generation, a new request is rejected with the reason
+`generation-changed', and no inbox file is made.
 
 After a committed handover of INSTANCE-ID, the prompt goes to the
 current instance of its chain; see
@@ -787,7 +859,8 @@ Return a plist with :destination (the instance that gets TEXT),
          (queue (cond ((not queue-given) 'auto)
                       ((memq queue '(auto always never)) queue)
                       (queue 'always)
-                      (t 'never))))
+                      (t 'never)))
+         (given-id instance-id))
     (when (claude-code-ide-control-valid-id-p instance-id)
       (setq instance-id (claude-code-ide-control--chain-current instance-id)))
     (if (not (claude-code-ide-control-valid-id-p instance-id))
@@ -796,6 +869,8 @@ Return a plist with :destination (the instance that gets TEXT),
              (known (claude-code-ide-control--find-record instance-id request-id pending)))
         (cond
          (known (claude-code-ide-control--result known t))
+         ((claude-code-ide-control--generation-changed-p given-id generation)
+          (claude-code-ide-control--rejected instance-id request-id 'generation-changed))
          ((not (and (stringp text) (not (string-empty-p (string-trim text)))))
           (claude-code-ide-control--rejected instance-id request-id 'empty-text))
          (t
@@ -832,6 +907,17 @@ and PENDING the pending records of INSTANCE-ID."
       (if (eq queue 'never)
           (setq action 'reject reason 'held)
         (setq action 'queue reason 'held)))
+     ;; A handover stops the source that it holds, and its commit moves
+     ;; the queued prompts to the target: a stopped or failed source
+     ;; queues too, unless QUEUE is nil
+     ((and (eq action 'reject) (not (eq queue 'never))
+           (claude-code-ide-control-held-p instance-id))
+      (setq action 'queue reason 'held))
+     ;; A guessed idle state can be a dialog: never type into it
+     ((and (eq action 'deliver) (claude-code-ide-control--guess-blocks-p instance state))
+      (if (eq queue 'never)
+          (setq action 'reject reason 'guessed-idle)
+        (setq action 'queue reason 'guessed-idle)))
      ;; Earlier prompts go first
      ((and (eq action 'deliver) pending)
       (if (eq queue 'never)
@@ -852,6 +938,11 @@ and PENDING the pending records of INSTANCE-ID."
         ('deliver (claude-code-ide-control--send record (plist-get state :guess)))
         ('queue (claude-code-ide-control--start-timer)))
       (claude-code-ide-control--result record))))
+
+(defvar claude-code-ide-control--pending-sends (make-hash-table :test 'eq :weakness 'key)
+  "The result list of each send whose provider command still runs.
+The value is (INSTANCE-ID . REQUEST-ID).  `codex queue' ends after the
+send, and then changes the :outcome of the list.")
 
 (defun claude-code-ide-control--send (record guess)
   "Give the prompt of RECORD to the provider of its instance.
@@ -882,16 +973,44 @@ when sent."
          ((claude-code-ide-provider-unavailable-p sent)
           (claude-code-ide-control--finish record 'rejected 'no-submit)
           nil)
-         (sent t)
+         (sent
+          ;; A command that ends later, such as `codex queue', reports
+          ;; its outcome in this list
+          (when (and (consp sent) (eq (plist-get sent :outcome) 'pending))
+            (puthash sent (cons instance-id (claude-code-ide-control--record-request-id record))
+                     claude-code-ide-control--pending-sends))
+          t)
          ;; Only when the acknowledgement did not come during the call
          ((not (claude-code-ide-control--final-p record))
-          (setf (claude-code-ide-control--record-sent-at record) nil
-                (claude-code-ide-control--record-sent-generation record) nil
-                (claude-code-ide-control--record-sent-guess record) nil
-                (claude-code-ide-control--record-reason record) 'send-failed)
-          (claude-code-ide-control--write-record record)
-          (claude-code-ide-control--start-timer)
+          (claude-code-ide-control--unsend record)
           nil))))))
+
+(defun claude-code-ide-control--unsend (record)
+  "Put the sent RECORD back in the queue with the reason `send-failed'.
+The next try sends it again."
+  (setf (claude-code-ide-control--record-sent-at record) nil
+        (claude-code-ide-control--record-sent-generation record) nil
+        (claude-code-ide-control--record-sent-guess record) nil
+        (claude-code-ide-control--record-reason record) 'send-failed)
+  (claude-code-ide-control--write-record record)
+  (claude-code-ide-control--start-timer))
+
+(defun claude-code-ide-control--on-queue-end (_instance result)
+  "Put the prompt of RESULT back in the queue when its command failed.
+RESULT is the list that `submit-prompt' returned, with its final
+:outcome.  With `failed', the provider did not store the prompt, so the
+retry sends it again.  With `timeout', the provider may have stored
+it: the record waits for its acknowledgement."
+  (when-let* ((sent (gethash result claude-code-ide-control--pending-sends)))
+    (remhash result claude-code-ide-control--pending-sends)
+    (when (eq (plist-get result :outcome) 'failed)
+      (when-let* ((record (cl-find (cdr sent) (claude-code-ide-control--pending-records (car sent))
+                                   :key #'claude-code-ide-control--record-request-id
+                                   :test #'equal)))
+        (when (claude-code-ide-control--record-sent-at record)
+          (claude-code-ide-control--unsend record))))))
+
+(add-hook 'claude-code-ide-codex-queue-functions #'claude-code-ide-control--on-queue-end)
 
 (defun claude-code-ide-control-deliver-pending (instance-id)
   "Send the oldest queued prompt of INSTANCE-ID when the instance can take it.
@@ -918,6 +1037,7 @@ ID of the prompt that was sent, or nil."
      ;; A sent prompt is still within its time: it blocks the queue
      ((cl-some #'claude-code-ide-control--record-sent-at pending) nil)
      ((and (eq (car (claude-code-ide-control-decide state 'never)) 'deliver)
+           (not (claude-code-ide-control--guess-blocks-p instance state))
            (claude-code-ide-control--send next (plist-get state :guess)))
       (claude-code-ide-control--record-request-id next)))))
 
@@ -927,21 +1047,27 @@ ID of the prompt that was sent, or nil."
   "Return (ID . DONE) for the copy of RECORD of FROM in the inbox of TO.
 ID is the request ID of the copy: the same one, or
 \"handover:HANDOVER-ID:ID\" when TO has another record with that ID.
-DONE is non-nil when an earlier move made the copy already.  PENDING
-is the list of the pending records of TO."
+When TO has another record with that ID too, a number follows:
+\"handover:HANDOVER-ID:ID:2\", then 3, and so on.  DONE is non-nil
+when an earlier move made the copy already: a record of TO with the
+ID whose `moved_from' names RECORD.  PENDING is the list of the
+pending records of TO."
   (let* ((id (claude-code-ide-control--record-request-id record))
          (from-ref (concat from ":" id))
-         (moved-before (lambda (found)
-                         (and found (equal (claude-code-ide-control--record-moved-from found)
-                                           from-ref))))
-         (existing (claude-code-ide-control--find-record to id pending)))
-    (cond
-     ((null existing) (cons id nil))
-     ((funcall moved-before existing) (cons id t))
-     (t
-      (let* ((renamed (format "handover:%s:%s" (or handover-id from) id))
-             (found (claude-code-ide-control--find-record to renamed pending)))
-        (cons renamed (and found t)))))))
+         (renamed (format "handover:%s:%s" (or handover-id from) id))
+         (candidate id)
+         (count 1)
+         (result nil))
+    (while (not result)
+      (let ((found (claude-code-ide-control--find-record to candidate pending)))
+        (cond
+         ((null found) (setq result (cons candidate nil)))
+         ((equal (claude-code-ide-control--record-moved-from found) from-ref)
+          (setq result (cons candidate t)))
+         (t
+          (setq count (1+ count)
+                candidate (if (= count 2) renamed (format "%s:%d" renamed (1- count))))))))
+    result))
 
 (defun claude-code-ide-control-move-inbox (from to &optional handover-id)
   "Move the queued prompts of the instance FROM into the inbox of TO.
@@ -1189,9 +1315,19 @@ Stop the timer when no running instance has a pending record."
    (claude-code-ide-control-resume
     instance-id :prompt (unless (claude-code-ide-control-blank-p prompt) prompt))))
 
-(defun claude-code-ide-control--mcp-submit (instance-id text &optional request-id queue)
+(defun claude-code-ide-control--generation-arg (value)
+  "Return the launch generation of the MCP argument VALUE, or nil.
+VALUE is a whole number, its decimal text, or missing.  Another value
+gives -1, which matches no launch."
+  (cond ((integerp value) value)
+        ((claude-code-ide-control-blank-p value) nil)
+        ((and (stringp value) (string-match-p "\\`[0-9]+\\'" value)) (string-to-number value))
+        (t -1)))
+
+(defun claude-code-ide-control--mcp-submit (instance-id text &optional request-id queue generation)
   "MCP tool: submit TEXT to INSTANCE-ID with REQUEST-ID.
-QUEUE is \"auto\" (the default), \"always\" or \"never\"."
+QUEUE is \"auto\" (the default), \"always\" or \"never\".  GENERATION,
+when given, is the launch generation that the caller saw."
   (let ((mode (pcase queue
                 ("always" 'always)
                 ("never" 'never)
@@ -1200,21 +1336,30 @@ QUEUE is \"auto\" (the default), \"always\" or \"never\"."
      (claude-code-ide-control-submit
       instance-id text
       :request-id (unless (claude-code-ide-control-blank-p request-id) request-id)
-      :queue mode))))
+      :queue mode
+      :generation (claude-code-ide-control--generation-arg generation)))))
 
 (defun claude-code-ide-control--mcp-request-status (instance-id request-id)
   "MCP tool: return the result of REQUEST-ID in the inbox of INSTANCE-ID."
   (claude-code-ide-control-json
    (claude-code-ide-control-request-status instance-id request-id)))
 
-(defun claude-code-ide-control--mcp-stop (instance-id)
-  "MCP tool: end the instance INSTANCE-ID."
-  (claude-code-ide-control-json (claude-code-ide-control-stop instance-id)))
+(defun claude-code-ide-control--mcp-stop (instance-id &optional generation)
+  "MCP tool: end the instance INSTANCE-ID.
+GENERATION, when given, is the launch generation that the caller saw."
+  (claude-code-ide-control-json
+   (claude-code-ide-control-stop
+    instance-id :generation (claude-code-ide-control--generation-arg generation))))
 
 (defconst claude-code-ide-control--instance-id-arg
   '(:name "instance_id" :type string
           :description "Instance ID of the target, from claude-code-ide-control-list-instances. Never a display name.")
   "The instance ID argument of the coordinator tools.")
+
+(defconst claude-code-ide-control--generation-arg-spec
+  '(:name "generation" :type number :optional t
+          :description "Launch generation from claude-code-ide-control-list-instances. When the instance ID runs another launch now, the tool does nothing and gives the reason generation-changed.")
+  "The optional launch generation argument of the coordinator tools.")
 
 (defun claude-code-ide-control--tool-specs ()
   "Return the `claude-code-ide-make-tool' arguments of each coordinator tool.
@@ -1257,7 +1402,8 @@ Each has :scope coordinator."
                        '(:name "request_id" :type string :optional t
                                :description "ID that makes the request idempotent. Default: a new ID.")
                        '(:name "queue" :type string :optional t
-                               :description "auto (default): queue while the instance is busy, reject a failed or stopped instance. always: always queue. never: reject unless the instance is idle.")))
+                               :description "auto (default): queue while the instance is busy, reject a failed or stopped instance. always: always queue. never: reject unless the instance is idle.")
+                       claude-code-ide-control--generation-arg-spec))
      (list :name "claude-code-ide-control-request-status"
            :function #'claude-code-ide-control--mcp-request-status
            :description "Return the current result of a submitted prompt: delivered, queued or rejected."
@@ -1267,7 +1413,7 @@ Each has :scope coordinator."
      (list :name "claude-code-ide-control-stop"
            :function #'claude-code-ide-control--mcp-stop
            :description "End an instance by its instance ID. Its queued prompts stay in its inbox."
-           :args (list id)))))
+           :args (list id claude-code-ide-control--generation-arg-spec)))))
 
 (defvar claude-code-ide-control--extra-tool-specs nil
   "Coordinator tools that other files add.

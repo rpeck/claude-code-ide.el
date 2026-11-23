@@ -234,6 +234,12 @@ The session registry has four files, one for each version:
 
 **Why version 4 (decision D3 of the orchestrator).** Version 4 adds the handover fields `chain` and `handover` of each record ([handover.md](handover.md), "The registry"). A package that knows only version 3 would drop them when it writes. So version 4 has its own file. A version 3 record reads as a version 4 record without these fields. The rest of this document describes the fields of version 3, which version 4 keeps.
 
+**The host ID.** A version 4 record can also have the optional field `host_id`. The version stays 4.
+
+- `host_id` is the host ID of the Emacs that started or claimed the record: the UUID of the file `host-id` in the report directory ([handover.md](handover.md), "The claim").
+- A new record, a failed record, and a claimed record get it. A record without it reads with null.
+- `host` stays, for people and for older records.
+
 The report directory stays `<version 1 name without extension>-reports`, so all versions of the package use the same reports.
 
 **Why version 3 (decision D1 of the orchestrator).** Version 3 adds the states `pending` and `failed` and the fields from `worktree` on. A package that knows only version 2 would read `pending` and `failed` as `closed`, and would drop the new fields when it writes. So version 3 has its own file, as version 2 did. A package of version 2 keeps working with the version 2 file.
@@ -356,21 +362,24 @@ The transitions:
 `claude-code-ide-restore-sessions` starts the restorable records again. A record is restorable when all of these are true:
 
 - It is `open`, `pending`, or `failed`, on this host, of an Emacs that no longer runs. Or the last Emacs closed it at its exit.
+  - **On this host:** a record with `host_id` must have the host ID of this host. The host name is not used, because it can change (on macOS, with the network). A record without `host_id` must have the host name of this host.
+  - The last exit of Emacs is found in the same way.
 - It does not run in this Emacs.
 - Its owner process does not run: no process has the ID `pid` and the start time `process_start_time`.
-- No running Claude Code CLI has its native ID (the files in `~/.claude/sessions`).
+- No running Claude Code CLI has its native ID (the files in `~/.claude/sessions`). This check does not find a Codex CLI that runs outside this Emacs.
 
 Each record restores alone:
 
 - **The provider of the record**, never the default provider and never the menu toggle, starts it. A record of a provider that is not loaded fails with a reason.
 - **The native ID of the record** is resumed:
-  - Claude Code: `claude --resume ID`, with the stored flags, the model of the transcript (else `model`) as `--model`, and the title of the transcript as `--name`.
+  - Claude Code: `claude --resume ID`, with the stored flags, the model of the transcript (else `model`) as `--model`, and the title of the transcript as `--name`. The restore splits the stored flags into words and quotes each word again. So the command gets the same words, and shell syntax in a changed state file is plain text.
   - Codex: `codex resume … -- ID PROMPT`. It gets no `--model` and no `--name`. The Codex options give the Codex flags and the model.
 - **The flags of each provider** come from the `restore-flags` slot of the provider struct (a function of the record), for a provider without an entry in the deprecated table below. A provider with nil in the slot gets no flags. See [providers.md](providers.md), "Restore flags".
   - Deprecated in 1.2.0: the table `claude-code-ide-session-registry-restore-flags-functions` (an alist of a provider name and a function of the record) keeps its old default (the `claude` entry) and its old meaning: an entry gives the flags (also an entry whose value is nil), and a table set to nil gives no flags. It goes away in the next release.
 - **The start spec** has the record's `instance_id`, `provider`, `generation` as `last-generation`, `role`, `project_dir`, and `instance_name`. So the instance keeps its instance ID, its name, its buffer name, and its worktree, and gets the next generation.
 - **Each start runs from its own timer.** An error or a quit in one start does not stop the others.
 - **Each timer reads its record again.** A record that changed since the plan (its state, its close, its Emacs, its generation, or its native ID; for example, you closed or archived it), or that runs now, is skipped. An instance whose ID runs already in this Emacs is skipped too. A skip is not a failure, and the record does not change. The check uses a context of that record alone; it does not rebuild the context of all records.
+- **Each timer claims its record before the start.** The check and the claim are one change under the lock of the state file. The claim sets `emacs_pid`, `emacs_start_time`, `host`, and `host_id` to this Emacs. A record that changed since the plan is not claimed, and is skipped. So of two Emacs that restore at the same time, only one starts the record.
 - **A failure marks only its own record `failed`**, with the reason:
   - The provider CLI is missing (for example "Codex CLI not available").
   - The directory is missing.
@@ -419,6 +428,6 @@ The cost of two files:
 
 - The entry key is the instance ID.
 - A new Claude Code conversation gets a new UUID as its `--session-id`. The record stores it as `native_id`. It is never the instance ID, so a new conversation of an existing instance never reuses a native ID.
-- A fork gets no `--session-id`, and its record has no native ID until the report. The record never takes the native ID of the parent conversation, also when it had that ID before. A native ID that a report of the fork's own launch generation set before the start was recorded stays (`native_id_generation`). The start spec's `fork` slot tells a fork; the CLI flag (`--fork-session`) is in the launch arguments, not in the stored flags.
+- A fork gets no `--session-id`, and its record has no native ID until the report. The record never takes the native ID of the parent conversation, also when it had that ID before. The provisional record removes the report file of an older launch, so the next write cannot read the parent's ID from it. A native ID that a report of the fork's own launch generation set before the start was recorded stays (`native_id_generation`). The start spec's `fork` slot tells a fork; the CLI flag (`--fork-session`) is in the launch arguments, not in the stored flags.
 - A start records the provider, the generation, the role, the worktree, and the process of the descriptor.
 - The list buffer (`M-x claude-code-ide-list-session-registry`) shows the provider of each record. The state is `live` for a record that runs in this Emacs, and `unknown` for a record without a native ID. For a `failed` record, the Title column shows the reason.

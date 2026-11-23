@@ -55,11 +55,16 @@
 They need CLAUDE_CODE_IDE_LIVE_TESTS=1, a daemon of their own that is
 not in batch mode (the CLIs need real terminals, and a person's Emacs
 must never run them), and the real packages, not the mocks of
-claude-code-ide-tests.el."
-  (and (equal (getenv "CLAUDE_CODE_IDE_LIVE_TESTS") "1")
-       (not noninteractive)
-       (daemonp)
-       (not (featurep 'claude-code-ide-tests))))
+claude-code-ide-tests.el.  A daemon of its own started without an init
+file (emacs -Q: `init-file-user' is nil), or has a name that starts
+with cci-live; a person's daemon loads an init file."
+  (let ((daemon (daemonp)))
+    (and (equal (getenv "CLAUDE_CODE_IDE_LIVE_TESTS") "1")
+         (not noninteractive)
+         daemon
+         (or (null init-file-user)
+             (and (stringp daemon) (string-prefix-p "cci-live" daemon)))
+         (not (featurep 'claude-code-ide-tests)))))
 
 (defmacro claude-code-ide-live-tests--skip-unless-live ()
   "Skip the current test unless the live tests may run."
@@ -283,6 +288,18 @@ in the file or now, counts as still running: the safe side."
          (let ((now (claude-code-ide-live-tests--start-time pid)))
            (or (null start) (null now) (< (abs (- now start)) 1.0))))))
 
+(defun claude-code-ide-live-tests--check-root (root)
+  "Signal a `user-error' when ROOT has files but no owner file.
+Such a folder is no live folder, for example a folder of the user that
+CLAUDE_CODE_IDE_LIVE_DIR names by mistake.  The claim lock owner.lock
+does not count: a new folder has only the lock while it is claimed.
+This only reads, so the setup calls it before it changes ROOT."
+  (when (and (file-directory-p root)
+             (not (file-exists-p (expand-file-name "owner" root)))
+             (remove "owner.lock" (directory-files root nil directory-files-no-dot-files-regexp)))
+    (user-error "%s has files and no owner file, so it is no live folder; choose an empty or new folder"
+                root)))
+
 (defun claude-code-ide-live-tests--claim-root-1 (root)
   "Claim ROOT for this Emacs; the caller holds the claim lock.
 An owner that no longer runs (`claude-code-ide-live-tests--owner-runs-p')
@@ -299,11 +316,7 @@ time, it writes its process ID only."
                    (string-to-number (car words))))
          (start (and (cadr words) (string-match-p "\\`[0-9]+\\(?:\\.[0-9]+\\)?\\'" (cadr words))
                      (string-to-number (cadr words)))))
-    ;; A new folder has only the lock
-    (when (and (not (file-exists-p file))
-               (remove "owner.lock" (directory-files root nil directory-files-no-dot-files-regexp)))
-      (user-error "%s has files and no owner file, so it is no live folder; choose an empty or new folder"
-                  root))
+    (claude-code-ide-live-tests--check-root root)
     (when (and pid (> pid 0) (/= pid (emacs-pid))
                (claude-code-ide-live-tests--owner-runs-p pid start))
       (user-error "Live folder %s belongs to Emacs %d; use CLAUDE_CODE_IDE_LIVE_DIR for another folder"
@@ -322,9 +335,12 @@ registry, whose recovery can start CLIs."
     (user-error "The live test setup runs only in an own daemon with CLAUDE_CODE_IDE_LIVE_TESTS=1; see docs/live-tests.md"))
   (unless claude-code-ide-live-tests--setup-done
     (let ((root (claude-code-ide-live-tests--root)))
+      ;; Refuse a folder that is no live folder before any change of it;
+      ;; the claim checks again under its lock
+      (claude-code-ide-live-tests--check-root root)
       (make-directory root t)
-      (set-file-modes root #o700)
       (claude-code-ide-live-tests--claim-root root)
+      (set-file-modes root #o700)
       ;; The CLIs get no API key and no marker of a parent CLI.  The test
       ;; checks only the names; it never reads a value.
       (setq claude-code-ide-cli-environment-unset (claude-code-ide-live-tests--environment-unset)
@@ -860,15 +876,53 @@ REQUEST-ID names the call.  Return the committed status."
       (should (eq (plist-get status :status) 'committed))
       status)))
 
-(defun claude-code-ide-live-tests--read-tool-p (tool)
-  "Return non-nil when TOOL, a tool name of a CLI, only reads.
-These are Read, Glob and Grep, and the tools of the claude-sessions
-server (Claude Code names them mcp__claude-sessions__NAME, Codex
-mcp__claude_sessions__NAME).  Every other tool, also Bash, is not."
-  (and (stringp tool)
-       (or (member tool '("Read" "Glob" "Grep"))
-           (string-match-p "\\`mcp__claude[-_]sessions__[a-z_]+\\'" tool))
-       t))
+(defun claude-code-ide-live-tests--inside-p (file folder)
+  "Return non-nil when FILE is FOLDER or in it, by their true names."
+  (let ((file (directory-file-name (file-truename file)))
+        (folder (directory-file-name (file-truename folder))))
+    (or (equal file folder)
+        (string-prefix-p (file-name-as-directory folder) file))))
+
+(defun claude-code-ide-live-tests--read-path-p (path directory)
+  "Return non-nil when the test may approve a read of PATH by a CLI in DIRECTORY.
+PATH must be in the live folder, in a Claude Code transcript folder of
+a folder in the live folder, or in the Codex sessions folder, by its
+true name: a link counts by its target.  A relative PATH is in
+DIRECTORY; without DIRECTORY, it counts as outside."
+  (when (and (stringp path) (not (string-empty-p path))
+             (or (file-name-absolute-p path) directory))
+    (let* ((file (expand-file-name path directory))
+           (root (claude-code-ide-live-tests--root))
+           (projects (expand-file-name "projects" (claude-code-ide-session-registry--claude-config-directory))))
+      (or (claude-code-ide-live-tests--inside-p file root)
+          (claude-code-ide-live-tests--inside-p file (expand-file-name "sessions" (claude-code-ide-codex-home)))
+          (and (claude-code-ide-live-tests--inside-p file projects)
+               (string-prefix-p (concat (claude-code-ide-live-tests--claude-folder-name root) "-")
+                                (file-relative-name (file-truename file) (file-truename projects))))))))
+
+(defun claude-code-ide-live-tests--read-tool-p (tool &optional input directory)
+  "Return non-nil when TOOL, a tool name of a CLI, only reads in a test folder.
+These are the tools of the claude-sessions server (Claude Code names
+them mcp__claude-sessions__NAME, Codex mcp__claude_sessions__NAME), and
+Read, Glob and Grep on a path of `claude-code-ide-live-tests--read-path-p'.
+INPUT is the tool input of the request: file_path for Read, path and
+pattern for Glob, path for Grep; a missing path is DIRECTORY, the
+folder of the CLI.  Every other tool, also Bash, is not."
+  (let ((value (lambda (key) (claude-code-ide-handover--event-value input key))))
+    (and (stringp tool)
+         (pcase tool
+           ((pred (string-match-p "\\`mcp__claude[-_]sessions__[a-z_]+\\'")) t)
+           ("Read" (claude-code-ide-live-tests--read-path-p (funcall value "file_path") directory))
+           ("Grep" (claude-code-ide-live-tests--read-path-p (or (funcall value "path") directory)
+                                                            directory))
+           ("Glob" (let ((base (or (funcall value "path") directory))
+                         (pattern (funcall value "pattern")))
+                     (and (claude-code-ide-live-tests--read-path-p base directory)
+                          (stringp pattern)
+                          (claude-code-ide-live-tests--read-path-p
+                           (expand-file-name pattern (expand-file-name base directory))
+                           directory)))))
+         t)))
 
 (defun claude-code-ide-live-tests--approval-tool (instance-id after)
   "Return the tool of the newest approval request of INSTANCE-ID, or nil.
@@ -891,15 +945,28 @@ a call that the test did not ask for.  Return non-nil."
       (ert-fail (format "%s asks to approve %S, not %s" instance-id named tool)))
     t))
 
+(defun claude-code-ide-live-tests--approval-on-screen-p (buffer)
+  "Return non-nil when the terminal BUFFER shows an approval dialog now.
+Only the screen counts (`claude-code-ide-codex--screen-text': the last
+lines of the buffer), not the scrollback: an old dialog there would
+make the test type its answer into the composer."
+  (string-match-p "Do you want to proceed\\|Allow the"
+                  (claude-code-ide-codex--screen-text buffer)))
+
 (defun claude-code-ide-live-tests--approve-while (instance-id predicate seconds &optional after)
   "Wait until PREDICATE is non-nil, and approve the read tools of INSTANCE-ID.
-A tool that only reads (`claude-code-ide-live-tests--read-tool-p') gets
-\"1. Yes\" from the test, as a person; the log has the tool and the
-screen.  Any other tool fails the test: the test never allows a write
-or a command.  AFTER is the float time from which approval requests
-count.  Return the value of PREDICATE, or nil after SECONDS."
-  (let ((answered nil)
-        (after (or after (float-time))))
+A tool that only reads in a folder of the tests
+\(`claude-code-ide-live-tests--read-tool-p') gets \"1. Yes\" from the
+test, as a person, when the screen shows the dialog; the log has the
+tool and the screen.  Any other tool or path fails the test: the test
+never allows a write, a command, or a read elsewhere.  AFTER is the
+float time from which approval requests count.  Return the value of
+PREDICATE, or nil after SECONDS."
+  (let* ((answered nil)
+         (after (or after (float-time)))
+         (instance (claude-code-ide-instance-by-id instance-id))
+         (directory (and instance (claude-code-ide-known-or-nil
+                                   (claude-code-ide-instance-project-root instance)))))
     (claude-code-ide-live-tests--wait
      (lambda ()
        (or (funcall predicate)
@@ -914,16 +981,18 @@ count.  Return the value of PREDICATE, or nil after SECONDS."
                              claude-code-ide-live-tests--events))
                      (text (claude-code-ide-live-tests--buffer-text instance-id)))
                  (when entry
-                   (let ((tool (claude-code-ide-handover--event-value
-                                (plist-get (cdr entry) :data) "tool_name"))
-                         (screen (replace-regexp-in-string
-                                  "[ \t\n│]+" " " (substring text (max 0 (- (length text) 600))))))
-                     (unless (claude-code-ide-live-tests--read-tool-p tool)
-                       (claude-code-ide-live-tests--log "%s asks for the tool %S: %s"
-                                                        instance-id tool screen)
-                       (ert-fail (format "%s asks for the tool %S, which the test does not approve"
-                                         instance-id tool)))
-                     (when (string-match-p "Do you want to proceed\\|Allow the" text)
+                   (let* ((data (plist-get (cdr entry) :data))
+                          (tool (claude-code-ide-handover--event-value data "tool_name"))
+                          (input (claude-code-ide-handover--event-value data "tool_input"))
+                          (screen (replace-regexp-in-string
+                                   "[ \t\n│]+" " " (substring text (max 0 (- (length text) 600))))))
+                     (unless (claude-code-ide-live-tests--read-tool-p tool input directory)
+                       (claude-code-ide-live-tests--log "%s asks for the tool %S with %S: %s"
+                                                        instance-id tool input screen)
+                       (ert-fail (format "%s asks for the tool %S with %S, which the test does not approve"
+                                         instance-id tool input)))
+                     (when (claude-code-ide-live-tests--approval-on-screen-p
+                            (claude-code-ide-live-tests--buffer instance-id))
                        (claude-code-ide-live-tests--log
                         "%s: the test approves the read tool %s, as a person: %s"
                         instance-id tool screen)
@@ -1058,6 +1127,12 @@ JSON object counts as no call."
         (cl-pushnew tool names :test #'equal)))
     (nreverse names)))
 
+(defun claude-code-ide-live-tests--document-tool-calls (calls)
+  "Return the CALLS (claude-sessions tool names) that the handover document names.
+These are get_session_outline and get_messages; another tool of the
+server, such as list_sessions, does not read the earlier session."
+  (cl-remove-if-not (lambda (tool) (member tool '("get_session_outline" "get_messages"))) calls))
+
 ;;; The handover tests
 
 (ert-deftest claude-code-ide-live-test-handover-chain ()
@@ -1094,7 +1169,7 @@ reads the Codex rollout through the file reference."
             ;; The detail came through the tools of claude-sessions
             (let ((calls (claude-code-ide-live-tests--session-tool-calls rollout)))
               (claude-code-ide-live-tests--log "case 1 rollout %s: claude-sessions calls %S" rollout calls)
-              (should calls)))
+              (should (claude-code-ide-live-tests--document-tool-calls calls))))
           ;; Leg 2 reads a second codeword; then leg 2 -> leg 3: Codex -> CC
           (claude-code-ide-live-tests--read-secret-turn leg-2 dir "note-2.txt" word-2 "cci-test-L3")
           (let* ((status-3 (claude-code-ide-live-tests--hand-over leg-2 'claude (claude-code-ide-live-tests--request-id "cci-test-L3-to-claude")))
@@ -1195,6 +1270,12 @@ The shell that starts it ends at once, so the sleep is no child of Emacs."
       (call-process "sh" nil t nil "-c" "sleep 900 </dev/null >/dev/null 2>&1 & echo $!"))
     (string-to-number (string-trim (buffer-string)))))
 
+(defun claude-code-ide-live-tests--own-strays-p (strays pid)
+  "Return non-nil when STRAYS, of a handover status, are only the process PID.
+The action `end' of a handover ends every stray, so the test may choose
+it only when no other process is a stray."
+  (equal (mapcar (lambda (stray) (plist-get stray :pid)) strays) (list pid)))
+
 (ert-deftest claude-code-ide-live-test-handover-stray ()
   "A stray process in the worktree stops the handover with needs-user; end goes on."
   :tags '(:live)
@@ -1214,8 +1295,12 @@ The shell that starts it ends at once, so the sleep is no child of Emacs."
             (should (eq (plist-get status :reason) 'strays))
             (should (eq (plist-get status :stage) 'source-stopped))
             (should (null (plist-get status :target-id)))
-            (should (member stray (mapcar (lambda (s) (plist-get s :pid)) (plist-get status :strays))))
             (should-not (claude-code-ide-live-tests--running-p source))
+            ;; `end' ends every stray of the handover: only the own sleep
+            ;; may be one, else the test fails and ends nothing
+            (unless (claude-code-ide-live-tests--own-strays-p (plist-get status :strays) stray)
+              (ert-fail (format "The strays are not only the sleep %d: %S"
+                                stray (plist-get status :strays))))
             (claude-code-ide-handover-resolve id 'end)
             (should (claude-code-ide-live-tests--wait
                      (lambda () (not (process-attributes stray))) 60 "the end of the stray"))
@@ -1295,13 +1380,16 @@ Emacs."
           (setq claude-code-ide-live-tests--kill-stage nil))))))
 
 (defun claude-code-ide-live-tests--cli-processes (native-id)
-  "Return the process IDs of the CLIs whose command line names NATIVE-ID."
+  "Return the process IDs of the CLIs whose command line names NATIVE-ID.
+A CLI is a process with a word of its command line whose file name is
+claude or codex, also after a launcher such as node .../bin/claude."
   (cl-remove-if-not
    (lambda (pid)
      (let ((args (alist-get 'args (process-attributes pid))))
        (and (stringp args)
             (string-search native-id args)
-            (string-match-p "\\`\\S-*\\(claude\\|codex\\)\\b" args))))
+            (string-match-p "\\(?:\\`\\|[[:space:]]\\)\\(?:\\S-*/\\)?\\(?:claude\\|codex\\)\\(?:[[:space:]]\\|\\'\\)"
+                            args))))
    (list-system-processes)))
 
 (ert-deftest claude-code-ide-live-test-recovery-2-after-kill ()
@@ -1648,7 +1736,10 @@ stopped, and committed while the source CLI ran on."
 The stop is `claude-code-ide-control-stop'.
 A coordinator stops an instance; nobody is there to answer a question
 such as \"Buffer has a running process; kill it?\".  In a daemon such a
-question blocks Emacs."
+question blocks Emacs.
+The soft stop kills the terminal buffer later, from timers.  So the
+question stubs stay in place until the CLI and the buffer are gone,
+and the check of the questions comes after that."
   (claude-code-ide-live-tests--stop-all)
   (claude-code-ide-live-tests--with-backend backend
     (let* ((dir (claude-code-ide-live-tests--project "projA"))
@@ -1657,7 +1748,8 @@ question blocks Emacs."
                  (when (eq provider 'codex)
                    (claude-code-ide-live-tests--ensure-codex-folder-trust dir))
                  (claude-code-ide-live-tests--launch dir provider nil)))
-           (process (get-buffer-process (claude-code-ide-live-tests--buffer id))))
+           (buffer (claude-code-ide-live-tests--buffer id))
+           (process (get-buffer-process buffer)))
       (claude-code-ide-live-tests--log "%s in %s: the query flag of the terminal process is %S"
                                        provider backend (process-query-on-exit-flag process))
       (accept-process-output nil 3)
@@ -1668,13 +1760,16 @@ question blocks Emacs."
         (let ((result (condition-case err
                           (claude-code-ide-control-stop id)
                         (error (list :status 'signal :error err)))))
-          (claude-code-ide-live-tests--log "%s in %s: stop %S, questions %S" provider backend result questions)
           (unwind-protect
               (progn
-                (should-not questions)
                 (should (eq (plist-get result :status) 'ok))
                 (should (claude-code-ide-live-tests--wait
-                         (lambda () (not (process-live-p process))) 15 "the end of the CLI")))
+                         (lambda () (not (process-live-p process))) 15 "the end of the CLI"))
+                (should (claude-code-ide-live-tests--wait
+                         (lambda () (not (buffer-live-p buffer))) 15 "the end of the terminal buffer"))
+                (claude-code-ide-live-tests--log "%s in %s: stop %S, questions %S"
+                                                 provider backend result questions)
+                (should-not questions))
             (let ((kill-buffer-query-functions nil))
               (when (claude-code-ide-live-tests--running-p id)
                 (claude-code-ide-control-stop id)))))))))
@@ -1713,15 +1808,156 @@ question blocks Emacs."
 
 (ert-deftest claude-code-ide-live-tests-test-read-tools ()
   "Only the read tools are approved for a person; every other tool is not."
-  (dolist (tool '("Read" "Glob" "Grep"
-                  "mcp__claude-sessions__get_session_outline"
-                  "mcp__claude-sessions__get_messages"
-                  "mcp__claude_sessions__get_messages"))
-    (should (claude-code-ide-live-tests--read-tool-p tool)))
-  (dolist (tool '("Bash" "Write" "Edit" "MultiEdit" "NotebookEdit" "WebFetch"
-                  "mcp__emacs-tools__emacs_eval" "mcp__emacs_tools__claude_code_ide_mcp_project_info"
-                  "mcp__claude-sessions-evil__x" "Readx" "" nil))
-    (should-not (claude-code-ide-live-tests--read-tool-p tool))))
+  (claude-code-ide-live-tests--with-temp-folder root
+    (let* ((process-environment (cons (concat "CLAUDE_CODE_IDE_LIVE_DIR=" root) process-environment))
+           (project (file-name-as-directory (expand-file-name "projA" root)))
+           (file (expand-file-name "note.txt" project)))
+      (make-directory project t)
+      (dolist (call `(("Read" ((file_path . ,file)))
+                      ("Glob" ((pattern . "*.txt")))
+                      ("Grep" ((pattern . "codeword")))
+                      ("mcp__claude-sessions__get_session_outline" nil)
+                      ("mcp__claude-sessions__get_messages" nil)
+                      ("mcp__claude_sessions__get_messages" nil)))
+        (should (claude-code-ide-live-tests--read-tool-p (car call) (cadr call) project)))
+      (dolist (tool '("Bash" "Write" "Edit" "MultiEdit" "NotebookEdit" "WebFetch"
+                      "mcp__emacs-tools__emacs_eval" "mcp__emacs_tools__claude_code_ide_mcp_project_info"
+                      "mcp__claude-sessions-evil__x" "Readx" "" nil))
+        (should-not (claude-code-ide-live-tests--read-tool-p tool `((file_path . ,file)) project))))))
+
+(ert-deftest claude-code-ide-live-tests-test-read-tool-paths ()
+  "A read tool is approved only for a path in a folder of the tests.
+These are the live folder, the Claude Code transcript folders of its
+projects, and the Codex sessions folder.  A link counts by its target."
+  (claude-code-ide-live-tests--with-temp-folder temp
+    (let* ((root (file-name-as-directory (expand-file-name "live" temp)))
+           (project (file-name-as-directory (expand-file-name "projA" root)))
+           (outside (file-name-as-directory (expand-file-name "outside" temp)))
+           (claude-dir (expand-file-name "claude-config" temp))
+           (codex-dir (expand-file-name "codex-home" temp))
+           (process-environment (append (list (concat "CLAUDE_CODE_IDE_LIVE_DIR=" root)
+                                              (concat "CLAUDE_CONFIG_DIR=" claude-dir)
+                                              (concat "CODEX_HOME=" codex-dir))
+                                        process-environment))
+           (transcripts (expand-file-name
+                         (concat "projects/" (claude-code-ide-live-tests--claude-folder-name project))
+                         claude-dir)))
+      (make-directory project t)
+      (make-directory outside t)
+      (make-directory transcripts t)
+      (make-symbolic-link outside (expand-file-name "link" project))
+      (dolist (call `(("Read" ((file_path . ,(expand-file-name "note.txt" project))))
+                      ("Read" ((file_path . "note.txt")))
+                      ("Read" ((file_path . ,(expand-file-name ".handover/h-1.md" project))))
+                      ("Read" ((file_path . ,(expand-file-name "sessions/2026/11/22/rollout-x.jsonl"
+                                                               codex-dir))))
+                      ("Read" ((file_path . ,(expand-file-name "abc.jsonl" transcripts))))
+                      ("Glob" ((pattern . "**/*.md")))
+                      ("Glob" ((pattern . "*.jsonl") (path . ,transcripts)))
+                      ("Grep" ((pattern . "MARMOT")))
+                      ("Grep" ((pattern . "MARMOT") (path . ,root)))))
+        (should (equal (list call t)
+                       (list call (and (claude-code-ide-live-tests--read-tool-p
+                                        (car call) (cadr call) project)
+                                       t)))))
+      (dolist (call `(("Read" nil)
+                      ("Read" ((file_path . "")))
+                      ("Read" ((file_path . "~/.ssh/id_rsa")))
+                      ("Read" ((file_path . ,(expand-file-name "secret.txt" outside))))
+                      ("Read" ((file_path . "../../outside/secret.txt")))
+                      ("Read" ((file_path . ,(expand-file-name "link/secret.txt" project))))
+                      ("Read" ((file_path . ,(expand-file-name "projects/-Users-cci-test-other/a.jsonl"
+                                                               claude-dir))))
+                      ("Read" ((file_path . ,(expand-file-name "config.toml" codex-dir))))
+                      ("Glob" ((pattern . "/etc/*")))
+                      ("Glob" ((pattern . "../../outside/*")))
+                      ("Glob" ((pattern . "*") (path . ,outside)))
+                      ("Grep" ((pattern . "x") (path . "/etc")))
+                      ("Grep" ((pattern . "x") (path . ,(expand-file-name "link" project))))))
+        (should (equal (list call nil)
+                       (list call (claude-code-ide-live-tests--read-tool-p
+                                   (car call) (cadr call) project)))))
+      ;; A relative path needs the folder of the CLI
+      (should-not (claude-code-ide-live-tests--read-tool-p "Read" '((file_path . "note.txt")) nil))
+      (should-not (claude-code-ide-live-tests--read-tool-p "Grep" '((pattern . "x")) nil)))))
+
+(ert-deftest claude-code-ide-live-tests-test-approval-on-screen ()
+  "Only an approval dialog on the current screen counts, not one in the scrollback."
+  (let ((claude-code-ide-codex--screen-lines 10))
+    (with-temp-buffer
+      (insert " Do you want to proceed?\n ❯ 1. Yes\n   2. No\n")
+      (dotimes (i 30) (insert (format "output line %d\n" i)))
+      (insert "╭──────╮\n│ >    │\n╰──────╯\n")
+      (should-not (claude-code-ide-live-tests--approval-on-screen-p (current-buffer)))
+      (insert " Do you want to proceed?\n ❯ 1. Yes\n   2. No\n")
+      (should (claude-code-ide-live-tests--approval-on-screen-p (current-buffer))))))
+
+(ert-deftest claude-code-ide-live-tests-test-document-tool-calls ()
+  "The chain check counts only the claude-sessions tools that the document names."
+  (should (equal (claude-code-ide-live-tests--document-tool-calls
+                  '("list_sessions" "get_session_outline" "get_messages"))
+                 '("get_session_outline" "get_messages")))
+  (should (equal (claude-code-ide-live-tests--document-tool-calls '("get_messages")) '("get_messages")))
+  (should-not (claude-code-ide-live-tests--document-tool-calls '("list_sessions" "export_session")))
+  (should-not (claude-code-ide-live-tests--document-tool-calls nil)))
+
+(ert-deftest claude-code-ide-live-tests-test-own-strays ()
+  "The stray test ends the strays only when they are exactly its own process."
+  (let ((own (list :pid 4242 :command "sleep 900" :reason 'worktree))
+        (other (list :pid 4343 :command "node server.js" :reason 'worktree)))
+    (should (claude-code-ide-live-tests--own-strays-p (list own) 4242))
+    (should-not (claude-code-ide-live-tests--own-strays-p (list own other) 4242))
+    (should-not (claude-code-ide-live-tests--own-strays-p (list other own) 4242))
+    (should-not (claude-code-ide-live-tests--own-strays-p (list other) 4242))
+    (should-not (claude-code-ide-live-tests--own-strays-p nil 4242))))
+
+(ert-deftest claude-code-ide-live-tests-test-cli-processes ()
+  "A CLI process counts when any word of its command line is claude or codex.
+The npm launcher runs the CLI as node .../bin/claude."
+  (let ((lines '((1 . "node /opt/homebrew/bin/claude --session-id cci-test-native")
+                 (2 . "/Users/cci-test/.local/bin/claude --resume cci-test-native")
+                 (3 . "/opt/homebrew/lib/node_modules/@openai/codex/vendor/aarch64-apple-darwin/codex/codex resume cci-test-native")
+                 (4 . "codex resume cci-test-native")
+                 (5 . "grep cci-test-native")
+                 (6 . "tail -f /tmp/claude-cci-test-native.log")
+                 (7 . "vim notes-about-claude.txt cci-test-native")
+                 (8 . "node /opt/homebrew/bin/claude --session-id cci-test-other")
+                 (9 . nil))))
+    (cl-letf (((symbol-function 'list-system-processes) (lambda () (mapcar #'car lines)))
+              ((symbol-function 'process-attributes)
+               (lambda (pid) (when-let* ((args (alist-get pid lines))) (list (cons 'args args))))))
+      (should (equal (sort (claude-code-ide-live-tests--cli-processes "cci-test-native") #'<)
+                     '(1 2 3 4))))))
+
+(ert-deftest claude-code-ide-live-tests-test-setup-refuses-user-folder ()
+  "The setup refuses a folder with files and no owner file before it changes it.
+Such a folder is no live folder, for example a folder of the user that
+CLAUDE_CODE_IDE_LIVE_DIR names by mistake: its mode stays, and it gets
+no lock and no owner file."
+  (claude-code-ide-live-tests--with-temp-folder root
+    (let ((process-environment (cons (concat "CLAUDE_CODE_IDE_LIVE_DIR=" root) process-environment))
+          (user-file (expand-file-name "notes.txt" root))
+          (claude-code-ide-live-tests--setup-done nil)
+          (claude-code-ide-state-file "/cci-test/unchanged.json")
+          (claude-code-ide-cli-environment-unset '("CCI_TEST_ONLY"))
+          (changes nil))
+      (write-region "the user's notes\n" nil user-file nil 'silent)
+      (set-file-modes root #o755)
+      (cl-letf (((symbol-function 'claude-code-ide-live-tests--live-p) (lambda () t))
+                ((symbol-function 'advice-add) (lambda (&rest args) (push (cons 'advice args) changes)))
+                ((symbol-function 'add-hook) (lambda (&rest args) (push (cons 'hook args) changes)))
+                ((symbol-function 'claude-code-ide-emacs-tools-setup)
+                 (lambda (&rest args) (push (cons 'tools args) changes)))
+                ((symbol-function 'claude-code-ide-session-registry-mode)
+                 (lambda (&rest args) (push (cons 'registry args) changes))))
+        (should-error (claude-code-ide-live-tests-setup) :type 'user-error))
+      (should (= (file-modes root) #o755))
+      (should (equal (directory-files root nil directory-files-no-dot-files-regexp) '("notes.txt")))
+      (should (equal (claude-code-ide-live-tests--file-text user-file) "the user's notes\n"))
+      (should-not changes)
+      (should-not claude-code-ide-live-tests--setup-done)
+      (should (equal claude-code-ide-state-file "/cci-test/unchanged.json"))
+      (should (equal claude-code-ide-cli-environment-unset '("CCI_TEST_ONLY"))))))
 
 (ert-deftest claude-code-ide-live-tests-test-approval-tool ()
   "The tool of an approval is that of the newest approval request after the time."
@@ -2031,12 +2267,25 @@ buffer."
                (lambda (feature &rest args)
                  (and (not (eq feature 'claude-code-ide-tests))
                       (apply real-featurep feature args)))))
-      (let ((noninteractive nil))
-        (cl-letf (((symbol-function 'daemonp) (lambda () "cci-test")))
-          (should (claude-code-ide-live-tests--live-p)))
+      (let ((noninteractive nil)
+            (init-file-user nil))
+        ;; emacs -Q: no init file
+        (dolist (name (list "cci-test" t))
+          (cl-letf (((symbol-function 'daemonp) (lambda () name)))
+            (should (claude-code-ide-live-tests--live-p))))
         ;; An Emacs with a frame of its own is not the test daemon
         (cl-letf (((symbol-function 'daemonp) (lambda () nil)))
-          (should-not (claude-code-ide-live-tests--live-p))))
+          (should-not (claude-code-ide-live-tests--live-p)))
+        ;; A daemon that loaded an init file is a person's daemon, unless
+        ;; its name starts with cci-live
+        (dolist (user (list "" "cci-test-user"))
+          (let ((init-file-user user))
+            (dolist (name (list t "server" "work" "my-cci-live"))
+              (cl-letf (((symbol-function 'daemonp) (lambda () name)))
+                (should-not (claude-code-ide-live-tests--live-p))))
+            (dolist (name (list "cci-live" "cci-live-2"))
+              (cl-letf (((symbol-function 'daemonp) (lambda () name)))
+                (should (claude-code-ide-live-tests--live-p)))))))
       (let ((noninteractive t))
         (cl-letf (((symbol-function 'daemonp) (lambda () "cci-test")))
           (should-not (claude-code-ide-live-tests--live-p)))))

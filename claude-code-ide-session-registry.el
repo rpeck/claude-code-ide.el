@@ -202,7 +202,11 @@ Each leg is an alist with JSON keys; see
 instance that no handover started.")
   (handover nil :type list
             :documentation "The last handover with this entry as its source, as an alist.
-Its stage and status say how far it came; see docs/handover.md."))
+Its stage and status say how far it came; see docs/handover.md.")
+  (host-id nil :type (or null string)
+           :documentation "The host ID of the host of the entry, or nil.
+See `claude-code-ide-session-registry-host-id'.  An older entry has
+only the host name."))
 
 (defconst claude-code-ide-session-registry--fields
   '((instance_id . key)
@@ -233,8 +237,10 @@ Its stage and status say how far it came; see docs/handover.md."))
     (failed_at . failed-at)
     (native_id_generation . native-id-generation)
     (chain . chain)
-    (handover . handover))
-  "JSON key and struct slot of each field of an entry, in version 4.")
+    (handover . handover)
+    (host_id . host-id))
+  "JSON key and struct slot of each field of an entry, in version 4.
+`host_id' is optional: an entry without it reads with nil.")
 
 (defconst claude-code-ide-session-registry--v1-renames
   '((key . instance_id)
@@ -545,7 +551,7 @@ Return nil when it has no instance ID."
         (setf (claude-code-ide-session-registry-entry-failure-count entry) 0))
       (unless (natnump (claude-code-ide-session-registry-entry-native-id-generation entry))
         (setf (claude-code-ide-session-registry-entry-native-id-generation entry) nil))
-      (dolist (slot '(worktree failure failed-at))
+      (dolist (slot '(worktree failure failed-at host-id))
         (unless (stringp (cl-struct-slot-value 'claude-code-ide-session-registry-entry slot entry))
           (setf (cl-struct-slot-value 'claude-code-ide-session-registry-entry slot entry) nil)))
       ;; The handover fields: a list of objects, and one object
@@ -918,7 +924,7 @@ generation set stays."
 
 (defconst claude-code-ide-session-registry--pending-slots
   '(provider generation role project-dir worktree instance-name state
-             emacs-pid host emacs-start-time last-seen-at)
+             emacs-pid host host-id emacs-start-time last-seen-at)
   "Slots that a provisional entry sets in an entry that exists.")
 
 (defun claude-code-ide-session-registry--change-pending (new)
@@ -1035,6 +1041,8 @@ it again.  The native ID and the names stay."
                  (claude-code-ide-session-registry-entry-emacs-start-time entry)
                  (claude-code-ide-session-registry--emacs-start-time)
                  (claude-code-ide-session-registry-entry-host entry) (system-name)
+                 (claude-code-ide-session-registry-entry-host-id entry)
+                 (claude-code-ide-session-registry--this-host-id)
                  (claude-code-ide-session-registry-entry-pid entry) nil
                  (claude-code-ide-session-registry-entry-process-start-time entry) nil
                  (claude-code-ide-session-registry-entry-closed-at entry) nil
@@ -1260,6 +1268,21 @@ get the same ID: the rename does not replace a file that exists."
                     (file-already-exists nil)))
               (when (file-exists-p tmp) (delete-file tmp))))
           (or (claude-code-ide-session-registry--read-host-id file) id)))))
+
+(defun claude-code-ide-session-registry--this-host-id ()
+  "Return the host ID of this host, or nil when its file cannot be made."
+  (ignore-errors (claude-code-ide-session-registry-host-id)))
+
+(defun claude-code-ide-session-registry--this-host-p (entry &optional host-id)
+  "Return non-nil when ENTRY is an entry of this host.
+An entry with a host ID matches by it, because the host name can
+change (on macOS, with the network).  An older entry without a host ID
+matches by the host name.  HOST-ID is the host ID of this host, when
+the caller has it already."
+  (let ((id (claude-code-ide-session-registry-entry-host-id entry)))
+    (if (stringp id)
+        (equal id (or host-id (claude-code-ide-session-registry--this-host-id)))
+      (equal (claude-code-ide-session-registry-entry-host entry) (system-name)))))
 
 (defun claude-code-ide-session-registry--owner-here (pid start)
   "Return the owner of a handover on this host: `self', `other', or nil.
@@ -1510,6 +1533,7 @@ descriptor and stores no flags."
      :last-seen-at now
      :emacs-pid (emacs-pid)
      :host (system-name)
+     :host-id (claude-code-ide-session-registry--this-host-id)
      :emacs-start-time (claude-code-ide-session-registry--emacs-start-time)
      :pid (and instance (funcall known (claude-code-ide-instance-pid instance) #'integerp))
      :process-start-time (and instance (funcall known (claude-code-ide-instance-process-start-time instance)
@@ -1554,6 +1578,10 @@ the entry: `claude-code-ide-session-registry--on-start' when it works,
                     session spec key
                     (claude-code-ide-session-registry--launch-native-id session spec))))
         (setf (claude-code-ide-session-registry-entry-state entry) 'pending)
+        ;; The report file of an older launch names an older
+        ;; conversation (for a fork, the parent).  The CLI of this
+        ;; launch writes it again at its start.
+        (ignore-errors (delete-file (claude-code-ide-session-registry--report-file key)))
         (puthash session (claude-code-ide-session-registry--pending-kind session spec)
                  claude-code-ide-session-registry--pending)
         (claude-code-ide-session-registry--submit
@@ -1933,7 +1961,8 @@ terminal process."
   (exit-keys nil :type list
              :documentation "Keys of the entries that the last Emacs closed at its exit.")
   (live-keys nil :type list :documentation "Keys of the sessions that run in this Emacs.")
-  (attributes nil :documentation "Hash table of the process attributes of each PID."))
+  (attributes nil :documentation "Hash table of the process attributes of each PID.")
+  (host-id nil :type (or null string) :documentation "The host ID of this host, or nil."))
 
 (defun claude-code-ide-session-registry--exit-keys (entries &optional cache)
   "Return the keys of ENTRIES that the last Emacs on this host closed at its exit.
@@ -1941,10 +1970,11 @@ That Emacs no longer runs.  Older exits are left out, and so is an exit
 after which another Emacs started sessions: that Emacs ran last.
 CACHE is as for `claude-code-ide-session-registry--process-attributes'."
   (let ((latest nil)
-        (latest-pid nil))
+        (latest-pid nil)
+        (host-id (claude-code-ide-session-registry--this-host-id)))
     (dolist (entry entries)
       (when (and (equal (claude-code-ide-session-registry-entry-closed-by entry) "emacs-exit")
-                 (equal (claude-code-ide-session-registry-entry-host entry) (system-name))
+                 (claude-code-ide-session-registry--this-host-p entry host-id)
                  (not (eql (claude-code-ide-session-registry-entry-emacs-pid entry) (emacs-pid)))
                  (not (claude-code-ide-session-registry--other-emacs-p entry cache))
                  (string< (or latest "")
@@ -1955,7 +1985,7 @@ CACHE is as for `claude-code-ide-session-registry--process-attributes'."
                (not (cl-some
                      (lambda (entry)
                        (let ((pid (claude-code-ide-session-registry-entry-emacs-pid entry)))
-                         (and (equal (claude-code-ide-session-registry-entry-host entry) (system-name))
+                         (and (claude-code-ide-session-registry--this-host-p entry host-id)
                               (not (eql pid latest-pid))
                               (not (eql pid (emacs-pid)))
                               (string< latest
@@ -1978,7 +2008,8 @@ It reads the live sessions once, and each process once, for all entries."
                                  (claude-code-ide-session-registry--live-cli-sessions)))
      :exit-keys (claude-code-ide-session-registry--exit-keys entries attributes)
      :live-keys (claude-code-ide-session-registry--live-keys)
-     :attributes attributes)))
+     :attributes attributes
+     :host-id (claude-code-ide-session-registry--this-host-id))))
 
 (defun claude-code-ide-session-registry--entry-context (entry)
   "Return a restore context for ENTRY alone.
@@ -1993,7 +2024,8 @@ entry with a native ID needs the running Claude Code CLIs."
                                  (claude-code-ide-session-registry--live-cli-sessions))))
    :exit-keys (list (claude-code-ide-session-registry-entry-key entry))
    :live-keys (claude-code-ide-session-registry--live-keys)
-   :attributes (make-hash-table :test 'eql)))
+   :attributes (make-hash-table :test 'eql)
+   :host-id (claude-code-ide-session-registry--this-host-id)))
 
 (defun claude-code-ide-session-registry--unchanged-p (planned current)
   "Return non-nil when the entry CURRENT is still the entry PLANNED of the plan.
@@ -2011,6 +2043,33 @@ CURRENT must be unchanged since the plan, and must not run now."
        (claude-code-ide-session-registry--unchanged-p planned current)
        (claude-code-ide-session-registry--restorable-p
         current (claude-code-ide-session-registry--entry-context current))))
+
+(defun claude-code-ide-session-registry--claim-restore (planned)
+  "Make this Emacs the owner of the entry PLANNED of a restore plan.
+The check and the claim are one change under the lock of the state
+file, so that of two Emacs that restore at the same time only one
+starts the entry.  The claim fails when the entry changed since the
+plan, for example because another Emacs claimed it.  Return non-nil
+when the state file holds the claim."
+  (let ((key (claude-code-ide-session-registry-entry-key planned)))
+    (eq (claude-code-ide-session-registry--submit-checked
+         "claim restore"
+         (lambda (done)
+           (lambda (entries)
+             (claude-code-ide-session-registry--update
+              entries (list key)
+              (lambda (entry)
+                (setcar done 'refused)
+                (when (claude-code-ide-session-registry--unchanged-p planned entry)
+                  (setf (claude-code-ide-session-registry-entry-emacs-pid entry) (emacs-pid)
+                        (claude-code-ide-session-registry-entry-emacs-start-time entry)
+                        (claude-code-ide-session-registry--emacs-start-time)
+                        (claude-code-ide-session-registry-entry-host entry) (system-name)
+                        (claude-code-ide-session-registry-entry-host-id entry)
+                        (claude-code-ide-session-registry--this-host-id))
+                  (setcar done 'claimed))))))
+         'drop)
+        'claimed)))
 
 (defun claude-code-ide-session-registry--restorable-p (entry &optional context)
   "Return non-nil when ENTRY ran when its Emacs ended, and runs no more.
@@ -2035,7 +2094,8 @@ computes one."
                   (not (and (eq state 'failed)
                             (>= (claude-code-ide-session-registry-entry-failure-count entry)
                                 claude-code-ide-session-registry-restore-attempts)))
-                  (equal (claude-code-ide-session-registry-entry-host entry) (system-name))
+                  (claude-code-ide-session-registry--this-host-p
+                   entry (claude-code-ide-session-registry--restore-context-host-id context))
                   (not (claude-code-ide-session-registry--other-emacs-p entry cache)))
              (member (claude-code-ide-session-registry-entry-key entry)
                      (claude-code-ide-session-registry--restore-context-exit-keys context)))
@@ -2146,7 +2206,8 @@ and at exit, since /clear changes it.  Return the number adopted."
                    :buffer-name (buffer-name buffer)
                    :instance-name (claude-code-ide-mcp-session-instance-name session)
                    :extra-flags "" :state 'open :started-at now :last-seen-at now
-                   :emacs-pid (emacs-pid) :host (system-name))))
+                   :emacs-pid (emacs-pid) :host (system-name)
+                   :host-id (claude-code-ide-session-registry--this-host-id))))
                 (cl-incf adopted)))))))
     (when (and (> (hash-table-count claude-code-ide-session-registry--adopted) 0)
                (not (timerp claude-code-ide-session-registry--adopt-timer)))
@@ -2400,11 +2461,17 @@ That is the transcript's modification time, else the last registry change."
 (defun claude-code-ide-session-registry--claude-restore-flags (entry)
   "Return the Claude Code flags that resume ENTRY.
 They are the stored flags, the model of the transcript (else the
-stored one) as --model, and the title that the user gave as --name."
+stored one) as --model, and the title that the user gave as --name.
+The stored flags are split into words and each word is quoted again,
+so that a changed state file cannot put shell syntax into the
+command: the terminal runs it through a shell."
   (let ((model (claude-code-ide-session-registry--model entry))
         (title (claude-code-ide-session-registry--custom-title entry)))
     (string-trim
-     (concat (claude-code-ide-session-registry-entry-extra-flags entry)
+     (concat (mapconcat #'shell-quote-argument
+                        (claude-code-ide--split-command-line
+                         (claude-code-ide-session-registry-entry-extra-flags entry))
+                        " ")
              (when model (concat " --model " (shell-quote-argument model)))
              (when title (concat " --name " (shell-quote-argument title)))))))
 
@@ -2623,11 +2690,13 @@ entry `failed'.  When its timer fires, each start reads its entry
 again: an entry that changed since the plan (for example, the user
 closed or archived it), or that runs now, is skipped, and so is an
 instance that runs already.  The check uses a context of that entry
-alone.  UNKNOWN is the list of entries without a conversation, which
-start nothing and are only reported.  INTERACTIVE non-nil marks each
-start as one that the user asked for; see
-`claude-code-ide-session-registry--start-entry'.  The last start
-reports the result."
+alone.  Then the start claims the entry under the lock (see
+`claude-code-ide-session-registry--claim-restore'); an entry that
+another Emacs claimed first is skipped.  UNKNOWN is the list of
+entries without a conversation, which start nothing and are only
+reported.  INTERACTIVE non-nil marks each start as one that the user
+asked for; see `claude-code-ide-session-registry--start-entry'.  The
+last start reports the result."
   (let ((run (claude-code-ide-session-registry--restore-run-create
               :remaining (length entries)
               :unknown (mapcar #'claude-code-ide-session-registry--describe unknown)))
@@ -2642,7 +2711,10 @@ reports the result."
                (let ((current (claude-code-ide-session-registry--find
                                (claude-code-ide-session-registry--entries)
                                (claude-code-ide-session-registry-entry-key entry))))
-                 (if (not (claude-code-ide-session-registry--still-restorable-p entry current))
+                 ;; The claim under the lock: another Emacs that
+                 ;; restores at the same time skips the entry
+                 (if (not (and (claude-code-ide-session-registry--still-restorable-p entry current)
+                               (claude-code-ide-session-registry--claim-restore current)))
                      (push (claude-code-ide-session-registry--describe entry)
                            (claude-code-ide-session-registry--restore-run-skipped run))
                    (if interactive

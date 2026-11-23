@@ -675,10 +675,60 @@ becomes a review of this Emacs."
       (unless (and (eql emacs (emacs-pid))
                    (gethash (claude-code-ide-review--record-review-id record)
                             claude-code-ide-review--records))
-        (setf (claude-code-ide-review--record-emacs-pid record) (emacs-pid)
-              (claude-code-ide-review--record-emacs-start record)
-              (claude-code-ide-review--emacs-start))
-        (claude-code-ide-review--write record))))))
+        (claude-code-ide-review--claim file record))))))
+
+(defconst claude-code-ide-review--lock-stale-seconds 10
+  "Seconds after which the claim lock of a review file is stale.
+A claim holds the lock for milliseconds; an older lock comes from an
+Emacs that ended during its claim.")
+
+(defun claude-code-ide-review--with-claim-lock (file function)
+  "Call FUNCTION while this Emacs holds the claim lock of the review FILE.
+The lock is the folder FILE.lock: its creation is atomic.  A stale lock
+is removed.  Return the value of FUNCTION, or `busy' at once when
+another Emacs holds the lock."
+  (let ((lock (concat file ".lock")))
+    (when-let* ((attributes (file-attributes lock)))
+      (when (> (float-time (time-subtract nil (file-attribute-modification-time attributes)))
+               claude-code-ide-review--lock-stale-seconds)
+        (ignore-errors (delete-directory lock t))))
+    (if (condition-case nil
+            (progn (make-directory lock) t)
+          (file-already-exists nil))
+        (unwind-protect
+            (funcall function)
+          (ignore-errors (delete-directory lock t)))
+      'busy)))
+
+(defun claude-code-ide-review--claim (file record)
+  "Make this Emacs the tracker of RECORD of FILE, whose Emacs is gone.
+Two Emacs can find the same review at the same time.  So the check
+and the write are one step under the claim lock of FILE: the file is
+read again there, and a review that another running Emacs claimed in
+the meantime stays with it.  While another Emacs holds the lock, the
+review counts as foreign, and the next check tries again."
+  (when (eq 'busy
+            (claude-code-ide-review--with-claim-lock
+             file
+             (lambda ()
+               (when-let* ((current (claude-code-ide-review--read-file file)))
+                 (let ((emacs (claude-code-ide-review--record-emacs-pid current))
+                       (start (claude-code-ide-review--record-emacs-start current)))
+                   (cond
+                    ((claude-code-ide-review--final-p current)
+                     (puthash (claude-code-ide-review--record-review-id current) current
+                              claude-code-ide-review--records))
+                    ((and (natnump emacs) (not (eql emacs (emacs-pid)))
+                          (claude-code-ide-review--emacs-live-p emacs start))
+                     (puthash file (cons emacs start) claude-code-ide-review--foreign))
+                    (t
+                     (setf (claude-code-ide-review--record-emacs-pid current) (emacs-pid)
+                           (claude-code-ide-review--record-emacs-start current)
+                           (claude-code-ide-review--emacs-start))
+                     (claude-code-ide-review--write current))))))))
+    (puthash file (cons (claude-code-ide-review--record-emacs-pid record)
+                        (claude-code-ide-review--record-emacs-start record))
+             claude-code-ide-review--foreign)))
 
 (defun claude-code-ide-review--scan ()
   "Read the review files that are new or changed, and the foreign ones.
@@ -878,7 +928,9 @@ Give the review process as PROCESS, an Emacs process object or a
 process ID, or give COMMAND, a list of strings that Emacs starts in
 DIRECTORY (default: the worktree of OWNER, also when OWNER does not
 run).  RESULT-FILE is the file that the review writes; a relative name
-is relative to DIRECTORY.  LABEL names the review for people.
+is relative to DIRECTORY.  When no folder is known, the result is the
+error `no-directory', unless PROCESS is given with an absolute
+RESULT-FILE.  LABEL names the review for people.
 REVIEW-ID is a string that the caller chooses; nil makes a new one.
 
 When the process ends, Emacs reads RESULT-FILE and puts the result
@@ -897,8 +949,7 @@ signals."
                        (claude-code-ide-instance-new-id)))
         (directory (or directory
                        (and (claude-code-ide-control-valid-id-p owner)
-                            (claude-code-ide-review--owner-directory owner))
-                       default-directory)))
+                            (claude-code-ide-review--owner-directory owner)))))
     (cond
      ((string-empty-p review-id)
       (claude-code-ide-review--error 'invalid-review-id))
@@ -924,12 +975,17 @@ signals."
       (claude-code-ide-review--error 'no-result-file review-id))
      ((not (stringp result-file))
       (claude-code-ide-review--error 'no-result-file review-id))
-     ((not (and (stringp directory) (file-directory-p directory)))
-      (claude-code-ide-review--error 'no-directory review-id
-                                     (format "No such directory: %s" directory)))
      ((null (claude-code-ide-control-state-of owner))
       (claude-code-ide-review--error 'unknown-instance review-id
                                      (format "No instance %s is known" owner)))
+     ((and directory (not (and (stringp directory) (file-directory-p directory))))
+      (claude-code-ide-review--error 'no-directory review-id
+                                     (format "No such directory: %s" directory)))
+     ;; Without a folder, a command would run in any folder, and a
+     ;; relative result file would have no base
+     ((and (null directory) (or command (not (file-name-absolute-p result-file))))
+      (claude-code-ide-review--error 'no-directory review-id
+                                     "No folder of the owner is known; give a directory"))
      (t
       (condition-case err
           (claude-code-ide-review--track-new

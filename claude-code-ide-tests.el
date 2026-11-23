@@ -262,11 +262,18 @@ read."
 (defun claude-code-ide-tests--isolate-run (run &rest args)
   "Call RUN with ARGS in a new temporary folder for all shared paths.
 RUN is `ert-run-tests'.  The folder is made before the run and removed
-after it; each setting is as before after the run.  A function that
-the run put on `kill-emacs-hook', such as the removal of a status
-snapshot, is taken off again: at the quit it would act on the paths
-of this Emacs, not on those of the run."
+after it; each setting is as before after the run.  The record of the
+stopped copies (`claude-code-ide-tests--record-stopped-copy') is on
+only during the run.  A function that the run put on
+`kill-emacs-hook', such as the removal of a status snapshot, is taken
+off again: at the quit it would act on the paths of this Emacs, not on
+those of the run."
   (let* ((quit-hooks (default-value 'kill-emacs-hook))
+         ;; The record of the stopped copies of the tests, only in the
+         ;; run; an outer run keeps its own
+         (record (and (fboundp 'claude-code-ide--keep-stopped-buffer)
+                      (not (advice-member-p #'claude-code-ide-tests--record-stopped-copy
+                                            'claude-code-ide--keep-stopped-buffer))))
          (dir (file-name-as-directory (make-temp-file "cci-test-run-" t)))
          (claude-code-ide-tests--run-directory dir)
          (claude-code-ide-state-file (expand-file-name "state.json" dir))
@@ -280,10 +287,16 @@ of this Emacs, not on those of the run."
           (append (list (concat "CLAUDE_CONFIG_DIR=" (expand-file-name "claude-config" dir))
                         (concat "CODEX_HOME=" (expand-file-name "codex-home" dir)))
                   process-environment)))
+    (when record
+      (advice-add 'claude-code-ide--keep-stopped-buffer :filter-return
+                  #'claude-code-ide-tests--record-stopped-copy))
     (unwind-protect
         (cl-letf (((symbol-function 'claude-code-ide-mcp--lockfile-directory)
                    #'claude-code-ide-tests--run-lockfile-directory))
           (apply run args))
+      (when record
+        (advice-remove 'claude-code-ide--keep-stopped-buffer
+                       #'claude-code-ide-tests--record-stopped-copy))
       (dolist (function (default-value 'kill-emacs-hook))
         (unless (memq function quit-hooks)
           (remove-hook 'kill-emacs-hook function)))
@@ -442,11 +455,25 @@ executes TEST-BODY, and ensures cleanup even if TEST-BODY fails."
 (defvar claude-code-ide-tests--session-counter 0
   "Counter making fixture session IDs unique within a test run.")
 
+(defvar claude-code-ide-tests--stopped-copies nil
+  "The buffers that `claude-code-ide--keep-stopped-buffer' made in the tests.")
+
+(defun claude-code-ide-tests--record-stopped-copy (copy)
+  "Record COPY, a buffer that a stopped instance of a test left, and return it."
+  (when (bufferp copy)
+    (push copy claude-code-ide-tests--stopped-copies))
+  copy)
+
+;; The record runs only while ERT runs: `claude-code-ide-tests--isolate-run'
+;; adds it, and removes it after the run, so that a working Emacs keeps
+;; no advice of the tests
+
 (defun claude-code-ide-tests--clear-processes ()
   "Reset all session state for testing.
 Ensures a clean state before each test that involves instances: the MCP
 session registry, the per-project selection timers, the MCP tools
-server registry and the global window-panel state."
+server registry, the global window-panel state, and the buffers that
+stopped instances of the tests kept."
   (when (boundp 'claude-code-ide-mcp--sessions)
     (clrhash claude-code-ide-mcp--sessions))
   (when (boundp 'claude-code-ide-mcp--selection-timers)
@@ -458,6 +485,13 @@ server registry and the global window-panel state."
   (when (boundp 'claude-code-ide-mcp-server--sessions)
     (clrhash claude-code-ide-mcp-server--sessions))
   (setq claude-code-ide--last-accessed-buffer nil)
+  ;; The buffers that stopped instances of the tests kept, so that no
+  ;; test sees those of another test; those of a working Emacs stay
+  (dolist (buffer claude-code-ide-tests--stopped-copies)
+    (when (buffer-live-p buffer)
+      (let ((kill-buffer-query-functions nil))
+        (kill-buffer buffer))))
+  (setq claude-code-ide-tests--stopped-copies nil)
   (set-frame-parameter nil 'claude-code-ide-hidden-panel nil))
 
 (defun claude-code-ide-tests--make-session (project-dir &rest overrides)
@@ -1271,10 +1305,12 @@ port, window slot and terminal buffer instead of reusing the first."
 
 (ert-deftest claude-code-ide-test-stop-with-session ()
   "Test that stopping an instance kills its own terminal buffer.
+This is the stop with `claude-code-ide-keep-stopped-buffers' nil.
 With several instances in a project the target is asked for rather than
 guessed, and only that instance is torn down."
   (claude-code-ide-tests--clear-processes)
-  (let ((project-dir "/tmp/claude-stop/")
+  (let ((claude-code-ide-keep-stopped-buffers nil)
+        (project-dir "/tmp/claude-stop/")
         (buffer-a (generate-new-buffer "*claude-stop-a*"))
         (buffer-b (generate-new-buffer "*claude-stop-b*"))
         (cleaned '()))
@@ -3934,9 +3970,11 @@ RESULT is the list `claude-code-ide-mcp-imenu-list-symbols' returns."
       (claude-code-ide-tests--clear-processes))))
 
 (ert-deftest claude-code-ide-test-cleanup-session-isolation ()
-  "Cleaning up one instance leaves its project sibling fully working."
+  "Cleaning up one instance leaves its project sibling fully working.
+The buffer is killed, with `claude-code-ide-keep-stopped-buffers' nil."
   (claude-code-ide-tests--clear-processes)
-  (let ((project-dir "/tmp/claude-isolation/")
+  (let ((claude-code-ide-keep-stopped-buffers nil)
+        (project-dir "/tmp/claude-isolation/")
         (buffer-a (generate-new-buffer "*claude-isolation-a*"))
         (session-a nil)
         (session-b nil))

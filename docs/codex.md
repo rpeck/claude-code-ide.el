@@ -116,7 +116,8 @@ When the list cannot be read, the launch puts no header in a variable:
 
 - The cases: `codex app-server` fails, has an error reply, or does not reply within `claude-code-ide-codex-config-read-timeout`. Also when the flags select a profile (`-p` or `--profile`), because `codex app-server` takes no profile.
 - The header values then go in `mcp_servers.emacs_tools.http_headers`, in the argument list.
-- Emacs shows one warning in each session.
+- The coordinator credential (`X-Emacs-MCP-Coordinator`) never goes in the argument list. A coordinator that launches this way gets no coordinator tools, and the warning says so.
+- Emacs shows a warning at each launch that does this.
 - A launch without headers does not read the config.
 
 ### Approvals
@@ -163,6 +164,7 @@ codex queue --thread=<native-id> --message=<text>
   - `:outcome failed`, with the `:exit` code.
   - `:outcome timeout`, after `claude-code-ide-codex-queue-timeout`. Emacs stops the command.
 - Then `claude-code-ide-codex-queue-functions` run with the instance and the result.
+- The control inbox listens on that hook. After `:outcome failed`, the prompt waits in the inbox again (reason `send-failed`), and the next try sends it. After `timeout`, it waits for its acknowledgement.
 - The result is nil when the command cannot start, or when the instance has no native ID yet. A message in the echo area gives the reason.
 - The acknowledgement of delivery is the `UserPromptSubmit` hook event with the same text.
 
@@ -226,7 +228,7 @@ codex queue --thread=<native-id> --message=<text>
 
 `detect`, `launch`, `resume`, `fork`, `submit-prompt`, `stop`, `native-id`, `map-event`, `mcp-setup`, `transcript`, and `exit-message`.
 
-- `stop` is `claude-code-ide--claude-stop`: it kills the terminal buffer. With `--no-daemon`, that ends Codex and its child processes.
+- `stop` is `claude-code-ide--claude-stop`. With `claude-code-ide-keep-stopped-buffers` and the process file, it ends Codex softly: SIGHUP from timers, as for the source of a handover. When Codex exits, a read-only copy of the buffer stays, with all the output. When the stop job ends, or after `claude-code-ide-process-stop-timeout` plus one second (6 s by default), and Codex still runs, the stop kills the buffer after a copy. Without the option or the process file, the stop kills the buffer at once. With `--no-daemon`, the buffer kill ends Codex and its child processes.
 - `transcript` gives the rollout file of the native ID (`claude-code-ide-codex-rollout-file`), the title from `session_index.jsonl`, and the model of the rollout. See [providers.md](providers.md), "The transcript operation".
 - No `status-events` yet. The status hooks come from the `codex-status` part.
 - No IDE protocol: Codex uses no WebSocket connection, no lock file, and no `openDiff`.

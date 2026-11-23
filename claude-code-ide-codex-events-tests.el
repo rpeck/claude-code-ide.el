@@ -3540,6 +3540,214 @@ is still untrusted gives one question, with no loop of checks."
   (let ((after-init-time nil))
     (should-not (claude-code-ide-codex-events--startup-complete-p))))
 
+;;; The order of the blockers, lost subagent ends, the start, and the trust question
+
+(ert-deftest claude-code-ide-codex-events-test-question-after-approval ()
+  "A question that opens after an older approval wins: the state is the question."
+  (claude-code-ide-codex-events-tests--with-codex
+    (unwind-protect
+        (let ((instance (claude-code-ide-codex-events-tests--instance "cci-test-order" 1)))
+          (claude-code-ide-codex-events--track instance)
+          (claude-code-ide-codex-events-tests--feed
+           "cci-test-order" 1
+           '(("SessionStart" "{}") ("UserPromptSubmit" "{}")
+             ("PreToolUse" "{\"tool_name\":\"Bash\",\"tool_use_id\":\"t1\",\"tool_input\":{\"command\":\"make\"}}")
+             ("PermissionRequest" "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"make\"}}")
+             ("PreToolUse" "{\"tool_name\":\"request_user_input\",\"tool_use_id\":\"q1\",\"tool_input\":{\"questions\":[{\"question\":\"Which one?\"}]}}")))
+          (should (equal (claude-code-ide-codex-events-tests--state instance 910.0)
+                         '(waiting-for-user question nil)))
+          (should (equal (claude-code-ide-codex-events--instance-detail instance 910.0)
+                         "Question: Which one?")))
+      (claude-code-ide-codex-events-tests--kill-instances))))
+
+(ert-deftest claude-code-ide-codex-events-test-answered-approval-hides-no-open-one ()
+  "An older approval that a read found answered hides no newer open approval or question."
+  (claude-code-ide-codex-events-tests--with-codex
+    (unwind-protect
+        (let* ((instance (claude-code-ide-codex-events-tests--instance "cci-test-answered" 1))
+               (launch (claude-code-ide-codex-events--track instance)))
+          (claude-code-ide-codex-events-tests--feed
+           "cci-test-answered" 1
+           '(("SessionStart" "{}") ("UserPromptSubmit" "{}")
+             ("PreToolUse" "{\"tool_name\":\"Bash\",\"tool_use_id\":\"t1\",\"tool_input\":{\"command\":\"make\"}}")
+             ("PermissionRequest" "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"make\"}}")
+             ("SubagentStart" "{\"agent_id\":\"a1\"}")))
+          ;; A read without the dialog found the approval of the main agent answered
+          (dolist (blocker (claude-code-ide-codex-events--launch-blockers launch))
+            (setf (claude-code-ide-codex-events--blocker-answered blocker) 906.0))
+          (should (equal (claude-code-ide-codex-events-tests--state instance 907.0) '(working nil t)))
+          ;; A newer approval of a subagent waits for the user
+          (claude-code-ide-codex-events-tests--feed
+           "cci-test-answered" 1
+           '(("PreToolUse" "{\"agent_id\":\"a1\",\"tool_name\":\"Bash\",\"tool_use_id\":\"s1\",\"tool_input\":{\"command\":\"ls\"}}")
+             ("PermissionRequest" "{\"agent_id\":\"a1\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"ls\"}}"))
+           907.0)
+          (should (equal (claude-code-ide-codex-events-tests--state instance 911.0)
+                         '(waiting-for-user approval nil)))
+          ;; Its end leaves the answered approval; a newer question of a subagent waits too
+          (claude-code-ide-codex-events-tests--feed
+           "cci-test-answered" 1
+           '(("PostToolUse" "{\"agent_id\":\"a1\",\"tool_name\":\"Bash\",\"tool_use_id\":\"s1\",\"tool_input\":{\"command\":\"ls\"}}"))
+           911.0)
+          (should (equal (claude-code-ide-codex-events-tests--state instance 913.0) '(working nil t)))
+          (claude-code-ide-codex-events-tests--feed
+           "cci-test-answered" 1
+           '(("PreToolUse" "{\"agent_id\":\"a1\",\"tool_name\":\"request_user_input\",\"tool_use_id\":\"s2\",\"tool_input\":{\"questions\":[{\"question\":\"Go on?\"}]}}"))
+           913.0)
+          (should (equal (claude-code-ide-codex-events-tests--state instance 915.0)
+                         '(waiting-for-user question nil))))
+      (claude-code-ide-codex-events-tests--kill-instances))))
+
+(ert-deftest claude-code-ide-codex-events-test-lost-subagent-stop ()
+  "A new prompt of the main agent ends the subagents whose SubagentStop was lost.
+A subagent that still runs shows again at its next event."
+  (claude-code-ide-codex-events-tests--with-codex
+    (unwind-protect
+        (let ((instance (claude-code-ide-codex-events-tests--instance "cci-test-lost" 1)))
+          (claude-code-ide-codex-events--track instance)
+          (claude-code-ide-codex-events-tests--feed
+           "cci-test-lost" 1
+           '(("SessionStart" "{}") ("UserPromptSubmit" "{}")
+             ("SubagentStart" "{\"agent_id\":\"a1\"}")
+             ("PreToolUse" "{\"agent_id\":\"a1\",\"tool_name\":\"Bash\",\"tool_use_id\":\"s1\",\"tool_input\":{\"command\":\"ls\"}}")
+             ("PermissionRequest" "{\"agent_id\":\"a1\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"ls\"}}")
+             ("Stop" "{\"last_assistant_message\":\"done\"}")))
+          (should (equal (claude-code-ide-codex-events-tests--state instance 907.0)
+                         '(waiting-for-user approval nil)))
+          ;; The SubagentStop of a1 never came; the user starts a new turn
+          (claude-code-ide-codex-events-tests--feed
+           "cci-test-lost" 1 '(("UserPromptSubmit" "{}") ("Stop" "{\"last_assistant_message\":\"ok\"}")) 910.0)
+          (should (equal (claude-code-ide-codex-events-tests--state instance 913.0) '(idle nil nil)))
+          ;; A subagent that runs on shows again at its next event
+          (claude-code-ide-codex-events-tests--feed
+           "cci-test-lost" 1
+           '(("PostModelRequest" "{\"agent_id\":\"a2\",\"status\":\"completed\"}")) 913.0)
+          (should (equal (claude-code-ide-codex-events-tests--state instance 915.0)
+                         '(waiting-for-task subagent nil)))
+          (claude-code-ide-codex-events-tests--feed
+           "cci-test-lost" 1 '(("SubagentStop" "{\"agent_id\":\"a2\"}")) 915.0)
+          (should (equal (claude-code-ide-codex-events-tests--state instance 917.0) '(idle nil nil))))
+      (claude-code-ide-codex-events-tests--kill-instances))))
+
+(ert-deftest claude-code-ide-codex-events-test-grace-counts-from-the-spawn ()
+  "The startup grace counts from the end of the trust wait, not from the track.
+An interactive start that waits for the trust question spawns Codex
+only after the wait, so the first screen read comes a grace time later."
+  (claude-code-ide-codex-events-tests--with-codex
+    (unwind-protect
+        (claude-code-ide-tests--call-with-clock
+         (lambda ()
+           (cl-letf (((symbol-function 'claude-code-ide-codex-events--settle-trust)
+                      (lambda (launch _instance _interactive)
+                        ;; The user reads the hooks and answers
+                        (claude-code-ide-tests--advance-clock 10)
+                        (setf (claude-code-ide-codex-events--launch-hooks launch) t))))
+             (let* ((start (float-time))
+                    (instance (claude-code-ide-codex-events-tests--instance "cci-test-grace" 1))
+                    (launch (claude-code-ide-codex-events--track instance t)))
+               (should (= (claude-code-ide-codex-events--launch-registered launch) (+ start 10)))
+               (should-not (claude-code-ide-codex-events--needs-screen-p launch (+ start 11)))
+               (should (equal (claude-code-ide-codex-events-tests--state instance (+ start 11))
+                              '(working starting t)))
+               (should (claude-code-ide-codex-events--needs-screen-p launch (+ start 14)))))))
+      (claude-code-ide-codex-events-tests--kill-instances))))
+
+(ert-deftest claude-code-ide-codex-events-test-no-signal-from-the-rollout ()
+  "A launch with hooks whose rollout shows a turn of the launch, but no event: no signal.
+A turn before the launch, or no turn, keeps the idle guess of a new session."
+  (claude-code-ide-codex-events-tests--with-rollout
+    (cl-letf (((symbol-function 'claude-code-ide-codex-screen-dialog) (lambda (_buffer) nil)))
+      (let* ((launch (claude-code-ide-codex-events--track instance))
+             (start (claude-code-ide-codex-events--launch-registered launch))
+             (state (lambda (now)
+                      (let ((state (claude-code-ide-instance-state instance now)))
+                        (list (plist-get state :state) (plist-get state :reason)
+                              (plist-get state :guess) (plist-get state :source))))))
+        (should (claude-code-ide-codex-events--launch-hooks launch))
+        ;; No turn yet: the composer waits for the first prompt
+        (claude-code-ide-codex-events-tests--append file (claude-code-ide-codex-events-tests--meta))
+        (claude-code-ide-codex-events--read-screen launch instance (+ start 5))
+        (should (equal (funcall state (+ start 6)) '(idle nil t hooks)))
+        ;; A turn of an earlier run, before the launch: the same
+        (claude-code-ide-codex-events-tests--append
+         file
+         (claude-code-ide-codex-events-tests--started "t0" (- (truncate start) 100))
+         (claude-code-ide-codex-events-tests--complete "t0" (- (truncate start) 90)))
+        (claude-code-ide-codex-events-tests--touch file (+ start 7))
+        (should (equal (funcall state (+ start 8)) '(idle nil t hooks)))
+        ;; A turn of this launch, and no hook event: the hooks do not report
+        (claude-code-ide-codex-events-tests--append
+         file (claude-code-ide-codex-events-tests--started "t1" (+ (truncate start) 20)))
+        (claude-code-ide-codex-events-tests--touch file (+ start 21))
+        ;; The events of the turn can come a moment later
+        (should (equal (funcall state (+ start 22)) '(idle nil t hooks)))
+        (should (equal (funcall state (+ start 30)) '(disconnected no-signal nil hooks)))
+        ;; The first event ends it
+        (claude-code-ide-codex-events-tests--feed
+         "cci-test-rollout" 1 '(("SessionStart" "{}") ("UserPromptSubmit" "{}")) (+ start 30))
+        (should (equal (funcall state (+ start 33)) '(working nil nil hooks)))))))
+
+(ert-deftest claude-code-ide-codex-events-test-load-check-asks-when-idle ()
+  "The question after the start of Emacs comes from an idle timer, also after a poll.
+The check of the app-server answers later: the poll of its result runs
+from a plain timer, which can run while the user types.  So the result
+asks only at the next idle moment."
+  (claude-code-ide-codex-events-tests--with-load-check
+    (let ((timers nil)
+          (pending nil))
+      (cl-letf (((symbol-function 'claude-code-ide-codex-events--start-trust-check)
+                 (lambda (key _directory)
+                   (cl-incf checks)
+                   (setq pending (claude-code-ide-codex-events--check-create :key key))))
+                ((symbol-function 'run-with-timer)
+                 (lambda (_secs _repeat fn &rest args) (push (cons fn args) timers) 'cci-test-timer)))
+        (claude-code-ide-codex-events--schedule-load-check)
+        (claude-code-ide-codex-events-tests--run-idle)
+        (should (= checks 1))
+        (should (= (length timers) 1))
+        ;; The check answers; the poll finds the result while the user types
+        (setf (claude-code-ide-codex-events--check-result pending)
+              (list :status 'untrusted :hooks '(((key . "cci-test-hook")))))
+        (let ((poll (pop timers)))
+          (apply (car poll) (cdr poll)))
+        (should (= asked 0))
+        (should (= (length idle) 1))
+        (claude-code-ide-codex-events-tests--run-idle)
+        (should (= asked 1))))))
+
+(ert-deftest claude-code-ide-codex-events-test-trust-question-needs-a-typed-yes ()
+  "The trust question needs a typed yes, also with short answers or a y-or-n-p alias."
+  (claude-code-ide-codex-events-tests--with-codex
+    (let ((claude-code-ide-codex-events--offer-running nil)
+          (claude-code-ide-codex-events--declined nil)
+          (result claude-code-ide-codex-events-tests--untrusted-result)
+          (short nil)
+          (seen nil))
+      (clrhash claude-code-ide-codex-events--trust-cache)
+      (cl-letf (((symbol-function 'display-buffer) #'ignore)
+                ((symbol-function 'message) #'ignore)
+                ((symbol-function 'sit-for) #'ignore)
+                ((symbol-function 'ding) #'ignore)
+                ((symbol-function 'y-or-n-p) (lambda (_prompt) (push 'y short) nil)))
+        ;; `use-short-answers' is off for the question
+        (let ((use-short-answers t))
+          (cl-letf (((symbol-function 'yes-or-no-p)
+                     (lambda (_prompt) (push use-short-answers seen) nil)))
+            (claude-code-ide-codex-events--offer-trust result nil)))
+        (should (equal seen '(nil)))
+        ;; (fset 'yes-or-no-p 'y-or-n-p): one key never answers; a typed word does
+        (setq claude-code-ide-codex-events--declined nil)
+        (let ((answers '("y" "no"))
+              (reads 0))
+          (cl-letf (((symbol-function 'yes-or-no-p) 'y-or-n-p)
+                    ((symbol-function 'read-from-minibuffer)
+                     (lambda (&rest _args) (cl-incf reads) (pop answers))))
+            (claude-code-ide-codex-events--offer-trust result nil))
+          (should-not short)
+          (should (= reads 2))
+          (should (member (claude-code-ide-codex-events--trust-key)
+                          claude-code-ide-codex-events--declined)))))))
+
 (provide 'claude-code-ide-codex-events-tests)
 
 ;; Local Variables:

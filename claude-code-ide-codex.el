@@ -183,9 +183,6 @@ those of Codex 0.164.0.")
 (defvar claude-code-ide-codex--screen-lines 50
   "Lines of a terminal screen when no window shows the terminal buffer.")
 
-(defvar claude-code-ide-codex--warned-plain-headers nil
-  "Non-nil after the warning about MCP headers in the argument list.")
-
 ;;; Values
 
 (defun claude-code-ide-codex--get (data key)
@@ -443,13 +440,20 @@ dotted key."
                   (cl-remove-if-not #'claude-code-ide-codex--bare-key-p
                                     (claude-code-ide-codex--approved-tool-names instance)))))
 
-(defun claude-code-ide-codex--warn-plain-headers ()
-  "Warn one time that MCP header values are in the argument list."
-  (unless claude-code-ide-codex--warned-plain-headers
-    (setq claude-code-ide-codex--warned-plain-headers t)
-    (display-warning
-     'claude-code-ide
-     "Codex: the shell environment policy of your Codex config could not be read, so the MCP header values are in the Codex argument list, which other local processes can read.  Remove -p or --profile from `claude-code-ide-codex-extra-flags', or check that `codex app-server' works.")))
+(defun claude-code-ide-codex--coordinator-header-p (name)
+  "Return non-nil when the header NAME is that of the coordinator credential."
+  (eq t (compare-strings name nil nil claude-code-ide-mcp-server-coordinator-header nil nil t)))
+
+(defun claude-code-ide-codex--warn-plain-headers (dropped)
+  "Warn that the MCP header values of this launch are in the argument list.
+DROPPED non-nil says that the launch left out the coordinator
+credential.  Each launch that puts the values there warns."
+  (display-warning
+   'claude-code-ide
+   (concat "Codex: the shell environment policy of your Codex config could not be read, so the MCP header values are in the Codex argument list, which other local processes can read."
+           (when dropped
+             "  The coordinator credential is not in it: this Codex coordinator starts without the coordinator tools.")
+           "  Remove -p or --profile from `claude-code-ide-codex-extra-flags', or check that `codex app-server' works.")))
 
 (defun claude-code-ide-codex--mcp-setup (instance)
   "Return the MCP config of INSTANCE for Codex, or nil.
@@ -463,7 +467,9 @@ Each header value goes into a variable of ENTRIES, which
 the variables from the model's shell commands.  That -c value replaces
 the user's own list, so it holds the user's effective list and the new
 variables.  When the user's list cannot be read, the values go in
-`http_headers' instead, in the argument list, with a warning."
+`http_headers' instead, in the argument list, with a warning at each
+launch.  The coordinator credential never goes there: such a
+coordinator starts without it."
   (when-let* (((claude-code-ide-mcp-server-ensure-server))
               (session (claude-code-ide-instance-session instance))
               (config (claude-code-ide-mcp-server-get-config
@@ -488,15 +494,20 @@ variables.  When the user's list cannot be read, the values go in
        ((null headers)
         (list :args (append url-args approval-args) :environment nil))
        ((eq exclude 'unknown)
-        (claude-code-ide-codex--warn-plain-headers)
-        (list :args (append url-args
-                            (claude-code-ide-codex--config-arg
-                             (concat key ".http_headers")
-                             (claude-code-ide-codex--toml-table
-                              (mapcar (lambda (header) (cons (car header) (nth 2 header)))
-                                      headers)))
-                            approval-args)
-              :environment nil))
+        ;; The argument list is visible to all local users: never put
+        ;; the coordinator credential in it
+        (let ((plain (cl-remove-if #'claude-code-ide-codex--coordinator-header-p headers
+                                   :key #'car)))
+          (claude-code-ide-codex--warn-plain-headers (not (equal plain headers)))
+          (list :args (append url-args
+                              (when plain
+                                (claude-code-ide-codex--config-arg
+                                 (concat key ".http_headers")
+                                 (claude-code-ide-codex--toml-table
+                                  (mapcar (lambda (header) (cons (car header) (nth 2 header)))
+                                          plain))))
+                              approval-args)
+                :environment nil)))
        (t
         (let ((variables (mapcar #'cadr headers)))
           (list :args (append

@@ -354,6 +354,85 @@ when its name has no \"emacs\"; a reused process ID does not count."
                              (claude-code-ide-review--emacs-start)))))
         (when (process-live-p other) (delete-process other))))))
 
+(ert-deftest claude-code-ide-test-review-takeover-claim ()
+  "Two Emacs that find the same orphaned review: only one takes it over.
+This Emacs read the record of a gone Emacs, and another live Emacs
+claimed it before this Emacs wrote its claim.  The claim reads the file
+again under its lock, so the review stays with the other Emacs.  While
+another Emacs holds the lock, this Emacs takes nothing, and the next
+check tries again."
+  (claude-code-ide-review-tests--with-review
+    (claude-code-ide-tests--control-add "cci-test-owner" "proj" 'idle)
+    (let* ((other (start-process "cci-test-other-emacs" nil "sleep" "30"))
+           (pid (process-id other))
+           (start (claude-code-ide-review--pid-start pid))
+           (file (claude-code-ide-review--file "cci-test-orphan")))
+      (unwind-protect
+          (progn
+            ;; The Emacs of the review is gone
+            (claude-code-ide-review-tests--foreign-record "cci-test-orphan" 999999 1.0 results)
+            (claude-code-ide-review-tests--restart)
+            (let ((stale (claude-code-ide-review--read-file file))
+                  (claimed (claude-code-ide-review--read-file file)))
+              ;; The other Emacs claims it first
+              (setf (claude-code-ide-review--record-emacs-pid claimed) pid
+                    (claude-code-ide-review--record-emacs-start claimed) start)
+              (claude-code-ide-control-write-json-file
+               file (claude-code-ide-review--to-alist claimed))
+              (claude-code-ide-review--take file stale))
+            (should-not (gethash "cci-test-orphan" claude-code-ide-review--records))
+            (should (equal (gethash file claude-code-ide-review--foreign) (cons pid start)))
+            (should (eql (claude-code-ide-review--record-emacs-pid
+                          (claude-code-ide-review--read-file file))
+                         pid))
+            ;; The other Emacs quits while a third one holds the lock
+            (delete-process other)
+            (claude-code-ide-review-tests--wait
+             (lambda () (not (claude-code-ide-review--pid-live-p pid start))))
+            (make-directory (concat file ".lock"))
+            (claude-code-ide-review--tick)
+            (should-not (gethash "cci-test-orphan" claude-code-ide-review--records))
+            (should (gethash file claude-code-ide-review--foreign))
+            ;; The lock is free again: the next check takes it over
+            (delete-directory (concat file ".lock"))
+            (claude-code-ide-review--tick)
+            (should (eq (claude-code-ide-review-tests--state "cci-test-orphan") 'submitted))
+            (should-not (gethash file claude-code-ide-review--foreign))
+            (should (eql (claude-code-ide-review--record-emacs-pid
+                          (claude-code-ide-review--read-file file))
+                         (emacs-pid))))
+        (when (process-live-p other) (delete-process other))
+        (ignore-errors (delete-directory (concat file ".lock")))))))
+
+(ert-deftest claude-code-ide-test-review-command-needs-a-folder ()
+  "A review command without a known folder gives `no-directory', never a start.
+A review process with an absolute result file needs no folder."
+  (claude-code-ide-review-tests--with-review
+    (let ((instance (claude-code-ide-tests--control-add "cci-test-nodir" "proj" 'working))
+          (default-directory results))
+      (setf (claude-code-ide-instance-project-root instance) "/nonexistent/cci-test-nodir/")
+      (let ((result (claude-code-ide-review-track
+                     "cci-test-nodir" :command '("sh" "-c" "pwd > r.md") :result-file "r.md")))
+        (should (eq (plist-get result :reason) 'no-directory))
+        (should (= (hash-table-count claude-code-ide-review--processes) 0))
+        (should-not (file-exists-p (expand-file-name "r.md" results))))
+      ;; A relative result file of a process needs a folder too
+      (should (eq (plist-get (claude-code-ide-review-track
+                              "cci-test-nodir" :process (emacs-pid) :result-file "r.md")
+                             :reason)
+                  'no-directory))
+      ;; An unknown owner is reported as such
+      (should (eq (plist-get (claude-code-ide-review-track
+                              "cci-test-nobody" :command '("true") :result-file "r.md")
+                             :reason)
+                  'unknown-instance))
+      (let ((result (claude-code-ide-review-track
+                     "cci-test-nodir" :process (emacs-pid)
+                     :result-file (expand-file-name "p.md" results))))
+        (should (eq (plist-get result :status) 'ok))
+        (should-not (claude-code-ide-review--record-directory
+                     (gethash (plist-get result :review-id) claude-code-ide-review--records)))))))
+
 ;;; Missing or broken result files
 
 (ert-deftest claude-code-ide-test-review-read-result ()

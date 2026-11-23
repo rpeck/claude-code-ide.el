@@ -2265,6 +2265,196 @@ restore from Lisp, and a restore without Codex entries, never call it."
       (when (fboundp 'claude-code-ide-start-spec-interactive)
         (should (funcall 'claude-code-ide-start-spec-interactive (car specs)))))))
 
+(ert-deftest claude-code-ide-test-registry-host-id-restore ()
+  "A record of this host restores by its host ID, also after the host name changed.
+A record with the host ID of another host is never this host's.  An
+older record without a host ID matches by the host name.  The exit of
+the last Emacs is found by the host ID too.  A new record stores the
+host ID."
+  (claude-code-ide-tests--with-registry
+    (let* ((dir (claude-code-ide-tests--registry-project registry-dir "cci-test-hostid"))
+           (here (claude-code-ide-session-registry-host-id))
+           (record (lambda (key host host-id &rest more)
+                     ;; MORE comes first: the first value of a key wins
+                     (append more
+                             `((instance_id . ,key) (provider . "claude")
+                               (native_id . ,(concat key "-native")) (project_dir . ,dir)
+                               (extra_flags . "") (state . "open")
+                               (started_at . "2026-11-18T08:00:00Z")
+                               (emacs_pid . 999999991) (host . ,host))
+                             (when host-id `((host_id . ,host-id)))))))
+      (with-temp-file (claude-code-ide-session-registry--state-file)
+        (insert (json-encode
+                 `((version . 4)
+                   (sessions
+                    . ,(vector
+                        ;; The host name changed since (X.local, then X.lan)
+                        (funcall record "cci-test-hostid-renamed" "cci-test-old.local" here)
+                        (funcall record "cci-test-hostid-other" (system-name)
+                                 "00000000-0000-4000-8000-000000000000")
+                        (funcall record "cci-test-hostid-legacy" (system-name) nil)
+                        (funcall record "cci-test-hostid-legacy-other" "cci-test-elsewhere" nil)
+                        ;; The last Emacs closed it at its exit
+                        (funcall record "cci-test-hostid-exit" "cci-test-old.local" here
+                                 '(state . "closed") '(closed_by . "emacs-exit")
+                                 '(closed_at . "2026-11-18T09:00:00Z")
+                                 '(started_at . "2026-11-18T07:00:00Z")
+                                 '(emacs_pid . 999999992))))))))
+      (should (equal (sort (mapcar #'claude-code-ide-session-registry-entry-key
+                                   (car (claude-code-ide-session-registry--restore-plan)))
+                           #'string<)
+                     '("cci-test-hostid-exit" "cci-test-hostid-legacy" "cci-test-hostid-renamed")))
+      ;; A new record stores the host ID, and the file keeps it
+      (let ((entry (claude-code-ide-session-registry--launch-entry
+                    (claude-code-ide-tests--make-session dir)
+                    (claude-code-ide-tests--registry-spec :directory dir)
+                    "cci-test-hostid-new" "cci-test-hostid-new-native")))
+        (should (equal (claude-code-ide-session-registry-entry-host-id entry) here))
+        (claude-code-ide-session-registry--submit
+         "new" (lambda (entries) (append entries (list entry)))))
+      (should (equal (claude-code-ide-session-registry-entry-host-id
+                      (claude-code-ide-tests--registry-get "cci-test-hostid-new"))
+                     here))
+      ;; A failed start makes this host the owner
+      (claude-code-ide-session-registry--submit
+       "failed" (claude-code-ide-session-registry--change-failed
+                 "cci-test-hostid-legacy-other" "cci-test-reason"))
+      (should (equal (claude-code-ide-session-registry-entry-host-id
+                      (claude-code-ide-tests--registry-get "cci-test-hostid-legacy-other"))
+                     here))
+      (claude-code-ide-tests--clear-processes))))
+
+(ert-deftest claude-code-ide-test-registry-restore-claims-under-lock ()
+  "Of two Emacs that restore one record at the same time, only one starts it.
+Each restore start claims the record under the lock of the state file
+before it starts it.  Here the other Emacs claims the record after this
+Emacs read it and before this Emacs claims it: this Emacs skips it.
+Without the other Emacs, the claim makes this Emacs the owner."
+  (claude-code-ide-tests--with-registry
+    (let* ((dir (claude-code-ide-tests--registry-project registry-dir "cci-test-claim"))
+           (key "cci-test-claim")
+           (real-check (symbol-function 'claude-code-ide-session-registry--still-restorable-p))
+           (other-emacs t)
+           (starts '())
+           (timers '())
+           (messages '())
+           (setup (lambda ()
+                    (claude-code-ide-session-registry--submit
+                     "setup" (lambda (_)
+                               (list (claude-code-ide-tests--registry-entry
+                                      key :project-dir dir :session-id "cci-test-claim-native"
+                                      :emacs-pid 999999991)))))))
+      (cl-letf (((symbol-function 'claude-code-ide--start-session)
+                 (lambda (_continue _resume spec)
+                   (push (claude-code-ide-start-spec-instance-id spec) starts)))
+                ((symbol-function 'run-with-timer)
+                 (lambda (_secs _repeat fn &rest args) (push (cons fn args) timers) nil))
+                ((symbol-function 'claude-code-ide-session-registry--still-restorable-p)
+                 (lambda (planned current)
+                   (prog1 (funcall real-check planned current)
+                     ;; The other Emacs claims the record now
+                     (when other-emacs
+                       (claude-code-ide-session-registry--submit
+                        "other Emacs"
+                        (lambda (entries)
+                          (claude-code-ide-session-registry--update
+                           entries (list key)
+                           (lambda (entry)
+                             (setf (claude-code-ide-session-registry-entry-emacs-pid entry)
+                                   999999992))))))))))
+        (funcall setup)
+        (claude-code-ide-tests--collect-messages messages
+          (claude-code-ide-restore-sessions)
+          (claude-code-ide-tests--run-restore-timers timers))
+        (should-not starts)
+        (should (string-match-p "skipped, running or changed: .*cci-test-claim"
+                                (claude-code-ide-tests--restore-message messages)))
+        ;; Alone, this Emacs claims and starts it
+        (setq other-emacs nil timers '() messages '())
+        (funcall setup)
+        (claude-code-ide-tests--collect-messages messages
+          (claude-code-ide-restore-sessions)
+          (claude-code-ide-tests--run-restore-timers timers))
+        (should (equal starts (list key)))
+        (let ((entry (claude-code-ide-tests--registry-get key)))
+          (should (eql (claude-code-ide-session-registry-entry-emacs-pid entry) (emacs-pid)))
+          (should (equal (claude-code-ide-session-registry-entry-host entry) (system-name)))
+          (should (eq (claude-code-ide-session-registry-entry-state entry) 'open)))))))
+
+(ert-deftest claude-code-ide-test-registry-fork-ignores-old-report ()
+  "A fork never takes the parent's ID from the report file of an older launch.
+The report file of the instance still names the parent conversation
+from its last launch.  No write after the fork's start takes that ID;
+the fork's own report gives its ID."
+  (claude-code-ide-tests--with-registry
+    (let ((claude-code-ide-instance--all nil)
+          (claude-code-ide-instance--generations (make-hash-table :test 'equal)))
+      (let* ((key "cci-test-forkold")
+             (session (claude-code-ide-tests--make-session "/tmp/cci-test-forkold/"))
+             (spec (claude-code-ide-tests--registry-spec
+                    :provider 'claude :resume-id "cci-test-parent" :fork t
+                    :instance-id key :last-generation 1))
+             (report (lambda (id)
+                       (make-directory (claude-code-ide-session-registry--report-directory) t)
+                       (with-temp-file (claude-code-ide-session-registry--report-file key)
+                         (insert (json-encode `((session_id . ,id))))))))
+        (claude-code-ide-instance-register
+         (claude-code-ide-instance-create :id key :provider 'claude :generation 2 :session session))
+        (claude-code-ide-session-registry--submit
+         "setup" (lambda (entries)
+                   (append entries (list (claude-code-ide-tests--registry-entry
+                                          key :session-id "cci-test-parent" :generation 1)))))
+        ;; The SessionStart hook of the parent's launch wrote it
+        (funcall report "cci-test-parent")
+        (claude-code-ide-session-registry--cli-args session spec)
+        (claude-code-ide-session-registry--on-start session spec)
+        ;; Any later write, and a read
+        (claude-code-ide-session-registry--submit "later" #'identity)
+        (should-not (claude-code-ide-session-registry-entry-session-id
+                     (claude-code-ide-tests--registry-get key)))
+        (should-not (claude-code-ide-session-registry-entry-session-id
+                     (claude-code-ide-session-registry--find
+                      (claude-code-ide-session-registry--entries) key)))
+        ;; The fork's own report
+        (funcall report "cci-test-fork-own")
+        (claude-code-ide-session-registry--submit "report" #'identity)
+        (should (equal (claude-code-ide-session-registry-entry-session-id
+                        (claude-code-ide-tests--registry-get key))
+                       "cci-test-fork-own"))
+        (claude-code-ide-instance-unregister key)))
+    (claude-code-ide-tests--clear-processes)))
+
+(ert-deftest claude-code-ide-test-registry-restore-flags-quoted ()
+  "A restore passes the stored flags as words, never as shell syntax.
+Flags that Emacs stored keep their words, also a value with a space
+and a value with a `;'.  Shell syntax in a changed state file stays
+plain text: /bin/sh, which runs the terminal command, gets the same
+words."
+  (claude-code-ide-tests--with-registry
+    (let* ((config-dir (expand-file-name "claude" registry-dir))
+           (process-environment (cons (concat "CLAUDE_CONFIG_DIR=" config-dir) process-environment))
+           (words (lambda (flags)
+                    (process-lines "/bin/sh" "-c" (concat "printf '%s\\n' " flags))))
+           (restore-flags (lambda (stored)
+                            (claude-code-ide-session-registry--claude-restore-flags
+                             (claude-code-ide-tests--registry-entry
+                              "cci-test-quoted" :extra-flags stored :model "opus")))))
+      ;; Flags that Emacs stored
+      (let ((stored (claude-code-ide-session-registry--flags-rest
+                     (claude-code-ide-session-registry--parse-flags
+                      "--append-system-prompt \"a b\" --add-dir 'c;d' --permission-mode plan"))))
+        (should (equal (funcall words (funcall restore-flags stored))
+                       '("--append-system-prompt" "a b" "--add-dir" "c;d"
+                         "--permission-mode" "plan" "--model" "opus"))))
+      ;; Plain flags stay as they are
+      (should (equal (funcall restore-flags "--permission-mode plan")
+                     "--permission-mode plan --model opus"))
+      ;; A changed state file
+      (should (equal (funcall words (funcall restore-flags
+                                             "--verbose; echo cci-test-injected $(echo cci-test-sub)"))
+                     '("--verbose;" "echo" "cci-test-injected" "$(echo" "cci-test-sub)"
+                       "--model" "opus"))))))
+
 (provide 'claude-code-ide-session-registry-tests)
 
 ;; Local Variables:

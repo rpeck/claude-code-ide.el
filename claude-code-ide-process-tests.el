@@ -120,9 +120,11 @@ ENTRIES get the entries of Emacs and its parent in front."
                               (list :pid (car pair) :cwd (cdr pair) :command "c")))
                           claude-code-ide-process-tests--cwds))))
          (claude-code-ide-process-signal-function #'claude-code-ide-process-tests--signal))
-     (unwind-protect
-         (progn ,@body)
-       (claude-code-ide-process--cancel-timer))))
+     ;; No review of the test run is spared by a stop
+     (cl-letf (((symbol-function 'claude-code-ide-review-process-ids) #'ignore))
+       (unwind-protect
+           (progn ,@body)
+         (claude-code-ide-process--cancel-timer)))))
 
 (defun claude-code-ide-process-tests--instance (&rest args)
   "Return a synthetic descriptor; ARGS are its slots.
@@ -1377,6 +1379,197 @@ ps shows the target, and its children, under the CLI's tree."
               (should (stringp (plist-get result :reason))))
             (should-error (claude-code-ide-process-worktree-strays worktree))))
       (delete-directory worktree t))))
+
+(defun claude-code-ide-process-tests--hanging-program ()
+  "Return a new script that never ends, as a ps or lsof that hangs."
+  (let ((script (make-temp-file "cci-test-hang-" nil ".sh" "#!/bin/sh\nexec /bin/sleep 300\n")))
+    (set-file-modes script #o700)
+    script))
+
+(ert-deftest claude-code-ide-test-process-stop-budget-limits-ps ()
+  "With :budget, a ps that hangs ends with the budget, not after 10 s.
+The lsof for the folders of the strays, which runs also with :scan nil,
+ends with the budget too, not after `claude-code-ide-process-lsof-timeout'."
+  (let ((script (claude-code-ide-process-tests--hanging-program)))
+    (unwind-protect
+        (progn
+          ;; The first ps runs well; the next one hangs
+          (claude-code-ide-process-tests--with-table
+              (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+                    (claude-code-ide-process-tests--entry 200 100 200))
+            (add-hook 'claude-code-ide-process-tests--reactions
+                      (claude-code-ide-process-tests--cli-exits-on 'SIGHUP))
+            (let* ((calls 0)
+                   (list-function claude-code-ide-process-list-function)
+                   (claude-code-ide-process-ps-program script)
+                   (claude-code-ide-process-list-function
+                    (lambda ()
+                      (if (<= (cl-incf calls) 1)
+                          (funcall list-function)
+                        (claude-code-ide-process--ps-list))))
+                   (elapsed nil)
+                   ;; On the virtual clock, only the waits take time
+                   (result (claude-code-ide-tests--call-with-clock
+                            (lambda ()
+                              (let ((start (float-time)))
+                                (prog1 (claude-code-ide-process-stop
+                                        (claude-code-ide-process-tests--instance)
+                                        :budget 0.3 :scan nil)
+                                  (setq elapsed (- (float-time) start))))))))
+              (should (eq (plist-get result :status) 'error))
+              (should (< elapsed 2))))
+          ;; lsof hangs while it looks up the folder of a survivor
+          (claude-code-ide-process-tests--with-table
+              (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+                    (claude-code-ide-process-tests--entry 200 100 200))
+            (setq claude-code-ide-process-tests--ignore '((200 SIGTERM SIGKILL)))
+            (add-hook 'claude-code-ide-process-tests--reactions
+                      (claude-code-ide-process-tests--cli-exits-on 'SIGHUP))
+            (let* ((claude-code-ide-process-lsof-program script)
+                   (claude-code-ide-process-cwd-function #'claude-code-ide-process--lsof-cwds)
+                   (elapsed nil)
+                   (result (claude-code-ide-tests--call-with-clock
+                            (lambda ()
+                              (let ((start (float-time)))
+                                (prog1 (claude-code-ide-process-stop
+                                        (claude-code-ide-process-tests--instance)
+                                        :budget 0.3 :kill-wait 0.05 :scan nil)
+                                  (setq elapsed (- (float-time) start))))))))
+              (should (eq (plist-get result :status) 'timeout))
+              (should (< elapsed 2)))))
+      (delete-file script))))
+
+(ert-deftest claude-code-ide-test-process-stop-later-runs-no-ps-at-once ()
+  "A stop from kill-buffer-hook runs no ps with a wait inside the call.
+The last record comes from a ps without a wait, and the stop starts
+after that record."
+  (claude-code-ide-process-tests--with-table
+      (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+            (claude-code-ide-process-tests--entry 200 100 200))
+    (let* ((inside nil)
+           (sync-calls nil)
+           (pending nil)
+           (list-function claude-code-ide-process-list-function)
+           (claude-code-ide-process-list-function
+            (lambda () (push inside sync-calls) (funcall list-function)))
+           (claude-code-ide-process-list-async-function
+            (lambda (callback) (push callback pending)))
+           (instance (claude-code-ide-process-tests--instance))
+           (result 'pending))
+      (setq inside t)
+      (claude-code-ide-process-stop-later instance :scan nil
+                                          :callback (lambda (r) (setq result r)))
+      (setq inside nil)
+      (should-not (memq t sync-calls))
+      (should (= (length pending) 1))
+      ;; The stop waits for the record
+      (accept-process-output nil 0.1)
+      (should (eq result 'pending))
+      (should-not sync-calls)
+      (funcall (car pending) (mapcar #'copy-sequence claude-code-ide-process-tests--table))
+      (should (equal (mapcar (lambda (g) (plist-get g :pgid))
+                             (claude-code-ide-process-groups instance))
+                     '(100 200)))
+      ;; The buffer kill sends SIGHUP, and the CLI exits
+      (claude-code-ide-process-tests--remove 100)
+      (should (claude-code-ide-tests--wait-until (lambda () (not (eq result 'pending)))))
+      (should (eq (plist-get result :status) 'stopped))
+      (should (equal (plist-get result :ended) '(200))))))
+
+(ert-deftest claude-code-ide-test-process-track-keeps-records-of-earlier-launch ()
+  "A new launch of an instance (a resume) keeps the groups of its earlier records.
+A stop that ended `timeout' or `error' keeps the records, so that a
+later stop ends what is left; the next track must not drop them."
+  (claude-code-ide-process-tests--with-table
+      (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+            (claude-code-ide-process-tests--entry 200 100 200))
+    (let ((instance (claude-code-ide-process-tests--instance)))
+      (claude-code-ide-process-track instance nil)
+      ;; The old CLI is gone; its background group runs on
+      (claude-code-ide-process-tests--remove 100)
+      ;; The resume starts a new CLI for the same instance
+      (push (claude-code-ide-process-tests--entry 300 (emacs-pid) 300)
+            claude-code-ide-process-tests--table)
+      (setf (claude-code-ide-instance-pid instance) 300)
+      (should (eql (claude-code-ide-process-track instance nil) 300))
+      (should (equal (mapcar (lambda (g) (plist-get g :pgid))
+                             (claude-code-ide-process-groups instance))
+                     '(200 300)))
+      (add-hook 'claude-code-ide-process-tests--reactions
+                (lambda (target signal)
+                  (when (and (eql target -300) (eq signal 'SIGHUP))
+                    (claude-code-ide-process-tests--remove 300))))
+      (let ((result (claude-code-ide-process-stop instance :scan nil)))
+        (should (eq (plist-get result :status) 'stopped))
+        (should (equal (plist-get result :ended) '(200)))))))
+
+(ert-deftest claude-code-ide-test-process-ps-async-time-limit ()
+  "An asynchronous ps that hangs is ended after its limit, and the records go on."
+  (let ((script (claude-code-ide-process-tests--hanging-program)))
+    (unwind-protect
+        (let ((claude-code-ide-process-ps-program script)
+              (claude-code-ide-process--ps-timeout 0.2)
+              (before (length (process-list)))
+              (entries 'pending))
+          (claude-code-ide-process--ps-list-async (lambda (table) (setq entries table)))
+          (should (claude-code-ide-tests--wait-until (lambda () (not (eq entries 'pending)))))
+          (should-not entries)
+          (should (claude-code-ide-tests--wait-until
+                   (lambda () (= (length (process-list)) before))))
+          ;; The timer of the records runs ps again after a ps that hung
+          (let ((claude-code-ide-process--refresh-running nil)
+                (claude-code-ide-process-list-async-function #'claude-code-ide-process--ps-list-async)
+                (claude-code-ide-process--tracks (make-hash-table :test 'equal)))
+            (claude-code-ide-process--tick)
+            (should claude-code-ide-process--refresh-running)
+            (should (claude-code-ide-tests--wait-until
+                     (lambda () (not claude-code-ide-process--refresh-running))))))
+      (delete-file script))))
+
+(ert-deftest claude-code-ide-test-process-stop-spares-review-groups ()
+  "Step 4 never signals the group of a spared process, such as a review.
+The PIDs of :exclude, and of the reviews that run, are spared."
+  (dolist (spare '(exclude review))
+    (claude-code-ide-process-tests--with-table
+        (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+              (claude-code-ide-process-tests--entry 200 100 200)
+              ;; A review that the CLI started in its own group
+              (claude-code-ide-process-tests--entry 300 100 300))
+      (add-hook 'claude-code-ide-process-tests--reactions
+                (claude-code-ide-process-tests--cli-exits-on 'SIGHUP))
+      (let ((instance (claude-code-ide-process-tests--instance)))
+        (claude-code-ide-process-track instance nil)
+        (cl-letf (((symbol-function 'claude-code-ide-review-process-ids)
+                   (lambda () (and (eq spare 'review) (list 300)))))
+          (let ((result (apply #'claude-code-ide-process-stop instance :scan nil
+                               (and (eq spare 'exclude) (list :exclude (list 300))))))
+            (should (equal (list spare (plist-get result :status)) (list spare 'stopped)))
+            (should (equal (plist-get result :ended) '(200)))))
+        (should (claude-code-ide-process-tests--find 300))
+        (should-not (assoc -300 claude-code-ide-process-tests--signals))))))
+
+(ert-deftest claude-code-ide-test-process-stop-ps-fails-at-finish ()
+  "A ps that fails in the last step gives error, never a stopped without a check."
+  (claude-code-ide-process-tests--with-table
+      (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+            (claude-code-ide-process-tests--entry 200 100 200))
+    (add-hook 'claude-code-ide-process-tests--reactions
+              (claude-code-ide-process-tests--cli-exits-on 'SIGHUP))
+    (let* ((instance (claude-code-ide-process-tests--instance))
+           (failing nil)
+           (list-function claude-code-ide-process-list-function)
+           (claude-code-ide-process-list-function
+            (lambda () (unless failing (funcall list-function)))))
+      (claude-code-ide-process-track instance nil)
+      (cl-letf* ((finish (symbol-function 'claude-code-ide-process--step-finish))
+                 ((symbol-function 'claude-code-ide-process--step-finish)
+                  (lambda (job) (setq failing t) (funcall finish job))))
+        (let ((result (claude-code-ide-process-stop instance :scan nil)))
+          (should (eq (plist-get result :status) 'error))
+          (should (stringp (plist-get result :reason)))
+          (should (equal (plist-get result :ended) '(200)))))
+      ;; The records stay for a later stop
+      (should (claude-code-ide-process--track-of instance)))))
 
 ;;; Live tests
 
