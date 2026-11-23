@@ -13,6 +13,12 @@
 
 Claude Code IDE for Emacs provides native integration with Claude Code CLI through the Model Context Protocol (MCP). Unlike simple terminal wrappers, this package creates a bidirectional bridge between Claude and Emacs, enabling Claude to understand and leverage Emacs' powerful features—from LSP and project management to custom Elisp functions. This transforms Claude into a true Emacs-aware AI assistant that works within your existing workflow and can interact with your entire Emacs ecosystem.
 
+This fork adds a second coding agent and tools to manage many agent sessions:
+
+- *Codex.* The package also runs the Codex CLI in an Emacs terminal. Codex and Claude Code instances can run in one project at the same time.
+- *Handover.* One command moves the work of an instance to a new conversation of Claude Code or Codex, for example at a quota limit.
+- *Sessions.* A session registry restores the instances after a crash of Emacs. A status buffer shows which sessions wait for you.
+
 ** Features
 
 - Automatic project detection and session management
@@ -24,6 +30,13 @@ Claude Code IDE for Emacs provides native integration with Claude Code CLI throu
 - Advanced diff view with ediff integration (modify suggestions before applying)
 - Tab-bar support for proper context switching
 - Selection and buffer tracking for better context awareness
+- Two providers: Claude Code and Codex, also in the same project (see [[*Providers: Claude Code and Codex][Providers]])
+- Handover of the work to a new conversation of the same or the other provider (see [[*Handover][Handover]])
+- Session registry: restore of the instances after a crash (see [[*Session Registry and Restore][Session Registry and Restore]])
+- Status buffer: the live state of each instance, and the ones that need you first (see [[*Session Status][Session Status]])
+- Menus in the menu bar for the commands and the running sessions (see [[*The menu bar][The menu bar]])
+- A read-only copy of the terminal buffer after a stop (see [[*Stopping Instances][Stopping Instances]])
+- Control operations and MCP tools for coordinator agents, and tracked external reviews
 
 ** Emacs Tool Integration
 
@@ -74,10 +87,27 @@ This deep integration means Claude Code understands your project context and can
 - Emacs 28.1 or higher
 - Claude Code CLI installed and available in PATH
 - =vterm=, =eat=, or =ghostel= package (for terminal support)
+- The Emacs packages =websocket= 1.12, =transient= 0.9.0 and =web-server= 0.1.2, or later versions
+- Optional: the Codex CLI, for Codex instances and for handovers to Codex
+- On Linux and macOS, =ps= and =lsof=: a stop and a handover use them to find the background processes of a CLI
 
 ** Installing Claude Code CLI
 
 Follow the installation instructions at [[https://docs.anthropic.com/en/docs/claude-code][Claude Code Documentation]].
+
+** Installing the Codex CLI (optional)
+
+Codex is optional. Without the Codex CLI, the Claude Code part of the package works as before. Only a Codex start and a handover to Codex fail.
+
+1. Install the Codex CLI. Follow the instructions at [[https://github.com/openai/codex][github.com/openai/codex]]. The package is verified with Codex 0.164.0.
+2. In a normal terminal (not in Emacs), log in with =codex login=.
+3. Make sure that Emacs finds the program. Evaluate =(executable-find "codex")=.
+   - If the result is nil, set =claude-code-ide-codex-cli-path= to the full file name.
+   - On macOS, an Emacs from the Dock does not get the =PATH= of your shell.
+4. Codex uses your =codex login= subscription. Emacs removes =OPENAI_API_KEY= from the Codex environment (=claude-code-ide-codex-remove-openai-api-key=, default t).
+5. Make Codex the current provider (=P= in =claude-code-ide-menu=), then run =M-x claude-code-ide-check-status=. It checks the CLI of the current provider.
+
+See [[*Codex][Codex]] for the first start and the status hooks.
 
 ** Installing the Emacs Package
 
@@ -124,17 +154,19 @@ After saving the above, run: =doom sync= in the terminal.
 
 *** From a local checkout
 
-Use a local checkout to run a branch that is not on the package archives, for example a fork's =session-registry= branch with the session registry and the status buffer.
+Use a local checkout to run code that is not on the package archives, for example the =main= branch of a fork with the Codex support and the handover.
 
 1. Get the code. Any folder works; the examples use =~/Source/claude-code-ide.el=:
 
    #+begin_src bash
    git clone https://github.com/<you>/claude-code-ide.el ~/Source/claude-code-ide.el
    cd ~/Source/claude-code-ide.el
-   git checkout session-registry
+   git checkout main
    #+end_src
 
-   Or keep your usual branch checked out and put the branch in a worktree: =git worktree add .worktrees/session-registry session-registry=.
+   - Load =main= for daily use. A feature branch stops at its own commit, and it does not get the later fixes.
+   - If you test a branch in a worktree (for example =git worktree add .worktrees/<branch> <branch>=), point =load-path= at the worktree only while you test. Then point it back at the checkout of =main=.
+   - To check which folder Emacs uses, evaluate =M-: (locate-library "claude-code-ide") RET=.
 
 2. Load the package from that folder, and nowhere else. Do not use =:vc= or =:straight= for it: such an install puts its own copy early in =load-path=, and that copy hides the checkout without any warning. Use =:demand t=, so that the modes below are on before the first session starts:
 
@@ -184,7 +216,12 @@ The easiest way to interact with Claude Code IDE is through the transient menu i
 
 The package adds two menus to the menu bar:
 
-- *Agents* has the commands: start, continue, resume, hand over, stop, restore, the status buffer, the registry, and the reload.
+- *Agents* has the commands of the package:
+  - the transient menu, start, start Codex, continue, resume, the provider toggle, and switch to an agent buffer;
+  - hand over, and answer a waiting handover;
+  - the status buffer, the registry, reopen, and restore;
+  - stop, stop all, and close the stopped buffers;
+  - the trust of the Codex status hooks, and the reload.
 - *Agent Sessions* lists the running sessions, with their states as the status buffer shows them (for example =NEEDS ANSWER= or =WAITS FOR YOU=). Select a session to go to its terminal. Without the status file, the items have no state.
 
 =claude-code-ide-menu-bar-mode= shows them, and it is on by default. To turn the menus off:
@@ -222,7 +259,7 @@ The package adds two menus to the menu bar:
 
 Commands that target one instance (stop, switch, send-prompt, insert-at-mentioned, clear-selection, escape, newline) resolve their target automatically: the Claude terminal you are in, the project's only instance, or its only visible one; beyond that, send-type commands use the most recently used instance (echoing the choice) while =claude-code-ide-stop= asks. A prefix argument (=C-u=) always lets you pick the instance explicitly.
 
-After a stop, the terminal buffer stays, so that you can read the last screen. This holds for every stop: =claude-code-ide-stop=, a coordinator stop, the source of a handover, and a CLI that ends by itself. The CLI ends; a read-only copy of the buffer stays, with " [stopped]" after its name. Close it with =C-x k=, or close all of a project with =M-x claude-code-ide-kill-stopped-buffers=. The toggle commands and the project scope of the side windows treat it as a window of its project. Set =claude-code-ide-keep-stopped-buffers= to nil to kill the buffer at the stop. A kill of the buffer of a running instance still ends the instance and the buffer. A restart with status hooks (=T= in the status buffer) is no stop: the conversation goes on in a new buffer, and the old buffer goes.
+After a stop, a read-only copy of the terminal buffer stays. See [[*Kept stopped buffers][Kept stopped buffers]].
 
 ** Multiple Projects and Instances
 
@@ -250,21 +287,98 @@ A provider is a coding-agent CLI. The package has two: =claude= (Claude Code) an
 
 *** Codex
 
-- =M-x claude-code-ide-codex= starts a Codex instance in the current project, and makes Codex the current provider. =claude-code-ide-codex-continue= and =claude-code-ide-codex-resume= continue the last conversation or open the picker.
-- A Codex instance with the role =coordinator= may call the coordinator tools that only read (=claude-code-ide-codex-coordinator-approved-tools=: list, inspect, request-status and handover-status) without approval. Launch, resume, stop, submit-prompt and handover ask for approval. Another instance gets no approval for any coordinator tool.
-- Emacs passes its instructions, the MCP tools server, and the approvals with =-c= options. Prompts go through =codex queue=. See [[file:docs/codex.md][docs/codex.md]].
-- A Codex instance gets no IDE server and no lock file in =~/.claude/ide/=, because Codex does not speak that protocol. It uses only the MCP tools server.
+*Commands:*
+
+| Command                                 | Description                                                 |
+|-----------------------------------------+-------------------------------------------------------------|
+| =M-x claude-code-ide-codex=             | Start a Codex instance, and make Codex the current provider |
+| =M-x claude-code-ide-codex-continue=    | Continue the most recent Codex conversation                 |
+| =M-x claude-code-ide-codex-resume=      | Open the Codex picker of earlier conversations              |
+| =M-x claude-code-ide-codex-trust-hooks= | Show the Codex status hooks, and trust them                 |
+
+*The first start in a repository:*
+
+1. Start Codex with =M-x claude-code-ide-codex=.
+2. Emacs checks the status hooks. If Codex does not trust them yet, Emacs shows the hook commands and asks you one time.
+   - After a yes, Emacs writes the trust through Codex. The instance starts with status.
+   - After a no, the instance runs without status. Emacs does not ask again until you restart Emacs.
+   - To trust the hooks later, run =M-x claude-code-ide-codex-trust-hooks=. A running instance gets status after its restart.
+3. Codex shows its folder trust dialog. Answer it yourself. Codex asks one time for each repository.
+4. The buffer opens, for example =*codex[app]*=. Type your first prompt in the terminal.
+
+*Who asks for the hook trust:*
+
+- A start from a command (=M-x=, the menu) asks.
+- =M-x claude-code-ide-restore-sessions= asks at most one time for the whole restore.
+- The automatic restore at the start of Emacs, a coordinator launch and a timer never ask. They get the hooks only when Emacs knows that the hooks are trusted.
+- See [[file:docs/status-events.md][docs/status-events.md]], section "Hook trust".
+
+*How Codex differs from Claude Code:*
+
+- A Codex instance gets no IDE server and no lock file in =~/.claude/ide/=. Codex does not speak that protocol. It uses only the MCP tools server.
+- Emacs passes its instructions, the MCP tools server and the approvals with =-c= options.
+- Emacs sends prompts with =codex queue=. Codex delivers a prompt when the conversation is idle.
 - Codex never gets =claude-code-ide-cli-extra-flags= or the Claude Code model. Its flags and its model come from =claude-code-ide-codex-extra-flags=.
-- You answer the Codex folder trust dialog yourself, one time for each repository.
-- Codex runs the status hooks only after you trust them. You need not remember a command for it: the first Codex start from a command (=M-x=, or the menu) shows the hook commands and asks you one time. After your yes, Emacs writes the trust through Codex, and the instance starts with status. After a no, the instance runs without status, and Emacs does not ask again until you restart Emacs.
-- =M-x claude-code-ide-restore-sessions= asks at most one time for the whole restore. The automatic restore at the start of Emacs, a coordinator launch and a timer never ask; they get the hooks only when Emacs knows that they are trusted. See [[file:docs/status-events.md][docs/status-events.md]], section "Hook trust".
-- Options: =claude-code-ide-codex-cli-path=, =claude-code-ide-codex-extra-flags=, =claude-code-ide-codex-remove-openai-api-key= (default t), =claude-code-ide-codex-no-alt-screen= (default t), =claude-code-ide-codex-skip-update-check= (default t), =claude-code-ide-codex-config-read-timeout= (5 s), =claude-code-ide-codex-queue-timeout= (30 s), =claude-code-ide-codex-coordinator-approved-tools=.
+- See [[file:docs/codex.md][docs/codex.md]].
+
+*Coordinator approvals:*
+
+- A Codex instance with the role =coordinator= can call the coordinator tools that only read without approval. The list is =claude-code-ide-codex-coordinator-approved-tools=: list, inspect, request-status and handover-status.
+- Launch, resume, stop, submit-prompt and handover ask for approval.
+- Another Codex instance gets no approval for a coordinator tool.
+
+*Options:*
+
+| Option                                             | Default   | Meaning                                                 |
+|----------------------------------------------------+-----------+---------------------------------------------------------|
+| =claude-code-ide-codex-cli-path=                   | ="codex"= | The Codex program                                       |
+| =claude-code-ide-codex-extra-flags=                | =""=      | Flags for every Codex launch, for example =--model=     |
+| =claude-code-ide-codex-remove-openai-api-key=      | =t=       | Remove =OPENAI_API_KEY=, so that Codex uses its login   |
+| =claude-code-ide-codex-no-alt-screen=              | =t=       | Pass =--no-alt-screen=: the buffer keeps earlier output |
+| =claude-code-ide-codex-skip-update-check=          | =t=       | Do not look for Codex updates at the start              |
+| =claude-code-ide-codex-config-read-timeout=        | =5=       | Seconds that a launch waits for the Codex config        |
+| =claude-code-ide-codex-queue-timeout=              | =30=      | Seconds after which a =codex queue= command stops       |
+| =claude-code-ide-codex-coordinator-approved-tools= | 4 tools   | Coordinator tools without approval (see above)          |
 
 ** Stopping Instances
 
-When Emacs stops an instance, or quits, it sends the CLI its soft end (SIGHUP), waits, and then ends the background commands that the CLI started and that still run. At an Emacs quit, all CLIs share one short wait. When a CLI exits by its own choice (for example "Move to background and exit"), Emacs leaves its background work running.
+- =M-x claude-code-ide-stop= stops one instance of the project. =M-x claude-code-ide-stop-all= stops all instances of the project, after a confirmation. With =C-u=, it stops the instances of all projects.
+- At a stop, or when Emacs quits, Emacs sends the CLI its soft end (SIGHUP) and waits. Then it ends the background commands that the CLI started and that still run.
+- At an Emacs quit, all CLIs share one short wait.
+- When a CLI exits by its own choice (for example "Move to background and exit"), Emacs leaves its background work running.
 
-The options are in the group =claude-code-ide-process=: =claude-code-ide-process-stop-timeout= (5 s), =claude-code-ide-process-quit-timeout= (1.5 s), =claude-code-ide-process-kill-wait= (2 s), =claude-code-ide-process-soft-end=, and =claude-code-ide-process-lsof-timeout= (30 s), which limits the scan of working folders. See [[file:docs/process-tree.md][docs/process-tree.md]].
+*** Kept stopped buffers
+
+After a stop, the terminal buffer stays, so that you can read the last screen.
+
+- This holds for every stop: =claude-code-ide-stop=, a coordinator stop, the source of a handover, and a CLI that ends by itself.
+- The CLI ends. A read-only copy of the buffer stays, with " [stopped]" after its name, for example =*claude-code[app]* [stopped]=.
+- The header line of the copy says when the instance stopped.
+- The toggle commands and the project scope of the side windows treat the copy as a window of its project.
+
+To close the copies:
+
+- Close one copy with =C-x k=.
+- Close all copies of the current project with =M-x claude-code-ide-kill-stopped-buffers=. With =C-u=, it closes the copies of all projects. The buffers of running instances stay.
+- The menu bar item *Agents > Close stopped buffers* runs the same command.
+
+To change the behaviour:
+
+- Set =claude-code-ide-keep-stopped-buffers= (default t) to nil. Then the stop kills the buffer.
+- A kill of the buffer of a running instance still ends the instance and the buffer.
+- A restart with status hooks (=T= in the status buffer) is no stop. The conversation goes on in a new buffer, and the old buffer goes.
+
+*** Options of the stop
+
+The options are in the group =claude-code-ide-process=. See [[file:docs/process-tree.md][docs/process-tree.md]].
+
+| Option                                 | Default | Meaning                                                  |
+|----------------------------------------+---------+----------------------------------------------------------|
+| =claude-code-ide-process-stop-timeout= |       5 | Seconds that a stop waits for the CLI after its soft end |
+| =claude-code-ide-process-quit-timeout= |     1.5 | Seconds that a stop waits for the CLIs when Emacs quits  |
+| =claude-code-ide-process-kill-wait=    |       2 | Seconds between SIGTERM and SIGKILL                      |
+| =claude-code-ide-process-soft-end=     |  SIGHUP | The soft end of each provider                            |
+| =claude-code-ide-process-lsof-timeout= |      30 | Seconds that the scan of working folders may take        |
 
 ** Editor Context
 
@@ -852,16 +966,128 @@ Once enabled, Claude can use these tools to navigate your codebase. For example:
 
 ** Handover
 
-- =M-x claude-code-ide-handover= hands the work of an instance to a new conversation of the same or the other provider (Claude Code or Codex). The source stops; the target gets a short first prompt that points to the handover document in =.handover/= of the worktree, and writes a state summary there. The source never needs one more turn, so a handover works at a quota limit.
-- In the status buffer, =H= offers a handover of the session on the line, or of the first session at a quota limit. Emacs never starts a handover by itself.
-- Before the source stops, Emacs checks that the target CLI is found, that no other instance runs in the worktree, and, for a Codex target, that its status hooks are trusted (it asks you for the trust).
-- Processes that still run in the worktree after the stop are shown with their process ID, command and folder: end them, wait, or cancel. While a handover runs, no other instance starts in its worktree.
-- Each stage is saved in the session registry before it runs. After a crash, the handover continues when the registry mode starts (=claude-code-ide-handover-recover-at-start=, default t): before the stop it is cancelled, after it only the target is resumed or started again, never the source. =M-x claude-code-ide-handover-recover= runs the same recovery.
-- After the commit, the queued prompts and review results of the source go to the target.
-- =M-x claude-code-ide-handover-resolve= answers a handover that needs you, and =M-x claude-code-ide-handover-cancel= cancels one.
-- Coordinators use the MCP tools =claude-code-ide-control-handover= and =claude-code-ide-control-handover-status=. Agents can ask with =request_handover=; Emacs then asks you after their turn.
-- Options: =claude-code-ide-handover-quiesce-timeout=, =claude-code-ide-handover-delivery-timeout= (600 s for the target to get the document), =claude-code-ide-handover-watch-interval= (5 s), =claude-code-ide-handover-ack-wait= (10 s for the acknowledgement of a prompt that the source got), =claude-code-ide-handover-stray-wait=, =claude-code-ide-handover-directory=, =claude-code-ide-handover-session-server-detection=, =claude-code-ide-handover-budget=, =claude-code-ide-handover-recover-at-start=, =claude-code-ide-handover-enable-request-tool=.
-- See [[file:docs/handover.md][docs/handover.md]].
+A handover moves the work of an instance (the source) to a new conversation (the target). The target can use the same provider or the other provider. The source stops, and the target goes on from a handover document. See [[file:docs/handover.md][docs/handover.md]] for the full design.
+
+*** When to use a handover
+
+- *A quota limit.* The source is at its usage limit. The source needs no more turn, so a handover works at a quota limit.
+- *A second opinion.* The other agent looks at the same work with a fresh view.
+
+In the status buffer, a session at a quota limit shows =FAILED= with the reason =quota-limit=. Emacs never starts a handover by itself.
+
+*** Before the first handover
+
+1. Turn on the session status mode. It also turns on the session registry, which saves each stage of a handover:
+   #+begin_src elisp
+   (claude-code-ide-session-status-mode 1)
+   #+end_src
+   Without the registry, a handover refuses with =registry-off=.
+2. For a handover to Codex, install the Codex CLI and log in (see [[*Installing the Codex CLI (optional)][Installing the Codex CLI]]). If Emacs does not find the CLI of the target, the handover refuses with =target-unavailable=.
+3. Stop the other instances in the worktree of the source. A handover refuses with =other-instance= while another instance runs in the same worktree.
+
+*** Start a handover
+
+1. Go to the terminal buffer of the source. Or start from another buffer, and choose the source from a list.
+2. Type =M-x claude-code-ide-handover=. You can also use these:
+   - *Agents > Hand over...* in the menu bar.
+   - =H= in the status buffer. It offers the session on the line. On a line without a session, it offers the first session at a quota limit.
+3. Answer the questions. Emacs asks them in this order:
+   1. *Target provider.* The default is the other provider. Press =RET= to accept it.
+   2. *The method.* Emacs asks this only when a fork is possible: the chain has an earlier conversation of the target provider.
+      - =fork= (the default: =RET= or =f=): the target goes on from the last conversation of that provider in the chain, with its full history. It also gets the document.
+      - =new= (=n=): a new conversation that knows only the document.
+      - Emacs refuses other keys and asks again. =?= shows the choices.
+   3. *Context for the target.* Type an optional note, or press =RET= for none. The note goes into the document as "Context from the coordinator".
+   4. *Interrupt.* Emacs asks this only when the source works, or waits for an approval or a dialog. =y= sends Escape one time. =n= waits until the source is idle.
+   5. *Hand over anyway.* Emacs asks this only when subagents or background tasks run, or when the state of the source is unknown. Type =yes= to go on.
+   6. *"After the handover, should the target go on with the task?"* Emacs asks this while =claude-code-ide-handover-continue= is =ask= (the default).
+      - =y=: yes, this time. =n=: no, this time.
+      - =a=: always. =v=: never. Emacs saves these two answers in your custom file.
+4. For a Codex target whose status hooks are not trusted, Emacs asks for the trust. Without the trust, the handover cannot see the delivery.
+5. The echo area shows "Handover ID started: SOURCE -> TARGET".
+
+*** What happens
+
+1. Emacs holds the queued prompts of the source. It waits until the source is idle, failed, or asks you a question.
+2. The source stops softly. Its buffer stays as a read-only copy "<name> [stopped]".
+3. Emacs scans the worktree for processes that still run (see [[*Stray processes][Stray processes]]).
+4. Emacs writes the handover document to =.handover/<id>.md= in the worktree. It adds =.handover/= to the Git exclude file (=.git/info/exclude=).
+5. The target starts in a new buffer. Its first prompt is a short pointer to =.handover/<id>.md=. The document never goes on the command line.
+6. When the target gets that prompt, Emacs commits the handover. The queued prompts and review results of the source go to the target.
+7. The target reads the document and writes a state summary to =.handover/<id>-state.md=. Then it replies =ready=.
+8. If your answer was yes, the target then gets one more prompt: go on with the task from its state summary.
+
+While a handover runs, Emacs starts no other instance in its worktree. The target has =claude-code-ide-handover-delivery-timeout= (600 s) to get the document. After that time, Emacs asks you to wait again or to cancel.
+
+*** Stray processes
+
+A stray is a process that still runs in the worktree after the source stops. An example is a test watcher or a server that the source started.
+
+- The scan covers only the working tree of the source.
+  - It leaves out the processes in other repositories or linked worktrees below that tree.
+  - It never counts the live sessions of this Emacs, or the processes that Emacs starts itself (for example a language server).
+  - The child processes of such a process (for example the workers of a language server) can still count as strays.
+  - It also leaves out the processes of a tracked review.
+- When the scan finds strays, Emacs lists each one with its process ID, command and folder. Then it asks "What now?":
+  - =end=: send SIGTERM, then SIGKILL after =claude-code-ide-handover-stray-wait= (10 s). Then scan again.
+  - =wait=: scan again after that time.
+  - =cancel=: cancel the handover.
+
+*Warning:* =end= signals every listed process. Read the list before you press =e=.
+
+=M-x claude-code-ide-handover-resolve= answers a handover that waits for you, for example after a =C-g= at the question. =M-x claude-code-ide-handover-cancel= cancels an unfinished handover. After the stop, a cancel leaves the source stopped. =M-x claude-code-ide-reopen-session= starts it again.
+
+*** Recovery after a crash
+
+After a crash of Emacs, the handover goes on when the registry mode starts (=claude-code-ide-handover-recover-at-start=, default t).
+
+- Before the stop of the source, Emacs cancels the handover. The source stays current.
+- After the stop, Emacs resumes or starts again only the target, never the source.
+- =M-x claude-code-ide-handover-recover= runs the same recovery.
+
+*** Example: Claude Code to Codex and back
+
+This example uses the project =app= with one Claude Code instance, =*claude-code[app]*=.
+
+1. The Claude Code instance reaches its quota limit. The status buffer shows =FAILED= with =quota-limit=.
+2. In =*claude-code[app]*=, type =M-x claude-code-ide-handover=.
+3. At "Target provider", press =RET= for =codex=.
+4. Emacs does not ask for the method. The chain has no Codex conversation yet, so the target is new.
+5. At "Context for the target", type =Finish the parser tests.= and press =RET=.
+6. Emacs does not ask to interrupt. The source failed, so it does not work.
+7. At "should the target go on", press =y=.
+8. If Emacs asks to trust the Codex status hooks, read the commands and answer yes.
+9. The Claude Code buffer becomes =*claude-code[app]* [stopped]=. A Codex buffer opens. Codex reads the document, replies =ready=, and goes on with the task.
+
+Later, the quota of Claude Code is free again:
+
+1. In the Codex buffer, type =M-x claude-code-ide-handover=.
+2. At "Target provider", press =RET= for =claude=.
+3. At the method question, press =RET= for =fork=. Claude Code goes on from its earlier conversation, with its full history. The new document tells it what Codex did.
+4. Answer the context, interrupt and continue questions as before.
+
+*** Agents and coordinators
+
+- An agent can ask for a handover with the MCP tool =request_handover=. Emacs asks you after the turn of that agent. =claude-code-ide-handover-enable-request-tool= (default t) turns the tool off.
+- Coordinators use the MCP tools =claude-code-ide-control-handover= and =claude-code-ide-control-handover-status=. See [[file:docs/api-control.md][docs/api-control.md]].
+
+*** Options of the handover
+
+| Option                                              | Default     | Meaning                                                               |
+|-----------------------------------------------------+-------------+-----------------------------------------------------------------------|
+| =claude-code-ide-handover-continue=                 | =ask=       | Whether the target goes on after the commit: =ask=, =always=, =never= |
+| =claude-code-ide-handover-quiesce-timeout=          | 600         | Seconds to wait for an idle source                                    |
+| =claude-code-ide-handover-poll-interval=            | 1           | Seconds between two checks of the source                              |
+| =claude-code-ide-handover-stray-wait=               | 10          | Seconds before the worktree is scanned again                          |
+| =claude-code-ide-handover-delivery-timeout=         | 600         | Seconds that the target has to get the document                       |
+| =claude-code-ide-handover-watch-interval=           | 5           | Seconds between two checks of the target                              |
+| =claude-code-ide-handover-ack-wait=                 | 10          | Seconds to wait for the acknowledgement of a sent prompt              |
+| =claude-code-ide-handover-directory=                | =.handover= | Folder in the worktree for the documents and summaries                |
+| =claude-code-ide-handover-session-server-detection= | =auto=      | The session server part of the document                               |
+| =claude-code-ide-handover-budget=                   | nil         | The size budget of the document                                       |
+| =claude-code-ide-handover-recover-at-start=         | t           | Continue the interrupted handovers when the registry starts           |
+| =claude-code-ide-handover-unsaved-target=           | =fresh=     | What a recovery does with a target that saved no conversation         |
+| =claude-code-ide-handover-enable-request-tool=      | t           | Give the agents the tool =request_handover=                           |
 
 ** Reviews
 
@@ -920,6 +1146,23 @@ Available argument types: =string=, =number=, =integer=, =boolean=, =array=, =ob
 #+end_src
 
 The =claude-code-ide-mcp-server-with-session-context= macro ensures your tool executes in the correct project context.
+
+* Package layout
+
+Each file name starts with =claude-code-ide=. The table shows the part after it.
+
+| Group        | Files                                                                                      | Purpose                                                                      |
+|--------------+--------------------------------------------------------------------------------------------+------------------------------------------------------------------------------|
+| Core         | (main file), =-provider=, =-instance=, =-debug=, =-reload=                                 | User commands, terminals, providers, instance descriptors, debug log, reload |
+| MCP          | =-mcp=, =-mcp-handlers=, =-mcp-server=, =-mcp-http-server=, =-emacs-tools=, =-diagnostics= | IDE WebSocket server, MCP tools server, Emacs tools, diagnostics             |
+| Codex        | =-codex=, =-codex-events=                                                                  | The Codex provider, and its status hooks and states                          |
+| Sessions     | =-session-registry=, =-session-status=                                                     | Registry and restore, status buffer                                          |
+| Coordination | =-control=, =-handover=, =-transcript=, =-process=, =-review=                              | Control operations, handover, transcript readers, process trees, reviews     |
+| UI           | =-transient=, =-menu-bar=                                                                  | Transient menu, menu bar                                                     |
+
+- The main file loads =-process=, =-codex=, =-control=, =-transcript=, =-handover=, =-review= and =-menu-bar= as optional files. A missing file is skipped. An error in a file gives a warning.
+- =-codex-events= loads together with =-session-status=.
+- The design documents are in [[file:docs/][docs/]].
 
 * License
 
