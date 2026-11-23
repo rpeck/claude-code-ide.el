@@ -110,6 +110,9 @@
 (declare-function claude-code-ide-process-untrack "claude-code-ide-process" (instance))
 (declare-function claude-code-ide-process-stop "claude-code-ide-process" (instance &rest args))
 (declare-function claude-code-ide-process-stop-later "claude-code-ide-process" (instance &rest args))
+(declare-function claude-code-ide-control-hold "claude-code-ide-control" (instance-id))
+(declare-function claude-code-ide-control-held-p "claude-code-ide-control" (instance-id))
+(declare-function claude-code-ide-control-release "claude-code-ide-control" (instance-id))
 (declare-function claude-code-ide-process-stop-many "claude-code-ide-process" (instances &rest args))
 (defvar claude-code-ide-process-quit-timeout)
 
@@ -951,7 +954,8 @@ The session registry resolves its provisional record here.")
   "Functions called when a Claude Code instance ends.
 Each function is called with SESSION and REASON: `exited' when the
 CLI process ended on its own, `killed' when Emacs ended a CLI that
-still ran (its buffer was killed, or a stop command).  This also runs
+still ran (its buffer was killed, or a stop command; also a CLI that
+exits in the soft stop of `claude-code-ide--stop-session').  This also runs
 for an instance whose start failed.  Errors are reported and do not
 stop the cleanup.")
 
@@ -1146,15 +1150,46 @@ Slots order windows along a frame side; reserving a contiguous block
 per project keeps one project's instances grouped together instead of
 interleaved by global creation order.")
 
+(defvar claude-code-ide--replace-copy-of nil
+  "Instance ID whose visible copy the next new instance replaces, or nil.
+The start of the target of a handover binds it to the source, so that
+the target takes the side-window slot, and so the window, of the copy
+of its source.  In a chain of handovers, the side area then does not
+fill with copies.")
+
 (defun claude-code-ide--assign-window-slot (project-dir)
   "Return a side-window slot for a new instance of PROJECT-DIR.
 `claude-code-ide-side-window-scope' decides the rule:
 `single' puts every instance in slot 0, `project' numbers each project
-from 0, and `all' gives each project its own block of slots."
+from 0, and `all' gives each project its own block of slots.  The slot
+of the visible copy that the instance replaces comes first (see
+`claude-code-ide--replace-copy-of')."
   (pcase claude-code-ide-side-window-scope
     ('single 0)
-    ('project (claude-code-ide--slot-within-project project-dir))
-    (_ (claude-code-ide--slot-across-projects project-dir))))
+    (scope
+     (or (claude-code-ide--replaced-copy-slot project-dir)
+         (if (eq scope 'project)
+             (claude-code-ide--slot-within-project project-dir)
+           (claude-code-ide--slot-across-projects project-dir))))))
+
+(defun claude-code-ide--replaced-copy-slot (project-dir)
+  "Return the slot of the copy that a new instance of PROJECT-DIR replaces, or nil.
+That is the copy that the instance `claude-code-ide--replace-copy-of'
+left in PROJECT-DIR, when a window shows it and no running instance
+has its slot."
+  (when-let* ((id claude-code-ide--replace-copy-of)
+              (keep (expand-file-name project-dir)))
+    (cl-loop with used = (mapcar #'claude-code-ide-mcp-session-window-slot
+                                 (claude-code-ide-mcp--active-sessions))
+             for buffer in (buffer-list)
+             for project = (buffer-local-value 'claude-code-ide--stopped-project buffer)
+             for slot = (buffer-local-value 'claude-code-ide--stopped-slot buffer)
+             when (and project slot
+                       (equal (buffer-local-value 'claude-code-ide--stopped-instance-id buffer) id)
+                       (string= (expand-file-name project) keep)
+                       (not (memql slot used))
+                       (get-buffer-window buffer t))
+             return slot)))
 
 (defun claude-code-ide--slot-within-project (project-dir)
   "Return the smallest slot that no live session of PROJECT-DIR uses.
@@ -1504,6 +1539,10 @@ See `claude-code-ide--display-buffer-in-side-window'."
   "The side-window slot of the instance whose stop left this buffer.")
 (put 'claude-code-ide--stopped-slot 'permanent-local t)
 
+(defvar-local claude-code-ide--stopped-instance-id nil
+  "The instance ID of the instance whose stop left this buffer.")
+(put 'claude-code-ide--stopped-instance-id 'permanent-local t)
+
 (defun claude-code-ide--stopped-slots (&optional project-dir)
   "Return the slots of the stopped buffers that a window shows.
 With PROJECT-DIR, only those of the buffers that its instances left.
@@ -1536,6 +1575,12 @@ This is also true of a buffer that a stopped instance left."
     (if-let* ((session (claude-code-ide--buffer-session buffer)))
         (claude-code-ide-mcp-session-project-dir session)
       (buffer-local-value 'claude-code-ide--stopped-project buffer))))
+
+(defun claude-code-ide--stopped-buffers-p ()
+  "Return non-nil when a buffer that a stopped instance left lives."
+  (cl-some (lambda (buffer)
+             (buffer-local-value 'claude-code-ide--stopped-project buffer))
+           (buffer-list)))
 
 (defun claude-code-ide--stopped-buffer-of (session)
   "Return the live buffer that the stop of SESSION left, or nil.
@@ -1591,6 +1636,17 @@ Each step uses private parts of its backend."
          (claude-code-ide-debug "Flush of %s before the copy failed: %s"
                                 (car step) (error-message-string err)))))))
 
+(defun claude-code-ide--output-not-drawn-p (buffer)
+  "Return non-nil when the terminal BUFFER can have output that it did not draw.
+ghostel draws only in a window: the output of a hidden terminal waits
+until a window shows it, also after the flush.  `ghostel--pending-redraw'
+tells; without it, a ghostel terminal that no window shows counts."
+  (with-current-buffer buffer
+    (and (derived-mode-p 'ghostel-mode)
+         (if (boundp 'ghostel--pending-redraw)
+             (symbol-value 'ghostel--pending-redraw)
+           (not (get-buffer-window buffer t))))))
+
 (defun claude-code-ide--move-windows (from to)
   "Show the buffer TO in each window of the buffer FROM, in all frames.
 Each window keeps its start, its point and its dedicated flag."
@@ -1637,9 +1693,15 @@ second call for SESSION returns the copy of the first call."
                             (claude-code-ide-mcp-session-project-dir session))
                 (setq-local claude-code-ide--stopped-slot
                             (claude-code-ide-mcp-session-window-slot session))
+                (setq-local claude-code-ide--stopped-instance-id
+                            (when-let* ((instance (claude-code-ide-instance-of-session session)))
+                              (claude-code-ide-instance-id instance)))
                 (setq header-line-format
-                      (format "Stopped at %s: the CLI ended.  %s closes this buffer."
+                      (format "Stopped at %s: the CLI ended.  %s%s closes this buffer."
                               (format-time-string "%H:%M")
+                              (if (claude-code-ide--output-not-drawn-p buffer)
+                                  "The terminal had output that it did not draw, so this copy can be incomplete.  "
+                                "")
                               (substitute-command-keys "\\[kill-buffer]")))
                 (goto-char (min position (point-max))))
               (claude-code-ide--move-windows buffer copy)
@@ -1710,11 +1772,18 @@ hook signals wrong-type-argument that way)."
              (not (claude-code-ide-mcp-session-cleanup-done session)))
     (setf (claude-code-ide-mcp-session-cleanup-done session) t)
     ;; A CLI that still runs here is being ended by Emacs (buffer kill,
-    ;; stop command); otherwise it ended on its own
-    (claude-code-ide--run-session-hook
-     'claude-code-ide-session-end-functions session
-     (let ((process (claude-code-ide-mcp-session-process session)))
-       (if (and process (process-live-p process)) 'killed 'exited)))
+    ;; stop command), and so is one that exits in a soft stop; otherwise
+    ;; it ended on its own
+    (let ((process (claude-code-ide-mcp-session-process session)))
+      (claude-code-ide--run-session-hook
+       'claude-code-ide-session-end-functions session
+       (if (and process
+                (or (process-live-p process)
+                    (process-get process 'claude-code-ide--stopping)))
+           'killed
+         'exited))
+      ;; The stop is over: the inbox delivery is no longer held
+      (claude-code-ide--end-soft-stop process))
     ;; End the CLI and its background work before the buffer goes.  The
     ;; soft end gives the CLI time to stop its background shells, and
     ;; the recorded process groups that still run are ended after it.
@@ -1764,8 +1833,10 @@ hook signals wrong-type-argument that way)."
     (when (= (hash-table-count claude-code-ide-mcp--sessions) 0)
       (remove-hook 'window-selection-change-functions
                    #'claude-code-ide--note-window-selection)
-      ;; A copy adds it again: a new tab must not clone a copy either
-      (when (boundp 'tab-bar-tab-post-open-functions)
+      ;; A new tab must not clone a copy either: the hook stays while a
+      ;; copy lives, and a copy made after this point adds it again
+      (when (and (boundp 'tab-bar-tab-post-open-functions)
+                 (not (claude-code-ide--stopped-buffers-p)))
         (remove-hook 'tab-bar-tab-post-open-functions
                      #'claude-code-ide--strip-new-tab-claude-windows))
       (pcase-dolist (`(,_backend ,fn . ,advice) claude-code-ide--reflow-advice)
@@ -2458,7 +2529,8 @@ with all the output, and kills the buffer.  When the stop ends, or
 after `claude-code-ide--soft-stop-limit' seconds, and the CLI still
 runs, kill the buffer after a copy.  Else kill the terminal
 buffer at once, after a copy when the option is on, or clean SESSION
-up when it has no buffer."
+up when it has no buffer.  A second stop while the first one runs
+only logs that SESSION is already stopping."
   (let* ((buffer (claude-code-ide-mcp-session-buffer session))
          (process (claude-code-ide-mcp-session-process session))
          (instance (claude-code-ide-instance-of-session session)))
@@ -2468,20 +2540,64 @@ up when it has no buffer."
      ((and claude-code-ide-keep-stopped-buffers
            (fboundp 'claude-code-ide-process-stop-later)
            instance process (process-live-p process))
-      ;; A second stop while the first one runs does nothing more
-      (unless (process-get process 'claude-code-ide--stopping)
-        (process-put process 'claude-code-ide--stopping t)
-        (let ((finish (lambda (&rest _)
-                        ;; The CLI did not exit, or its sentinel did not run
-                        (unless (claude-code-ide-mcp-session-cleanup-done session)
-                          (claude-code-ide--kill-terminal-buffer buffer session)))))
-          (claude-code-ide-process-stop-later
-           instance :process process :soft-end nil :scan nil :callback finish)
-          ;; The job can wait long, for example for the background groups
-          ;; of the CLI; the old stop, a buffer kill, comes after a limit
-          (run-at-time (claude-code-ide--soft-stop-limit) nil finish))))
+      (if (process-get process 'claude-code-ide--stopping)
+          (claude-code-ide-log "%s is already stopping"
+                               (claude-code-ide--session-display-name session))
+        (claude-code-ide--soft-stop session buffer process instance)))
      (t
       (claude-code-ide--kill-terminal-buffer buffer session)))))
+
+(defun claude-code-ide--soft-stop (session buffer process instance)
+  "End SESSION with the soft end of its provider, from timers.
+BUFFER is its terminal, PROCESS the terminal process, INSTANCE its
+descriptor.  The process property `claude-code-ide--stopping' marks
+the stop, and the inbox delivery to INSTANCE is held, so that no
+queued prompt goes into the CLI that exits.  The stop ends at the end
+of the stop job or at the limit, whichever comes first.  When the CLI
+still runs then, kill BUFFER after a copy; a kill that was refused or
+quit undoes the stop (`claude-code-ide--end-soft-stop')."
+  (let* ((limit nil)
+         (finished nil)
+         (finish
+          (lambda (&rest _)
+            (unless finished
+              (setq finished t)
+              (when (timerp limit) (cancel-timer limit))
+              (unwind-protect
+                  ;; The CLI did not exit, or its sentinel did not run
+                  (unless (claude-code-ide-mcp-session-cleanup-done session)
+                    (claude-code-ide--kill-terminal-buffer buffer session))
+                (unless (claude-code-ide-mcp-session-cleanup-done session)
+                  (claude-code-ide--end-soft-stop process)))))))
+    (process-put process 'claude-code-ide--stopping t)
+    ;; A hold of another owner, such as a handover, stays its own
+    (let ((id (claude-code-ide-instance-id instance)))
+      (when (and (fboundp 'claude-code-ide-control-hold)
+                 (not (claude-code-ide-control-held-p id)))
+        (claude-code-ide-control-hold id)
+        (process-put process 'claude-code-ide--stop-hold id)))
+    ;; The job can wait long, for example for the background groups of
+    ;; the CLI; the old stop, a buffer kill, comes after a limit.  The
+    ;; limit comes first, so that it holds also when the job fails
+    (setq limit (run-at-time (claude-code-ide--soft-stop-limit) nil finish))
+    (condition-case err
+        (claude-code-ide-process-stop-later
+         instance :process process :soft-end nil :scan nil :callback finish)
+      (error
+       (message "Cannot end %s softly: %s"
+                (claude-code-ide--session-display-name session)
+                (error-message-string err))
+       (funcall finish)))))
+
+(defun claude-code-ide--end-soft-stop (process)
+  "End the mark of a soft stop on PROCESS, and the inbox hold of the stop.
+For a stop that ended, or that a refused kill undid."
+  (when (processp process)
+    (process-put process 'claude-code-ide--stopping nil)
+    (when-let* ((id (process-get process 'claude-code-ide--stop-hold)))
+      (process-put process 'claude-code-ide--stop-hold nil)
+      (when (fboundp 'claude-code-ide-control-release)
+        (claude-code-ide-control-release id)))))
 
 (defun claude-code-ide--soft-stop-limit ()
   "Return the seconds after which a soft stop kills the terminal buffer.
@@ -2875,8 +2991,11 @@ spec."
                                     (lambda (proc event)
                                       (when prev-sentinel
                                         (ignore-errors (funcall prev-sentinel proc event)))
-                                      ;; Check for abnormal exit with error code
-                                      (when (string-match "exited abnormally with code \\([0-9]+\\)" event)
+                                      ;; Check for abnormal exit with error code.
+                                      ;; A CLI that exits in a soft stop of Emacs
+                                      ;; gets no exit message
+                                      (when (and (string-match "exited abnormally with code \\([0-9]+\\)" event)
+                                                 (not (process-get proc 'claude-code-ide--stopping)))
                                         (let ((exit-code (string-to-number (match-string 1 event))))
                                           (claude-code-ide-debug "%s process exited with code %d, event: %s"
                                                                  display exit-code event)

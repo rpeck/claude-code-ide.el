@@ -472,6 +472,21 @@ BODY can use `worktree', the folder of a Git repository."
       (should (equal (claude-code-ide-start-spec-resume-id spec) "cci-test-b-new"))
       (should (claude-code-ide-transcript-document-id (claude-code-ide-start-spec-prompt spec))))))
 
+(ert-deftest claude-code-ide-test-handover-target-replaces-source-copy ()
+  "The start of the target names its source, whose copy it replaces in its window."
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (let ((replaced 'none))
+      (cl-letf* ((start (symbol-function 'claude-code-ide--start-session))
+                 ((symbol-function 'claude-code-ide--start-session)
+                  (lambda (&rest args)
+                    (setq replaced claude-code-ide--replace-copy-of)
+                    (apply start args))))
+        (claude-code-ide-handover-session "cci-test-src" 'cci-test-b)
+        (claude-code-ide-handover-tests--run-timers))
+      (should (equal replaced "cci-test-src"))
+      (should-not claude-code-ide--replace-copy-of))))
+
 ;;; Strays
 
 (ert-deftest claude-code-ide-test-handover-strays-coordinator ()

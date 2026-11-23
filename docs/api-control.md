@@ -86,6 +86,7 @@ This document describes the control operations of claude-code-ide.el, the prompt
 - The prompts in the inbox of the instance stay there.
 - Error reasons: `not-running`, `stop-failed`.
 - The stop does not wait for the process tree. `feat/process-tree` owns that part.
+- With `claude-code-ide-keep-stopped-buffers`, the CLI ends softly, within about 6 s. Until then, the instance stays in the list, a `resume` of its ID gives `already-running`, and the inbox delivery to it is held. The result is `stopped` at once.
 
 ## submit-prompt
 

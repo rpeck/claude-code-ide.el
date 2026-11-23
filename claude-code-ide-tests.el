@@ -262,11 +262,18 @@ read."
 (defun claude-code-ide-tests--isolate-run (run &rest args)
   "Call RUN with ARGS in a new temporary folder for all shared paths.
 RUN is `ert-run-tests'.  The folder is made before the run and removed
-after it; each setting is as before after the run.  A function that
-the run put on `kill-emacs-hook', such as the removal of a status
-snapshot, is taken off again: at the quit it would act on the paths
-of this Emacs, not on those of the run."
+after it; each setting is as before after the run.  The record of the
+stopped copies (`claude-code-ide-tests--record-stopped-copy') is on
+only during the run.  A function that the run put on
+`kill-emacs-hook', such as the removal of a status snapshot, is taken
+off again: at the quit it would act on the paths of this Emacs, not on
+those of the run."
   (let* ((quit-hooks (default-value 'kill-emacs-hook))
+         ;; The record of the stopped copies of the tests, only in the
+         ;; run; an outer run keeps its own
+         (record (and (fboundp 'claude-code-ide--keep-stopped-buffer)
+                      (not (advice-member-p #'claude-code-ide-tests--record-stopped-copy
+                                            'claude-code-ide--keep-stopped-buffer))))
          (dir (file-name-as-directory (make-temp-file "cci-test-run-" t)))
          (claude-code-ide-tests--run-directory dir)
          (claude-code-ide-state-file (expand-file-name "state.json" dir))
@@ -280,10 +287,16 @@ of this Emacs, not on those of the run."
           (append (list (concat "CLAUDE_CONFIG_DIR=" (expand-file-name "claude-config" dir))
                         (concat "CODEX_HOME=" (expand-file-name "codex-home" dir)))
                   process-environment)))
+    (when record
+      (advice-add 'claude-code-ide--keep-stopped-buffer :filter-return
+                  #'claude-code-ide-tests--record-stopped-copy))
     (unwind-protect
         (cl-letf (((symbol-function 'claude-code-ide-mcp--lockfile-directory)
                    #'claude-code-ide-tests--run-lockfile-directory))
           (apply run args))
+      (when record
+        (advice-remove 'claude-code-ide--keep-stopped-buffer
+                       #'claude-code-ide-tests--record-stopped-copy))
       (dolist (function (default-value 'kill-emacs-hook))
         (unless (memq function quit-hooks)
           (remove-hook 'kill-emacs-hook function)))
@@ -451,9 +464,9 @@ executes TEST-BODY, and ensures cleanup even if TEST-BODY fails."
     (push copy claude-code-ide-tests--stopped-copies))
   copy)
 
-(with-eval-after-load 'claude-code-ide
-  (advice-add 'claude-code-ide--keep-stopped-buffer :filter-return
-              #'claude-code-ide-tests--record-stopped-copy))
+;; The record runs only while ERT runs: `claude-code-ide-tests--isolate-run'
+;; adds it, and removes it after the run, so that a working Emacs keeps
+;; no advice of the tests
 
 (defun claude-code-ide-tests--clear-processes ()
   "Reset all session state for testing.
