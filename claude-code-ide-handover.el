@@ -1517,6 +1517,11 @@ reaches only that process, and keeps the proof of its owner (see
       (pcase (plist-get result :status)
         ((or 'stopped (and 'strays (guard (null strays))))
          (claude-code-ide-handover--after-scan run))
+        ;; A source that still runs wins over its strays: its CLI and its
+        ;; tree are then among them, and `end' of the strays would leave
+        ;; them alone when other writers run here
+        ((and 'strays (guard (claude-code-ide-handover--source-live-p run)))
+         (claude-code-ide-handover--source-still-running run))
         ('strays
          (claude-code-ide-handover--needs-user
           run 'strays (concat "Processes still run in the worktree"

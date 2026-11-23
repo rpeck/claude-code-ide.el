@@ -863,11 +863,13 @@ The file with CODEWORD in DIRECTORY must exist before the start."
 A request ID is known for good, so each run needs its own."
   (format "%s-%s" label (format-time-string "%Y%m%dT%H%M%S")))
 
-(defun claude-code-ide-live-tests--hand-over (source-id target-provider request-id)
+(defun claude-code-ide-live-tests--hand-over (source-id target-provider request-id &optional allow-others)
   "Hand SOURCE-ID over to TARGET-PROVIDER as a coordinator does.
-REQUEST-ID names the call.  Return the committed status."
+REQUEST-ID names the call; ALLOW-OTHERS is as for
+`claude-code-ide-handover-session'.  Return the committed status."
   (let ((result (claude-code-ide-handover-session source-id target-provider
-                                                  :request-id request-id)))
+                                                  :request-id request-id
+                                                  :allow-others allow-others)))
     (claude-code-ide-live-tests--log "handover of %s to %s: %S" source-id target-provider
                                      (claude-code-ide-live-tests--brief-status result))
     (should (eq (plist-get result :status) 'running))
@@ -1729,6 +1731,36 @@ stopped, and committed while the source CLI ran on."
             (should-not (claude-code-ide-live-tests--running-p codex))
             (claude-code-ide-live-tests--target-ready status-2)
             (claude-code-ide-live-tests--cli-pid (plist-get status-2 :target-id))))))))
+
+(ert-deftest claude-code-ide-live-test-handover-old-session ()
+  "In ghostel, a handover ends the CLI of a session that an older package started.
+Such a session has no PID and no start time in its descriptor, and no
+process records.  Another session runs in the same worktree, and the
+handover allows it.  In the user's Emacs the stop could not end the
+source CLI, and the handover said strays of unknown owner."
+  :tags '(:live)
+  (claude-code-ide-live-tests--live
+    (claude-code-ide-live-tests--with-backend 'ghostel
+      (let* ((dir (claude-code-ide-live-tests--claude-project "projA"))
+             (other (claude-code-ide-live-tests--launch dir 'claude nil))
+             (source (claude-code-ide-live-tests--launch
+                      dir 'claude "cci-test-L10 old session: reply with the single word ok")))
+        (claude-code-ide-live-tests--show source)
+        (should (claude-code-ide-live-tests--wait-turn source 0 claude-code-ide-live-tests--turn-limit))
+        (let* ((descriptor (claude-code-ide-instance-by-id source))
+               (pid (claude-code-ide-live-tests--cli-pid source)))
+          ;; As an older package left it: no PID, no start time, no records
+          (setf (claude-code-ide-instance-pid descriptor) 'unknown
+                (claude-code-ide-instance-process-start-time descriptor) 'unknown)
+          (claude-code-ide-process-untrack descriptor)
+          (claude-code-ide-live-tests--log "%s: made an old session of the CLI %d" source pid)
+          (let ((status (claude-code-ide-live-tests--hand-over
+                         source 'claude (claude-code-ide-live-tests--request-id "cci-test-L10") t)))
+            (claude-code-ide-live-tests--wait-gone pid)
+            (should-not (claude-code-ide-live-tests--running-p source))
+            ;; The other session runs on
+            (should (claude-code-ide-live-tests--running-p other))
+            (claude-code-ide-live-tests--target-ready status)))))))
 
 ;;; The stop asks nothing
 
