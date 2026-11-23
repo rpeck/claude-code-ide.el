@@ -282,6 +282,199 @@ stop from timers, which the handover uses."
 
 (declare-function make-claude-code-ide-mcp-session "claude-code-ide-mcp" (&rest args))
 
+(defun claude-code-ide-process-tests--old-session (provider buffer worktree)
+  "Return a live descriptor of PROVIDER in BUFFER, as an older package left it.
+Its PID and start time are unknown, and WORKTREE is its folder."
+  (claude-code-ide-instance-register
+   (claude-code-ide-instance-create
+    :id (format "cci-test-old-%s" provider) :provider provider :buffer buffer
+    :project-root worktree :worktree worktree)))
+
+(ert-deftest claude-code-ide-test-process-stop-old-session ()
+  "A stop ends the ghostel CLI of a session that an older package started.
+The descriptor has no PID and no start time, but the live terminal
+process now gives the PID.  The CLI is a child of this Emacs that leads
+its own group, so the stop takes the start time of that process, records
+both in the descriptor, sends the soft end, and counts the CLI tree as
+its own.  In the user's Emacs the CLI got no signal, and it and its 17
+MCP servers came back as strays of unknown owner."
+  (dolist (provider '(claude codex))
+    (let ((worktree (file-name-as-directory (make-temp-file "cci-test-wt-" t))))
+      (unwind-protect
+          (claude-code-ide-process-tests--with-table
+              (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+                    ;; An MCP server of the CLI, in the group of the CLI
+                    (claude-code-ide-process-tests--entry 110 100 100)
+                    ;; Another MCP server in a group of its own, which
+                    ;; survives the soft end
+                    (claude-code-ide-process-tests--entry 120 100 120))
+            (let* ((claude-code-ide-instance--all nil)
+                   (buffer (generate-new-buffer " *cci-test-ghostel*"))
+                   (pipe (make-pipe-process :name "cci-test-ghostel-pipe" :buffer buffer :noquery t))
+                   (instance (claude-code-ide-process-tests--old-session provider buffer worktree)))
+              (unwind-protect
+                  (progn
+                    (process-put pipe 'ghostel--native-child 'cci-test-handle)
+                    (setq claude-code-ide-process-tests--cwds
+                          (list (cons 100 worktree) (cons 110 worktree) (cons 120 worktree)))
+                    (add-hook 'claude-code-ide-process-tests--reactions
+                              (claude-code-ide-process-tests--cli-exits-on 'SIGHUP))
+                    (cl-letf (((symbol-function 'ghostel--native-child-pid)
+                               (lambda (handle) (and (eq handle 'cci-test-handle) 100))))
+                      (let ((result (claude-code-ide-process-stop instance)))
+                        ;; The soft end reached the group of the CLI
+                        (should (equal (list provider (car (claude-code-ide-process-tests--signal-list)))
+                                       (list provider '(-100 SIGHUP))))
+                        (should-not (claude-code-ide-process-tests--find 100))
+                        ;; The server in its own group was a recorded group:
+                        ;; it got SIGTERM and ended
+                        (should-not (claude-code-ide-process-tests--find 120))
+                        (should (equal (list provider (plist-get result :status))
+                                       (list provider 'stopped)))))
+                    ;; The descriptor knows the PID and the start time now
+                    (should (eql (claude-code-ide-instance-pid instance) 100))
+                    (should (eql (claude-code-ide-instance-process-start-time instance)
+                                 claude-code-ide-process-tests--start)))
+                (delete-process pipe)
+                (kill-buffer buffer))))
+        (delete-directory worktree t)))))
+
+(ert-deftest claude-code-ide-test-process-old-session-own-strays ()
+  "The CLI tree of an old session is its own, also when the CLI survives.
+Its CLI ignores every signal here; the stop must report it as its CLI
+\(`cli', :own) and its MCP server as its own, never as unverified."
+  (let ((worktree (file-name-as-directory (make-temp-file "cci-test-wt-" t))))
+    (unwind-protect
+        (claude-code-ide-process-tests--with-table
+            (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+                  (claude-code-ide-process-tests--entry 110 100 100))
+          (let* ((claude-code-ide-instance--all nil)
+                 (buffer (generate-new-buffer " *cci-test-ghostel*"))
+                 (pipe (make-pipe-process :name "cci-test-ghostel-pipe" :buffer buffer :noquery t))
+                 (instance (claude-code-ide-process-tests--old-session 'claude buffer worktree)))
+            (unwind-protect
+                (progn
+                  (process-put pipe 'ghostel--native-child 'cci-test-handle)
+                  (setq claude-code-ide-process-tests--cwds
+                        (list (cons 100 worktree) (cons 110 worktree))
+                        claude-code-ide-process-tests--ignore
+                        (list (list 100 'SIGHUP 'SIGTERM 'SIGKILL) (list 110 'SIGHUP 'SIGTERM 'SIGKILL)))
+                  (cl-letf (((symbol-function 'ghostel--native-child-pid)
+                             (lambda (handle) (and (eq handle 'cci-test-handle) 100))))
+                    (let* ((result (claude-code-ide-process-stop instance))
+                           (strays (plist-get result :strays)))
+                      (should (eq (plist-get result :status) 'timeout))
+                      ;; The CLI and its server in the CLI's group: both its own
+                      (should (equal (mapcar (lambda (s) (list (plist-get s :pid) (plist-get s :reason)
+                                                               (plist-get s :own)))
+                                             strays)
+                                     '((100 cli t) (110 worktree t))))
+                      (should-not (cl-find 'unverified strays :key (lambda (s) (plist-get s :reason)))))))
+              (delete-process pipe)
+              (kill-buffer buffer))))
+      (delete-directory worktree t))))
+
+(ert-deftest claude-code-ide-test-process-old-session-old-track ()
+  "A record without a start time, from before the proof, gets it at the stop.
+A stop of an older version could leave records with the PID but no
+start time; the next stop proves the start time and ends the CLI."
+  (claude-code-ide-process-tests--with-table
+      (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100))
+    (let* ((claude-code-ide-instance--all nil)
+           (buffer (generate-new-buffer " *cci-test-ghostel*"))
+           (pipe (make-pipe-process :name "cci-test-ghostel-pipe" :buffer buffer :noquery t))
+           (instance (claude-code-ide-process-tests--old-session 'codex buffer "/nonexistent/cci-test-wt")))
+      (unwind-protect
+          (progn
+            (process-put pipe 'ghostel--native-child 'cci-test-handle)
+            (puthash (claude-code-ide-instance-id instance)
+                     (claude-code-ide-process--track-create :instance instance :process pipe
+                                                            :pid 100 :start nil)
+                     claude-code-ide-process--tracks)
+            (add-hook 'claude-code-ide-process-tests--reactions
+                      (claude-code-ide-process-tests--cli-exits-on 'SIGHUP))
+            (cl-letf (((symbol-function 'ghostel--native-child-pid)
+                       (lambda (handle) (and (eq handle 'cci-test-handle) 100))))
+              (let ((result (claude-code-ide-process-stop instance :scan nil)))
+                (should (equal (car (claude-code-ide-process-tests--signal-list)) '(-100 SIGHUP)))
+                (should (eq (plist-get result :status) 'stopped))))
+            (should (eql (claude-code-ide-instance-pid instance) 100)))
+        (delete-process pipe)
+        (kill-buffer buffer)))))
+
+(ert-deftest claude-code-ide-test-process-old-session-pid-of-another-terminal ()
+  "A PID that another terminal of this Emacs gives or records proves nothing.
+Ghostel pipes have no `process-id': their CLI PID comes from the child
+handle.  When the old CLI exited and another ghostel terminal got its
+PID, that process passes the parent and group checks; the proof must
+still refuse, so that no signal reaches the other terminal."
+  (dolist (other-gives '(pipe descriptor))
+    (claude-code-ide-process-tests--with-table
+        (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100))
+      (let* ((claude-code-ide-instance--all nil)
+             (buffer (generate-new-buffer " *cci-test-old*"))
+             (pipe (make-pipe-process :name "cci-test-old-pipe" :buffer buffer :noquery t))
+             (other-buffer (generate-new-buffer " *cci-test-other*"))
+             (other-pipe (make-pipe-process :name "cci-test-other-pipe" :buffer other-buffer :noquery t))
+             (instance (claude-code-ide-process-tests--old-session 'claude buffer "/nonexistent/cci-test-wt"))
+             (other (claude-code-ide-instance-register
+                     (claude-code-ide-instance-create
+                      :id "cci-test-other" :provider 'claude :buffer other-buffer
+                      :project-root "/nonexistent/cci-test-wt2" :worktree "/nonexistent/cci-test-wt2"))))
+        (unwind-protect
+            (progn
+              (process-put pipe 'ghostel--native-child 'cci-test-old-handle)
+              (pcase other-gives
+                ;; The other pipe gives the same PID through its child handle
+                ('pipe (process-put other-pipe 'ghostel--native-child 'cci-test-other-handle))
+                ;; The other descriptor records the PID from its start
+                ('descriptor (setf (claude-code-ide-instance-pid other) 100
+                                   (claude-code-ide-instance-process-start-time other)
+                                   claude-code-ide-process-tests--start)))
+              (cl-letf (((symbol-function 'ghostel--native-child-pid)
+                         (lambda (handle)
+                           (and (memq handle '(cci-test-old-handle cci-test-other-handle)) 100))))
+                (should-not (claude-code-ide-process--terminal-child-start pipe 100))
+                (let ((result (claude-code-ide-process-stop instance :scan nil)))
+                  (should-not (cl-find-if (lambda (s) (memql (car s) '(100 -100)))
+                                          claude-code-ide-process-tests--signals))
+                  (should (cl-find 'unverified (plist-get result :strays)
+                                   :key (lambda (s) (plist-get s :reason))))))
+              (should (equal (list other-gives (claude-code-ide-known-or-nil
+                                                (claude-code-ide-instance-process-start-time instance)))
+                             (list other-gives nil)))
+              (should (claude-code-ide-process-tests--find 100)))
+          (delete-process pipe)
+          (delete-process other-pipe)
+          (kill-buffer buffer)
+          (kill-buffer other-buffer))))))
+
+(ert-deftest claude-code-ide-test-process-old-session-no-proof ()
+  "A PID from the terminal process gets no start time without proof.
+The proof is that its process is a child of this Emacs that leads its
+own group, while the terminal process runs.  A PID that names another
+process gets no signal, and the descriptor stays as it was."
+  (dolist (entry (list (claude-code-ide-process-tests--entry 100 1 100)      ; not a child of Emacs
+                       (claude-code-ide-process-tests--entry 100 (emacs-pid) 50))) ; not its own group
+    (claude-code-ide-process-tests--with-table (list entry)
+      (let* ((claude-code-ide-instance--all nil)
+             (buffer (generate-new-buffer " *cci-test-ghostel*"))
+             (pipe (make-pipe-process :name "cci-test-ghostel-pipe" :buffer buffer :noquery t))
+             (instance (claude-code-ide-process-tests--old-session 'claude buffer "/nonexistent/cci-test-wt")))
+        (unwind-protect
+            (progn
+              (process-put pipe 'ghostel--native-child 'cci-test-handle)
+              (cl-letf (((symbol-function 'ghostel--native-child-pid)
+                         (lambda (handle) (and (eq handle 'cci-test-handle) 100))))
+                (let ((result (claude-code-ide-process-stop instance :scan nil)))
+                  (should-not (cl-find-if (lambda (s) (memql (car s) '(100 -100)))
+                                          claude-code-ide-process-tests--signals))
+                  (should (cl-find 'unverified (plist-get result :strays)
+                                   :key (lambda (s) (plist-get s :reason))))))
+              (should-not (claude-code-ide-known-or-nil (claude-code-ide-instance-process-start-time instance))))
+          (delete-process pipe)
+          (kill-buffer buffer))))))
+
 (ert-deftest claude-code-ide-test-process-stop-exited-cli-without-pid ()
   "A stop with an unknown PID reports stopped once the terminal process has exited.
 The buffer and the descriptor stay after the CLI exits, so

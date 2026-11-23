@@ -3114,6 +3114,33 @@ never writes the document or starts the target."
                        '(end wait cancel)))
         (should-not claude-code-ide-handover-tests--starts)))))
 
+(ert-deftest claude-code-ide-test-handover-source-alive-wins-over-strays ()
+  "Strays while the source instance still runs give source-still-running, not strays.
+In the user's Emacs, a stop could not end an old session's CLI: the
+CLI and its MCP servers came back as strays of unknown owner, and the
+handover said strays, so that `end' left the CLI alone."
+  (dolist (allow-others '(nil t))
+    (claude-code-ide-handover-tests--with
+      (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+      (claude-code-ide-handover-tests--with-live-stop
+          (list :status 'strays
+                :strays (list (list :pid 99971 :command "claude --session-id cci-test-src-native"
+                                    :cwd worktree :reason 'unverified :start 1.0)
+                              (list :pid 99972 :command "cci-test-mcp-server"
+                                    :cwd worktree :reason 'worktree :start 1.0)))
+        (let ((id (plist-get (claude-code-ide-handover-session "cci-test-src" 'cci-test-b
+                                                               :allow-others allow-others)
+                             :handover-id)))
+          (claude-code-ide-handover-tests--run-timers)
+          (let ((status (claude-code-ide-handover-status id)))
+            (should (equal (list allow-others (plist-get status :reason))
+                           (list allow-others 'source-still-running)))
+            (should (eq (plist-get status :stage) 'source-stopped)))
+          (should (equal (mapcar #'cadr (claude-code-ide-handover--choices
+                                         (gethash id claude-code-ide-handover--runs)))
+                         '(end wait cancel)))
+          (should-not claude-code-ide-handover-tests--starts))))))
+
 (ert-deftest claude-code-ide-test-handover-source-alive-choices ()
   "End kills the source as the control stop does and goes on; wait stops again; cancel cancels."
   (dolist (choice '(end wait cancel))

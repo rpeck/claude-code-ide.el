@@ -666,7 +666,13 @@ whose own process ID is that PID.  Emacs has not reaped such a child,
 so the PID cannot belong to another process.  A ghostel pipe is not
 the real child: ghostel's native thread reaps the child before the
 pipe closes, so a lookup of its PID can find an unrelated process.
-Else the start time stays nil, and the root never gets a signal."
+It gives the start time only with the proof of
+`claude-code-ide-process--terminal-child-start'.  Else the start time
+stays nil, and the root never gets a signal.
+
+A descriptor without a PID or a start time, for example of a session
+that an older version of the package started, gets the ones of the
+proof: later stops and records use them."
   (let* ((process (or (claude-code-ide-process--accept-process instance process)
                       (let ((buffer (claude-code-ide-instance-buffer instance)))
                         (and (buffer-live-p buffer) (get-buffer-process buffer)))))
@@ -676,16 +682,67 @@ Else the start time stays nil, and the root never gets a signal."
          (known-start (claude-code-ide-known-or-nil
                        (claude-code-ide-instance-process-start-time instance))))
     (when (integerp pid)
-      (claude-code-ide-process--track-create
-       :instance instance
-       :process process
-       :pid pid
-       :start (cond
-               ((and (numberp known-start) (eql known-pid pid)) known-start)
-               ((and (processp process)
-                     (eql (process-id process) pid)
-                     (process-live-p process))
-                (plist-get (funcall claude-code-ide-process-entry-function pid) :start)))))))
+      (let ((start (cond
+                    ((and (numberp known-start) (eql known-pid pid)) known-start)
+                    ((and (processp process)
+                          (eql (process-id process) pid)
+                          (process-live-p process))
+                     (plist-get (funcall claude-code-ide-process-entry-function pid) :start))
+                    ((claude-code-ide-process--terminal-child-start process pid)))))
+        ;; Record what the proof gave in a descriptor that lacks it
+        (when (and (numberp start) (not (numberp known-start)))
+          (setf (claude-code-ide-instance-pid instance) pid
+                (claude-code-ide-instance-process-start-time instance) start))
+        (claude-code-ide-process--track-create
+         :instance instance
+         :process process
+         :pid pid
+         :start start)))))
+
+(defun claude-code-ide-process--terminal-child-start (process pid)
+  "Return the start time of PID when the terminal PROCESS proves PID is its CLI.
+PROCESS is a terminal process that stands for its child, such as a
+ghostel pipe; PID is the PID that it gives.  The proof:
+- PROCESS runs, and its PID lookup gives PID;
+- the process PID runs as a child of this Emacs (ghostel forks the CLI
+  itself), and leads its own process group, as the session leader of
+  its terminal does;
+- no other process object of this Emacs gives PID, by its
+  `process-id' or as the native child of a ghostel pipe
+  (`claude-code-ide-process--process-pid');
+- no descriptor of another terminal records PID.
+A reused PID fails it: a process that another program started has
+another parent, a process that Emacs starts in other ways does not lead
+its own group or has its own process object, and a new terminal of this
+Emacs gives or records that PID.  Else return nil."
+  (when (and (processp process)
+             (process-live-p process)
+             (eql (claude-code-ide-process--ghostel-pid process) pid))
+    (let ((entry (funcall claude-code-ide-process-entry-function pid)))
+      (when (and entry
+                 (numberp (plist-get entry :start))
+                 (eql (plist-get entry :ppid) (emacs-pid))
+                 (eql (plist-get entry :pgid) pid)
+                 (not (claude-code-ide-process--pid-of-another-p process pid)))
+        (plist-get entry :start)))))
+
+(defun claude-code-ide-process--pid-of-another-p (process pid)
+  "Return non-nil when PID belongs to a terminal of this Emacs other than PROCESS.
+That is another process object whose PID lookup gives PID (also a
+ghostel pipe, whose CLI PID is not its `process-id'), or a descriptor
+whose terminal is not PROCESS and that records PID."
+  (or (cl-some (lambda (other)
+                 (and (not (eq other process))
+                      (eql (claude-code-ide-process--process-pid other) pid)))
+               (process-list))
+      (cl-some (lambda (instance)
+                 (let ((buffer (claude-code-ide-instance-buffer instance)))
+                   (and (not (and (buffer-live-p buffer)
+                                  (eq (get-buffer-process buffer) process)))
+                        (not (eq (process-buffer process) buffer))
+                        (eql (claude-code-ide-known-or-nil (claude-code-ide-instance-pid instance))
+                             pid))))
+               (claude-code-ide-instances))))
 
 ;;;###autoload
 (defun claude-code-ide-process-track (instance process)
@@ -1627,7 +1684,22 @@ when nothing is known."
         (puthash (claude-code-ide-process--track-id new) new
                  claude-code-ide-process--tracks)
         new))
-     (track track)
+     (track
+      ;; Records without a start time, for example from a stop of an
+      ;; older version: the terminal process can prove it now
+      (unless (claude-code-ide-process--track-start track)
+        (when-let* ((pid (claude-code-ide-process--track-pid track))
+                    (terminal (or (and (processp process) process)
+                                  (claude-code-ide-process--track-process track)
+                                  (let ((buffer (claude-code-ide-instance-buffer descriptor)))
+                                    (and (buffer-live-p buffer) (get-buffer-process buffer)))))
+                    (start (claude-code-ide-process--terminal-child-start terminal pid)))
+          (setf (claude-code-ide-process--track-start track) start)
+          (unless (numberp (claude-code-ide-known-or-nil
+                            (claude-code-ide-instance-process-start-time descriptor)))
+            (setf (claude-code-ide-instance-pid descriptor) pid
+                  (claude-code-ide-instance-process-start-time descriptor) start))))
+      track)
      (descriptor (claude-code-ide-process--new-track descriptor process)))))
 
 (defun claude-code-ide-process--items (instances options)
