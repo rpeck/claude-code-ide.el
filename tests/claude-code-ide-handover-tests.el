@@ -4648,6 +4648,271 @@ into needs-user."
           (should (eq (plist-get (claude-code-ide-handover-status id) :status) 'cancelled))
           (should (equal (mapcar #'car calls) '(cancelled committed))))))))
 
+;;; An unsent draft in the source prompt
+
+(defconst claude-code-ide-handover-tests--screen-width 64
+  "Width of the synthetic terminal screens of the draft tests.")
+
+(defun claude-code-ide-handover-tests--screen (provider backend input)
+  "Return a synthetic terminal screen of PROVIDER in BACKEND with INPUT.
+PROVIDER is `claude' or `codex'.  BACKEND is `vterm' (lines without
+trailing spaces), `eat' (lines padded with spaces to the width, a
+no-break space after the prompt marker) or `ghostel' (padded lines,
+empty lines at the end, and for `claude' the older box with borders).
+INPUT is a list of the lines in the input box or the composer; nil
+gives an empty one.  The screens follow the layouts of Claude Code 2
+and Codex 0.164; they are synthetic, not captured."
+  (let* ((rule (make-string (- claude-code-ide-handover-tests--screen-width 2) ?─))
+         (space (if (eq backend 'eat) " " " "))
+         (lines
+          (pcase provider
+            ('claude
+             (if (eq backend 'ghostel)
+                 (append (list "⏺ Done. The tests pass." ""
+                               (concat "╭" rule "╮"))
+                         (if input
+                             (cons (format "│ >%s%s" space (car input))
+                                   (mapcar (lambda (line) (format "│   %s" line)) (cdr input)))
+                           (list "│ > "))
+                         (list (concat "╰" rule "╯")
+                               "  ? for shortcuts"))
+               (append (list "⏺ Done. The tests pass." "" rule)
+                       (if input
+                           (cons (format "❯%s%s" space (car input))
+                                 (mapcar (lambda (line) (concat "  " line)) (cdr input)))
+                         (list (concat "❯" space)))
+                       (list rule "  ⏵⏵ accept edits on (shift+tab to cycle)"))))
+            ('codex
+             (append (list "• Done. The tests pass." "")
+                     (if input
+                         (cons (format "›%s%s" space (car input))
+                               (mapcar (lambda (line) (concat "  " line)) (cdr input)))
+                       (list (concat "›" space)))
+                     (list "" "  ⏎ send   ⌃J newline   ⌃T transcript   ⌃C quit   100% context left")))))
+         (padded (if (memq backend '(eat ghostel))
+                     (mapcar (lambda (line)
+                               (let ((pad (- claude-code-ide-handover-tests--screen-width
+                                             (string-width line))))
+                                 (concat line (make-string (max 0 pad) ?\s))))
+                             lines)
+                   lines)))
+    (concat (string-join padded "\n")
+            (if (eq backend 'ghostel)
+                (concat "\n" (make-string claude-code-ide-handover-tests--screen-width ?\s) "\n\n")
+              "\n"))))
+
+(ert-deftest claude-code-ide-test-handover-read-draft-fixtures ()
+  "The screen read finds the unsent draft of each provider in each backend.
+An empty input, a placeholder and a menu are no draft; an unknown screen
+is unsure."
+  (dolist (provider '(claude codex))
+    (dolist (backend '(vterm eat ghostel))
+      (let ((context (list provider backend)))
+        ;; A draft of one line and of two lines
+        (should (equal (cons context (claude-code-ide-handover--read-draft
+                                      provider (claude-code-ide-handover-tests--screen
+                                                provider backend '("cci-test update the changelog"))))
+                       (cons context '(:status draft :text "cci-test update the changelog"))))
+        (should (equal (cons context (claude-code-ide-handover--read-draft
+                                      provider (claude-code-ide-handover-tests--screen
+                                                provider backend '("cci-test update the changelog"
+                                                                   "and the README"))))
+                       (cons context '(:status draft :text "cci-test update the changelog\nand the README"))))
+        ;; An empty input
+        (should (equal (cons context (plist-get (claude-code-ide-handover--read-draft
+                                                 provider (claude-code-ide-handover-tests--screen
+                                                           provider backend nil))
+                                                :status))
+                       (cons context 'none)))
+        ;; The placeholders
+        (dolist (placeholder (if (eq provider 'claude)
+                                 '("Try \"refactor <filepath>\"" "Try \"fix lint errors\"")
+                               '("Ask Codex to do anything" "Explain this codebase"
+                                 "Find and fix a bug in @filename" "Implement {feature}")))
+          (should (equal (cons context (plist-get (claude-code-ide-handover--read-draft
+                                                   provider (claude-code-ide-handover-tests--screen
+                                                             provider backend (list placeholder)))
+                                                  :status))
+                         (cons context 'none))))))
+    ;; An unknown screen: unsure, never a draft
+    (let ((result (claude-code-ide-handover--read-draft provider "cci-test some output\nand more\n")))
+      (should (eq (plist-get result :status) 'unsure))
+      (should (stringp (plist-get result :why)))))
+  ;; A menu in the Claude Code box is no draft
+  (should (eq (plist-get (claude-code-ide-handover--read-draft
+                          'claude (claude-code-ide-handover-tests--screen 'claude 'vterm '("1. Yes")))
+                         :status)
+              'unsure))
+  ;; A Codex choice list is not the composer
+  (should (eq (plist-get (claude-code-ide-handover--read-draft
+                          'codex "  Allow the tool?\n› 1. Yes, proceed\n  2. No\n")
+                         :status)
+              'unsure))
+  ;; Another provider has no reader
+  (should (eq (plist-get (claude-code-ide-handover--read-draft 'cci-test-x "› cci-test text\n") :status)
+              'unsure)))
+
+(ert-deftest claude-code-ide-test-handover-source-draft-from-buffer ()
+  "The draft of a source comes from the screen of its terminal buffer."
+  (claude-code-ide-handover-tests--with
+    (let* ((instance (claude-code-ide-handover-tests--add "cci-test-src" 'claude worktree 'idle))
+           (run (claude-code-ide-handover--run-create :id "cci-test-run" :source-id "cci-test-src"
+                                                      :source-provider 'claude)))
+      (with-current-buffer (claude-code-ide-instance-buffer instance)
+        (insert (claude-code-ide-handover-tests--screen 'claude 'vterm '("cci-test the draft"))))
+      (should (equal (claude-code-ide-handover--source-draft run)
+                     '(:status draft :text "cci-test the draft")))
+      ;; No buffer: unsure
+      (claude-code-ide-instance-unregister "cci-test-src")
+      (should (eq (plist-get (claude-code-ide-handover--source-draft run) :status) 'unsure)))))
+
+(defmacro claude-code-ide-handover-tests--with-draft (draft &rest body)
+  "Run BODY with the screen read of the source giving DRAFT, a result plist."
+  (declare (indent 1))
+  `(cl-letf (((symbol-function 'claude-code-ide-handover--source-draft)
+              (lambda (&rest _) ,draft)))
+     ,@body))
+
+(defun claude-code-ide-handover-tests--document-of (id)
+  "Return the text of the handover document of ID, or nil."
+  (when-let* ((file (plist-get (claude-code-ide-handover-status id) :document)))
+    (with-temp-buffer (insert-file-contents file) (buffer-string))))
+
+(defconst claude-code-ide-handover-tests--draft-heading
+  "## The user's unsent prompt (not sent to the source)"
+  "Heading of the part of the document with a carried draft.")
+
+(ert-deftest claude-code-ide-test-handover-unsent-draft-coordinator ()
+  "With `ask', a coordinator handover with a draft needs a person before the stop."
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (claude-code-ide-handover-tests--with-draft '(:status draft :text "cci-test my draft")
+      (let ((id (plist-get (claude-code-ide-handover-session "cci-test-src" 'cci-test-b) :handover-id)))
+        (claude-code-ide-handover-tests--run-timers)
+        (let ((status (claude-code-ide-handover-status id)))
+          (should (eq (plist-get status :status) 'needs-user))
+          (should (eq (plist-get status :reason) 'unsent-draft))
+          (should (eq (plist-get status :stage) 'quiescing))
+          (should (equal (plist-get status :draft) "cci-test my draft")))
+        (should (equal (mapcar #'cadr (claude-code-ide-handover--choices
+                                       (gethash id claude-code-ide-handover--runs)))
+                       '(carry drop cancel)))
+        ;; The source was not stopped, and the record keeps the draft
+        (should-not claude-code-ide-handover-tests--stops)
+        (should (equal (alist-get 'draft_text (claude-code-ide-handover-tests--record "cci-test-src"))
+                       "cci-test my draft"))))))
+
+(ert-deftest claude-code-ide-test-handover-unsent-draft-choices ()
+  "Carry puts the draft in the document; drop records it; cancel keeps the source running."
+  (dolist (choice '(carry drop cancel))
+    (claude-code-ide-handover-tests--with
+      (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+      (claude-code-ide-handover-tests--with-draft '(:status draft :text "cci-test my draft\nsecond line")
+        (let ((id (plist-get (claude-code-ide-handover-session "cci-test-src" 'cci-test-b) :handover-id)))
+          (claude-code-ide-handover-tests--run-timers)
+          (should (eq (plist-get (claude-code-ide-handover-status id) :reason) 'unsent-draft))
+          (claude-code-ide-handover-resolve id choice)
+          (claude-code-ide-handover-tests--run-timers)
+          (let ((status (claude-code-ide-handover-status id))
+                (record (claude-code-ide-handover-tests--record "cci-test-src")))
+            (pcase choice
+              ('carry
+               (should (eq (plist-get status :stage) 'target-started))
+               (should (equal claude-code-ide-handover-tests--stops '("cci-test-src")))
+               (should (equal (alist-get 'draft_decision record) "carry"))
+               (let ((document (claude-code-ide-handover-tests--document-of id)))
+                 (should (string-match-p (regexp-quote claude-code-ide-handover-tests--draft-heading)
+                                         document))
+                 (should (string-match-p "^> cci-test my draft\n> second line$" document))
+                 (should (string-match-p "next request" document))))
+              ('drop
+               (should (eq (plist-get status :stage) 'target-started))
+               (should (equal (alist-get 'draft_decision record) "drop"))
+               ;; Nothing is lost for good: the record keeps the text
+               (should (equal (alist-get 'draft_text record) "cci-test my draft\nsecond line"))
+               (should-not (string-match-p (regexp-quote claude-code-ide-handover-tests--draft-heading)
+                                           (claude-code-ide-handover-tests--document-of id))))
+              ('cancel
+               (should (eq (plist-get status :status) 'cancelled))
+               (should-not claude-code-ide-handover-tests--stops)
+               (should-not claude-code-ide-handover-tests--starts)
+               (should (claude-code-ide-instance-by-id "cci-test-src"))))))))))
+
+(ert-deftest claude-code-ide-test-handover-unsent-draft-option-values ()
+  "carry, drop and refuse decide without a question; no draft and unsure go on."
+  (dolist (case '((carry draft target-started "carry")
+                  (drop draft target-started "drop")
+                  (refuse draft cancelled nil)
+                  (ask none target-started "none")
+                  (ask unsure target-started "unsure")))
+    (claude-code-ide-handover-tests--with
+      (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+      (let ((claude-code-ide-handover-unsent-draft (nth 0 case)))
+        (claude-code-ide-handover-tests--with-draft
+            (pcase (nth 1 case)
+              ('draft '(:status draft :text "cci-test my draft"))
+              ('none '(:status none))
+              ('unsure '(:status unsure :why "cci-test: no input box on the screen")))
+          (cl-letf (((symbol-function 'read-multiple-choice)
+                     (lambda (&rest _) (error "No question expected"))))
+            (let ((id (plist-get (claude-code-ide-handover-session "cci-test-src" 'cci-test-b)
+                                 :handover-id)))
+              (claude-code-ide-handover-tests--run-timers)
+              (let ((status (claude-code-ide-handover-status id))
+                    (record (claude-code-ide-handover-tests--record "cci-test-src")))
+                (if (eq (nth 2 case) 'cancelled)
+                    (progn
+                      (should (eq (plist-get status :status) 'cancelled))
+                      (should (eq (plist-get status :reason) 'unsent-draft))
+                      (should-not claude-code-ide-handover-tests--stops))
+                  (should (eq (plist-get status :stage) (nth 2 case))))
+                (should (equal (alist-get 'draft_decision record) (nth 3 case)))
+                (when (eq (nth 1 case) 'unsure)
+                  (should (equal (alist-get 'draft_unsure record)
+                                 "cci-test: no input box on the screen")))))))))))
+
+(ert-deftest claude-code-ide-test-handover-unsent-draft-interactive ()
+  "An interactive handover shows the draft and asks before the stop."
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (let ((prompts nil))
+      (claude-code-ide-handover-tests--with-draft '(:status draft :text "cci-test my draft")
+        (cl-letf (((symbol-function 'read-multiple-choice)
+                   (lambda (prompt choices &rest _)
+                     (push prompt prompts)
+                     (should (equal (mapcar #'car choices) '(?t ?d ?c)))
+                     (assq ?t choices))))
+          (let ((id (plist-get (claude-code-ide-handover-session "cci-test-src" 'cci-test-b :interactive t)
+                               :handover-id)))
+            (claude-code-ide-handover-tests--run-timers)
+            (should (= (length prompts) 1))
+            (should (string-match-p "cci-test my draft" (car prompts)))
+            ;; Carried: the source stopped after the answer
+            (should (equal claude-code-ide-handover-tests--stops '("cci-test-src")))
+            (should (string-match-p (regexp-quote claude-code-ide-handover-tests--draft-heading)
+                                    (claude-code-ide-handover-tests--document-of id)))))))))
+
+(ert-deftest claude-code-ide-test-handover-unsent-draft-recovery ()
+  "A crash while the draft decision waits: the recovery cancels, and the record keeps the draft."
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (claude-code-ide-handover-tests--with-draft '(:status draft :text "cci-test my draft")
+      (let ((id (plist-get (claude-code-ide-handover-session "cci-test-src" 'cci-test-b) :handover-id)))
+        (claude-code-ide-handover-tests--run-timers)
+        (should (eq (plist-get (claude-code-ide-handover-status id) :reason) 'unsent-draft))
+        ;; The crash
+        (setq claude-code-ide-instance--all nil)
+        (clrhash claude-code-ide-handover--runs)
+        (claude-code-ide-handover-recover)
+        (claude-code-ide-handover-tests--run-timers)
+        (let ((status (claude-code-ide-handover-status id)))
+          (should (eq (plist-get status :status) 'cancelled))
+          (should (eq (plist-get status :reason) 'recovered-before-stop))
+          (should (equal (plist-get status :draft) "cci-test my draft")))
+        (should (equal (alist-get 'draft_text (claude-code-ide-handover-tests--record "cci-test-src"))
+                       "cci-test my draft"))
+        (should-not claude-code-ide-handover-tests--starts)))))
+
 (provide 'claude-code-ide-handover-tests)
 
 ;;; claude-code-ide-handover-tests.el ends here

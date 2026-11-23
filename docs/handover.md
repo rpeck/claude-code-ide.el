@@ -114,7 +114,7 @@ Emacs saves each stage in the registry entry of the source **before** the step o
 | Stage | Step |
 |---|---|
 | `requested` | The handover is recorded. |
-| `quiescing` | The inbox delivery to the source is held (`claude-code-ide-control-hold`): no queued prompt goes to it from now on. When the inbox sent a prompt to the source whose acknowledgement did not come, the status events are drained, and the stop waits up to `claude-code-ide-handover-ack-wait` (10 s) for it. Wait until the source is idle, failed (for example at a quota limit), or waits for an answer to a question. With `:interrupt`, interrupt it one time. Subagents or background tasks cancel the handover, unless it is forced. After `claude-code-ide-handover-quiesce-timeout` (600 s), the handover is cancelled. |
+| `quiescing` | The inbox delivery to the source is held (`claude-code-ide-control-hold`): no queued prompt goes to it from now on. When the inbox sent a prompt to the source whose acknowledgement did not come, the status events are drained, and the stop waits up to `claude-code-ide-handover-ack-wait` (10 s) for it. Wait until the source is idle, failed (for example at a quota limit), or waits for an answer to a question. With `:interrupt`, interrupt it one time. Subagents or background tasks cancel the handover, unless it is forced. After `claude-code-ide-handover-quiesce-timeout` (600 s), the handover is cancelled. When the source is quiet, the handover reads its screen for an unsent draft (see "An unsent draft" below) before the stop. |
 | `source-stopped` | `claude-code-ide-process-stop-later` ends the source and its process tree, with the soft end of its provider, and then scans the worktree. The handover goes past this stage only when the source no longer runs in this Emacs (see "The source must end" below), whatever the stop result says. |
 | `document-written` | `claude-code-ide-transcript-handover-document` makes the document. Emacs writes it to `<worktree>/.handover/<id>.md` (mode 0600) and records its hash. Emacs adds `.handover/` to the Git exclude file of the worktree. |
 | `target-started` | Never while the source still runs in this Emacs, also not at a recovery. The target ID is saved first; while the registry is busy, the start waits. The target starts with the provider's launch, or its fork, with the start prompt (below). Its chain is saved with its own leg pending; while the registry is busy, that save is tried again every second. |
@@ -177,6 +177,22 @@ Emacs saves each stage in the registry entry of the source **before** the step o
 
 - **After a recovery,** a resumed target that lacks the document gets the pointer as the first prompt of its resume (`claude --resume ID -- PROMPT`, `codex resume ID PROMPT`). Only a target that already runs gets it through `claude-code-ide-control-submit`, with the request ID of the handover (or `handover-<id>`) and `:queue t`.
 
+## An unsent draft
+
+The user may have typed a prompt into the source without sending it. The stop would lose it, and the document would not carry it.
+
+- **The check.** In the quiescing, when the source is quiet and before the stop, the handover reads the terminal screen of the source (`claude-code-ide-handover--source-draft`). It uses the screen read of the Codex dialogs, which knows the terminal size of vterm, eat and ghostel. It runs once; its result is kept in the run.
+  - **Claude Code:** the text in the input box: between the last two box rules (a line of `─`, or the older `╭─╮` and `╰─╯` box with its `│` borders), after the prompt marker `❯` (or `>` in the older box). Continuation lines lose their two spaces of indent.
+  - **Codex:** the text of the composer: the last line that starts with `›` and is not a numbered choice, with its indented continuation lines up to the next empty line.
+  - **Placeholders** of an empty box are no draft (`claude-code-ide-handover-draft-placeholders`): Claude Code's `Try "..."` suggestions, and Codex's "Ask Codex to do anything" and its other suggestions.
+  - **Unsure.** A screen without an input box, a menu in the box, a source without a terminal buffer, or a provider without a reader counts as no draft. The record says that the check was unsure (`draft_decision` `unsure`, with `draft_unsure`).
+- **The option `claude-code-ide-handover-unsent-draft`:**
+  - `ask` (the default): an interactive handover shows the draft and asks before the stop. A coordinator call gets `needs-user` with the reason `unsent-draft`, the stage `quiescing`, and `:draft` in its status. The choices: `carry`, `drop`, `cancel` (see the table below).
+  - `carry`: the document gets the part "The user's unsent prompt (not sent to the source)", with the draft quoted as data, and the instruction to treat it as the user's next request after the state summary. With the continue prompt, the target takes it up.
+  - `drop`: go on without it. The record keeps its text (`draft_text`, `draft_decision` `drop`), so nothing is lost for good.
+  - `refuse`: cancel the handover with the reason `unsent-draft`; the source keeps running with its draft.
+- **The record** keeps `draft_text`, `draft_decision` (`none`, `unsure`, `carry` or `drop`) and `draft_unsure`. A crash while the decision waits is a crash before the stop: the recovery cancels the handover (`recovered-before-stop`), and the record and the status keep the draft.
+
 ## Stray processes
 
 ### The source must end
@@ -216,6 +232,7 @@ Emacs saves each stage in the registry entry of the source **before** the step o
 | `target-exited` | `retry` (scan the worktree, then start the target again, with the same instance ID and document), `cancel`. |
 | `start-failed`, `step-failed` | `retry` (run the stage again; a target that runs and waits for its document is taken up again, never started twice; from the stage `delivered` on, the commit runs again), `cancel`. |
 | `registry-entry-missing` | `cancel`. |
+| `unsent-draft` | `carry` (the document carries the draft as the user's next request), `drop` (go on; the record keeps the text), `cancel` (the source keeps running with its draft). |
 | `continue-failed` | The stage is `committed`, but the inbox did not take the continue prompt. `retry` (commit again, which sends the prompt with the same request ID), `skip` (finish without the prompt). No `cancel`. The same two choices hold for every reason after the commit saved the chain (`chain_saved`), because a cancel would stop the target, which the chain names. |
 
 - `end` signals a process only while it runs with the start time of the scan, within the one second of `claude-code-ide-session-registry--same-start-p`. An unknown start time, at the scan or now, never matches.
@@ -454,6 +471,8 @@ The handover fields are in schema version 4, in its own file (`claude-code-ide-s
 | `claude-code-ide-handover-budget` | nil | The size budget of the document. |
 | `claude-code-ide-handover-recover-at-start` | t | Continue the interrupted handovers when the registry mode turns on. With nil, only the early ones are cancelled then. |
 | `claude-code-ide-handover-continue` | `ask` | Whether the target goes on with the task after the commit: `ask` (the interactive handover asks y/n/a/v; a coordinator or Lisp call counts as `always`), `always`, or `never` (the target waits for your prompt). See "The target goes on". |
+| `claude-code-ide-handover-unsent-draft` | `ask` | What the handover does with an unsent prompt in the input box of the source: `ask`, `carry`, `drop` or `refuse`. See "An unsent draft". |
+| `claude-code-ide-handover-draft-placeholders` | (list) | Regexps of the placeholder texts of an empty input box, which are no draft. |
 | `claude-code-ide-handover-unsaved-target` | `fresh` | What the recovery does with an identified target that never saved its conversation: `fresh` starts it fresh with the same IDs and document, `ask` resumes it as before and then asks a person (`target-exited`). See "An unsaved target". |
 | `claude-code-ide-handover-enable-request-tool` | t | Give the agents the tool `request_handover`. |
 

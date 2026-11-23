@@ -149,6 +149,48 @@ A target with a saved conversation is resumed in both cases."
                  (const :tag "Resume as before, then ask a person" ask))
   :group 'claude-code-ide-handover)
 
+(defcustom claude-code-ide-handover-unsent-draft 'ask
+  "What a handover does with an unsent prompt in the input box of the source.
+Before the stop, when the source is idle, the handover reads its
+terminal screen (`claude-code-ide-handover--source-draft').  A text in
+the input box of Claude Code, or in the composer of Codex, that the user
+did not send would be lost by the stop.
+- `ask': an interactive handover shows the draft and asks before the
+  stop: carry it to the target, drop it, or cancel (the source keeps
+  running with its draft).  A coordinator call gets the status
+  needs-user with the reason `unsent-draft' and the draft in its
+  status, with the same choices through
+  `claude-code-ide-handover-resolve'.
+- `carry': put the draft in the handover document, as the user's next
+  request after the state summary of the target.
+- `drop': go on without it.  The handover record keeps its text.
+- `refuse': cancel the handover; the source keeps running with it.
+A screen that cannot be read counts as no draft, and the record says
+that the check was unsure."
+  :type '(choice (const :tag "Ask" ask)
+                 (const :tag "Carry it to the target" carry)
+                 (const :tag "Drop it (the record keeps it)" drop)
+                 (const :tag "Refuse the handover" refuse))
+  :group 'claude-code-ide-handover)
+
+(defcustom claude-code-ide-handover-draft-placeholders
+  '("\\`Try \"[^\"]*\"\\'"
+    "\\`Ask Codex to do anything\\'"
+    "\\`Explain this codebase\\'"
+    "\\`Summarize recent commits\\'"
+    "\\`Implement {feature}\\'"
+    "\\`Find and fix a bug in @filename\\'"
+    "\\`Write tests for @filename\\'"
+    "\\`Improve documentation in @filename\\'"
+    "\\`Run /review on my current changes\\'"
+    "\\`Use /skills to list available skills\\'")
+  "Regexps of the placeholder texts of an empty input box.
+Claude Code shows a suggestion such as Try \"fix lint errors\", and
+Codex shows a suggestion such as Ask Codex to do anything.  A screen
+read sees no draft when the whole input matches one of them."
+  :type '(repeat regexp)
+  :group 'claude-code-ide-handover)
+
 (defcustom claude-code-ide-handover-continue 'ask
   "Whether the target goes on with the task after a handover commits.
 The target reads its document, writes its state summary and replies
@@ -228,6 +270,9 @@ Emacs asks you whether to hand over."
   (force nil :documentation "Non-nil to go on while subagents or tasks run.")
   (interactive nil :documentation "Non-nil when a person started it in Emacs.")
   (continue nil :documentation "Non-nil to send the continue prompt to the target at the commit.")
+  (draft nil :documentation "The unsent prompt that the screen of the source showed, or nil.")
+  (draft-decision nil :documentation "`none', `unsure', `carry' or `drop', or nil before the check.")
+  (draft-unsure nil :documentation "Why the draft check was unsure, or nil.")
   (continue-sent nil :documentation "Non-nil after the inbox of the target accepted the continue prompt.")
   (chain-saved nil :documentation "Non-nil after the commit saved the chain of the target.")
   (missing-entry nil :documentation "`source' or `target': the registry entry that a save missed, or nil.")
@@ -362,6 +407,10 @@ while a handover holds the worktree.")
                                             (claude-code-ide-handover--run-strays run)))))
            (cons 'interactive (and (claude-code-ide-handover--run-interactive run) t))
            (cons 'continue (and (claude-code-ide-handover--run-continue run) t))
+           (cons 'draft_text (claude-code-ide-handover--run-draft run))
+           (cons 'draft_decision (claude-code-ide-handover--name
+                                  (claude-code-ide-handover--run-draft-decision run)))
+           (cons 'draft_unsure (claude-code-ide-handover--run-draft-unsure run))
            (cons 'continue_sent (and (claude-code-ide-handover--run-continue-sent run) t))
            (cons 'chain_saved (and (claude-code-ide-handover--run-chain-saved run) t))
            ;; The owner of the run: this Emacs
@@ -410,6 +459,9 @@ while a handover holds the worktree.")
      :interactive (alist-get 'interactive alist)
      ;; An older record has no field: the old behavior, no prompt
      :continue (eq (alist-get 'continue alist) t)
+     :draft (alist-get 'draft_text alist)
+     :draft-decision (claude-code-ide-handover--symbol (alist-get 'draft_decision alist))
+     :draft-unsure (alist-get 'draft_unsure alist)
      :continue-sent (eq (alist-get 'continue_sent alist) t)
      :chain-saved (eq (alist-get 'chain_saved alist) t)
      :owner (claude-code-ide-session-registry--handover-owner alist)
@@ -516,6 +568,8 @@ document after a crash still has the context."
          :target-provider (claude-code-ide-handover--run-target-provider run)
          :method (claude-code-ide-handover--run-method run)
          :continue (claude-code-ide-handover--run-continue run)
+         :draft (claude-code-ide-handover--run-draft run)
+         :draft-decision (claude-code-ide-handover--run-draft-decision run)
          :reason (claude-code-ide-handover--run-reason run)
          :message (claude-code-ide-handover--run-message run)
          :document (claude-code-ide-handover--run-document run)
@@ -1242,6 +1296,153 @@ counts."
                     (claude-code-ide-control--pending-records source))
            (< (float-time) (claude-code-ide-handover--run-ack-deadline run))))))
 
+(declare-function claude-code-ide-codex--screen-text "claude-code-ide-codex" (buffer))
+
+(defun claude-code-ide-handover--screen-text (buffer)
+  "Return the text of the terminal screen of BUFFER.
+The screen read of the Codex dialogs (`claude-code-ide-codex--screen-text')
+knows the size of the terminal of each backend (vterm, eat, ghostel);
+without it, the screen is the last 50 lines of BUFFER."
+  (if (fboundp 'claude-code-ide-codex--screen-text)
+      (claude-code-ide-codex--screen-text buffer)
+    (with-current-buffer buffer
+      (save-excursion
+        (goto-char (point-max))
+        (forward-line -49)
+        (buffer-substring-no-properties (line-beginning-position) (point-max))))))
+
+(defun claude-code-ide-handover--screen-lines (text)
+  "Return the lines of the screen TEXT, without trailing spaces.
+A no-break space counts as a space, and a carriage return is dropped,
+so the screens of the backends read alike."
+  (mapcar (lambda (line) (string-trim-right line))
+          (split-string (replace-regexp-in-string
+                         "\r" "" (replace-regexp-in-string " " " " text))
+                        "\n")))
+
+(defun claude-code-ide-handover--placeholder-p (text)
+  "Return non-nil when TEXT is a placeholder of an empty input box.
+See `claude-code-ide-handover-draft-placeholders'."
+  (let ((case-fold-search nil))
+    (cl-some (lambda (regexp) (string-match-p regexp text))
+             claude-code-ide-handover-draft-placeholders)))
+
+(defun claude-code-ide-handover--draft-result (lines)
+  "Return the draft result of the input LINES (strings, already stripped)."
+  (let ((text (string-trim (string-join lines "\n"))))
+    (cond
+     ((string-empty-p text) (list :status 'none))
+     ((claude-code-ide-handover--placeholder-p text) (list :status 'none))
+     (t (list :status 'draft :text text)))))
+
+(defun claude-code-ide-handover--read-claude-draft (lines)
+  "Return the unsent draft in the Claude Code input box of the screen LINES.
+The input box is between the last two box rules: a line of ─ (Claude
+Code 2), or the lines ╭─...─╮ and ╰─...─╯ of the older box.  Its first
+line starts with the prompt marker ❯ (or > in the older box)."
+  (let* ((rule "\\`[ \t]*[╭╰]?─\\{8,\\}[╮╯]?\\'")
+         (rules (cl-loop for line in lines for index from 0
+                         when (string-match-p rule line) collect index))
+         (bottom (car (last rules)))
+         (top (car (last rules 2))))
+    (if (not (and top bottom (< top bottom)))
+        (list :status 'unsure :why "no input box of Claude Code on the screen")
+      (let* ((content (mapcar (lambda (line)
+                                ;; The borders of the older box: │ and its
+                                ;; space on the left, │ on the right
+                                (replace-regexp-in-string
+                                 "[ \t]*│\\'" ""
+                                 (replace-regexp-in-string "\\`[ \t]*│ ?" "" line)))
+                              (cl-subseq lines (1+ top) bottom)))
+             (first (car content)))
+        (cond
+         ((not (and first (string-match "\\`[ \t]*[❯>][ \t]?\\(.*\\)\\'" first)))
+          (list :status 'unsure :why "no prompt marker in the input box of Claude Code"))
+         ((string-match-p "\\`[0-9]+\\. " (match-string 1 first))
+          (list :status 'unsure :why "a menu, not an input, in the box of Claude Code"))
+         (t
+          (claude-code-ide-handover--draft-result
+           (cons (match-string 1 first)
+                 (mapcar (lambda (line) (replace-regexp-in-string "\\`  " "" line))
+                         (cdr content))))))))))
+
+(defun claude-code-ide-handover--read-codex-draft (lines)
+  "Return the unsent draft in the Codex composer of the screen LINES.
+The composer is the last line that starts with › and is not a numbered
+choice, with its continuation lines (two spaces in front) up to the
+next empty line."
+  (let ((start (cl-loop for line in lines for index from 0
+                        when (and (string-match "\\`›\\(?: \\(.*\\)\\)?\\'" line)
+                                  (not (string-match-p "\\`[0-9]+\\. " (or (match-string 1 line) ""))))
+                        maximize index)))
+    (if (not (and start (string-match-p "\\`›" (nth start lines))))
+        (list :status 'unsure :why "no composer of Codex on the screen")
+      (let ((first (progn (string-match "\\`›\\(?: \\(.*\\)\\)?\\'" (nth start lines))
+                          (or (match-string 1 (nth start lines)) "")))
+            (rest (cl-loop for line in (nthcdr (1+ start) lines)
+                           while (string-prefix-p "  " line)
+                           collect (substring line 2))))
+        (claude-code-ide-handover--draft-result (cons first rest))))))
+
+(defun claude-code-ide-handover--read-draft (provider text)
+  "Return the unsent draft that the terminal screen TEXT of PROVIDER shows.
+The result is (:status draft :text TEXT), (:status none), or (:status
+unsure :why WHY) when the screen cannot be read: an unknown screen, or a
+provider without a reader."
+  (let ((lines (claude-code-ide-handover--screen-lines text)))
+    (pcase provider
+      ('claude (claude-code-ide-handover--read-claude-draft lines))
+      ('codex (claude-code-ide-handover--read-codex-draft lines))
+      (_ (list :status 'unsure :why (format "no screen reader for the provider %s" provider))))))
+
+(defun claude-code-ide-handover--source-draft (run)
+  "Return the unsent draft of the source of RUN, from its terminal screen.
+See `claude-code-ide-handover--read-draft'.  A source without a live
+terminal buffer gives unsure."
+  (let* ((instance (claude-code-ide-instance-by-id (claude-code-ide-handover--run-source-id run)))
+         (buffer (and instance (claude-code-ide-instance-buffer instance))))
+    (if (not (buffer-live-p buffer))
+        (list :status 'unsure :why "the source has no terminal buffer")
+      (condition-case err
+          (claude-code-ide-handover--read-draft
+           (claude-code-ide-instance-provider instance)
+           (claude-code-ide-handover--screen-text buffer))
+        (error (list :status 'unsure :why (error-message-string err)))))))
+
+(defun claude-code-ide-handover--draft-cleared-p (run)
+  "Return non-nil when the stop of the source of RUN may go on, as for its draft.
+The first call reads the screen of the source; then
+`claude-code-ide-handover-unsent-draft' decides.  A decision is kept
+in the run, so the next call goes on at once.  With `ask', RUN needs a
+person (the reason `unsent-draft'); with `refuse', it is cancelled."
+  (or (claude-code-ide-handover--run-draft-decision run)
+      (let ((result (claude-code-ide-handover--source-draft run)))
+        (pcase (plist-get result :status)
+          ('draft
+           (setf (claude-code-ide-handover--run-draft run) (plist-get result :text))
+           (pcase claude-code-ide-handover-unsent-draft
+             ((or 'carry 'drop)
+              (setf (claude-code-ide-handover--run-draft-decision run)
+                    claude-code-ide-handover-unsent-draft)
+              t)
+             ('refuse
+              (claude-code-ide-handover--finish
+               run 'cancelled 'unsent-draft
+               "The source has an unsent prompt in its input box; the handover is refused, and the source keeps running with it")
+              nil)
+             (_
+              (claude-code-ide-handover--needs-user
+               run 'unsent-draft
+               "The source has an unsent prompt in its input box.  Carry it to the target, drop it (the record keeps it), or cancel (the source keeps running with it)")
+              nil)))
+          ('none
+           (setf (claude-code-ide-handover--run-draft-decision run) 'none)
+           t)
+          (_
+           (setf (claude-code-ide-handover--run-draft-decision run) 'unsure
+                 (claude-code-ide-handover--run-draft-unsure run) (plist-get result :why))
+           t)))))
+
 (defun claude-code-ide-handover--quiesce (run)
   "Wait until the source of RUN is quiet, then go to the stop.
 The inbox delivery to the source is held from now on, so that no
@@ -1269,11 +1470,12 @@ and the source stays current."
           (claude-code-ide-handover--quiet-state-p state)
           (and (claude-code-ide-handover--run-force run)
                (claude-code-ide-handover--busy-state-p state)))
-      (when instance
-        (setf (claude-code-ide-handover--run-source-leg run)
-              (claude-code-ide-handover--source-leg instance)))
-      (when (claude-code-ide-handover--enter run 'source-stopped)
-        (claude-code-ide-handover--stop run)))
+      (when (or (not live) (claude-code-ide-handover--draft-cleared-p run))
+        (when instance
+          (setf (claude-code-ide-handover--run-source-leg run)
+                (claude-code-ide-handover--source-leg instance)))
+        (when (claude-code-ide-handover--enter run 'source-stopped)
+          (claude-code-ide-handover--stop run))))
      ((claude-code-ide-handover--busy-state-p state)
       (claude-code-ide-handover--finish
        run 'cancelled 'busy "Subagents or background tasks run in the source; it stays current"))
@@ -1609,6 +1811,10 @@ would stop the current instance."
        (?c cancel "cancel the handover")))
     ('registry-entry-missing
      '((?c cancel "cancel the handover")))
+    ('unsent-draft
+     '((?t carry "carry it to the target, as your next request")
+       (?d drop "drop it; the handover record keeps its text")
+       (?c cancel "cancel; the source keeps running with its draft")))
     (_
      '((?r retry "try the stage again")
        (?c cancel "cancel the handover")))))
@@ -1633,10 +1839,17 @@ A stray in UNKNOWN gets the note \"owner unknown\"."
                     (format "Handover %s: %s%s\nWhat now? "
                             (claude-code-ide-handover--run-id run)
                             (claude-code-ide-handover--run-message run)
-                            (if strays
-                                (concat ":\n" (claude-code-ide-handover--describe-strays
-                                               strays (claude-code-ide-handover--unknown-strays run strays)))
-                              ""))
+                            (cond
+                             (strays
+                              (concat ":\n" (claude-code-ide-handover--describe-strays
+                                             strays (claude-code-ide-handover--unknown-strays run strays))))
+                             ((eq (claude-code-ide-handover--run-reason run) 'unsent-draft)
+                              (concat "\nThe unsent prompt:\n"
+                                      (mapconcat (lambda (line) (concat "  " line))
+                                                 (split-string (or (claude-code-ide-handover--run-draft run) "")
+                                                               "\n")
+                                                 "\n")))
+                             (t "")))
                     (mapcar (lambda (choice)
                               (list (nth 0 choice) (symbol-name (nth 1 choice)) (nth 2 choice)))
                             choices))))
@@ -1726,6 +1939,8 @@ ACTION is one of the choices that the handover offers:
 - `retry': run the stage again; a target that runs is taken up again,
   and a target that ended starts again after a scan of the worktree.
 - `skip': finish a committed handover without its continue prompt.
+- `carry', `drop': carry the unsent draft of the source to the target, or
+  drop it (the record keeps it); see `claude-code-ide-handover-unsent-draft'.
 - `cancel': cancel the handover; see `claude-code-ide-handover-cancel'.
 A handover that this Emacs does not run is taken over first (see
 `claude-code-ide-handover--adopt'; another live Emacs needs a yes).
@@ -1743,6 +1958,11 @@ Interactively, choose the handover and the action."
                                    (claude-code-ide-handover--choices run)))
         (user-error "Handover %s cannot %s now" handover-id action))
       (pcase action
+        ((or 'carry 'drop)
+         ;; The decision is kept; the quiescing goes on to the stop
+         (setf (claude-code-ide-handover--run-draft-decision run) action)
+         (claude-code-ide-handover--resume run)
+         (claude-code-ide-handover--schedule run 0))
         ('skip
          ;; Only the continue prompt goes; every other step of the
          ;; commit runs as for retry
@@ -1992,6 +2212,8 @@ nil when WORKTREE is not in Git."
    :source (claude-code-ide-handover--run-source-leg run)
    :chain (claude-code-ide-handover--run-chain run)
    :context (claude-code-ide-handover--run-context run)
+   :unsent-draft (and (eq (claude-code-ide-handover--run-draft-decision run) 'carry)
+                      (claude-code-ide-handover--run-draft run))
    :budget claude-code-ide-handover-budget
    :handover-id (claude-code-ide-handover--run-id run)
    :target-provider (claude-code-ide-handover--run-target-provider run)
