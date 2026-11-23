@@ -235,8 +235,6 @@ codex queue --thread=<native-id> --message=<text>
 
 ## Known limits
 
-- **The generic start still makes a WebSocket server and a lock file** for each Codex instance, and logs "Claude Code started in ...". `claude-code-ide--start-session` does this for every provider.
-- **The MCP connection fails** until the HTTP server replies `202 Accepted` to notifications (`feat/mcp-routing`).
 - **A launch with MCP headers waits** for `codex app-server` (0.3 to 1.3 s on this machine).
 - **Folder trust:** Codex asks for it one time for each new repository root. Emacs never answers it.
 
