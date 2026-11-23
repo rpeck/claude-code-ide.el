@@ -707,10 +707,14 @@ ghostel pipe; PID is the PID that it gives.  The proof:
 - the process PID runs as a child of this Emacs (ghostel forks the CLI
   itself), and leads its own process group, as the session leader of
   its terminal does;
-- no other process object of this Emacs has PID.
+- no other process object of this Emacs gives PID, by its
+  `process-id' or as the native child of a ghostel pipe
+  (`claude-code-ide-process--process-pid');
+- no descriptor of another terminal records PID.
 A reused PID fails it: a process that another program started has
-another parent, and a process that Emacs starts in other ways does not
-lead its own group or has its own process object.  Else return nil."
+another parent, a process that Emacs starts in other ways does not lead
+its own group or has its own process object, and a new terminal of this
+Emacs gives or records that PID.  Else return nil."
   (when (and (processp process)
              (process-live-p process)
              (eql (claude-code-ide-process--ghostel-pid process) pid))
@@ -719,11 +723,26 @@ lead its own group or has its own process object.  Else return nil."
                  (numberp (plist-get entry :start))
                  (eql (plist-get entry :ppid) (emacs-pid))
                  (eql (plist-get entry :pgid) pid)
-                 (not (cl-some (lambda (other)
-                                 (and (not (eq other process))
-                                      (eql (process-id other) pid)))
-                               (process-list))))
+                 (not (claude-code-ide-process--pid-of-another-p process pid)))
         (plist-get entry :start)))))
+
+(defun claude-code-ide-process--pid-of-another-p (process pid)
+  "Return non-nil when PID belongs to a terminal of this Emacs other than PROCESS.
+That is another process object whose PID lookup gives PID (also a
+ghostel pipe, whose CLI PID is not its `process-id'), or a descriptor
+whose terminal is not PROCESS and that records PID."
+  (or (cl-some (lambda (other)
+                 (and (not (eq other process))
+                      (eql (claude-code-ide-process--process-pid other) pid)))
+               (process-list))
+      (cl-some (lambda (instance)
+                 (let ((buffer (claude-code-ide-instance-buffer instance)))
+                   (and (not (and (buffer-live-p buffer)
+                                  (eq (get-buffer-process buffer) process)))
+                        (not (eq (process-buffer process) buffer))
+                        (eql (claude-code-ide-known-or-nil (claude-code-ide-instance-pid instance))
+                             pid))))
+               (claude-code-ide-instances))))
 
 ;;;###autoload
 (defun claude-code-ide-process-track (instance process)

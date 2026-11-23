@@ -402,6 +402,53 @@ start time; the next stop proves the start time and ends the CLI."
         (delete-process pipe)
         (kill-buffer buffer)))))
 
+(ert-deftest claude-code-ide-test-process-old-session-pid-of-another-terminal ()
+  "A PID that another terminal of this Emacs gives or records proves nothing.
+Ghostel pipes have no `process-id': their CLI PID comes from the child
+handle.  When the old CLI exited and another ghostel terminal got its
+PID, that process passes the parent and group checks; the proof must
+still refuse, so that no signal reaches the other terminal."
+  (dolist (other-gives '(pipe descriptor))
+    (claude-code-ide-process-tests--with-table
+        (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100))
+      (let* ((claude-code-ide-instance--all nil)
+             (buffer (generate-new-buffer " *cci-test-old*"))
+             (pipe (make-pipe-process :name "cci-test-old-pipe" :buffer buffer :noquery t))
+             (other-buffer (generate-new-buffer " *cci-test-other*"))
+             (other-pipe (make-pipe-process :name "cci-test-other-pipe" :buffer other-buffer :noquery t))
+             (instance (claude-code-ide-process-tests--old-session 'claude buffer "/nonexistent/cci-test-wt"))
+             (other (claude-code-ide-instance-register
+                     (claude-code-ide-instance-create
+                      :id "cci-test-other" :provider 'claude :buffer other-buffer
+                      :project-root "/nonexistent/cci-test-wt2" :worktree "/nonexistent/cci-test-wt2"))))
+        (unwind-protect
+            (progn
+              (process-put pipe 'ghostel--native-child 'cci-test-old-handle)
+              (pcase other-gives
+                ;; The other pipe gives the same PID through its child handle
+                ('pipe (process-put other-pipe 'ghostel--native-child 'cci-test-other-handle))
+                ;; The other descriptor records the PID from its start
+                ('descriptor (setf (claude-code-ide-instance-pid other) 100
+                                   (claude-code-ide-instance-process-start-time other)
+                                   claude-code-ide-process-tests--start)))
+              (cl-letf (((symbol-function 'ghostel--native-child-pid)
+                         (lambda (handle)
+                           (and (memq handle '(cci-test-old-handle cci-test-other-handle)) 100))))
+                (should-not (claude-code-ide-process--terminal-child-start pipe 100))
+                (let ((result (claude-code-ide-process-stop instance :scan nil)))
+                  (should-not (cl-find-if (lambda (s) (memql (car s) '(100 -100)))
+                                          claude-code-ide-process-tests--signals))
+                  (should (cl-find 'unverified (plist-get result :strays)
+                                   :key (lambda (s) (plist-get s :reason))))))
+              (should (equal (list other-gives (claude-code-ide-known-or-nil
+                                                (claude-code-ide-instance-process-start-time instance)))
+                             (list other-gives nil)))
+              (should (claude-code-ide-process-tests--find 100)))
+          (delete-process pipe)
+          (delete-process other-pipe)
+          (kill-buffer buffer)
+          (kill-buffer other-buffer))))))
+
 (ert-deftest claude-code-ide-test-process-old-session-no-proof ()
   "A PID from the terminal process gets no start time without proof.
 The proof is that its process is a child of this Emacs that leads its
