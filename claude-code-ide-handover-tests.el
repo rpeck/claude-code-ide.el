@@ -31,6 +31,7 @@
 (require 'claude-code-ide-handover)
 (require 'claude-code-ide-session-status)
 (require 'claude-code-ide-codex)
+(require 'claude-code-ide-process-tests)
 
 (declare-function claude-code-ide-tests--wait-until "claude-code-ide-tests")
 (defvar claude-code-ide-session-registry-mode)
@@ -194,6 +195,8 @@ BODY can use `worktree', the folder of a Git repository."
           (claude-code-ide-control--held nil)
           (claude-code-ide-instance--all nil)
           (claude-code-ide-instance--generations (make-hash-table :test 'equal))
+          ;; No MCP session of another test counts as a live session
+          (claude-code-ide-mcp--sessions (make-hash-table :test 'equal))
           (claude-code-ide-instance-state-functions
            (list #'claude-code-ide-handover-tests--state-function))
           (claude-code-ide-event-functions (list #'claude-code-ide-handover--on-event
@@ -2370,6 +2373,27 @@ makes the second submit a duplicate."
       (should-not (plist-get (claude-code-ide-handover-status id) :target-id))
       (should-not claude-code-ide-handover-tests--sent))))
 
+(ert-deftest claude-code-ide-test-handover-method-question ()
+  "The method question: RET and f fork, n starts a new conversation.
+Any other key is refused, and the question asks again."
+  (dolist (case '(("\r" fork) ("f" fork) ("n" fresh) ("xzn" fresh) ("x\r" fork)))
+    (let ((unread-command-events (listify-key-sequence (car case))))
+      (should (eq (claude-code-ide-handover--read-method 'claude) (nth 1 case)))
+      (should-not unread-command-events))))
+
+(ert-deftest claude-code-ide-test-handover-method-question-text ()
+  "The method question names the target provider and says what each choice means."
+  (let (prompt keys)
+    (cl-letf (((symbol-function 'read-multiple-choice)
+               (lambda (text choices &rest _)
+                 (setq prompt text keys (mapcar #'car choices))
+                 (assq ?\r choices))))
+      (should (eq (claude-code-ide-handover--read-method 'claude) 'fork)))
+    (should (equal keys '(?f ?n ?\r)))
+    (should (string-match-p "Claude Code" prompt))
+    (should (string-match-p "full history" prompt))
+    (should (string-match-p "only the handover document" prompt))))
+
 (ert-deftest claude-code-ide-test-handover-continue-question ()
   "With `ask', the interactive question gives y, n, a or v; a and v save the option.
 With `always' or `never', nothing is asked."
@@ -3183,6 +3207,201 @@ starts."
       (should (eq (plist-get (claude-code-ide-handover-status id) :stage) 'target-started))
       (claude-code-ide-handover-tests--deliver result)
       (should (eq (plist-get (claude-code-ide-handover-status id) :status) 'committed)))))
+
+;;; Other sessions in the working tree
+
+(defun claude-code-ide-handover-tests--session (id directory &optional cleanup-done)
+  "Add a live MCP session ID in DIRECTORY without an instance descriptor.
+CLEANUP-DONE non-nil makes it a session after its cleanup.  Return it."
+  (let ((buffer (generate-new-buffer (format "*cci-test-session-%s*" id)))
+        (session nil))
+    (push buffer claude-code-ide-handover-tests--buffers)
+    (setq session (make-claude-code-ide-mcp-session
+                   :session-id id :buffer buffer :project-dir directory
+                   :cleanup-done cleanup-done))
+    (puthash id session claude-code-ide-mcp--sessions)
+    session))
+
+(defun claude-code-ide-handover-tests--preflight-reason (id &optional force)
+  "Return the preflight reason of a handover of ID to cci-test-b, or nil.
+FORCE is the :force of the handover."
+  (plist-get (claude-code-ide-handover--preflight
+              (claude-code-ide-instance-by-id id) 'cci-test-b force nil)
+             :reason))
+
+(ert-deftest claude-code-ide-test-handover-other-session-in-same-tree ()
+  "The `other-instance' check sees live sessions and instances in a subfolder.
+A subfolder without its own repository is the same working tree.  A
+live MCP session without a descriptor counts there too; :force goes on."
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (let ((sub (file-name-as-directory (expand-file-name "src/module" worktree))))
+      (make-directory sub t)
+      (claude-code-ide-handover-tests--session "cci-test-old" sub)
+      (let ((refused (claude-code-ide-handover-session "cci-test-src" 'cci-test-b)))
+        (should (eq (plist-get refused :reason) 'other-instance))
+        (should (string-match-p "cci-test-old" (plist-get refused :message))))
+      (should-not (claude-code-ide-handover-tests--preflight-reason "cci-test-src" t))
+      (remhash "cci-test-old" claude-code-ide-mcp--sessions)
+      ;; A live instance in the subfolder
+      (claude-code-ide-handover-tests--add "cci-test-sub" 'cci-test-a sub 'idle)
+      (should (eq (claude-code-ide-handover-tests--preflight-reason "cci-test-src")
+                  'other-instance)))))
+
+(ert-deftest claude-code-ide-test-handover-strays-of-other-sessions ()
+  "A process of another live MCP session of this Emacs is never a stray.
+The scan tags it with :session-id; the session has no descriptor, as
+one that an older version of the package started.  A process of the
+source's own session, or of a session after its cleanup, stays a stray."
+  (claude-code-ide-handover-tests--with
+    (let* ((source (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle))
+           (own (make-claude-code-ide-mcp-session :session-id "cci-test-own"
+                                                  :buffer (claude-code-ide-instance-buffer source)
+                                                  :project-dir worktree))
+           (elsewhere (claude-code-ide-handover-tests--other "elsewhere"))
+           (signals nil))
+      (setf (claude-code-ide-instance-session source) own)
+      (puthash "cci-test-own" own claude-code-ide-mcp--sessions)
+      (claude-code-ide-handover-tests--session "cci-test-old" elsewhere)
+      (claude-code-ide-handover-tests--session "cci-test-done" elsewhere t)
+      (let ((claude-code-ide-handover-tests--scan-strays
+             (list (list :pid 99981 :command "cci-test-old-cli" :cwd worktree :reason 'worktree
+                         :session-id "cci-test-old" :start 1.0)
+                   (list :pid 99982 :command "cci-test-own-child" :cwd worktree :reason 'worktree
+                         :session-id "cci-test-own" :start 1.0)
+                   (list :pid 99983 :command "cci-test-done-child" :cwd worktree :reason 'worktree
+                         :session-id "cci-test-done" :start 1.0)
+                   (list :pid 99984 :command "cci-test-stray" :cwd worktree :reason 'worktree
+                         :start 1.0))))
+        (setq claude-code-ide-handover-tests--stop-result
+              (list :status 'strays :strays claude-code-ide-handover-tests--scan-strays))
+        (let ((id (plist-get (claude-code-ide-handover-session "cci-test-src" 'cci-test-b)
+                             :handover-id)))
+          (claude-code-ide-handover-tests--run-timers)
+          (let ((status (claude-code-ide-handover-status id)))
+            (should (eq (plist-get status :status) 'needs-user))
+            (should (equal (mapcar (lambda (s) (plist-get s :pid)) (plist-get status :strays))
+                           '(99982 99983 99984))))
+          (cl-letf (((symbol-function 'claude-code-ide-handover--stray-alive-p) (lambda (_) t))
+                    ((symbol-function 'signal-process)
+                     (lambda (pid signal) (push (cons pid signal) signals) 0)))
+            (setq claude-code-ide-handover-tests--scan-strays
+                  (list (car claude-code-ide-handover-tests--scan-strays)))
+            (claude-code-ide-handover-resolve id 'end)
+            (claude-code-ide-handover-tests--run-timers))
+          (should-not (assq 99981 signals))
+          (should (assq 99984 signals))
+          (should (eq (plist-get (claude-code-ide-handover-status id) :stage) 'target-started)))))))
+
+;;; Linked Git worktrees
+
+(defun claude-code-ide-handover-tests--linked-repo (repo worktrees)
+  "Make the Git repository REPO with one commit and the linked WORKTREES.
+Each of WORKTREES is (FOLDER . BRANCH); `git worktree add' makes it."
+  (make-directory repo t)
+  (should (eql 0 (claude-code-ide-handover-tests--git repo "init" "-q")))
+  (should (eql 0 (claude-code-ide-handover-tests--git
+                  repo "-c" "user.name=cci-test" "-c" "user.email=cci-test@example.invalid"
+                  "commit" "-q" "--allow-empty" "-m" "cci-test")))
+  (dolist (worktree worktrees)
+    (should (eql 0 (claude-code-ide-handover-tests--git
+                    repo "worktree" "add" "-q" "-b" (cdr worktree) (car worktree))))))
+
+(defun claude-code-ide-handover-tests--strays-of-source (directory folders)
+  "Return the FOLDERS with a stray process for a source in DIRECTORY.
+The scan covers the worktree of a handover of DIRECTORY
+\(`claude-code-ide-handover--directory-key').  One process runs in each
+of FOLDERS, which are absolute and get their true names, as lsof
+gives them."
+  (dolist (folder folders)
+    (make-directory folder t))
+  (let* ((pids (number-sequence 800 (+ 799 (length folders))))
+         (strays (claude-code-ide-process-tests--stray-pids
+                  (claude-code-ide-handover--directory-key directory)
+                  (cl-mapcar (lambda (pid folder) (cons pid (file-truename folder)))
+                             pids folders))))
+    (cl-loop for pid in pids for folder in folders
+             when (memql pid strays) collect folder)))
+
+(defmacro claude-code-ide-handover-tests--with-tmp (&rest body)
+  "Run BODY with `tmp', a new temporary folder that a link reaches.
+The folder is the link, as macOS reaches /private/var through /var."
+  (declare (indent 0))
+  `(let* ((real (make-temp-file "cci-test-linked-" t))
+          (tmp (concat real "-link")))
+     (unwind-protect
+         (progn (make-symbolic-link real tmp) ,@body)
+       (ignore-errors (delete-file tmp))
+       (delete-directory real t))))
+
+(ert-deftest claude-code-ide-test-handover-linked-worktrees-inside ()
+  "Worktrees inside the repository (layout A): each tree keeps its own strays.
+A source in the main checkout does not get the processes of
+.worktrees/feat-x or .worktrees/fix/y; a source in feat-x gets only
+those of feat-x.  The root of feat-x is feat-x, whose .git is a file."
+  (skip-unless (executable-find "git"))
+  (claude-code-ide-handover-tests--with-tmp
+    (let* ((repo (expand-file-name "repo" tmp))
+           (feat (expand-file-name ".worktrees/feat-x" repo))
+           (fix (expand-file-name ".worktrees/fix/y" repo)))
+      (claude-code-ide-handover-tests--linked-repo repo `((,feat . "feat-x") (,fix . "fix/y")))
+      (should (file-regular-p (expand-file-name ".git" feat)))
+      (should (equal (claude-code-ide--worktree-root feat) (file-name-as-directory feat)))
+      (should (equal (claude-code-ide--worktree-root (expand-file-name "sub" feat))
+                     (file-name-as-directory feat)))
+      (let ((src (expand-file-name "src" repo))
+            (feat-sub (expand-file-name "sub" feat))
+            (fix-sub (expand-file-name "a/b" fix)))
+        (should (equal (claude-code-ide-handover-tests--strays-of-source
+                        repo (list feat feat-sub fix fix-sub src repo))
+                       (list src repo)))
+        (should (equal (claude-code-ide-handover-tests--strays-of-source
+                        feat (list feat-sub feat repo src fix))
+                       (list feat-sub feat)))))))
+
+(ert-deftest claude-code-ide-test-handover-linked-worktrees-outside ()
+  "Worktrees outside the repository (layout B): each tree keeps its own strays.
+A source in worktrees/repo/feat-x gets only the processes there.  A
+source in worktrees/repo itself, which is no repository, does not get
+the processes of feat-x or fix/y, but gets those of a plain subfolder."
+  (skip-unless (executable-find "git"))
+  (claude-code-ide-handover-tests--with-tmp
+    (let* ((source (expand-file-name "Source" tmp))
+           (repo (expand-file-name "repo" source))
+           (holder (expand-file-name "worktrees/repo" source))
+           (feat (expand-file-name "feat-x" holder))
+           (fix (expand-file-name "fix/y" holder))
+           (notes (expand-file-name "notes" holder)))
+      (claude-code-ide-handover-tests--linked-repo repo `((,feat . "feat-x") (,fix . "fix/y")))
+      (should (equal (claude-code-ide-handover-tests--strays-of-source
+                      feat (list (expand-file-name "lib" feat) fix repo))
+                     (list (expand-file-name "lib" feat))))
+      (should (eq (claude-code-ide--worktree-root holder) 'unknown))
+      (should (equal (claude-code-ide-handover-tests--strays-of-source
+                      holder (list feat (expand-file-name "lib" feat) fix notes holder))
+                     (list notes holder))))))
+
+(ert-deftest claude-code-ide-test-handover-linked-worktrees-other-instance ()
+  "A live session in a linked worktree does not block a handover in the main checkout.
+The reverse holds too: each linked worktree is a working tree of its own."
+  (skip-unless (executable-find "git"))
+  (claude-code-ide-handover-tests--with
+    (let* ((repo (expand-file-name "repo" claude-code-ide-handover-tests--root))
+           (feat (file-name-as-directory (expand-file-name ".worktrees/feat-x" repo))))
+      (claude-code-ide-handover-tests--linked-repo repo `((,feat . "feat-x")))
+      (claude-code-ide-handover-tests--add "cci-test-main" 'cci-test-a repo 'idle)
+      (claude-code-ide-handover-tests--session "cci-test-feat-session" feat)
+      (should-not (claude-code-ide-handover-tests--preflight-reason "cci-test-main"))
+      (remhash "cci-test-feat-session" claude-code-ide-mcp--sessions)
+      (claude-code-ide-handover-tests--add "cci-test-feat" 'cci-test-a feat 'idle)
+      (should-not (claude-code-ide-handover-tests--preflight-reason "cci-test-main"))
+      (should-not (claude-code-ide-handover-tests--preflight-reason "cci-test-feat"))
+      (claude-code-ide-handover-tests--session "cci-test-main-session" (expand-file-name "src" repo))
+      (should-not (claude-code-ide-handover-tests--preflight-reason "cci-test-feat"))
+      ;; A second session in feat-x does block
+      (claude-code-ide-handover-tests--session "cci-test-feat-2" (expand-file-name "sub" feat))
+      (should (eq (claude-code-ide-handover-tests--preflight-reason "cci-test-feat")
+                  'other-instance)))))
 
 (provide 'claude-code-ide-handover-tests)
 

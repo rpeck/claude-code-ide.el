@@ -16,6 +16,11 @@ The usual reason is a quota limit of the source. So the source never runs one mo
 
 - `M-x claude-code-ide-handover` hands over the instance of the current buffer, or an instance that you choose.
 - It asks for the target provider (default: another provider), the method, and optional context text for the target.
+- **The method question** comes only when a fork is possible: the chain has a conversation of the target provider (`claude-code-ide-handover--read-method`).
+  - `fork` (the default: `RET` or `f`): the target goes on from the last conversation of its provider in the chain, with its full history, and gets the document. For example, a handover back to Claude Code continues the earlier Claude Code conversation.
+  - `new` (`n`): a new conversation that knows only the document. This is the method `fresh`.
+  - Any other key is refused, and the question asks again. `?` shows the choices.
+  - A fork gets a new conversation ID. The earlier conversation stays unchanged.
 - When the source is busy, it asks whether to interrupt it. Else the handover waits until the source is idle.
 - When subagents or background tasks run, or the state of the source is unknown (`disconnected`), it asks for a confirmation. The same yes lets the handover go on while other instances run in the worktree.
 - For a Codex target whose status hooks are not trusted, it asks for the trust (`claude-code-ide-codex-prepare-trust`).
@@ -32,7 +37,7 @@ The usual reason is a quota limit of the source. So the source never runs one mo
 
 | Key | Value |
 |---|---|
-| `:method` | `fresh` (default): a new conversation. `fork`: fork the latest conversation of the target provider in the chain. Both get the document. |
+| `:method` | `fresh` (default): a new conversation. `fork`: fork the latest conversation of the target provider in the chain. Both get the document. The default of this operation stays `fresh`, so that a coordinator chooses a fork explicitly; the question of `M-x claude-code-ide-handover` has `fork` as its default. |
 | `:context` | Text of the coordinator for the document, or nil. It is kept in the private file `.handover/<id>-context.md` (mode 0600), whose path and hash the registry record holds, so that a rewrite of the document after a crash still has it. |
 | `:interrupt` | Non-nil: send Escape to a busy source one time. Else wait until the source is idle. |
 | `:force` | Non-nil: go on while subagents or background tasks run, and while other instances run in the worktree. |
@@ -57,7 +62,7 @@ A refusal is a result, not a signal: `(:status error :reason REASON :message TEX
 | `no-registry-entry` | The registry has no entry of the source. |
 | `handover-running` | Another handover holds the worktree of the source. |
 | `target-unavailable` | Preflight: the `detect` operation of the target provider does not find its CLI. |
-| `other-instance` | Preflight: another live instance runs in the worktree: in this Emacs, or in another Emacs that runs (an open or pending registry entry of that Emacs). Give `:force` to go on. |
+| `other-instance` | Preflight: another live instance runs in the worktree: in this Emacs, or in another Emacs that runs (an open or pending registry entry of that Emacs). A live MCP session of this Emacs without an instance descriptor counts too. An instance or a session in a subfolder counts when the subfolder is no worktree of its own. Give `:force` to go on. |
 | `hooks-not-trusted` | Preflight: the target is Codex, and its status hooks are not trusted. Without them, the handover cannot see the delivery. A coordinator call checks only the cached trust; on a cache miss, a check starts in the background, so a later call knows the answer. |
 | `busy` | Subagents or background tasks run. Give `:force` to go on. |
 | `no-earlier-conversation` | `fork`, but the chain has no conversation of the target provider. |
@@ -166,8 +171,10 @@ Emacs saves each stage in the registry entry of the source **before** the step o
 
 
 - The stop reports processes that still run in the worktree (`:status strays`).
+  - A process in another repository or linked worktree below the worktree does not count. The scan leaves it out (see "Worktrees" below, and "Worktree scan" in docs/process-tree.md). So `end` never signals it.
   - A process that this Emacs runs (`:emacs-process`, for example a language server) does not count.
   - A process of another live instance of this Emacs (`:instance-id`) does not count. Only a forced handover has such an instance. So `end` never signals its processes.
+  - A process in the CLI tree of another live MCP session of this Emacs (`:session-id`) does not count. A session without an instance descriptor counts as such a session, for example one that an older version of the package started. The sessions of the source and of the target do not count as other sessions. The run keeps the session ID of the source in memory for this, also after the source descriptor ends. A session after its cleanup is no live session, so its processes stay strays.
   - A review process (`claude-code-ide-review-process-ids`) does not count. The stop and the scan also leave it out. Its result goes to the target after the commit.
 - Each stray gets the start time of its process right after the scan (`:start`).
 - A handover with strays, a source that survived SIGKILL (`source-did-not-stop`), a source that may still run (`source-pid-unknown`, `source-still-running`), or a failed scan (`scan-failed`) gets the status `needs-user`.
@@ -190,6 +197,22 @@ Emacs saves each stage in the registry entry of the source **before** the step o
 - **Survivors before any start.** A recovery that resumes or restarts the target, and the retry of a target that ended, first scan the worktree. The target CLI of its registry entry (its PID with its start time) counts as a stray when it runs outside this Emacs.
 - `M-x claude-code-ide-handover-resolve` also takes up a handover that this Emacs does not run. One of an Emacs that ended is claimed and recovered. One whose Emacs seems to run needs a yes to a question that names that Emacs (a forced claim).
 
+### Worktrees
+
+The worktree of the source is the nearest folder at or above its project folder that has a `.git`. That `.git` can be a folder (a main checkout) or a file (a linked worktree). Without a `.git` above it, the worktree is the project folder itself.
+
+The scan looks at each process whose working folder is inside the worktree. It finds the nearest folder at or above that working folder with a `.git`. The process is a stray only when that folder is the worktree itself. A process in a folder below the worktree with its own `.git` belongs to another repository or linked worktree, and the scan leaves it out.
+
+- **Worktrees inside the repository** (`repo` and `repo/.worktrees/feat-x`, `repo/.worktrees/fix/y`):
+  - A source in `repo`: a process in `repo/src` is a stray. A process in `repo/.worktrees/feat-x`, in `repo/.worktrees/fix/y`, or in a subfolder of them is not.
+  - A source in `repo/.worktrees/feat-x`: its worktree is `feat-x`. A process in `feat-x/sub` is a stray. A process in `repo` or in `repo/.worktrees/fix/y` is not.
+- **Worktrees outside the repository** (`Source/repo` and `Source/worktrees/repo/feat-x`, `Source/worktrees/repo/fix/y`):
+  - A source in `Source/worktrees/repo/feat-x`: a process in it is a stray. A process in `fix/y` or in `Source/repo` is not.
+  - A source in `Source/worktrees/repo`, which is no repository: a process in `feat-x` or `fix/y` is not a stray. A process in a plain subfolder, for example `notes`, is a stray.
+- **An accidental `.git`.** An empty `git init` in `~/Source` makes `~/Source` the worktree of each project in it without its own `.git`. The scan still leaves out the processes of the projects with their own `.git`.
+- **Links.** The scan compares true names, with the links resolved (on macOS, `/var` is a link to `/private/var`).
+- **The `other-instance` check.** A live session in a linked worktree does not block a handover in the main checkout, and the reverse. Each linked worktree is a worktree of its own.
+
 ### Cancel
 
 `M-x claude-code-ide-handover-cancel` cancels an unfinished handover.
@@ -206,8 +229,7 @@ Emacs saves each stage in the registry entry of the source **before** the step o
 - While a handover is unfinished, Emacs refuses to start another instance in its worktree (`user-error`). Only the start of its own target goes through.
 - An unfinished handover in the registry, for example of an Emacs that crashed, holds the worktree too, until a recovery or a cancel ends it.
 - The check is an `:around` advice of `claude-code-ide--start-session` (`claude-code-ide-handover--guard-start`).
-- The preflight refuses a handover while other instances run in the worktree, unless it is forced.
-
+- The preflight refuses a handover while other instances or MCP sessions run in the worktree, unless it is forced.
 ## The inbox moves to the target
 
 `(claude-code-ide-control-move-inbox FROM TO)` runs at the commit, before the commit is final.
