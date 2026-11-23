@@ -38,6 +38,8 @@ This document describes how claude-code-ide.el records that work, ends it at a s
 - Each `ps` run builds one snapshot: the table, a PID index, the children of each PID, and the protected set (see "Safety"). All records of that run use it.
 - The timer stops when no tracked CLI runs now. The check uses the current records, so a `ps` run that started before a new CLI existed does not stop the timer.
 - The records stay until a stop or `claude-code-ide-process-untrack`.
+- A new launch of the instance, for example a resume, keeps the groups of the earlier records. After a stop that ended `timeout` or `error`, a later stop then still ends them.
+- The asynchronous `ps` of the timer has a limit of 10 s. After it, the timer ends `ps`, and the next tick runs a new one.
 
 Other functions:
 
@@ -52,29 +54,32 @@ Other functions:
 1. **Record one last time,** while the CLI still runs.
 2. **Send the soft end of the provider.** `claude-code-ide-process-soft-end` gives it for each provider. The default is SIGHUP to the process group of the CLI for both providers, which is what a buffer kill sends.
 3. **Wait for the CLI to exit,** up to `:timeout` seconds (`claude-code-ide-process-stop-timeout`, default 5).
-   - If the CLI still runs, send SIGTERM to its group. Wait `:kill-wait` seconds (`claude-code-ide-process-kill-wait`, default 2). Then send SIGKILL.
+   - If the CLI still runs, send SIGTERM to its group. Wait `:kill-wait` seconds (`claude-code-ide-process-kill-wait`, default 2). Then send SIGKILL, and wait up to the smaller of `:kill-wait` and 1 s.
    - With `:escalate nil`, skip this. A CLI that still runs then keeps its groups, and the result is `timeout`.
-4. **End the recorded groups that still run:** SIGTERM to the group, then SIGKILL after the kill wait. Up to three rounds catch members that start during a round.
+4. **End the recorded groups that still run:** SIGTERM to the group, then SIGKILL after the kill wait, then a wait of up to the smaller of `:kill-wait` and 1 s. Up to three rounds catch members that start during a round.
+   - The groups of the spared processes get no signal: the process IDs of `:exclude`, and the review processes that run (`claude-code-ide-review-process-ids`, see [review.md](review.md)). A review outlives a stop of its owner.
 5. **Scan the worktree** (unless `:scan nil`): list the processes whose working folder is inside it (`lsof -n -P -w -a -u UID -d cwd -Fpcn`).
    - The full scan runs only when a worktree of the stop exists as a folder.
    - It takes about 0.6 s on an idle Mac, and 20 to 30 s under heavy load (load average 23, measured). `claude-code-ide-process-lsof-timeout` (default 30 s) limits it; then the result is `error`.
    - The working folders of the strays that the records found come from one `lsof -p PID,PID,...` call for all instances.
 
-`ps` runs have a limit of 10 s. If `ps` fails in any step, the stop sends nothing more, keeps the records, and returns `error`.
+`ps` runs have a limit of 10 s. If `ps` fails in a step, the stop sends nothing more, keeps the records, and returns `error`. One exception: when `ps` fails in the escalation of step 3, the CLI still gets its signal, but alone, because its group cannot be checked.
+
+With `:budget`, the `ps` and `lsof` runs count toward the budget too. A run gets at most the time that is left, but at least 0.5 s, so that the steps after the end of the budget still send their signals.
 
 The keys of ARGS:
 
 | Key | Value |
 |---|---|
 | `:timeout` | Seconds for step 3. |
-| `:kill-wait` | Seconds between SIGTERM and SIGKILL, and after SIGKILL. |
-| `:budget` | Seconds for all waits together, or nil for no limit. A wait that has no time left is skipped, but its signals still go out. |
+| `:kill-wait` | Seconds between SIGTERM and SIGKILL. The wait after SIGKILL is the smaller of this and 1 s. |
+| `:budget` | Seconds for all waits and all `ps` and `lsof` runs together, or nil for no limit. A wait that has no time left is skipped, but its signals still go out. |
 | `:soft-end` | A signal symbol, a function of `(INSTANCE PROCESS)`, or `none` when the caller already did the soft end. Default: the provider's. |
 | `:escalate` | nil skips SIGTERM and SIGKILL of the CLI. Default t. |
 | `:scan` | nil skips step 5. Default t. |
 | `:worktree` | The folder for step 5. Default: the descriptor's worktree, else its project root. |
 | `:process` | The terminal process. Default: the process of the descriptor's buffer, else the descriptor's `pid`. A process that is neither the process of the instance's buffer nor has the descriptor's PID is ignored, with a debug message. The same rule holds for `claude-code-ide-process-track`. |
-| `:exclude` | Process IDs that step 5 leaves out. |
+| `:exclude` | Process IDs that the stop spares: step 4 does not signal their groups, and step 5 leaves them out. The stop adds the review processes that run. |
 
 The result is a plist:
 
@@ -106,7 +111,7 @@ The quit of Emacs uses it with `:budget`, so that N instances wait once and not 
 
 ### Stop from kill-buffer-hook
 
-`(claude-code-ide-process-stop-later INSTANCE &rest ARGS)` records the groups at once, and runs the stop from timers with `:soft-end none`. The key `:callback` gives a function that gets the result.
+`(claude-code-ide-process-stop-later INSTANCE &rest ARGS)` starts the last record at once, with a `ps` without a wait. After that record, it runs the stop from timers with `:soft-end none`. The key `:callback` gives a function that gets the result.
 
 - The stop is a chain of steps. Each wait is a poll every 0.05 s from a new timer, so the command loop runs between the steps. One step takes about one `ps` run (60 ms on an idle Mac).
 
@@ -176,4 +181,4 @@ The orchestrator adds these calls. Each call checks `fboundp`, so the package wo
   - The CLI ended by itself: `claude-code-ide-process-untrack`. What it left running was its own choice, for example "Move to background and exit".
   - Called from `kill-buffer-hook` (BUFFER-DYING): `claude-code-ide-process-stop-later` with `:scan nil`.
   - Else: `claude-code-ide-process-stop` with `:scan nil`, and then the buffer kill.
-- **`kill-emacs-hook`:** `claude-code-ide-process-stop-many` for all instances with `:budget claude-code-ide-process-quit-timeout` (1.5 s for all waits together), `:timeout 1`, `:kill-wait 0.25`, and `:scan nil`, before the cleanup of each session. The hook must run before the ghostel hook, which sends SIGKILL to its native children.
+- **`kill-emacs-hook`:** `claude-code-ide-process-stop-many` for all instances with `:budget claude-code-ide-process-quit-timeout` (1.5 s for all waits together), `:timeout 1`, `:kill-wait 0.25`, and `:scan nil`, before the cleanup of each session. The cleanup of each session then runs no second stop, because that stop would wait without the budget. The hook must run before the ghostel hook, which sends SIGKILL to its native children.

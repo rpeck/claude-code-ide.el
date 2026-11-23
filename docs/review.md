@@ -21,6 +21,7 @@ The package knows no review tool. A workflow gives the command or the process, a
 
 - **OWNER-INSTANCE-ID:** the instance that gets the result. It must be an instance that this Emacs or the session registry knows.
 - **`:command`:** a list of strings. Emacs starts it in `:directory`. Without `:directory`, Emacs uses the worktree of the owner: of its descriptor when it runs, else of its session registry entry.
+  - When no folder is known, the result is the error `no-directory`. A `:process` with an absolute `:result-file` needs no folder.
   - Emacs drops the output of the command. The output never goes into a prompt or a record.
   - The record keeps only the program name (for example `sh`), not the arguments.
 - **`:process`:** an Emacs process object, or the process ID of a process that runs already. Give `:command` or `:process`, not both.
@@ -31,7 +32,7 @@ The package knows no review tool. A workflow gives the command or the process, a
 
 The function never signals. It returns one of these:
 
-- `(:status ok :review-id ID :owner OWNER :state running :pid PID)`.
+- `(:status ok :review-id ID :owner OWNER :state STATE :pid PID)`. STATE is `running`, or a later state when the process ended before the call returned.
 - `(:status error :reason R ...)`. The reasons are `invalid-instance-id`, `unknown-instance`, `no-process`, `process-and-command`, `invalid-process`, `invalid-command`, `no-result-file`, `no-directory`, and `start-failed`.
 
 `(claude-code-ide-review-status REVIEW-ID)` returns the current state of a review.
@@ -88,11 +89,11 @@ A result whose owner is not known, or whose submit failed, waits in the state `e
 - After its commit, the handover moves the queued prompts of the inbox (`claude-code-ide-control-move-inbox`). The record of the source becomes final, `rejected` with the reason `handed-over`, and the target gets a queued copy with the same request ID.
   - That reason is not a rejection of the review. The review looks up the current owner and tracks the copy there. When the current owner has no copy, the review submits the result there.
   - When the chain does not name the new instance yet, the review stays `submitted` and the next check looks again.
-- `(claude-code-ide-review-process-ids)` returns the process IDs of the reviews that run. A review command runs in the worktree of its owner, so a stray scan of that worktree finds it. A handover leaves these processes alone.
+- `(claude-code-ide-review-process-ids)` returns the process IDs of the reviews that run. A review command runs in the worktree of its owner, so a stray scan of that worktree finds it. A stop of a CLI, also in a handover, leaves these processes alone: step 4 of the stop does not signal their process groups (docs/process-tree.md).
 
 ### Restarts
 
-- **A review that ends while Emacs does not run** is found at the next start. Emacs runs `claude-code-ide-review-recover` 2 seconds after the package loads. A batch Emacs does not run it.
+- **A review that ends while Emacs does not run** is found at the next start. Emacs runs `claude-code-ide-review-recover` from an idle timer: after the package loads, when Emacs is idle for 2 seconds. A batch Emacs does not run it.
   - This works for a review that Emacs knows by its process ID: the process does not belong to Emacs, so it outlives Emacs.
 - **A command that Emacs started ends at the Emacs quit.** Emacs ends its child processes at the quit; a test showed that `trap '' HUP` does not keep them alive.
   - `kill-emacs-hook` marks such a review `interrupted`.
@@ -100,6 +101,7 @@ A result whose owner is not known, or whose submit failed, waits in the state `e
 - **Two Emacs processes:** each record has the process ID and the start time of the Emacs that tracks it.
   - A review of another Emacs that still runs (the same process ID and the same start time) stays with that Emacs. A new process with the same ID does not count.
   - The check takes the review over as soon as that Emacs is gone.
+  - Only one Emacs takes it over. The claim holds the lock folder `<record file>.lock`, reads the record file again, and writes its own Emacs only when no other running Emacs claimed the review first. While another Emacs holds the lock, the next check tries again.
 
 ### Result files
 

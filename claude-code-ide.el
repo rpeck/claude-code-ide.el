@@ -1234,6 +1234,12 @@ most recently used one — only displaying or hiding windows would."
       (when (and process (not (process-live-p process)))
         (claude-code-ide--cleanup-session session)))))
 
+(defvar claude-code-ide--quit-stopped-processes nil
+  "Non-nil while the quit cleans up the sessions whose CLIs it stopped.
+`claude-code-ide--cleanup-session' then runs no stop of its own: the
+stop of the quit has a time budget, and a second stop would wait
+without one for a CLI that still runs.")
+
 (defun claude-code-ide--cleanup-all-sessions ()
   "Clean up all active instances of every provider."
   ;; End all CLIs first, with one short shared wait, so that each one
@@ -1246,8 +1252,10 @@ most recently used one — only displaying or hiding windows would."
                                            :timeout 1 :kill-wait 0.25 :scan nil)
       (error
        (message "Error stopping the agent CLIs: %s" (error-message-string err)))))
-  (dolist (session (claude-code-ide-mcp--active-sessions))
-    (claude-code-ide--cleanup-session session))
+  (let ((claude-code-ide--quit-stopped-processes
+         (fboundp 'claude-code-ide-process-stop-many)))
+    (dolist (session (claude-code-ide-mcp--active-sessions))
+      (claude-code-ide--cleanup-session session)))
   ;; A config file whose session is already gone from the table
   (claude-code-ide--delete-all-mcp-config-files))
 
@@ -1485,7 +1493,9 @@ hook signals wrong-type-argument that way)."
     ;; End the CLI and its background work before the buffer goes.  The
     ;; soft end gives the CLI time to stop its background shells, and
     ;; the recorded process groups that still run are ended after it.
+    ;; At the quit, the stop of all CLIs came before.
     (when-let* (((fboundp 'claude-code-ide-process-stop))
+                ((not claude-code-ide--quit-stopped-processes))
                 (instance (claude-code-ide-instance-of-session session))
                 (process (claude-code-ide-mcp-session-process session)))
       (condition-case err
