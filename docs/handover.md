@@ -161,7 +161,7 @@ Emacs saves each stage in the registry entry of the source **before** the step o
 - **When it runs.** The check runs after each clean scan (also after the stop), before the document step enters `target-started`, and before each start of the target. So a recovery never starts a target next to a live source, for example after the source was restored.
 - **The reasons:**
   - `source-pid-unknown`: the process-tree stop could not end or check the source CLI, because its process ID is unknown (the stop gives `error` with "the process ID of the CLI is unknown"). The message says that the source CLI may still run.
-  - `source-still-running`: the stop or the scan was clean, but the source still runs. The handover never goes on silently.
+  - `source-still-running`: the source still runs after the stop or the scan. The result of the stop or the scan can be clean or an `error` (for example, `ps` or `lsof` failed). A failed scan of a live source gives this reason, not `scan-failed`, so `go` is not offered. The handover never goes on silently.
 - Both stop the handover at its stage, with its next step kept, until a person chooses `end`, `wait` or `cancel` (the table below).
 
 
@@ -178,7 +178,7 @@ Emacs saves each stage in the registry entry of the source **before** the step o
 | Reason | Choices |
 |---|---|
 | `strays`, `source-did-not-stop` | `end`: SIGTERM, then SIGKILL after `claude-code-ide-handover-stray-wait` (10 s), then scan again. `wait`: scan again after that time. `cancel`. |
-| `source-pid-unknown`, `source-still-running` | `end`: end the source as `claude-code-ide-control-stop` does (the stop of its provider kills its terminal buffer, which ends the CLI), then scan the worktree as usual. `wait`: try the stop again after `claude-code-ide-handover-stray-wait` (a recovery scans again, with its next step). `cancel`. There is no `go`: the handover never goes on while the source may run. |
+| `source-pid-unknown`, `source-still-running` | `end`: end the source as `claude-code-ide-control-stop` does (the stop of its provider kills its terminal buffer, which ends the CLI), then scan the worktree. The scan waits `claude-code-ide-handover-stray-wait`, but at least the limit of the soft stop of the kept buffers (6 s by default). `wait`: after a refusal of the stop or the scan, try the stop again after `claude-code-ide-handover-stray-wait`. After a refusal in the document step or the target start (for example, in a recovery with a restored source), `wait` runs that step again and checks again; it does not stop the source. `cancel`: the message says whether the source still runs. There is no `go`: the handover never goes on while the source may run. |
 | `scan-failed` | `wait` (scan again), `go` (go on without the check), `cancel`. |
 | `no-delivery` | `wait` (look at the transcript, then wait again for the delivery), `cancel` (stop the target). |
 | `target-exited` | `retry` (scan the worktree, then start the target again, with the same instance ID and document), `cancel`. |

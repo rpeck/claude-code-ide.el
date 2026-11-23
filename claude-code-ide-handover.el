@@ -1351,7 +1351,7 @@ would stop the current instance."
        (?c cancel "cancel the handover")))
     ((or 'source-pid-unknown 'source-still-running)
      '((?e end "end the source: kill its terminal buffer, then check the worktree")
-       (?w wait "try the stop again later")
+       (?w wait "wait, then try the step again")
        (?c cancel "cancel the handover")))
     ('scan-failed
      '((?w wait "check again")
@@ -1413,13 +1413,14 @@ An unknown start time, at the scan or now, never matches."
     (when (claude-code-ide-handover--stray-alive-p stray)
       (ignore-errors (signal-process (plist-get stray :pid) signal)))))
 
-(defun claude-code-ide-handover--rescan (run &optional then)
+(defun claude-code-ide-handover--rescan (run &optional then seconds)
   "Scan the worktree of RUN again after `claude-code-ide-handover-stray-wait'.
-THEN, when given, runs first, with the strays of RUN."
+THEN, when given, runs first, with the strays of RUN.  SECONDS, when
+given, is the wait in place of `claude-code-ide-handover-stray-wait'."
   (setf (claude-code-ide-handover--run-status run) 'running)
   (claude-code-ide-handover--save run)
   (setf (claude-code-ide-handover--run-timer run)
-        (run-at-time claude-code-ide-handover-stray-wait nil
+        (run-at-time (or seconds claude-code-ide-handover-stray-wait) nil
                      (lambda ()
                        (claude-code-ide-handover--guarded
                         run (lambda ()
@@ -1545,14 +1546,19 @@ Interactively, choose the handover and the action."
         ((and 'end (guard (memq (claude-code-ide-handover--run-reason run)
                                 '(source-pid-unknown source-still-running))))
          ;; As `claude-code-ide-control-stop': the stop of the provider
-         ;; kills the terminal buffer, which ends the CLI.  Then the
-         ;; worktree scan, as usual
+         ;; kills the terminal buffer, which ends the CLI.  With the
+         ;; kept buffers, the CLI ends softly from timers, so the scan
+         ;; waits at least until the limit of that soft stop
          (let ((stop (claude-code-ide-control-stop (claude-code-ide-handover--run-source-id run))))
            (when (eq (plist-get stop :status) 'error)
              (message "Handover %s: the stop of the source gave %s"
                       (claude-code-ide-handover--run-id run)
                       (or (plist-get stop :message) (plist-get stop :reason)))))
-         (claude-code-ide-handover--rescan run))
+         (claude-code-ide-handover--rescan
+          run nil (max claude-code-ide-handover-stray-wait
+                       (if (fboundp 'claude-code-ide--soft-stop-limit)
+                           (claude-code-ide--soft-stop-limit)
+                         0))))
         ('wait
          (if (eq (claude-code-ide-handover--run-reason run) 'no-delivery)
              (progn
@@ -1639,10 +1645,14 @@ shows it to a person first (see `claude-code-ide-handover-cancel')."
     (claude-code-ide-handover--drop-target run))
   (claude-code-ide-handover--finish
    run 'cancelled 'user-cancelled
-   (if (claude-code-ide-handover--stage< (claude-code-ide-handover--run-stage run)
-                                         'source-stopped)
-       "the source stays current"
-     "the source is stopped; M-x claude-code-ide-reopen-session starts it again"))
+   (cond
+    ((claude-code-ide-handover--stage< (claude-code-ide-handover--run-stage run)
+                                       'source-stopped)
+     "the source stays current")
+    ;; The stop could not end it, or it runs again after a restore
+    ((claude-code-ide-handover--source-live-p run)
+     "the source still runs in this Emacs, and stays current")
+    (t "the source is stopped; M-x claude-code-ide-reopen-session starts it again")))
   (claude-code-ide-handover--result run))
 
 (defun claude-code-ide-handover-cancel (handover-id)

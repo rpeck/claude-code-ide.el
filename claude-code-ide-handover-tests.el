@@ -3112,6 +3112,40 @@ never writes the document or starts the target."
              (should (eq (plist-get (claude-code-ide-handover-status id) :status) 'cancelled))
              (should-not claude-code-ide-handover-tests--starts))))))))
 
+(ert-deftest claude-code-ide-test-handover-source-alive-cancel-message ()
+  "A cancel while the source still runs never says that the source is stopped."
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (claude-code-ide-handover-tests--with-live-stop claude-code-ide-handover-tests--pid-unknown
+      (let ((id (plist-get (claude-code-ide-handover-session "cci-test-src" 'cci-test-b) :handover-id)))
+        (claude-code-ide-handover-tests--run-timers)
+        (should (eq (plist-get (claude-code-ide-handover-status id) :reason) 'source-pid-unknown))
+        (claude-code-ide-handover-resolve id 'cancel)
+        (let ((message (plist-get (claude-code-ide-handover-status id) :message)))
+          (should (eq (plist-get (claude-code-ide-handover-status id) :status) 'cancelled))
+          (should-not (string-match-p "source is stopped" message))
+          (should (string-match-p "still runs" message)))))))
+
+(ert-deftest claude-code-ide-test-handover-source-alive-end-waits-for-soft-stop ()
+  "After end, the rescan waits at least as long as the soft stop of the source.
+A shorter wait finds the source still live, and asks again."
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (claude-code-ide-handover-tests--with-live-stop claude-code-ide-handover-tests--pid-unknown
+      (let ((id (plist-get (claude-code-ide-handover-session "cci-test-src" 'cci-test-b) :handover-id))
+            (delays nil)
+            (original (symbol-function 'run-at-time)))
+        (claude-code-ide-handover-tests--run-timers)
+        (cl-letf (((symbol-function 'claude-code-ide--soft-stop-limit) (lambda () 7))
+                  ((symbol-function 'claude-code-ide-control-stop) (lambda (_id) '(:status ok)))
+                  ((symbol-function 'run-at-time)
+                   (lambda (time &rest args)
+                     (push time delays)
+                     (apply original time args))))
+          (let ((claude-code-ide-handover-stray-wait 2))
+            (claude-code-ide-handover-resolve id 'end)))
+        (should (member 7 delays))))))
+
 (ert-deftest claude-code-ide-test-handover-recovery-live-source ()
   "A recovery never starts a target next to a live source.
 The source runs again in this Emacs (for example after a restore), so
