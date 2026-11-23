@@ -832,6 +832,12 @@ and PENDING the pending records of INSTANCE-ID."
       (if (eq queue 'never)
           (setq action 'reject reason 'held)
         (setq action 'queue reason 'held)))
+     ;; A handover stops the source that it holds, and its commit moves
+     ;; the queued prompts to the target: a stopped or failed source
+     ;; queues too, unless QUEUE is nil
+     ((and (eq action 'reject) (not (eq queue 'never))
+           (claude-code-ide-control-held-p instance-id))
+      (setq action 'queue reason 'held))
      ;; Earlier prompts go first
      ((and (eq action 'deliver) pending)
       (if (eq queue 'never)
@@ -927,21 +933,27 @@ ID of the prompt that was sent, or nil."
   "Return (ID . DONE) for the copy of RECORD of FROM in the inbox of TO.
 ID is the request ID of the copy: the same one, or
 \"handover:HANDOVER-ID:ID\" when TO has another record with that ID.
-DONE is non-nil when an earlier move made the copy already.  PENDING
-is the list of the pending records of TO."
+When TO has another record with that ID too, a number follows:
+\"handover:HANDOVER-ID:ID:2\", then 3, and so on.  DONE is non-nil
+when an earlier move made the copy already: a record of TO with the
+ID whose `moved_from' names RECORD.  PENDING is the list of the
+pending records of TO."
   (let* ((id (claude-code-ide-control--record-request-id record))
          (from-ref (concat from ":" id))
-         (moved-before (lambda (found)
-                         (and found (equal (claude-code-ide-control--record-moved-from found)
-                                           from-ref))))
-         (existing (claude-code-ide-control--find-record to id pending)))
-    (cond
-     ((null existing) (cons id nil))
-     ((funcall moved-before existing) (cons id t))
-     (t
-      (let* ((renamed (format "handover:%s:%s" (or handover-id from) id))
-             (found (claude-code-ide-control--find-record to renamed pending)))
-        (cons renamed (and found t)))))))
+         (renamed (format "handover:%s:%s" (or handover-id from) id))
+         (candidate id)
+         (count 1)
+         (result nil))
+    (while (not result)
+      (let ((found (claude-code-ide-control--find-record to candidate pending)))
+        (cond
+         ((null found) (setq result (cons candidate nil)))
+         ((equal (claude-code-ide-control--record-moved-from found) from-ref)
+          (setq result (cons candidate t)))
+         (t
+          (setq count (1+ count)
+                candidate (if (= count 2) renamed (format "%s:%d" renamed (1- count))))))))
+    result))
 
 (defun claude-code-ide-control-move-inbox (from to &optional handover-id)
   "Move the queued prompts of the instance FROM into the inbox of TO.

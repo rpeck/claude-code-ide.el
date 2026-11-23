@@ -57,7 +57,7 @@ A refusal is a result, not a signal: `(:status error :reason REASON :message TEX
 | `no-registry-entry` | The registry has no entry of the source. |
 | `handover-running` | Another handover holds the worktree of the source. |
 | `target-unavailable` | Preflight: the `detect` operation of the target provider does not find its CLI. |
-| `other-instance` | Preflight: another live instance runs in the worktree. Give `:force` to go on. |
+| `other-instance` | Preflight: another live instance runs in the worktree: in this Emacs, or in another Emacs that runs (an open or pending registry entry of that Emacs). Give `:force` to go on. |
 | `hooks-not-trusted` | Preflight: the target is Codex, and its status hooks are not trusted. Without them, the handover cannot see the delivery. A coordinator call checks only the cached trust; on a cache miss, a check starts in the background, so a later call knows the answer. |
 | `busy` | Subagents or background tasks run. Give `:force` to go on. |
 | `no-earlier-conversation` | `fork`, but the chain has no conversation of the target provider. |
@@ -157,6 +157,7 @@ Emacs saves each stage in the registry entry of the source **before** the step o
 
 - The stop reports processes that still run in the worktree (`:status strays`).
   - A process that this Emacs runs (`:emacs-process`, for example a language server) does not count.
+  - A process of another live instance of this Emacs (`:instance-id`) does not count. Only a forced handover has such an instance. So `end` never signals its processes.
   - A review process (`claude-code-ide-review-process-ids`) does not count. The stop and the scan also leave it out. Its result goes to the target after the commit.
 - Each stray gets the start time of its process right after the scan (`:start`).
 - A handover with strays, a source that survived SIGKILL (`source-did-not-stop`), or a failed scan (`scan-failed`) gets the status `needs-user`.
@@ -170,7 +171,7 @@ Emacs saves each stage in the registry entry of the source **before** the step o
 | `scan-failed` | `wait` (scan again), `go` (go on without the check), `cancel`. |
 | `no-delivery` | `wait` (look at the transcript, then wait again for the delivery), `cancel` (stop the target). |
 | `target-exited` | `retry` (scan the worktree, then start the target again, with the same instance ID and document), `cancel`. |
-| `start-failed`, `step-failed` | `retry` (run the stage again; a target that runs is taken up again, never started twice), `cancel`. |
+| `start-failed`, `step-failed` | `retry` (run the stage again; a target that runs and waits for its document is taken up again, never started twice; from the stage `delivered` on, the commit runs again), `cancel`. |
 | `registry-entry-missing` | `cancel`. |
 | `continue-failed` | The stage is `committed`, but the inbox did not take the continue prompt. `retry` (commit again, which sends the prompt with the same request ID), `skip` (finish without the prompt). No `cancel`. The same two choices hold for every reason after the commit saved the chain (`chain_saved`), because a cancel would stop the target, which the chain names. |
 
@@ -203,10 +204,13 @@ Emacs saves each stage in the registry entry of the source **before** the step o
 - Each pending record of FROM gets a queued record in the inbox of TO.
   - The record has **the same request ID**, the same text, and the same creation time. Its reason is `handed-over`.
   - So a review result is still delivered one time, and its acknowledgement names its review ID.
-  - When TO has another record with that request ID, the copy gets the ID `handover:<handover-id>:<request-id>`. No record is dropped.
+  - When TO has another record with that request ID, the copy gets the ID `handover:<handover-id>:<request-id>`. When TO has that ID too, a number follows (`:2`, `:3`, and so on). No record is dropped.
   - The copy names its origin in `moved_from` (`FROM:ID`), and the old record its copy in `moved_to` (`TO:ID`).
 - The record of FROM then becomes final: result `rejected`, reason **`handed-over`**. A reader that sees this reason follows the chain to the current owner (`claude-code-ide-session-registry-chain-current`).
-- A prompt that FROM received, and whose acknowledgement did not come in the wait of the quiescing, moves too. Its copy has a `note` that it may have reached FROM.
+- A prompt that FROM received, and whose acknowledgement did not come in the wait of the quiescing:
+  - When the transcript of FROM has a user turn with the same text hash at or after the send, FROM got it, and the document holds it. Its record becomes `delivered`, and it does not move.
+  - Else it moves too. Its copy has a `note` that it may have reached FROM.
+- Until the handover ends, the inbox of FROM is held. A submit to FROM without QUEUE queues also after the stop, and the commit moves it. A recovery holds the inbox of FROM again from the stage `source-stopped` on.
 - A second call moves nothing.
 - After the commit, a prompt that `claude-code-ide-control-submit` gets for FROM goes to the current instance of the chain, and its result names that `:destination`.
 
