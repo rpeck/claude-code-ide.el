@@ -3727,6 +3727,7 @@ still loads."
 (claude-code-ide--require-optional 'claude-code-ide-transcript)
 (claude-code-ide--require-optional 'claude-code-ide-handover)
 (claude-code-ide--require-optional 'claude-code-ide-review)
+(claude-code-ide--require-optional 'claude-code-ide-mailbox)
 (claude-code-ide--require-optional 'claude-code-ide-menu-bar)
 
 ;; The Codex status adapter gives Codex instances their status hooks
