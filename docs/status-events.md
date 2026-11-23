@@ -130,7 +130,7 @@ Emacs settles the trust before a Codex instance spawns, so that the user never n
 - **No hooks** means no hook arguments and no hook environment. So Codex shows no "Hooks need review" dialog for them.
 - **A launch without hooks** has no status events. Its state is `disconnected/untracked`, whatever a later check says. When a later check finds the hooks trusted, its detail becomes "Hooks were not trusted at the launch: restart to get status".
 - **A launch with hooks** keeps them. Codex read the trust at its start.
-- **Never without a yes.** Emacs writes the trust only after the yes of `yes-or-no-p`.
+- **Never without a yes.** Emacs writes the trust only after a typed "yes" (`claude-code-ide-codex-events--typed-yes-p`). One key never answers: `use-short-answers` is nil for the question, and when `yes-or-no-p` is an alias of `y-or-n-p` (for example after `(fset 'yes-or-no-p 'y-or-n-p)`), the minibuffer reads the word.
 
 ### A restore of the user
 
@@ -160,8 +160,8 @@ A start from a coordinator or an agent never asks: it gets only the refusal `hoo
   - The hooks are trusted (the cache) or disabled, or the user declined them in this Emacs.
 - **The check:**
   1. A valid cached result is used as it is.
-  2. Else the background check of the app-server (`hooks/list`, the same as a start) lists the hooks. Emacs does not wait for it: a timer looks for its result every 0.5 seconds.
-  3. An `untrusted` result asks, through `claude-code-ide-codex-events--offer-trust`, the same question as a start: the hooks in `*Codex status hooks*` and `yes-or-no-p`. A yes writes the trust. A no adds the hooks to the declined keys.
+  2. Else the background check of the app-server (`hooks/list`, the same as a start) lists the hooks. Emacs does not wait for it: a timer looks for its result every 0.5 seconds. That timer can run while you type, so the result goes on only at the next idle moment.
+  3. An `untrusted` result asks, through `claude-code-ide-codex-events--offer-trust`, the same question as a start: the hooks in `*Codex status hooks*` and a typed "yes". A yes writes the trust. A no adds the hooks to the declined keys.
 - **Not while the minibuffer is active, or a recursive edit runs.** The question waits for the next idle moment instead.
 - **One trust question at a time.** `claude-code-ide-codex-events--offer-trust` sets `claude-code-ide-codex-events--offer-running` while it asks and writes, and clears it in `unwind-protect`. A start that waits for its trust write in `accept-process-output` runs timers, so the question after the start waits while the guard is set. A second offer asks nothing, and the trust command says that another question runs. Each offer reads the cache again first: trusted hooks get no question.
 - **At most once in each Emacs.** The state `claude-code-ide-codex-events--load-check` ends at `done` after the question, also after a no or C-g, and after each case without a question. A `defvar` keeps it at `claude-code-ide-reload`, so a reload checks and asks no second time.
@@ -177,7 +177,7 @@ A start from a coordinator or an agent never asks: it gets only the refusal `hoo
 
 1. It starts the app-server with the hook arguments and calls `hooks/list`.
 2. It shows the hooks that Codex does not run yet, with their event, command, trust status, and key, in the buffer `*Codex status hooks*`.
-3. It asks with `yes-or-no-p`.
+3. It asks for a typed "yes" (see "Never without a yes").
 4. It calls `config/batchWrite`. Each edit has `keyPath` `hooks.state`, `mergeStrategy` `upsert`, and the value `{KEY: {trusted_hash: CURRENT-HASH}}`, with the hash that `hooks/list` gave.
 5. It calls `hooks/list` again and reports the result.
 
@@ -217,7 +217,7 @@ So an event of an earlier launch (for example before a resume) changes nothing, 
 | Codex event | Common event | Change of the status |
 |---|---|---|
 | `SessionStart` | `session-start` | `idle` "Ready". Clears tools, blockers, subagents, and a failure. |
-| `UserPromptSubmit` | `prompt-submit` | `working`. Clears the blockers of the main agent and a failure. |
+| `UserPromptSubmit` | `prompt-submit` | `working`. Clears the blockers of the main agent and a failure. Main agent: also ends each subagent, with its tools and blockers (see "Subagents"). |
 | `PreToolUse` | `tool-start` | Records the tool. Main agent: `working`. `request_user_input`: `waiting-for-user/question`, not a guess. |
 | `PermissionRequest` | `approval-request` | `waiting-for-user/approval` for its tool (see "Matching an approval to its tool"). |
 | `PostToolUse` | `tool-end` | Ends the tool and its blockers. Main agent: `working`. |
@@ -232,6 +232,9 @@ So an event of an earlier launch (for example before a resume) changes nothing, 
 Rules:
 
 - **Subagents.** An event with `agent_id` belongs to a subagent. It never changes the turn of the main agent. A subagent's approval or question waits for the user too.
+  - A new prompt of the main agent (`UserPromptSubmit` without `agent_id`) ends each subagent, with its tools and blockers. So a lost `SubagentStop` does not keep `waiting-for-task/subagent` for ever.
+  - A `PreToolUse`, `PermissionRequest`, `PostToolUse`, or `PostModelRequest` of a subagent that has no record starts its record again. So a subagent that still runs after the new prompt shows again at its next event.
+  - A main `Interrupt` does not end the subagents, and an `Interrupt` of a subagent changes nothing: the events of T1 do not show what Codex does to its subagents then.
 - **Deny and Esc.** Both give only `Interrupt`. Emacs cannot tell them apart.
 - **Allow.** No event shows it. The approval stays until the `PostToolUse` of the tool, a `Stop`, an `Interrupt`, or the end of the session. Without a screen read that confirms the dialog, the approval is a guess after `claude-code-ide-codex-events-approval-guess-time` (10 seconds). The result of a screen read belongs to each approval of the main agent, so the end of a subagent does not change it.
 - **A screen read without the dialog.** `claude-code-ide-codex-events-approval-end` decides whether it ends the wait for an approval:
@@ -320,16 +323,17 @@ The tests use these texts as fixtures (`claude-code-ide-codex-events-tests--quot
 
 1. `SessionEnd` came: `disconnected`.
 2. A failed model request: `failed/error` or `failed/quota-limit`.
-3. An open question: `waiting-for-user/question`.
-4. An open approval:
+3. An open question of any agent, also when an older approval is open: `waiting-for-user/question`.
+4. An open approval. Emacs looks at each approval, of the main agent and of the subagents:
    - The screen shows the approval dialog, also only its tail: `waiting-for-user/approval`, not a guess.
-   - A read found no dialog, and the rule of `claude-code-ide-codex-events-approval-end` lets that end the wait (by default: the read sees the whole screen): `working`, a guess ("Approved, runs?").
-   - Else: `waiting-for-user/approval`, a guess after 10 seconds.
+   - An approval that no read found answered: `waiting-for-user/approval`, a guess after 10 seconds. An older answered approval does not hide it.
+   - Each approval was found answered: a read found no dialog, and the rule of `claude-code-ide-codex-events-approval-end` lets that end the wait (by default: the read sees the whole screen): `working`, a guess ("Approved, runs?").
 5. A startup dialog on the screen: `waiting-for-user/dialog`.
 6. A subagent runs: `waiting-for-task/subagent`.
 7. No event yet. Codex sends `SessionStart` only with the first prompt:
    - The hooks were not trusted at the launch: `disconnected/untracked`.
-   - In the first `claude-code-ide-codex-events-startup-grace` seconds (3): `working/starting` "Starting", a guess.
+   - The launch has hooks, and the rollout file of the conversation shows a turn of this launch that is older than 3 seconds: `disconnected/no-signal`, not a guess. The hooks do not report. Only a known conversation (a resume or a continue) has a rollout file before the first event, so a new session never gets this state.
+   - In the first `claude-code-ide-codex-events-startup-grace` seconds (3): `working/starting` "Starting", a guess. The time counts from the end of the trust check, just before Codex spawns. So a wait for the trust question uses none of it.
    - The screen read found no dialog: `idle`, a guess. The composer waits for the first prompt.
    - No screen read: `working/starting` "Starting: no event yet", a guess.
 8. The turn ended: `idle`, or `waiting-for-user/question` as a guess.
@@ -404,7 +408,7 @@ Codex keeps no status file for each process. But it appends each turn to the rol
 
 - **Each rollout state is a guess** (`:guess t`, a `?` in the status buffer). The state plist has `:source` `rollout`. An UNTRACKED state has no `:source`.
 - **The detail** says once that the hooks are missing: the trust problem of the launch, else "No status hooks". A state from the rollout ends with " · <problem>"; an UNTRACKED state starts with "<problem>; ".
-- **The start of the launch.** The time when Emacs tracked the launch, else the start of the terminal process. A `task_started` more than 1 second before it is of a process that was killed in a turn (`started_at` has whole seconds).
+- **The start of the launch.** The time when Emacs settled the trust of the launch, just before the spawn, else the start of the terminal process. A `task_started` more than 1 second before it is of a process that was killed in a turn (`started_at` has whole seconds).
 - **The keys of the terminal do not count.** Emacs does not watch the terminal. A RET, an empty prompt, a slash command such as `/status`, or the answer to an approval changes no state; only the rollout file does.
 - **Limits.**
   - **After `/new` or a fork in a terminal without hooks, the status follows the old conversation until Emacs learns the new native ID.** The instance keeps its old native ID, and Codex writes the new conversation to another rollout file. So the state is a guess of the old conversation: it is often `idle` while the new conversation works. A restart of the instance with hooks ends this: the hook `SessionStart` of the new conversation moves the launch (see "Event files").
@@ -452,7 +456,7 @@ A failure whose plan does not include Codex (see "Quota limits") is `failed/quot
 | `claude-code-ide-codex-events-program` | `"codex"` | The program for the app-server. |
 | `claude-code-ide-codex-events-trust-timeout` | 5 | Seconds that a start waits for the trust check. |
 | `claude-code-ide-codex-events-trust-at-load` | `ask` | `ask`: check the trust after the start of Emacs, and ask once when the hooks are not trusted. `never`: no check. |
-| `claude-code-ide-codex-events-startup-grace` | 3 | Seconds before the first screen read of a launch. |
+| `claude-code-ide-codex-events-startup-grace` | 3 | Seconds before the first screen read of a launch, from the end of the trust check. |
 | `claude-code-ide-codex-events-approval-guess-time` | 10 | Seconds after which an unconfirmed approval is a guess. |
 | `claude-code-ide-codex-events-approval-end` | `window` | When a screen read without the dialog ends the wait for an approval: `window`, `event`, or `screen`. |
 | `claude-code-ide-session-status-quota-regexp` | see "Quota limits" | The usage-limit pattern of both providers. |
