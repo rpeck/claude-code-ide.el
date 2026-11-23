@@ -153,7 +153,7 @@ A leg is a plist, or an instance descriptor that becomes a plist:
 3. **Context from the coordinator**, when CONTEXT is given.
 4. **Source sessions:** how to read the full source sessions, and one entry for each leg (see "Source sessions" below).
 5. **History of the chain:** a short extract.
-   - **Original task:** the first user prompt of the first leg, marked "it can be out of date". When a handover document started the first leg, the original task of that document is used.
+   - **Original task:** the first user prompt of the first leg, marked "it can be out of date". When a handover document started the first leg, the original task of that document is used. When the first user turn is the pointer of a start prompt, the original task comes from the document file that the pointer names, when that file can be read (`claude-code-ide-transcript-document-file`).
      - When no original task is found, the part says "Not found in the transcripts.". The next document reads this as no original task, not as a prompt. The prompt list then starts at P1.
    - **State summary of the previous target:** the summary file of the source, verbatim. The file comes from `:summary-file`, or from the document that started the source. The part is left out when no handover started the source.
    - **User prompts of the chain:** every other user prompt, oldest first, with the numbers P2, P3, and so on. P1 is the original task. Each prompt is cut to `claude-code-ide-transcript-prompt-limit` characters.
@@ -214,7 +214,7 @@ Test S7 showed that a document that copies the previous document doubles in size
 - A user turn whose first line is the marker of a handover document is a document turn. A marker in a later line, for example in a quoted text, does not count.
 - A document turn and the assistant turns after it, up to the next user turn, are the bootstrap of a leg. The bootstrap is left out of the prompts and of the latest turns. This also leaves out the turn that wrote the state summary and the "ready" reply.
 - The document names each earlier document only by its handover ID and hash, in the header.
-- `(claude-code-ide-transcript-document-id TEXT)`, `(claude-code-ide-transcript-document-summary-file TEXT)`, and `(claude-code-ide-transcript-document-original-task TEXT)` read these values from a document.
+- `(claude-code-ide-transcript-document-id TEXT)`, `(claude-code-ide-transcript-document-summary-file TEXT)`, and `(claude-code-ide-transcript-document-original-task TEXT)` read these values from a document. `(claude-code-ide-transcript-document-file TEXT)` reads the document file from the pointer of a start prompt.
 
 ### The size budget
 

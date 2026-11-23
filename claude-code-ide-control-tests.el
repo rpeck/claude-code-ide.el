@@ -853,6 +853,33 @@ The two instances have the same display name."
     (should (string-match-p "\"result\":\"stopped\""
                             (claude-code-ide-control--mcp-stop "cci-test-a")))))
 
+(ert-deftest claude-code-ide-test-control-move-inbox-renamed-id-taken ()
+  "A move whose renamed ID is taken by a record of TO that FROM did not make drops nothing."
+  (claude-code-ide-tests--with-control
+    (claude-code-ide-tests--control-add "cci-test-from" "proj" 'working)
+    (claude-code-ide-tests--control-add "cci-test-to" "proj" 'working)
+    (claude-code-ide-control-submit "cci-test-from" "cci-test-for-from" :request-id "q1")
+    ;; TO has q1 and the renamed ID already, both its own
+    (claude-code-ide-control-submit "cci-test-to" "cci-test-own" :request-id "q1")
+    (claude-code-ide-control-submit "cci-test-to" "cci-test-own-renamed"
+                                    :request-id "handover:cci-test-h:q1")
+    (let* ((moved (claude-code-ide-control-move-inbox "cci-test-from" "cci-test-to" "cci-test-h"))
+           (copy (and moved (claude-code-ide-control--find-record "cci-test-to" (car moved)))))
+      (should (= (length moved) 1))
+      (should copy)
+      (should (equal (claude-code-ide-control--record-text copy) "cci-test-for-from"))
+      (should (equal (claude-code-ide-control--record-moved-from copy) "cci-test-from:q1"))
+      (should (equal (claude-code-ide-control--record-moved-to
+                      (claude-code-ide-control--find-record "cci-test-from" "q1"))
+                     (concat "cci-test-to:" (car moved))))
+      ;; The records of TO are unchanged
+      (should (equal (claude-code-ide-control--record-text
+                      (claude-code-ide-control--find-record "cci-test-to" "handover:cci-test-h:q1"))
+                     "cci-test-own-renamed"))
+      ;; A second move moves nothing again
+      (should-not (claude-code-ide-control-move-inbox "cci-test-from" "cci-test-to" "cci-test-h"))
+      (should (= (length (claude-code-ide-control--pending-records "cci-test-to")) 3)))))
+
 (provide 'claude-code-ide-control-tests)
 
 ;;; claude-code-ide-control-tests.el ends here

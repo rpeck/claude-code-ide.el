@@ -133,7 +133,7 @@ This document describes the control operations of claude-code-ide.el, the prompt
 | `earlier-prompts-pending` | queued or rejected | The instance is idle, but older prompts wait. They go first. |
 | `send-failed` | queued | The provider did not send the prompt. It waits for the next try. |
 | `no-submit` | rejected | The provider has no `submit-prompt`. Queued prompts of such an instance also become final with this reason. |
-| `held` | queued or rejected | A handover holds the delivery to the instance while it quiesces and stops it (`claude-code-ide-control-hold`). The prompt waits; with QUEUE nil it is rejected. |
+| `held` | queued or rejected | A handover holds the delivery to the instance while it quiesces and stops it, until the handover ends (`claude-code-ide-control-hold`). The prompt waits; with QUEUE nil it is rejected. A held instance that is stopped or failed also queues the prompt without QUEUE, so that the commit moves it to the target. |
 | `handed-over` | rejected, or queued | A handover moved the prompt to its target (`claude-code-ide-control-move-inbox`). The old record is `rejected` with this reason. The target has a `queued` copy with the same request ID and this reason. Follow the chain with `claude-code-ide-session-registry-chain-current`. |
 | `unknown-instance` | rejected | Neither this Emacs nor the registry knows the ID. |
 | `invalid-instance-id`, `empty-text` | rejected | The request is not valid. |
@@ -202,7 +202,7 @@ The state comes from `claude-code-ide-instance-state`.
 - **Reload.** Loading the package reads no inbox file. The index fills from disk at the first use of each instance, so the inbox survives a reload of the package and a restart of Emacs.
 - **Old Emacs.** The files are read with the native JSON parser when Emacs has one, else with json.el.
 - `claude-code-ide-control-inbox-directory-of (INSTANCE-ID)` returns the folder.
-- `(claude-code-ide-control-move-inbox FROM TO &optional HANDOVER-ID)` moves the pending prompts of FROM to TO at a handover (plan §4.8). Each keeps its request ID; see the reason `handed-over`. When TO has another record with that ID, the copy gets the ID `handover:HANDOVER-ID:ID`. The fields `moved_from` and `moved_to` record the mapping, and `note` says when a moved prompt may have reached FROM.
+- `(claude-code-ide-control-move-inbox FROM TO &optional HANDOVER-ID)` moves the pending prompts of FROM to TO at a handover (plan §4.8). Each keeps its request ID; see the reason `handed-over`. When TO has another record with that ID, the copy gets the ID `handover:HANDOVER-ID:ID`, and when TO has that ID too, `handover:HANDOVER-ID:ID:2`, then `:3`, and so on. The fields `moved_from` and `moved_to` record the mapping, and `note` says when a moved prompt may have reached FROM.
 - After a committed handover, a submit to the old instance goes to the current instance of its chain (`claude-code-ide-session-registry-chain-current`), and `:destination` names it.
 - `(claude-code-ide-control-hold INSTANCE-ID)` and `(claude-code-ide-control-release INSTANCE-ID)` hold and release the delivery to an instance; `claude-code-ide-control-held-p` tells. A held instance gets no prompt, also when it is idle. The release delivers the queued prompts.
 - The inbox writes its files with `claude-code-ide-control-write-json-file` and cleans `done/` with `claude-code-ide-control-prune-folder`. See "Helpers for other files".

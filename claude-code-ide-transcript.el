@@ -834,6 +834,30 @@ without a block quote (the original task was not found) gives nil."
       (unless (string-empty-p prompt)
         prompt))))
 
+(defun claude-code-ide-transcript-document-file (text)
+  "Return the document file that the start prompt TEXT points to, or nil.
+A handover gives its target a short pointer, not the document (see
+`claude-code-ide-handover-start-prompt'); its second line names the
+file."
+  (and (stringp text)
+       (claude-code-ide-transcript-document-id text)
+       (string-match "^Read the handover document at \\(.+\\) fully, and follow its instructions\\.$"
+                     text)
+       (match-string 1 text)))
+
+(defun claude-code-ide-transcript--turn-original-task (text)
+  "Return the original task of the document turn TEXT, or nil.
+TEXT is the document itself, or a pointer to the document file; then
+the original task comes from that file, when it is readable."
+  (or (claude-code-ide-transcript-document-original-task text)
+      (when-let* ((file (claude-code-ide-transcript-document-file text))
+                  ((file-readable-p file)))
+        (claude-code-ide-transcript-document-original-task
+         (with-temp-buffer
+           (let ((coding-system-for-read 'utf-8))
+             (insert-file-contents file))
+           (buffer-string))))))
+
 ;;; Rendering
 
 (defun claude-code-ide-transcript--quote (text)
@@ -1661,14 +1685,15 @@ its tools.  The part always names the transcript files."
                        (plist-get source-data :documents))))
          ;; The original first prompt is the first prompt of the first
          ;; leg.  When a handover document started that leg, it is the
-         ;; original task in that document.
+         ;; original task in that document, or in the document file
+         ;; that the pointer of the start prompt names.
          (first-raw (claude-code-ide-transcript--first-user-turn
                      (plist-get (car leg-data) :all)))
          (first-document-p (claude-code-ide-transcript-document-id (plist-get first-raw :text)))
          (first-turn (and first-raw (not first-document-p) first-raw))
          (first-prompt (if first-turn
                            (plist-get first-turn :text)
-                         (claude-code-ide-transcript-document-original-task
+                         (claude-code-ide-transcript--turn-original-task
                           (plist-get first-raw :text))))
          (state (claude-code-ide-transcript-workspace-state
                  worktree (claude-code-ide-transcript--source-start-commit
