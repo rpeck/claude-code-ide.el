@@ -5144,16 +5144,25 @@ last row too, is the raw text."
                  (list :status 'unsure :why "no footer row under the composer of Codex"
                        :raw (concat "cci-test first paragraph\n\ncci-test second paragraph\n\n"
                                     "cci-test third paragraph"))))
-  ;; The footer forms: the model, the effort and the folder; a hint
-  ;; row counts only on the row of that form or next to it
+  ;; The footer forms: the model, the effort and the folder, as one
+  ;; whole row (a hint can be on that row)
   (dolist (footer '("GPT-5.6-Terra low · ~" "cci-test-model xhigh · ~/cci-test-proj"
-                    "GPT-5.6-Terra low · ~ · 100% context left"
-                    "GPT-5.6-Terra low · ~\n  ? for shortcuts"
-                    "? for shortcuts\n  GPT-5.6-Terra low · ~"
-                    "GPT-5.6-Terra low · ~\n  esc to interrupt"))
+                    "GPT-5.6-Terra low · ~ · 100% context left"))
     (should (equal (list footer (claude-code-ide-handover--read-draft
                                  'codex (format "› cci-test one\n\n  cci-test two\n\n  %s\n" footer)))
                    (list footer '(:status draft :text "cci-test one\n\ncci-test two")))))
+  ;; A hint row next to the form: the guard leaves out only the last
+  ;; row, and only the form, so the hint row is kept as maybe text
+  (dolist (footer '("GPT-5.6-Terra low · ~\n  ? for shortcuts"
+                    "? for shortcuts\n  GPT-5.6-Terra low · ~"
+                    "GPT-5.6-Terra low · ~\n  esc to interrupt"))
+    (let ((result (claude-code-ide-handover--read-draft
+                   'codex (format "› cci-test one\n\n  cci-test two\n\n  %s\n" footer))))
+      (should (equal (list footer (plist-get result :status)) (list footer 'unsure)))
+      (should (claude-code-ide-handover-tests--keeps-rows-p
+               result (append '("cci-test one" "cci-test two")
+                              (cl-remove "GPT-5.6-Terra low · ~"
+                                         (mapcar #'string-trim (split-string footer "\n"))))))))
   ;; A bare hint row is no footer: it can be the user's text
   (dolist (hint '("? for shortcuts" "esc to interrupt" "100% context left"))
     (let ((result (claude-code-ide-handover--read-draft
@@ -5204,15 +5213,18 @@ The raw text has the composer rows, then the popup rows under a label."
   (string-trim (replace-regexp-in-string "[ \t\n]+" " " text)))
 
 (defun claude-code-ide-handover-tests--keeps-rows-p (result rows)
-  "Return non-nil when RESULT keeps each of ROWS.
+  "Return non-nil when RESULT keeps each of ROWS, in their order.
 RESULT must be a draft, or unsure with :raw; never none."
   (when-let* ((text (pcase (plist-get result :status)
                       ('draft (plist-get result :text))
                       ('unsure (plist-get result :raw)))))
-    (cl-every (lambda (row)
-                (string-search (claude-code-ide-handover-tests--flat row)
-                               (claude-code-ide-handover-tests--flat text)))
-              rows)))
+    (let ((whole (claude-code-ide-handover-tests--flat text))
+          (from 0))
+      (cl-every (lambda (row)
+                  (let* ((flat (claude-code-ide-handover-tests--flat row))
+                         (at (string-search flat whole from)))
+                    (when at (setq from (+ at (length flat))))))
+                rows))))
 
 (ert-deftest claude-code-ide-test-handover-read-draft-never-loses-text ()
   "The safety rule of the screen read: a misread may cost a question, but never text.
@@ -5281,6 +5293,65 @@ the result is a draft, or unsure with :raw, and it keeps every such row."
                             collect (list (nth 0 case) (nth 1 case) result))
                    nil))))
 
+(ert-deftest claude-code-ide-test-handover-read-draft-guard-own-footer ()
+  "The guard has its own footer rule: at most the last row, and only the model form.
+A hint row next to the footer is text that the guard keeps, also when
+the reader counts it as a part of the footer."
+  (dolist (composer '("›" "› cci-test text"))
+    (let ((result (claude-code-ide-handover--read-draft
+                   'codex (concat composer "\n\n  100% context left\n  GPT-5.6-Terra low · ~\n"))))
+      (should (equal (list composer (plist-get result :status)) (list composer 'unsure)))
+      (should (claude-code-ide-handover-tests--keeps-rows-p
+               result (if (string= composer "›")
+                          '("100% context left")
+                        '("cci-test text" "100% context left"))))
+      ;; The footer row is labelled in the raw text, not left out
+      (should (string-match-p "(the footer of Codex:)\nGPT-5.6-Terra low · ~\\'"
+                              (plist-get result :raw))))))
+
+(ert-deftest claude-code-ide-test-handover-read-draft-clipped-box ()
+  "A Claude Code box whose top rule and ❯ row are above the screen keeps its rows.
+The region is the rows above the bottom rule, not the status rows under it."
+  (let* ((rule (make-string 62 ?─))
+         (result (claude-code-ide-handover--read-draft
+                  'claude (concat "  cci-test second row of a long draft\n"
+                                  "    cci-test third row\n"
+                                  rule "\n"
+                                  "  ? for shortcuts\n"
+                                  "  ⏵⏵ auto mode on (shift+tab to cycle)\n"))))
+    (should (eq (plist-get result :status) 'unsure))
+    (should (claude-code-ide-handover-tests--keeps-rows-p
+             result '("cci-test second row of a long draft" "cci-test third row")))
+    (should-not (string-match-p "for shortcuts\\|auto mode" (plist-get result :raw)))))
+
+(ert-deftest claude-code-ide-test-handover-keeps-rows-in-order ()
+  "The guard matches the rows of the region in order, each one past the last."
+  (should (claude-code-ide-handover--keeps-rows-p "cci-test first cci-test second"
+                                                  '("cci-test first" "cci-test second")))
+  (should (claude-code-ide-handover--keeps-rows-p "cci-test repeat\n\ncci-test repeat"
+                                                  '("cci-test repeat" "cci-test repeat")))
+  (should-not (claude-code-ide-handover--keeps-rows-p "cci-test repeat"
+                                                      '("cci-test repeat" "cci-test repeat")))
+  (should-not (claude-code-ide-handover--keeps-rows-p "cci-test second cci-test first"
+                                                      '("cci-test first" "cci-test second")))
+  ;; Through the guard: a reader that drops a repeated row, or turns
+  ;; the rows around
+  (let ((screen "› cci-test repeat\n  cci-test repeat\n\n  GPT-5.6-Terra low · ~\n"))
+    (dolist (bug '((:status draft :text "cci-test repeat")
+                   (:status unsure :why "cci-test reader bug" :raw "cci-test repeat")))
+      (cl-letf (((symbol-function 'claude-code-ide-handover--read-codex-draft) (lambda (_lines) bug)))
+        (let ((result (claude-code-ide-handover--read-draft 'codex screen)))
+          (should (equal (list bug (plist-get result :status)) (list bug 'unsure)))
+          (should (claude-code-ide-handover-tests--keeps-rows-p
+                   result '("cci-test repeat" "cci-test repeat")))))))
+  (cl-letf (((symbol-function 'claude-code-ide-handover--read-codex-draft)
+             (lambda (_lines) '(:status draft :text "cci-test second cci-test first"))))
+    (let ((result (claude-code-ide-handover--read-draft
+                   'codex "› cci-test first\n  cci-test second\n\n  GPT-5.6-Terra low · ~\n")))
+      (should (eq (plist-get result :status) 'unsure))
+      (should (claude-code-ide-handover-tests--keeps-rows-p
+               result '("cci-test first" "cci-test second"))))))
+
 (ert-deftest claude-code-ide-test-handover-read-draft-guard ()
   "The final guard of the screen read fixes a reader that would lose text.
 A result of none, unsure without :raw, or a text that misses a row of
@@ -5291,8 +5362,10 @@ the input region becomes unsure with the whole region as :raw."
            (claude ,(concat (make-string 62 ?─) "\n❯ cci-test first\n  cci-test second\n"
                             (make-string 62 ?─) "\n  ? for shortcuts\n")
                    "cci-test first" "cci-test second")
-           ;; No sure box: the rows after the last rule
-           (claude ,(concat "⏺ cci-test reply\n" (make-string 62 ?─) "\n cci-test first\n cci-test second\n")
+           ;; No sure box, and a sent ❯ prompt with the conversation
+           ;; under it: the rows after the last rule
+           (claude ,(concat "❯ cci-test older request\n⏺ cci-test reply\n" (make-string 62 ?─)
+                            "\n cci-test first\n cci-test second\n")
                    "cci-test first" "cci-test second"))))
     (dolist (screen screens)
       (dolist (bug '((:status none)

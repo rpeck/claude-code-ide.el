@@ -199,9 +199,16 @@ The user may have typed a prompt into the source without sending it. The stop wo
     - A row is left out of the input region only with strong evidence: a whole footer row, the status lines under the bottom rule, the borders of the older box, the prompt marker, and the IDE context chip.
     - A read never gives `none` when the region (the composer, or the box) has text that is not a placeholder. It gives `draft`, or `unsure` with the whole region as the raw text, never one row of it.
     - **The final guard** (`claude-code-ide-handover--guard-draft`) makes this rule structural. `claude-code-ide-handover--read-draft` applies it once, after each reader returns:
-      - It finds the candidate region on its own. For Codex: every row from the last `›` row to the end of the screen. For Claude Code: the input box; with its top rule above the screen, the rows from the last `❯` row to the bottom rule; with no sure box, the rows after the last box rule.
-      - The result is checked against each row of that region that has text and is not a placeholder. Only the rows that are surely the Codex footer are not checked.
-      - When the result is `none`, `unsure` without raw text, or a text that misses such a row, the guard changes it to `unsure`, with the whole region as the raw text. The footer rows are in it under the label "(the footer of Codex:)", never left out. A raw text of the reader that the region does not hold stays in front.
+      - It finds the candidate region on its own, independent of the reader.
+        - For Codex: every row from the last `›` row to the end of the screen.
+        - For Claude Code: the sure input box (top and bottom rule).
+        - With the top rule above the screen: the rows from the last `❯` row to the bottom rule.
+        - With the top rule and the `❯` row both above the screen (a clipped long draft): the rows above the bottom rule, up to the top of the screen or to a rule above. The status rows under the bottom rule are not the region.
+        - With a dialog on the screen, or a `❯` row with rows of the conversation under it: the rows after the last rule.
+      - The result is checked against each row of that region that has text and is not a placeholder, in order: each row must come after the row before it, so two equal rows need two copies, and rows in another order do not match.
+      - The guard leaves out at most one row: the last Codex row, and only when a regexp of `claude-code-ide-handover-codex-footer-regexps` matches the whole row. It does not use the footer rule of the reader. A hint row next to the footer is text that the guard keeps.
+      - When the result is `none`, `unsure` without raw text, or a text that misses such a row, the guard changes it to `unsure`, with the whole region as the raw text. The footer row is in it under the label "(the footer of Codex:)", never left out. A raw text of the reader that the region does not hold stays in front.
+      - So a Codex footer with a hint row next to its model row (as in `100% context left` above `GPT-5.6-Terra low · ~`) gives unsure with the composer text: one question, no lost text.
     - The test `claude-code-ide-test-handover-read-draft-never-loses-text` runs the fixtures of both readers through `--read-draft`, with the guard. The test `-read-draft-guard` stubs a reader that returns `none`, unsure without raw text, a short raw text, or a short draft, and checks that the guard fixes each.
   - **Dialogs.** A dialog on the screen gives unsure, for both CLIs. The reader knows a dialog by its structure, not by the text of a choice:
     - the selection marker (`❯` or `›`) on a numbered choice row;

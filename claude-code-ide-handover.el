@@ -1713,12 +1713,18 @@ The prompt marker and an IDE context chip are left out."
 
 (defun claude-code-ide-handover--claude-region (lines)
   "Return the candidate input region of the Claude Code screen LINES, or nil.
-The value is (ROWS . 0).  ROWS are the rows of the input box when it
-is sure (its top and bottom rules); else, with the top rule above the
-screen, the rows from the last ❯ row to the bottom rule; else the rows
-after the last box rule.  The first row of a box loses its marker and
-its IDE context chip."
-  (let ((box (claude-code-ide-handover--claude-box lines)))
+The value is (ROWS . 0).  ROWS are:
+- the rows of the input box when it is sure (its top and bottom rules);
+- with the top rule above the screen, the rows from the last ❯ row to
+  the bottom rule;
+- with the top rule and the ❯ row both above the screen (a long draft),
+  the rows above the bottom rule, up to the top of the screen or to a
+  rule above;
+- with a dialog on the screen, or a ❯ row with rows of the conversation
+  under it, the rows after the last rule.
+The first row of a box loses its marker and its IDE context chip."
+  (let ((box (claude-code-ide-handover--claude-box lines))
+        (rule-p (lambda (line) (string-match-p "\\`[╭╰]?─\\{8,\\}" line))))
     (if (and box (car box))
         (let ((rows (claude-code-ide-handover--claude-box-rows lines box)))
           (and rows (cons (cons (claude-code-ide-handover--claude-first-row (car rows)) (cdr rows)) 0)))
@@ -1727,32 +1733,55 @@ its IDE context chip."
                                          when (string-match-p "\\`❯" (nth index lines))
                                          return index)))
              (rows (and start (cl-subseq lines start bottom))))
-        (if (and rows (claude-code-ide-handover--indented-p (cdr rows)))
-            (cons (cons (claude-code-ide-handover--claude-first-row (car rows)) (cdr rows)) 0)
+        (cond
+         ((and rows (claude-code-ide-handover--indented-p (cdr rows)))
+          (cons (cons (claude-code-ide-handover--claude-first-row (car rows)) (cdr rows)) 0))
+         ((and bottom (not start) (not (claude-code-ide-handover--dialog-p lines "❯")))
+          ;; A clipped box: everything above its bottom rule
+          (let ((above (cl-loop for index downfrom (1- bottom) to 0
+                                when (funcall rule-p (nth index lines)) return index)))
+            (cons (cl-subseq lines (if above (1+ above) 0) bottom) 0)))
+         (t
           (when-let* ((rule (cl-loop for index downfrom (1- (length lines)) to 0
-                                     when (string-match-p "\\`[╭╰]?─\\{8,\\}" (nth index lines))
-                                     return index)))
-            (cons (nthcdr (1+ rule) lines) 0)))))))
+                                     when (funcall rule-p (nth index lines)) return index)))
+            (cons (nthcdr (1+ rule) lines) 0))))))))
 
 (defun claude-code-ide-handover--codex-region (lines)
   "Return the candidate input region of the Codex screen LINES, or nil.
 The value is (ROWS . FOOTER): ROWS are every row from the last › row
-to the last row with text, the first one without its marker, and
-FOOTER is how many rows at the end are surely the footer."
+to the last row with text, the first one without its marker.  FOOTER
+is 1 when the last row is surely the footer, else 0.  This rule is the
+guard's own, independent of the reader, and minimal: at most the last
+row, and only when a regexp of
+`claude-code-ide-handover-codex-footer-regexps' matches the whole row.
+A hint row next to it is text that the guard keeps."
   (let* ((last (claude-code-ide-handover--last-text-row lines))
          (start (and last (cl-loop for index downfrom last to 0
                                    when (string-prefix-p "›" (nth index lines)) return index))))
     (when start
       (cons (cons (claude-code-ide-handover--codex-first-row (nth start lines))
                   (cl-subseq lines (1+ start) (1+ last)))
-            (claude-code-ide-handover--codex-footer-size lines start last)))))
+            (if (and (< start last)
+                     (claude-code-ide-handover--whole-row-p
+                      claude-code-ide-handover-codex-footer-regexps (nth last lines)))
+                1
+              0)))))
 
 (defun claude-code-ide-handover--keeps-rows-p (text rows)
-  "Return non-nil when TEXT has each of ROWS, with white space as one space."
-  (let ((flat (lambda (string)
-                (string-trim (replace-regexp-in-string "[ \t\n]+" " " string)))))
-    (let ((whole (funcall flat text)))
-      (cl-every (lambda (row) (string-search (funcall flat row) whole)) rows))))
+  "Return non-nil when TEXT has each of ROWS, in their order.
+White space counts as one space.  Each row must come after the one
+before it, so two equal rows need two copies, and rows in another
+order do not match."
+  (let* ((flat (lambda (string)
+                 (string-trim (replace-regexp-in-string "[ \t\n]+" " " string))))
+         (whole (funcall flat text))
+         (from 0))
+    (cl-every (lambda (row)
+                (let* ((part (funcall flat row))
+                       (at (string-search part whole from)))
+                  (when at
+                    (setq from (+ at (length part))))))
+              rows)))
 
 (defun claude-code-ide-handover--guard-draft (result region)
   "Return RESULT of a screen read, made safe against the input REGION.
