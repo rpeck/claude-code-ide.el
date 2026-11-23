@@ -182,18 +182,36 @@ Emacs saves each stage in the registry entry of the source **before** the step o
 The user may have typed a prompt into the source without sending it. The stop would lose it, and the document would not carry it.
 
 - **The check.** In the quiescing, when the source is quiet and before the stop, the handover reads the terminal screen of the source (`claude-code-ide-handover--source-draft`). It uses the screen read of the Codex dialogs, which knows the terminal size of vterm, eat and ghostel. It runs once; its result is kept in the run.
-  - **Claude Code:** the text in the input box: between the last two box rules (a line that starts with `─`, whose top one can hold the session title, as in `──── my title ─`; or the older `╭─╮` and `╰─╯` box with its `│` borders), after the prompt marker `❯` (or `>` in the older box). A sent prompt with `❯` above the box, and the status lines under it, are no part of it.
+  - **Claude Code:** the text in the input box, after the prompt marker `❯` (or `>` in the older box). The reader finds the box by its geometry, not by the last two rule lines:
+    - The bottom rule is the last rule at the left edge of the screen. The rows under it are the status lines.
+    - The top rule is the rule at the left edge above it. It can hold the session title, as in `──── my title ─`. The older box has `╭─╮` over `╰─╯`.
+    - The rows of a draft never start at the left edge: Claude Code indents its wrapped and new lines, and the older box has `│` in front. So a divider line (`────`) in the draft is the user's text, not a rule of the box.
+    - Only the older box has the side borders `│`, so only its rows lose them. In the borderless box, a `│` of the user's text stays.
+    - A sent prompt with `❯` above the box, and the status lines under it, are no part of it.
     - **The IDE context chip** that Claude Code puts in front of the draft, such as `[⧉ In foo.el]` for the file that is open in Emacs, is not the user's text. It is left out, and kept as information (`draft_context`; the note "(written while foo.el was open)").
-  - **Codex:** the text of the composer: the last line that starts with `›` and is not a numbered choice, with its indented continuation lines up to the next empty line.
-  - **The lines join with one space** for both CLIs. A screen cannot tell a soft wrap at its width from a new line that the user typed, and the indents of the wraps differ (2 and 4 spaces on a real Claude Code screen).
+  - **Codex:** the text of the composer. The reader finds the bottom of the composer first:
+    - The last row of the screen is the footer row (the model and the folder), with an empty row above it.
+    - The composer starts at the last row above it that starts with `›`. Every row up to the empty row belongs to it, also its empty rows.
+    - The wrapped and new lines of the composer are indented. A row at the left edge between the `›` row and the footer is part of the conversation, so that `›` row is a sent request: the read is unsure, and it does not search further back.
+    - Without the empty row and the footer row under it, the read is unsure.
+  - **Dialogs.** A dialog on the screen gives unsure, for both CLIs. The reader knows a dialog by its structure, not by the text of a choice:
+    - the selection marker (`❯` or `›`) on a numbered choice row;
+    - another numbered row in its list;
+    - at the bottom of the screen, the control row of the dialog (such as `Esc to cancel`, `Press enter to confirm or esc to cancel`, `enter continue · esc quit`, `option 1/2 | enter to submit`) or the choice list itself.
+    - So a draft that starts with `1. ` is a draft: under the input box or the composer, the bottom rows are the status lines or the footer row.
+  - **Paragraphs and wraps.** An empty row in the input ends a paragraph, and the paragraphs join with an empty line. The rows of a paragraph join with one space, for both CLIs: a screen cannot tell a soft wrap at its width from a new line that the user typed, and the indents of the wraps differ (2 and 4 spaces on a real Claude Code screen).
   - **Placeholders** of an empty box are no draft (`claude-code-ide-handover-draft-placeholders`): Claude Code's `Try "..."` suggestions, and Codex's "Ask Codex to do anything" and its other suggestions.
-  - **Unsure.** A screen without an input box, a menu in the box, a source without a terminal buffer, or a provider without a reader counts as no draft. The record says that the check was unsure (`draft_decision` `unsure`, with `draft_unsure`).
+  - **Unsure.** A screen without an input box, a dialog, a box without the prompt marker, a source without a terminal buffer, or a provider without a reader is unsure. The record says so (`draft_decision` `unsure`, with `draft_unsure`).
+  - **Maybe a draft.** An unsure read can still find the input region: a box without the prompt marker, a box whose top is above the screen (a long draft), or a composer without the footer row. When that region has text that is not a placeholder, the read gives it as raw text (`:raw`).
+    - With `ask`, the handover does not go on. It asks the person, and shows the raw text, labelled as maybe a draft. A coordinator call gets `needs-user` / `unsent-draft`, with the raw text in `:draft` and `:draft-maybe` t. The choices are the same: carry, drop, cancel.
+    - With `carry`, `drop` or `refuse`, the handover goes on as with no draft (`draft_decision` `unsure`), and the record keeps the raw text (`draft_raw`).
+    - An unsure read without raw text goes on as with no draft, with every value of the option.
 - **The option `claude-code-ide-handover-unsent-draft`:**
   - `ask` (the default): an interactive handover shows the draft and asks before the stop. A coordinator call gets `needs-user` with the reason `unsent-draft`, the stage `quiescing`, and `:draft` in its status. The choices: `carry`, `drop`, `cancel` (see the table below).
   - `carry`: the document gets the part "The user's unsent prompt (not sent to the source)", with the draft quoted as data, and the instruction to treat it as the user's next request after the state summary. With the continue prompt, the target takes it up.
   - `drop`: go on without it. The record keeps its text (`draft_text`, `draft_decision` `drop`), so nothing is lost for good.
   - `refuse`: cancel the handover with the reason `unsent-draft`; the source keeps running with its draft.
-- **The record** keeps `draft_text`, `draft_decision` (`none`, `unsure`, `carry` or `drop`), `draft_unsure` and `draft_context`. The status has `:draft`, `:draft-decision` and `:draft-context`, and the question shows the note of the chip. A crash while the decision waits is a crash before the stop: the recovery cancels the handover (`recovered-before-stop`), and the record and the status keep the draft.
+- **The record** keeps `draft_text`, `draft_decision` (`none`, `unsure`, `carry` or `drop`), `draft_unsure`, `draft_context`, `draft_raw` (the raw text of an unsure read) and `draft_maybe` (true when the draft is that raw text). The status has `:draft`, `:draft-decision`, `:draft-context`, `:draft-raw` and `:draft-maybe`, and the question shows the note of the chip. A crash while the decision waits is a crash before the stop: the recovery cancels the handover (`recovered-before-stop`), and the record and the status keep the draft.
 
 ## Stray processes
 
