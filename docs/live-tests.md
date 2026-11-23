@@ -12,6 +12,7 @@ They check what the unit tests cannot: the handover between real conversations, 
 - Each live test (`claude-code-ide-live-test-…`) skips unless all of these are true:
   - `CLAUDE_CODE_IDE_LIVE_TESTS=1` is set.
   - Emacs is a daemon (`daemonp`), not in batch mode. The CLIs need real terminals, and a person's Emacs must never run them.
+  - The daemon started without an init file (`emacs -Q`: `init-file-user` is nil), or its name starts with `cci-live`. A person's daemon loads an init file, so the gate stays closed there.
   - The mocks of `claude-code-ide-tests.el` are not loaded.
 - The gate is part of the macro `claude-code-ide-live-tests--live`, which holds the body of each live test. So a live test cannot leave it out.
 - `./scripts/compile-and-test.sh` loads the file. Its live tests skip, and the unit tests of its helpers (`claude-code-ide-live-tests-test-…`) run. One of them runs each live test with the gate closed (also in a live daemon), and checks that it skips and that no setup, stop, cleanup, or launch runs.
@@ -37,7 +38,7 @@ They check what the unit tests cannot: the handover between real conversations, 
     ```
 
     With the default live folder: `rm -r tmp/live/owner.lock` in the repository.
-  - A folder that has files but no `owner` file is no live folder, for example a folder of yours that `CLAUDE_CODE_IDE_LIVE_DIR` names by mistake. The setup refuses it.
+  - A folder that has files but no `owner` file is no live folder, for example a folder of yours that `CLAUDE_CODE_IDE_LIVE_DIR` names by mistake. The setup refuses it before it changes the folder: the folder keeps its mode, and gets no lock and no `owner` file. The claim checks again under its lock.
 - **The setup runs only in a live daemon.** Where the gate is closed (batch Emacs, your own Emacs), `claude-code-ide-live-tests-setup` signals an error before it changes anything. It changes package options, adds advice, and turns on the session registry, whose recovery can start CLIs.
 
 ## Start a daemon of your own
@@ -93,7 +94,7 @@ emacsclient -s cci-live -e '(claude-code-ide-live-tests-run "handover-chain" "/a
 |---|---|
 | `CLAUDE_CODE_IDE_LIVE_TESTS=1` | The tests run. |
 | `CLAUDE_CODE_IDE_LIVE_TRUST=1` | A test may answer the folder trust dialog of a CLI for a test project, as a person. Without it, a test whose project gets the question skips. |
-| `CLAUDE_CODE_IDE_LIVE_KILL=<stage>` | The recovery test part 1 runs, and kills its Emacs at that stage. |
+| `CLAUDE_CODE_IDE_LIVE_KILL=<stage>` | The recovery test part 1 runs, and kills its Emacs at that stage. The stage is `source-stopped`, `document-written`, `target-started`, `target-identified`, or `delivered`. With another value, the test skips. |
 | `CLAUDE_CODE_IDE_LIVE_DIR` | The live folder. |
 | `CLAUDE_CODE_IDE_LIVE_CLAUDE_FLAGS` | Replaces the Claude Code flags (below). |
 | `CLAUDE_CODE_IDE_LIVE_CODEX_FLAGS` | Replaces the Codex flags (default: low reasoning effort, and no approval for the tools of `claude-sessions`). |
@@ -105,9 +106,16 @@ emacsclient -s cci-live -e '(claude-code-ide-live-tests-run "handover-chain" "/a
   - It writes only the files of the handover folder (the state summary) without a question.
   - It has no Bash. So it runs no command, and it reads the transcripts with the read tools.
   - There is no `acceptEdits` and no bypass mode.
-- **The test approves only read tools.** When a CLI asks for an approval, `claude-code-ide-live-tests--approve-while` reads the tool name of the `PermissionRequest` event.
-  - Read, Glob, Grep, and the tools of `claude-sessions` get "1. Yes", as a person would answer. The log has the tool and the screen.
-  - Any other tool fails the test. The test never allows a write or a command.
+- **The test approves only read tools in the test folders.** When a CLI asks for an approval, `claude-code-ide-live-tests--approve-while` reads the tool name and the tool input of the `PermissionRequest` event.
+  - The tools of `claude-sessions` get "1. Yes", as a person would answer.
+  - Read, Glob, and Grep get "1. Yes" only for a path in one of these folders, by its true name (a link counts by its target):
+    - the live folder;
+    - the Claude Code transcript folders of the folders in the live folder;
+    - the Codex sessions folder (`~/.codex/sessions`).
+  - The path is `file_path` (Read), `path` and `pattern` (Glob), or `path` (Grep). A missing path is the folder of the CLI.
+  - The test sends "1" only when the current screen shows the dialog (the last lines of the buffer), not when only the scrollback has an old one.
+  - The log has the tool, its input, and the screen.
+  - Any other tool or path fails the test. The test never allows a write, a command, or a read in another folder.
 
 ## Hook trust of Codex
 
@@ -123,10 +131,12 @@ emacsclient -s cci-live -e '(claude-code-ide-live-tests-run "handover-chain" "/a
 | `handover-chain` | CC → Codex with `claude-sessions`, Codex → CC, and the chain of three legs. |
 | `handover-file-reference` | CC → Codex with `claude-code-ide-handover-session-server` nil. |
 | `handover-hooks-not-trusted` | A coordinator handover to Codex without trusted hooks gets `hooks-not-trusted`, twice: before and after the real check. |
-| `handover-stray` | A process in the worktree gives `needs-user/strays`; `end` ends it, and the handover commits. |
+| `handover-stray` | A process in the worktree gives `needs-user/strays`; `end` ends it, and the handover commits. `end` ends every stray, so the strays must be exactly the `sleep` of the test. Else the test fails and ends nothing. |
+| `handover-ghostel-sources-end` | In ghostel, CC → Codex and then Codex → CC. Each handover ends the CLI process of its source (by its recorded PID). |
 | `stop-asks-nothing-vterm`, `-eat`, `-ghostel` | `claude-code-ide-control-stop` ends a Codex instance without a question such as "Buffer has a running process; kill it?". |
 | `recovery-1-kill`, `recovery-2-after-kill` | A crash of Emacs between `source-stopped` and `committed`; the next Emacs starts only the target. |
 | `codex-dialogs-vterm`, `-eat`, `-ghostel` | The folder trust, hooks review, and approval dialogs of Codex in each terminal. |
+| `codex-approval-eat-no-window` | The Codex approval dialog in an eat buffer that shows in no window (see [The dialogs](#the-dialogs)). |
 
 ### Folder trust
 
@@ -137,7 +147,7 @@ emacsclient -s cci-live -e '(claude-code-ide-live-tests-run "handover-chain" "/a
 
 ### The codeword
 
-- Each handover test writes a codeword file in the project, for example `MARMOT-731`.
+- The tests `handover-chain`, `handover-file-reference`, and `recovery-1-kill` write a codeword file in the project, for example `MARMOT-731`. The other handover tests use no codeword.
 - The source reads it with a tool and replies only "done". Then the test deletes the file.
 - So the codeword is only in a tool result of the source. The handover document leaves tool results out; the test checks that the document does not have the codeword.
 - The question to the target does not have the codeword either. A right answer shows that the target read the earlier session.
@@ -145,13 +155,14 @@ emacsclient -s cci-live -e '(claude-code-ide-live-tests-run "handover-chain" "/a
 ### Turns, request IDs and prompts
 
 - **The turn of a prompt.** The test submits each prompt with a request ID, and waits until its request status is `delivered`. The turn that answers it is the first turn end after the `prompt-submit` event with that text. An earlier turn end, for example of the first turn of a target, does not count.
-- Each handover gets a new request ID (`<label>-<time>`): a known request ID returns the result of the earlier handover.
+- Each handover that the test expects to run gets a new request ID (`<label>-<time>`): a known request ID returns the result of the earlier handover.
+  - `handover-hooks-not-trusted` uses the fixed IDs `cci-test-L5-1` and `cci-test-L5-2`. The package refuses those calls and records no handover; the test checks that each ID stays unknown.
 - The prompts do not call the codeword a secret, and do not forbid to repeat it. With such a prompt, the Claude Code target refused to say it later ("I will not do this").
 
 ### The chain
 
 1. Leg 1 (CC) reads codeword 1. The handover to Codex commits.
-2. The document has the `claude-sessions` tool names. The question asks leg 2 to use them, because the document offers the tools or the file, and Codex chose the file without the hint. Leg 2 answers codeword 1. Its rollout exists and has calls of `mcp__claude_sessions__get_session_outline` or `get_messages` (read from the fields of the records: an `item_completed` event with an `McpToolCall` item of the server `claude-sessions` and the status `completed`, or a `function_call` named `mcp__claude_sessions__<tool>`; a text that only names a tool does not count).
+2. The document has the `claude-sessions` tool names. The question asks leg 2 to use them, because the document offers the tools or the file, and Codex chose the file without the hint. Leg 2 answers codeword 1. Its rollout exists and has calls of `mcp__claude_sessions__get_session_outline` or `get_messages` (read from the fields of the records: an `item_completed` event with an `McpToolCall` item of the server `claude-sessions` and the status `completed`, or a `function_call` named `mcp__claude_sessions__<tool>`; a text that only names a tool does not count, and neither does a call of another tool of `claude-sessions`).
 3. Leg 2 reads codeword 2. The handover to CC commits.
 4. The document of leg 3 has the first prompt of leg 1 one time, its own marker one time, and not codeword 2. (Codeword 1 is in it: leg 2 said it in its answer.) The registry chain of leg 3 is `claude, codex, claude`, with no pending leg. `chain-current` of legs 1 and 2 gives leg 3.
 5. Leg 3 answers codeword 2 from the Codex rollout (file reference).
@@ -160,13 +171,13 @@ In `handover-file-reference`, the rollout of the target must exist before the te
 
 ### The recovery
 
-1. Start the daemon with `CLAUDE_CODE_IDE_LIVE_KILL=target-identified` (or another stage after `source-stopped`), and run `recovery-1-kill`.
+1. Start the daemon with `CLAUDE_CODE_IDE_LIVE_KILL=target-identified` (or `source-stopped`, `document-written`, `target-started`, or `delivered`), and run `recovery-1-kill`.
 2. At the save of that stage, an advice writes `recovery.eld` to the live folder and sends SIGKILL to Emacs.
 3. Start a new daemon with the same live folder, without the kill variable. The registry mode turns on at its start, and its recovery runs in the first idle moment.
 4. Run `recovery-2-after-kill`. It checks:
    - the handover commits with the same target ID;
    - this Emacs started only the target (`starts.txt` of the live folder);
-   - no CLI process runs with the conversation ID of the source;
+   - no CLI process runs with the conversation ID of the source. A CLI process is one with a word of its command line whose file name is `claude` or `codex`, also after a launcher such as `node .../bin/claude`;
    - `chain-current` of the source gives the target;
    - the target answers the codeword of the source.
 
