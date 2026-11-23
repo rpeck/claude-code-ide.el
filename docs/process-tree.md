@@ -4,7 +4,7 @@ A coding-agent CLI can start background work that runs after the CLI ends.
 This document describes how claude-code-ide.el records that work, ends it at a stop, and reports the processes that are left.
 
 - Code: `claude-code-ide-process.el`.
-- Tests: `claude-code-ide-process-tests.el`.
+- Tests: `tests/claude-code-ide-process-tests.el`.
 - Instances: [session-schema.md](session-schema.md).
 
 ## Why the CLI's own process group is not enough

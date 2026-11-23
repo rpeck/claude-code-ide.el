@@ -35,22 +35,23 @@ This package integrates coding-agent CLIs with Emacs via the Model Context Proto
 - `claude-code-ide-reload.el` - `claude-code-ide-reload`: loads the package files again in dependency order in a running Emacs, and turns the package modes that are on off and on again
 
 **Test Files:**
-- `claude-code-ide-tests.el` - ERT test suite with mocks. It loads every `claude-code-ide-*-tests.el` file of its folder. Each test file must `provide` a feature equal to its file name.
-- `claude-code-ide-session-registry-tests.el` - Session registry tests
-- `claude-code-ide-session-status-tests.el` - Session status tests
-- `claude-code-ide-provider-tests.el` - Provider, instance, event, state, and registry file version tests
-- `claude-code-ide-codex-tests.el` - Codex provider tests; process tests run small shell scripts in place of `codex`
-- `claude-code-ide-codex-events-tests.el` - Codex status, status buffer columns, status snapshot, and shared status file helper tests
-- `claude-code-ide-mcp-routing-tests.el` - MCP routing tests: secrets, request checks, descriptor context, the one active buffer tracker, coordinator scope, get_capabilities
-- `claude-code-ide-control-tests.el` - Control operation, inbox, and coordinator tool tests
-- `claude-code-ide-handover-tests.el` - Handover tests: stages, preflight, quiescing and the inbox hold, strays, the delivery watch, recovery at each stage and its claims, two writers, the inbox move, the chain, the version 4 registry file, control states, approvals, the status key, and a real review process
-- `claude-code-ide-review-tests.el` - Review tracking and dedicated ediff frame tests; the tests with real frames skip in batch Emacs
-- `claude-code-ide-transcript-tests.el` - Transcript and handover document tests, with fixtures in `test-fixtures/transcripts/` (made by `make-fixtures.py` there)
-- `claude-code-ide-process-tests.el` - Process tree tests; live tests run with `CLAUDE_CODE_IDE_LIVE_TESTS=1`
-- `claude-code-ide-reload-tests.el` - Reload tests; one test reloads a copy of the package in a new batch Emacs
-- `claude-code-ide-menu-bar-tests.el` - Menu bar tests: the mode and its default, the commands of the Agents menu, and the items of the Agent Sessions menu
-- `claude-code-ide-wiring-tests.el` - Tests of the core wiring: no IDE server without the IDE protocol, provider texts, flags per provider, forks, secrets in the debug log, the CC MCP config file, the process-tree calls, the prepare hook, the provider choice, and the buffers kept after a stop. At load, it points the MCP config folder and the provider file at a temporary folder for the whole run.
-- `claude-code-ide-live-tests.el` - Live tests with the real `claude` and `codex` CLIs: handovers between both providers, recovery after a crash of Emacs, the Codex dialogs in each terminal, and stops without a question. They run only in an own `emacs -Q` daemon with `CLAUDE_CODE_IDE_LIVE_TESTS=1` (docs/live-tests.md); in the batch suite each one skips, and only the unit tests of its helpers run.
+- `claude-code-ide-tests.el` - ERT test suite with mocks (upstream file; it stays at the top level). It loads every `claude-code-ide-*-tests.el` file of its folder and of `tests/`, and puts `tests/` on `load-path`. Each test file must `provide` a feature equal to its file name.
+- `tests/` - The test files of this fork, and their fixtures in `tests/fixtures/`. Do not move or rename a file that upstream (manzaltu/claude-code-ide.el) has, so that PRs to upstream merge without conflicts.
+- `tests/claude-code-ide-session-registry-tests.el` - Session registry tests
+- `tests/claude-code-ide-session-status-tests.el` - Session status tests
+- `tests/claude-code-ide-provider-tests.el` - Provider, instance, event, state, and registry file version tests
+- `tests/claude-code-ide-codex-tests.el` - Codex provider tests; process tests run small shell scripts in place of `codex`
+- `tests/claude-code-ide-codex-events-tests.el` - Codex status, status buffer columns, status snapshot, and shared status file helper tests
+- `tests/claude-code-ide-mcp-routing-tests.el` - MCP routing tests: secrets, request checks, descriptor context, the one active buffer tracker, coordinator scope, get_capabilities
+- `tests/claude-code-ide-control-tests.el` - Control operation, inbox, and coordinator tool tests
+- `tests/claude-code-ide-handover-tests.el` - Handover tests: stages, preflight, quiescing and the inbox hold, strays, the delivery watch, recovery at each stage and its claims, two writers, the inbox move, the chain, the version 4 registry file, control states, approvals, the status key, and a real review process
+- `tests/claude-code-ide-review-tests.el` - Review tracking and dedicated ediff frame tests; the tests with real frames skip in batch Emacs
+- `tests/claude-code-ide-transcript-tests.el` - Transcript and handover document tests, with fixtures in `tests/fixtures/transcripts/` (made by `make-fixtures.py` there)
+- `tests/claude-code-ide-process-tests.el` - Process tree tests; live tests run with `CLAUDE_CODE_IDE_LIVE_TESTS=1`
+- `tests/claude-code-ide-reload-tests.el` - Reload tests; one test reloads a copy of the package in a new batch Emacs
+- `tests/claude-code-ide-menu-bar-tests.el` - Menu bar tests: the mode and its default, the commands of the Agents menu, and the items of the Agent Sessions menu
+- `tests/claude-code-ide-wiring-tests.el` - Tests of the core wiring: no IDE server without the IDE protocol, provider texts, flags per provider, forks, secrets in the debug log, the CC MCP config file, the process-tree calls, the prepare hook, the provider choice, and the buffers kept after a stop. At load, it points the MCP config folder and the provider file at a temporary folder for the whole run.
+- `tests/claude-code-ide-live-tests.el` - Live tests with the real `claude` and `codex` CLIs: handovers between both providers, recovery after a crash of Emacs, the Codex dialogs in each terminal, and stops without a question. They run only in an own `emacs -Q` daemon with `CLAUDE_CODE_IDE_LIVE_TESTS=1` (docs/live-tests.md); in the batch suite each one skips, and only the unit tests of its helpers run.
 
 **Design documents (docs/):**
 - Providers: docs/providers.md. Instances, events, states, registry: docs/session-schema.md.
@@ -77,15 +78,17 @@ These hooks help ensure consistent code formatting and catch issues early in the
 Tests run automatically as part of Claude Code hooks, but you can also run them manually:
 ```bash
 # Run all tests in batch mode
-emacs -batch -L . -l ert -l claude-code-ide-tests.el -f ert-run-tests-batch-and-exit
+emacs -batch -L . -L tests -l ert -l claude-code-ide-tests.el -f ert-run-tests-batch-and-exit
 
 # Run core tests only
-emacs -batch -L . -l ert -l claude-code-ide-tests.el -f claude-code-ide-run-tests
+emacs -batch -L . -L tests -l ert -l claude-code-ide-tests.el -f claude-code-ide-run-tests
 
 # Run all tests including MCP tests
-emacs -batch -L . -l ert -l claude-code-ide-tests.el -f claude-code-ide-run-all-tests
+emacs -batch -L . -L tests -l ert -l claude-code-ide-tests.el -f claude-code-ide-run-all-tests
 
 # Byte-compile and run the full suite; finds the Emacs app when emacs is not on PATH
+# (for the commands above, use the app binary in place of emacs, for example
+# "/Applications/Emacs 30.1.app/Contents/MacOS/Emacs")
 ./scripts/compile-and-test.sh
 ```
 
@@ -128,7 +131,7 @@ Tests must not depend on the machine load or on other test runs:
 - Wait for a condition with `claude-code-ide-tests--wait-until` (60 s limit), never for a fixed time.
 - A test of a time limit of the package runs on `claude-code-ide-tests--call-with-clock`: a virtual clock that moves only by the waits. The test also fails after 20 s of real time.
 - While ERT runs, `claude-code-ide-tests--isolate-run` (an advice on `ert-run-tests`) binds the state file, the lock file folder, the MCP config folder, the provider file, `CLAUDE_CONFIG_DIR` and `CODEX_HOME` to a new folder of the run (`claude-code-ide-tests--run-directory`), and removes it after the run. Never write to a fixed shared path in a test, and never read or write the user's live folders (`~/.claude`, `~/.codex`, the live state files).
-- The one exception is the live tests of `claude-code-ide-live-tests.el`, gated by `CLAUDE_CODE_IDE_LIVE_TESTS=1` and an own daemon. The real CLIs read their login and config there, and write transcripts; with `CLAUDE_CODE_IDE_LIVE_TRUST=1` they also write folder trust entries. The package state still goes to the live folder. docs/live-tests.md lists every such write and how to remove it.
+- The one exception is the live tests of `tests/claude-code-ide-live-tests.el`, gated by `CLAUDE_CODE_IDE_LIVE_TESTS=1` and an own daemon. The real CLIs read their login and config there, and write transcripts; with `CLAUDE_CODE_IDE_LIVE_TRUST=1` they also write folder trust entries. The package state still goes to the live folder. docs/live-tests.md lists every such write and how to remove it.
 
 ## Committing code
 Never commit changes unless the user explicitly asks you to.

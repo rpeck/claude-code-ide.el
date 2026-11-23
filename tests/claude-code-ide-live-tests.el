@@ -15,7 +15,7 @@
 ;; folder (folder trust entries of the CLIs, transcripts).
 ;;
 ;; All state of the package goes to the live folder
-;; (CLAUDE_CODE_IDE_LIVE_DIR, default tmp/live/ next to this file): the
+;; (CLAUDE_CODE_IDE_LIVE_DIR, default tmp/live/ of the repository): the
 ;; registry, the report folder with the hooks, the inbox, the MCP
 ;; config files, the provider file and the IDE lock files.  The CLIs
 ;; keep their own login and configuration.
@@ -97,7 +97,7 @@ target that the recovery at the start of Emacs started."
   (file-name-as-directory
    (expand-file-name
     (or (getenv "CLAUDE_CODE_IDE_LIVE_DIR")
-        (expand-file-name "tmp/live/" (file-name-directory claude-code-ide-live-tests--file))))))
+        (expand-file-name "../tmp/live/" (file-name-directory claude-code-ide-live-tests--file))))))
 
 (defun claude-code-ide-live-tests--path (name)
   "Return the file NAME in the live folder."

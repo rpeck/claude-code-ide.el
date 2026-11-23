@@ -4,7 +4,7 @@ A handover moves the work of one instance (the source) to a new native conversat
 The usual reason is a quota limit of the source. So the source never runs one more turn: the target gets the handover document, and writes a state summary in its first turn.
 
 - Code: `claude-code-ide-handover.el`.
-- Tests: `claude-code-ide-handover-tests.el`.
+- Tests: `tests/claude-code-ide-handover-tests.el`.
 - The document: [handover-document.md](handover-document.md).
 - The control operations and the inbox: [api-control.md](api-control.md).
 - The registry: [session-schema.md](session-schema.md).

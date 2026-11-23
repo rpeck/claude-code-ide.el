@@ -446,7 +446,7 @@ The live tests cost quota. Run them only from a shell, in an own daemon.
     - **Expected:** `*Live test leftovers*` lists the Codex trust entries, the Claude Code trust entries, and the Claude Code transcript folders that the tests left.
 14. Stop the daemon: `emacsclient -s cci-live -e '(kill-emacs)'`.
 15. Remove each listed item by hand, as [live-tests.md](live-tests.md), section "Clean up", tells.
-16. In an Emacs that loaded `claude-code-ide-live-tests.el`, evaluate `M-: (claude-code-ide-live-tests-leftovers "<live folder>") RET`.
+16. In an Emacs that loaded `tests/claude-code-ide-live-tests.el`, evaluate `M-: (claude-code-ide-live-tests-leftovers "<live folder>") RET`.
     - **Expected:** all three lists are empty.
 
 ## 10. Clean up
