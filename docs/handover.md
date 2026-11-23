@@ -182,8 +182,10 @@ Emacs saves each stage in the registry entry of the source **before** the step o
 The user may have typed a prompt into the source without sending it. The stop would lose it, and the document would not carry it.
 
 - **The check.** In the quiescing, when the source is quiet and before the stop, the handover reads the terminal screen of the source (`claude-code-ide-handover--source-draft`). It uses the screen read of the Codex dialogs, which knows the terminal size of vterm, eat and ghostel. It runs once; its result is kept in the run.
-  - **Claude Code:** the text in the input box: between the last two box rules (a line of `─`, or the older `╭─╮` and `╰─╯` box with its `│` borders), after the prompt marker `❯` (or `>` in the older box). Continuation lines lose their two spaces of indent.
+  - **Claude Code:** the text in the input box: between the last two box rules (a line that starts with `─`, whose top one can hold the session title, as in `──── my title ─`; or the older `╭─╮` and `╰─╯` box with its `│` borders), after the prompt marker `❯` (or `>` in the older box). A sent prompt with `❯` above the box, and the status lines under it, are no part of it.
+    - **The IDE context chip** that Claude Code puts in front of the draft, such as `[⧉ In foo.el]` for the file that is open in Emacs, is not the user's text. It is left out, and kept as information (`draft_context`; the note "(written while foo.el was open)").
   - **Codex:** the text of the composer: the last line that starts with `›` and is not a numbered choice, with its indented continuation lines up to the next empty line.
+  - **The lines join with one space** for both CLIs. A screen cannot tell a soft wrap at its width from a new line that the user typed, and the indents of the wraps differ (2 and 4 spaces on a real Claude Code screen).
   - **Placeholders** of an empty box are no draft (`claude-code-ide-handover-draft-placeholders`): Claude Code's `Try "..."` suggestions, and Codex's "Ask Codex to do anything" and its other suggestions.
   - **Unsure.** A screen without an input box, a menu in the box, a source without a terminal buffer, or a provider without a reader counts as no draft. The record says that the check was unsure (`draft_decision` `unsure`, with `draft_unsure`).
 - **The option `claude-code-ide-handover-unsent-draft`:**
@@ -191,7 +193,7 @@ The user may have typed a prompt into the source without sending it. The stop wo
   - `carry`: the document gets the part "The user's unsent prompt (not sent to the source)", with the draft quoted as data, and the instruction to treat it as the user's next request after the state summary. With the continue prompt, the target takes it up.
   - `drop`: go on without it. The record keeps its text (`draft_text`, `draft_decision` `drop`), so nothing is lost for good.
   - `refuse`: cancel the handover with the reason `unsent-draft`; the source keeps running with its draft.
-- **The record** keeps `draft_text`, `draft_decision` (`none`, `unsure`, `carry` or `drop`) and `draft_unsure`. A crash while the decision waits is a crash before the stop: the recovery cancels the handover (`recovered-before-stop`), and the record and the status keep the draft.
+- **The record** keeps `draft_text`, `draft_decision` (`none`, `unsure`, `carry` or `drop`), `draft_unsure` and `draft_context`. The status has `:draft`, `:draft-decision` and `:draft-context`, and the question shows the note of the chip. A crash while the decision waits is a crash before the stop: the recovery cancels the handover (`recovered-before-stop`), and the record and the status keep the draft.
 
 ## Stray processes
 

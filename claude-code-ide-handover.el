@@ -273,6 +273,7 @@ Emacs asks you whether to hand over."
   (draft nil :documentation "The unsent prompt that the screen of the source showed, or nil.")
   (draft-decision nil :documentation "`none', `unsure', `carry' or `drop', or nil before the check.")
   (draft-unsure nil :documentation "Why the draft check was unsure, or nil.")
+  (draft-context nil :documentation "The IDE context chip of the draft, such as \"In foo.el\", or nil.")
   (continue-sent nil :documentation "Non-nil after the inbox of the target accepted the continue prompt.")
   (chain-saved nil :documentation "Non-nil after the commit saved the chain of the target.")
   (missing-entry nil :documentation "`source' or `target': the registry entry that a save missed, or nil.")
@@ -411,6 +412,7 @@ while a handover holds the worktree.")
            (cons 'draft_decision (claude-code-ide-handover--name
                                   (claude-code-ide-handover--run-draft-decision run)))
            (cons 'draft_unsure (claude-code-ide-handover--run-draft-unsure run))
+           (cons 'draft_context (claude-code-ide-handover--run-draft-context run))
            (cons 'continue_sent (and (claude-code-ide-handover--run-continue-sent run) t))
            (cons 'chain_saved (and (claude-code-ide-handover--run-chain-saved run) t))
            ;; The owner of the run: this Emacs
@@ -462,6 +464,7 @@ while a handover holds the worktree.")
      :draft (alist-get 'draft_text alist)
      :draft-decision (claude-code-ide-handover--symbol (alist-get 'draft_decision alist))
      :draft-unsure (alist-get 'draft_unsure alist)
+     :draft-context (alist-get 'draft_context alist)
      :continue-sent (eq (alist-get 'continue_sent alist) t)
      :chain-saved (eq (alist-get 'chain_saved alist) t)
      :owner (claude-code-ide-session-registry--handover-owner alist)
@@ -570,6 +573,7 @@ document after a crash still has the context."
          :continue (claude-code-ide-handover--run-continue run)
          :draft (claude-code-ide-handover--run-draft run)
          :draft-decision (claude-code-ide-handover--run-draft-decision run)
+         :draft-context (claude-code-ide-handover--run-draft-context run)
          :reason (claude-code-ide-handover--run-reason run)
          :message (claude-code-ide-handover--run-message run)
          :document (claude-code-ide-handover--run-document run)
@@ -1327,20 +1331,42 @@ See `claude-code-ide-handover-draft-placeholders'."
     (cl-some (lambda (regexp) (string-match-p regexp text))
              claude-code-ide-handover-draft-placeholders)))
 
-(defun claude-code-ide-handover--draft-result (lines)
-  "Return the draft result of the input LINES (strings, already stripped)."
-  (let ((text (string-trim (string-join lines "\n"))))
+(defun claude-code-ide-handover--draft-result (lines &optional ide-context)
+  "Return the draft result of the input LINES (strings, already stripped).
+The lines join with one space: a terminal screen cannot tell a soft
+wrap at its width from a new line that the user typed, and the indents
+of the wraps differ.  IDE-CONTEXT is the text of the IDE context chip
+in front of the draft, or nil; a draft keeps it as :ide-context."
+  (let ((text (string-trim
+               (replace-regexp-in-string
+                "[ \t]+" " "
+                (string-join (delete "" (mapcar #'string-trim lines)) " ")))))
     (cond
      ((string-empty-p text) (list :status 'none))
      ((claude-code-ide-handover--placeholder-p text) (list :status 'none))
-     (t (list :status 'draft :text text)))))
+     (t (append (list :status 'draft :text text)
+                (and ide-context (list :ide-context ide-context)))))))
+
+(defun claude-code-ide-handover--draft-note (ide-context)
+  "Return the note about the IDE-CONTEXT chip of a draft, or nil without one.
+Claude Code shows a chip such as [⧉ In foo.el] for the file that is
+open in Emacs.  It is not the user's text, so the draft leaves it out;
+the note keeps it as information."
+  (when (and (stringp ide-context) (not (string-empty-p ide-context)))
+    (if (string-match "\\`In \\(.+\\)\\'" ide-context)
+        (format "(written while %s was open)" (match-string 1 ide-context))
+      (format "(IDE context when it was written: %s)" ide-context))))
 
 (defun claude-code-ide-handover--read-claude-draft (lines)
   "Return the unsent draft in the Claude Code input box of the screen LINES.
-The input box is between the last two box rules: a line of ─ (Claude
-Code 2), or the lines ╭─...─╮ and ╰─...─╯ of the older box.  Its first
-line starts with the prompt marker ❯ (or > in the older box)."
-  (let* ((rule "\\`[ \t]*[╭╰]?─\\{8,\\}[╮╯]?\\'")
+The input box is between the last two box rules: a line that starts
+with ─ (Claude Code 2; the top rule can hold the session title, as in
+\"──── my title ─\"), or the lines ╭─...─╮ and ╰─...─╯ of the older
+box.  Its first line starts with the prompt marker ❯ (or > in the
+older box).  An IDE context chip such as [⧉ In foo.el] after the marker
+is left out of the text, and kept as :ide-context.  A sent prompt with
+❯ above the box, and the status lines under it, are no part of it."
+  (let* ((rule "\\`[ \t]*[╭╰]?─\\{8,\\}")
          (rules (cl-loop for line in lines for index from 0
                          when (string-match-p rule line) collect index))
          (bottom (car (last rules)))
@@ -1361,10 +1387,12 @@ line starts with the prompt marker ❯ (or > in the older box)."
          ((string-match-p "\\`[0-9]+\\. " (match-string 1 first))
           (list :status 'unsure :why "a menu, not an input, in the box of Claude Code"))
          (t
-          (claude-code-ide-handover--draft-result
-           (cons (match-string 1 first)
-                 (mapcar (lambda (line) (replace-regexp-in-string "\\`  " "" line))
-                         (cdr content))))))))))
+          (let* ((input (match-string 1 first))
+                 (chip (and (string-match "\\`\\[⧉ \\([^]]*\\)\\] ?" input)
+                            (string-trim (match-string 1 input)))))
+            (claude-code-ide-handover--draft-result
+             (cons (if chip (substring input (match-end 0)) input) (cdr content))
+             chip))))))))
 
 (defun claude-code-ide-handover--read-codex-draft (lines)
   "Return the unsent draft in the Codex composer of the screen LINES.
@@ -1419,7 +1447,8 @@ person (the reason `unsent-draft'); with `refuse', it is cancelled."
       (let ((result (claude-code-ide-handover--source-draft run)))
         (pcase (plist-get result :status)
           ('draft
-           (setf (claude-code-ide-handover--run-draft run) (plist-get result :text))
+           (setf (claude-code-ide-handover--run-draft run) (plist-get result :text)
+                 (claude-code-ide-handover--run-draft-context run) (plist-get result :ide-context))
            (pcase claude-code-ide-handover-unsent-draft
              ((or 'carry 'drop)
               (setf (claude-code-ide-handover--run-draft-decision run)
@@ -1848,7 +1877,11 @@ A stray in UNKNOWN gets the note \"owner unknown\"."
                                       (mapconcat (lambda (line) (concat "  " line))
                                                  (split-string (or (claude-code-ide-handover--run-draft run) "")
                                                                "\n")
-                                                 "\n")))
+                                                 "\n")
+                                      (if-let* ((note (claude-code-ide-handover--draft-note
+                                                       (claude-code-ide-handover--run-draft-context run))))
+                                          (concat "\n  " note)
+                                        "")))
                              (t "")))
                     (mapcar (lambda (choice)
                               (list (nth 0 choice) (symbol-name (nth 1 choice)) (nth 2 choice)))
@@ -2214,6 +2247,9 @@ nil when WORKTREE is not in Git."
    :context (claude-code-ide-handover--run-context run)
    :unsent-draft (and (eq (claude-code-ide-handover--run-draft-decision run) 'carry)
                       (claude-code-ide-handover--run-draft run))
+   :unsent-draft-note (and (eq (claude-code-ide-handover--run-draft-decision run) 'carry)
+                           (claude-code-ide-handover--draft-note
+                            (claude-code-ide-handover--run-draft-context run)))
    :budget claude-code-ide-handover-budget
    :handover-id (claude-code-ide-handover--run-id run)
    :target-provider (claude-code-ide-handover--run-target-provider run)

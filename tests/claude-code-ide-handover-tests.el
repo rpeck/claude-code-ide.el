@@ -4708,7 +4708,8 @@ is unsure."
   (dolist (provider '(claude codex))
     (dolist (backend '(vterm eat ghostel))
       (let ((context (list provider backend)))
-        ;; A draft of one line and of two lines
+        ;; A draft of one line and of two lines; the lines join with a
+        ;; space, because a screen cannot tell a wrap from a new line
         (should (equal (cons context (claude-code-ide-handover--read-draft
                                       provider (claude-code-ide-handover-tests--screen
                                                 provider backend '("cci-test update the changelog"))))
@@ -4717,7 +4718,7 @@ is unsure."
                                       provider (claude-code-ide-handover-tests--screen
                                                 provider backend '("cci-test update the changelog"
                                                                    "and the README"))))
-                       (cons context '(:status draft :text "cci-test update the changelog\nand the README"))))
+                       (cons context '(:status draft :text "cci-test update the changelog and the README"))))
         ;; An empty input
         (should (equal (cons context (plist-get (claude-code-ide-handover--read-draft
                                                  provider (claude-code-ide-handover-tests--screen
@@ -4912,6 +4913,81 @@ is unsure."
         (should (equal (alist-get 'draft_text (claude-code-ide-handover-tests--record "cci-test-src"))
                        "cci-test my draft"))
         (should-not claude-code-ide-handover-tests--starts)))))
+
+(defconst claude-code-ide-handover-tests--real-cc-screen
+  (let ((width 110))
+    (concat
+     "✻ Worked for 2m 0s · done 2:23 PM\n"
+     "\n"
+     "❯ /rename cci-test project title\n"
+     "  ⎿  Session renamed to: cci-test project title\n"
+     "\n"
+     ;; The top rule holds the session title
+     (make-string (- width (length " cci-test project title ─")) ?─) " cci-test project title ─\n"
+     ;; An IDE context chip, then the draft, wrapped at the width with
+     ;; indents of 2 and 4, and one short wrapped line
+     "❯ [⧉ In cci-test-notes.el] Please read the plan in the docs folder, then write a short ticket for the new\n"
+     "  feature and draft a plan.\n"
+     "    Look at the older sessions that built the first version. When we built the other client we traced\n"
+     "    its protocol with a proxy; those sessions can show you the steps, and they can also tell you\n"
+     "  about\n"
+     "    how to do that quickly.\n"
+     (make-string width ?─) "\n"
+     ;; Two status lines under the box
+     "  Mon Nov 23 [main] cci-test-project/ cci-test-model · high · context 6% used · usage 7d 7% (0.1× …\n"
+     "  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+     "\n"))
+  "A copy of the layout of a real Claude Code screen with an unsent draft.
+It has the layout of a ghostel screen of Claude Code 2 (2026-11-23):
+the session title in the top rule, a sent prompt with ❯ above the box,
+an IDE context chip in front of the draft, wraps with indents of 2 and
+4 spaces, and two status lines under the box.  The words are neutral.")
+
+(ert-deftest claude-code-ide-test-handover-read-draft-real-layout ()
+  "The reader finds the draft of the layout of a real Claude Code screen.
+The title in the top rule, the sent prompt above the box and the status
+lines under it are no part of the draft.  The IDE context chip is left
+out of the text and kept as information.  The wrapped lines join with
+spaces, because a screen cannot tell a soft wrap from a new line."
+  (should (equal (claude-code-ide-handover--read-draft 'claude claude-code-ide-handover-tests--real-cc-screen)
+                 (list :status 'draft
+                       :text (concat "Please read the plan in the docs folder, then write a short ticket "
+                                     "for the new feature and draft a plan. Look at the older sessions "
+                                     "that built the first version. When we built the other client we "
+                                     "traced its protocol with a proxy; those sessions can show you the "
+                                     "steps, and they can also tell you about how to do that quickly.")
+                       :ide-context "In cci-test-notes.el")))
+  ;; The note for people and for the document
+  (should (equal (claude-code-ide-handover--draft-note "In cci-test-notes.el")
+                 "(written while cci-test-notes.el was open)"))
+  (should (equal (claude-code-ide-handover--draft-note "Selected 3 lines from cci-test.el")
+                 "(IDE context when it was written: Selected 3 lines from cci-test.el)"))
+  (should-not (claude-code-ide-handover--draft-note nil))
+  ;; An input box with only a chip is no draft
+  (should (eq (plist-get (claude-code-ide-handover--read-draft
+                          'claude (replace-regexp-in-string
+                                   "❯ \\[⧉ In cci-test-notes.el\\] .*\\(?:\n  .*\\)*\n─"
+                                   "❯ [⧉ In cci-test-notes.el]\n─"
+                                   claude-code-ide-handover-tests--real-cc-screen))
+                         :status)
+              'none)))
+
+(ert-deftest claude-code-ide-test-handover-unsent-draft-context-note ()
+  "A carried draft with an IDE context chip has the note in the document and the record."
+  (claude-code-ide-handover-tests--with
+    (claude-code-ide-handover-tests--add "cci-test-src" 'cci-test-a worktree 'idle)
+    (let ((claude-code-ide-handover-unsent-draft 'carry))
+      (claude-code-ide-handover-tests--with-draft
+          '(:status draft :text "cci-test my draft" :ide-context "In cci-test-notes.el")
+        (let ((id (plist-get (claude-code-ide-handover-session "cci-test-src" 'cci-test-b) :handover-id)))
+          (claude-code-ide-handover-tests--run-timers)
+          (should (equal (alist-get 'draft_context (claude-code-ide-handover-tests--record "cci-test-src"))
+                         "In cci-test-notes.el"))
+          (let ((document (claude-code-ide-handover-tests--document-of id)))
+            (should (string-match-p "^> cci-test my draft$" document))
+            ;; The note is outside the quote of the user's text
+            (should (string-match-p "^(written while cci-test-notes.el was open)$" document))
+            (should-not (string-match-p "⧉" document))))))))
 
 (provide 'claude-code-ide-handover-tests)
 
