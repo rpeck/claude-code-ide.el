@@ -5151,8 +5151,13 @@ last row too, is the raw text."
       (should (equal (claude-code-ide-handover--read-draft 'codex screen)
                      '(:status draft :text "cci-test one"))))))
 
+(defconst claude-code-ide-handover-tests--popup-label
+  "(the completion popup of Codex under the composer:)"
+  "The label of the popup rows in the raw text of a Codex screen read.")
+
 (ert-deftest claude-code-ide-test-handover-read-draft-codex-popup ()
-  "An open slash-command popup of Codex is no draft: unsure, with the composer row as raw text."
+  "An open slash-command popup of Codex is no draft: unsure, with the whole region as raw text.
+The raw text has the composer rows, then the popup rows under a label."
   (dolist (control '("\n  ↑/↓ navigate · enter to select · esc to close\n" "\n"))
     (let ((result (claude-code-ide-handover--read-draft
                    'codex (concat "› cci-test older request\n\n• cci-test reply\n\n"
@@ -5160,30 +5165,131 @@ last row too, is the raw text."
                                   "  /review  Review current changes\n"
                                   "  /resume  Resume a conversation\n"
                                   control))))
-      (should (equal (list control result)
-                     (list control '(:status unsure :why "a completion popup of Codex on the screen"
-                                             :raw "/re"))))))
+      (should (equal (list control (plist-get result :status) (plist-get result :why))
+                     (list control 'unsure "a completion popup of Codex on the screen")))
+      (should (equal (plist-get result :raw)
+                     (concat "/re\n\n" claude-code-ide-handover-tests--popup-label "\n"
+                             "/review  Review current changes\n/resume  Resume a conversation"
+                             (if (string-match-p "esc to close" control)
+                                 "\n\n↑/↓ navigate · enter to select · esc to close"
+                               ""))))
+      ;; The older request is no part of it
+      (should-not (string-match-p "older request" (plist-get result :raw)))))
+  ;; Bare absolute paths are the user's text, not suggestions
+  (should (equal (claude-code-ide-handover--read-draft 'codex "› /etc\n  /usr\n\n  GPT-5.6-Terra low · ~\n")
+                 '(:status draft :text "/etc /usr")))
   ;; A draft whose row starts with a path is no popup
   (should (equal (claude-code-ide-handover--read-draft
                   'codex "› /cci-test-dir is the folder\n  /tmp/cci-test is the file\n\n  ? for shortcuts\n")
                  '(:status draft :text "/cci-test-dir is the folder /tmp/cci-test is the file"))))
 
+(defun claude-code-ide-handover-tests--flat (text)
+  "Return TEXT with each run of white space as one space."
+  (string-trim (replace-regexp-in-string "[ \t\n]+" " " text)))
+
+(defun claude-code-ide-handover-tests--keeps-rows-p (result rows)
+  "Return non-nil when RESULT keeps each of ROWS.
+RESULT must be a draft, or unsure with :raw; never none."
+  (when-let* ((text (pcase (plist-get result :status)
+                      ('draft (plist-get result :text))
+                      ('unsure (plist-get result :raw)))))
+    (cl-every (lambda (row)
+                (string-search (claude-code-ide-handover-tests--flat row)
+                               (claude-code-ide-handover-tests--flat text)))
+              rows)))
+
+(ert-deftest claude-code-ide-test-handover-read-draft-never-loses-text ()
+  "The safety rule of the screen read: a misread may cost a question, but never text.
+For each screen whose input region has text that is not a placeholder,
+the result is a draft, or unsure with :raw, and it keeps every such row."
+  (let ((cases nil))
+    ;; The synthetic screens of each provider and backend
+    (dolist (provider '(claude codex))
+      (dolist (backend '(vterm eat ghostel))
+        (dolist (input '(("cci-test one") ("cci-test one" "and two")
+                         ("first paragraph" "" "second paragraph") ("" "after a blank row")
+                         ("1. first item" "2. second item")
+                         ("part one" "────────────────────" "❯ part two")
+                         ("│ a table │") ("│")
+                         ("Ask Codex to do anything" "cci-test more")
+                         ("Try \"fix lint errors\"" "cci-test more")
+                         ("/etc" "/usr") ("/re" "/review  is the command I mean")
+                         ("cci-test question" "cci-test explain why 50% context left appears.")))
+          (push (append (list provider (claude-code-ide-handover-tests--screen provider backend input))
+                        (remove "" input))
+                cases))))
+    ;; The layouts of real screens
+    (push (list 'claude claude-code-ide-handover-tests--real-cc-screen
+                "Please read the plan in the docs folder" "how to do that quickly.")
+          cases)
+    (push (list 'codex (format claude-code-ide-handover-tests--real-codex-screen
+                               "› cci-test first\n\n  cci-test second\n")
+                "cci-test first" "cci-test second")
+          cases)
+    ;; The screens of the gate reviews
+    (dolist (case '(("›\n\n  cci-test keep this draft\n" "cci-test keep this draft")
+                    ("› cci-test first\n\n  cci-test second\n\n  cci-test third\n"
+                     "cci-test first" "cci-test second" "cci-test third")
+                    ("› cci-test question\n\n  cci-test explain why 50% context left appears.\n"
+                     "cci-test question" "cci-test explain why 50% context left appears.")
+                    ("› /etc\n  /usr\n\n  GPT-5.6-Terra low · ~\n" "/etc" "/usr")
+                    ("› /re\n  /review  Review current changes\n\n  ↑/↓ navigate · enter to select · esc to close\n"
+                     "/re" "/review  Review current changes")
+                    ("› cci-test text of the composer\n  cci-test more text\n"
+                     "cci-test text of the composer" "cci-test more text")
+                    ("› Ask Codex to do anything\n  cci-test more text\n" "cci-test more text")
+                    ("› 1. cci-test first item\n  2. cci-test second item\n"
+                     "1. cci-test first item" "2. cci-test second item")))
+      (push (cons 'codex case) cases))
+    (let ((rule (make-string 62 ?─)))
+      (dolist (case `((,(concat rule "\n  cci-test text without a marker\n" rule "\n  ? for shortcuts\n")
+                       "cci-test text without a marker")
+                      (,(concat "❯ cci-test the end of a long draft\n  and its last row\n" rule "\n  ? for shortcuts\n")
+                       "cci-test the end of a long draft" "and its last row")
+                      ;; A numbered draft in the box, whose status line
+                      ;; looks like the control row of a dialog
+                      (,(concat rule "\n❯ 1. cci-test first\n  2. cci-test second\n" rule "\n  Esc to cancel\n")
+                       "1. cci-test first" "2. cci-test second")))
+        (push (cons 'claude case) cases)))
+    ;; Every case that loses a row, with its result
+    (should (equal (cl-loop for case in (nreverse cases)
+                            for result = (claude-code-ide-handover--read-draft (nth 0 case) (nth 1 case))
+                            unless (claude-code-ide-handover-tests--keeps-rows-p result (nthcdr 2 case))
+                            collect (list (nth 0 case) (nth 1 case) result))
+                   nil))))
+
+(ert-deftest claude-code-ide-test-handover-read-draft-codex-footer-whole-row ()
+  "A Codex footer regexp matches the whole row, so a draft row with a footer phrase stays."
+  (should (equal (claude-code-ide-handover--read-draft
+                  'codex "› cci-test question\n\n  cci-test explain why 50% context left appears.\n")
+                 '(:status unsure :why "no footer row under the composer of Codex"
+                           :raw "cci-test question\n\ncci-test explain why 50% context left appears.")))
+  (dolist (regexp claude-code-ide-handover-codex-footer-regexps)
+    (should (string-prefix-p "\\`" regexp))
+    (should (string-suffix-p "\\'" regexp))))
+
 (ert-deftest claude-code-ide-test-handover-read-draft-dialog-forms ()
   "The captured Codex dialogs give unsure: with a control row, or with the choices at the end.
-A Claude Code dialog whose choices end the screen gives unsure too."
+A Claude Code dialog whose choices end the screen gives unsure too.  A
+dialog without its control row keeps the region as raw text."
   (let ((result (claude-code-ide-handover--read-draft
                  'claude (concat (make-string 62 ?─) "\n Do you want to proceed?\n"
                                  " ❯ 1. Yes\n   2. No\n"))))
     (should (eq (plist-get result :status) 'unsure))
     (should-not (plist-get result :raw)))
-  (dolist (screen '("  ✨ Update available! 0.164.0 -> 0.169.0\n\n› 1. Update now\n  2. Skip\n  3. Skip until next version\n"
-                    "  Allow the emacs-tools MCP server\n  to run tool \"emacs_eval\"?\n\n› 1. Allow\n  2. Cancel\n"
-                    "  Trust this folder?\n\n› 1. Trust and continue\n  2. Quit\n\n  enter continue · esc quit\n\n\n\n"
-                    "• Calling cci-test\n\n› 1. Allow\n  2. Cancel\n\n  Press enter to submit\n"
-                    "› 1. Allow  Run the tool and\n  2. Cancel\n  option 1/2 | enter to submit | esc\n"))
-    (let ((result (claude-code-ide-handover--read-draft 'codex screen)))
-      (should (equal (list screen (plist-get result :status)) (list screen 'unsure)))
-      (should-not (plist-get result :raw)))))
+  ;; With the control row at the bottom, the dialog is sure: no raw
+  ;; text.  With only the choice list at the bottom, it could be a
+  ;; numbered draft without its footer: the region is the raw text.
+  (dolist (case '(("  ✨ Update available! 0.164.0 -> 0.169.0\n\n› 1. Update now\n  2. Skip\n  3. Skip until next version\n"
+                   "1. Update now\n2. Skip\n3. Skip until next version")
+                  ("  Allow the emacs-tools MCP server\n  to run tool \"emacs_eval\"?\n\n› 1. Allow\n  2. Cancel\n"
+                   "1. Allow\n2. Cancel")
+                  ("  Trust this folder?\n\n› 1. Trust and continue\n  2. Quit\n\n  enter continue · esc quit\n\n\n\n" nil)
+                  ("• Calling cci-test\n\n› 1. Allow\n  2. Cancel\n\n  Press enter to submit\n" nil)
+                  ("› 1. Allow  Run the tool and\n  2. Cancel\n  option 1/2 | enter to submit | esc\n" nil)))
+    (let ((result (claude-code-ide-handover--read-draft 'codex (car case))))
+      (should (equal (list (car case) (plist-get result :status) (plist-get result :raw))
+                     (list (car case) 'unsure (cadr case)))))))
 
 (ert-deftest claude-code-ide-test-handover-unsent-draft-maybe ()
   "With `ask', an unsure read with text in the box asks, labelled as maybe a draft.
