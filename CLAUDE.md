@@ -19,7 +19,7 @@ This package integrates coding-agent CLIs with Emacs via the Model Context Proto
 - `claude-code-ide-codex.el` - The Codex provider: command lines, MCP config and the user's exclude list, approvals, `codex queue` prompts in the background, native ID, the transcript operation (rollout file, title, model; the lookup is `claude-code-ide-codex-rollout-file`), and the dialog scan
 - `claude-code-ide-codex-events.el` - Codex status: hook script, hook arguments, the hook trust at each start (cache by the config trust records, one question for a start or a restore of the user, trust command), event mapping, Codex states
 - `claude-code-ide-control.el` - Control operations for coordinators: list, inspect, launch, resume, submit-prompt, stop; the durable prompt inbox; MCP coordinator tools
-- `claude-code-ide-handover.el` - Handover of an instance to a new conversation of either provider: the preflight, the stages saved before each step, the stop with stray checks, the document and the pointer prompt, the delivery watch, recovery with claims, the one writer rule, the control operation and tools, and `request_handover`. See docs/handover.md
+- `claude-code-ide-handover.el` - Handover of an instance to a new conversation of either provider: the preflight, the stages saved before each step, the stop with stray checks, the document and the pointer prompt, the delivery watch, recovery with claims, the one writer rule, the question about other sessions and `:allow-others`, the batch of a worktree (`claude-code-ide-handover-worktree`, its stop command, and the status hook `claude-code-ide-handover--status-functions`), the control operation and tools, and `request_handover`. See docs/handover.md and docs/handover-several.md
 - `claude-code-ide-review.el` - Tracked external reviews: durable records, result files, delivery to the owner's inbox, the track-review control operation and coordinator tool
 - `claude-code-ide-transcript.el` - Transcript readers (CC and Codex), workspace state from Git, and the handover document. Format: docs/handover-document.md
 - `claude-code-ide-process.el` - Process trees: records the background process groups of each CLI, ends them at a stop, and lists stray processes in the worktree (docs/process-tree.md). The main file loads it as an optional file and calls it through `fboundp`.
@@ -44,7 +44,7 @@ This package integrates coding-agent CLIs with Emacs via the Model Context Proto
 - `tests/claude-code-ide-codex-events-tests.el` - Codex status, status buffer columns, status snapshot, and shared status file helper tests
 - `tests/claude-code-ide-mcp-routing-tests.el` - MCP routing tests: secrets, request checks, descriptor context, the one active buffer tracker, coordinator scope, get_capabilities
 - `tests/claude-code-ide-control-tests.el` - Control operation, inbox, and coordinator tool tests
-- `tests/claude-code-ide-handover-tests.el` - Handover tests: stages, preflight, quiescing and the inbox hold, strays, the delivery watch, recovery at each stage and its claims, two writers, the inbox move, the chain, the version 4 registry file, control states, approvals, the status key, and a real review process
+- `tests/claude-code-ide-handover-tests.el` - Handover tests: stages, preflight, quiescing and the inbox hold, strays, the delivery watch, recovery at each stage and its claims, two writers, the inbox move, the chain, the version 4 registry file, control states, approvals, the status key, a real review process, other sessions in the worktree, the status hook, the launch refusal, and the batch
 - `tests/claude-code-ide-review-tests.el` - Review tracking and dedicated ediff frame tests; the tests with real frames skip in batch Emacs
 - `tests/claude-code-ide-transcript-tests.el` - Transcript and handover document tests, with fixtures in `tests/fixtures/transcripts/` (made by `make-fixtures.py` there)
 - `tests/claude-code-ide-process-tests.el` - Process tree tests; live tests run with `CLAUDE_CODE_IDE_LIVE_TESTS=1`
@@ -59,7 +59,7 @@ This package integrates coding-agent CLIs with Emacs via the Model Context Proto
 - MCP tools server routing, secrets, request checks and scopes: docs/api-mcp.md.
 - Control operations and the inbox: docs/api-control.md.
 - Reviews and dedicated ediff frames: docs/review.md.
-- Handover: docs/handover.md. The handover document: docs/handover-document.md. Process trees: docs/process-tree.md.
+- Handover: docs/handover.md. Several instances in one worktree: docs/handover-several.md. The handover document: docs/handover-document.md. Process trees: docs/process-tree.md.
 - Updating the package and reloading it in a running Emacs: docs/updating.md.
 - Live tests with the real CLIs: docs/live-tests.md.
 

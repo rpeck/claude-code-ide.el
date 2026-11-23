@@ -941,6 +941,21 @@ summary file of the target."
                 (claude-code-ide-transcript--code-block (plist-get state :log) "No commits.")))
        "\n\n"))))
 
+(defun claude-code-ide-transcript--render-others (lines)
+  "Return the part about the other sessions of the worktree.
+It has one item for each of LINES.  Without LINES, return nil: the
+document has no such part."
+  (when lines
+    (concat "## Other sessions in this worktree\n\n"
+            "These sessions ran in this worktree when Emacs wrote this document. "
+            "They can change files at the same time as you.\n\n"
+            (mapconcat (lambda (line) (concat "- " line)) lines "\n")
+            "\n\nThe owner of each change in the workspace state above is not known. "
+            "It can be yours (the earlier conversation), or the work of one of these sessions.\n"
+            "Before you write a file that another session can also write, and before you "
+            "revert or commit a change that you did not make, coordinate with that session "
+            "or ask the user.")))
+
 (defun claude-code-ide-transcript--turn-heading (turn leg-number provider)
   "Return the heading text of TURN of leg LEG-NUMBER of PROVIDER."
   (format "%s, leg %d (%s)%s"
@@ -1605,7 +1620,7 @@ The last leg is the source."
 
 (cl-defun claude-code-ide-transcript-handover-document
     (&key source chain context budget handover-id target-provider summary-file time
-          (session-server 'auto))
+          (session-server 'auto) others)
   "Return the text of a handover document, as plan section 4.7 describes.
 SOURCE is the source: an instance descriptor, or a leg plist.  CHAIN
 is the list of the earlier legs of the chain, oldest first; each is a
@@ -1626,7 +1641,10 @@ default) to read the configuration of TARGET-PROVIDER with
 `claude-code-ide-transcript-session-server-p'.  With the server, the
 \"Source sessions\" part tells the target to read the legs of the
 providers in `claude-code-ide-handover-session-server-providers' with
-its tools.  The part always names the transcript files."
+its tools.  The part always names the transcript files.  OTHERS is a
+list of strings, one for each other session in the worktree; the part
+\"Other sessions in this worktree\" lists them, right after the
+workspace state, and the budget never cuts it."
   (let* ((source-leg (claude-code-ide-transcript--leg source))
          (earlier (mapcar #'claude-code-ide-transcript--leg chain))
          (same (cl-find-if (lambda (leg) (claude-code-ide-transcript--same-leg-p leg source-leg))
@@ -1705,6 +1723,7 @@ its tools.  The part always names the transcript files."
                        (format-time-string "%Y-%m-%dT%H:%M:%SZ" time t)
                        (or (plist-get state :worktree) worktree) summary-file)
                       (claude-code-ide-transcript--render-workspace state)
+                      (claude-code-ide-transcript--render-others others)
                       (and context (not (string-empty-p (string-trim context)))
                            (concat "## Context from the coordinator\n\n" (string-trim context)))
                       (claude-code-ide-transcript--render-references

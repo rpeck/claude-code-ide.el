@@ -15,24 +15,40 @@ The usual reason is a quota limit of the source. So the source never runs one mo
 ### The command
 
 - `M-x claude-code-ide-handover` hands over the instance of the current buffer, or an instance that you choose.
-- It asks for the target provider (default: another provider), the method, and optional context text for the target.
+- **The checks come before any question** (`claude-code-ide-handover--check-worktree`): a handover that holds the worktree gives a `user-error` with its ID, and a live instance of another Emacs in the worktree gives a `user-error` with its key and the process ID of its Emacs.
+- **The question about other sessions** comes first, when other live instances or MCP sessions of this Emacs run in the worktree (`claude-code-ide-handover--confirm-others`):
+
+  ```text
+  2 other sessions run in the worktree /Users/me/src/app/:
+    plan (claude, 5afe576e-...): idle
+    coder (codex, 01a1eb92-...): failed/quota-limit
+  They go on with their work. The handover does not stop them or their processes.
+  The target gets this list.
+  Hand over anyway? (y or n)
+  ```
+
+  - `y`: the handover goes on with `:allow-others` set to the IDs that the question showed. A session that starts after the question still refuses the handover (`other-instance`). `n`: `user-error` "Handover not started"; no other question comes, and the registry gets no record.
+  - **`C-u M-x claude-code-ide-handover`** skips the question. When other sessions run, it gives `:allow-others` with their IDs; without them, nil. `H` in the status buffer reads the prefix argument the same way.
+- Then it asks for the target provider (default: another provider), the method, and optional context text for the target.
 - **The method question** comes only when a fork is possible: the chain has a conversation of the target provider (`claude-code-ide-handover--read-method`).
   - `fork` (the default: `RET` or `f`): the target goes on from the last conversation of its provider in the chain, with its full history, and gets the document. For example, a handover back to Claude Code continues the earlier Claude Code conversation.
   - `new` (`n`): a new conversation that knows only the document. This is the method `fresh`.
   - Any other key is refused, and the question asks again. `?` shows the choices.
   - A fork gets a new conversation ID. The earlier conversation stays unchanged.
 - When the source is busy, it asks whether to interrupt it. Else the handover waits until the source is idle.
-- When subagents or background tasks run, or the state of the source is unknown (`disconnected`), it asks for a confirmation. The same yes lets the handover go on while other instances run in the worktree.
+- When subagents or background tasks run, or the state of the source is unknown (`disconnected`), it asks for a confirmation (`yes-or-no-p`, because background tasks end). That yes gives `:force`.
 - For a Codex target whose status hooks are not trusted, it asks for the trust (`claude-code-ide-codex-prepare-trust`).
 - With `claude-code-ide-handover-continue` at `ask` (the default), the last question is whether the target goes on with the task after the commit (see "The target goes on"). It comes with the other questions, before the handover starts, never later from a timer. The answers: `y` yes, this time; `n` no, this time; `a` always (saved with `customize-save-variable`); `v` never (saved). When the save fails, the value holds in this Emacs.
 - In the status buffer `*Coding Agents Sessions*`, the key `H` offers a handover of the session on the line. Without a session on the line, it offers the first session at a quota limit (`failed/quota-limit`).
 - Emacs never starts a handover by itself.
+- `claude-code-ide-handover` takes `ALLOW-OTHERS` as its eighth optional argument, after `CONTINUE`.
+- To hand over all instances of a worktree, see "Several instances in one worktree".
 
 ### The function
 
 ```elisp
 (claude-code-ide-handover-session INSTANCE-ID TARGET-PROVIDER
-  &key METHOD CONTEXT INTERRUPT FORCE REQUEST-ID INTERACTIVE CONTINUE)
+  &key METHOD CONTEXT INTERRUPT FORCE ALLOW-OTHERS REQUEST-ID INTERACTIVE CONTINUE BATCH-NEXT)
 ```
 
 | Key | Value |
@@ -40,10 +56,12 @@ The usual reason is a quota limit of the source. So the source never runs one mo
 | `:method` | `fresh` (default): a new conversation. `fork`: fork the latest conversation of the target provider in the chain. Both get the document. The default of this operation stays `fresh`, so that a coordinator chooses a fork explicitly; the question of `M-x claude-code-ide-handover` has `fork` as its default. |
 | `:context` | Text of the coordinator for the document, or nil. It is kept in the private file `.handover/<id>-context.md` (mode 0600), whose path and hash the registry record holds, so that a rewrite of the document after a crash still has it. |
 | `:interrupt` | Non-nil: send Escape to a busy source one time. Else wait until the source is idle. |
-| `:force` | Non-nil: go on while subagents or background tasks run, and while other instances run in the worktree. |
+| `:force` | Non-nil: go on while subagents or background tasks run, and while other instances run in the worktree (also of another Emacs). |
+| `:allow-others` | `t`: go on while other live instances or MCP sessions of **this** Emacs run in the worktree, and nothing more. A list of IDs allows only those writers; any other one gives `other-instance`. The command and the batch give a list; the control API and the MCP tool (`allow_others`) give `t`. Subagents or background tasks still give `busy`, and an instance of another Emacs still gives `other-instance`. It is a separate key because `:force` also lets the quiescing stop a source that reaches `waiting-for-task`, which ends its background tasks. The run does not keep it: only the preflight reads it. |
 | `:request-id` | A string that the caller chooses. A second call with a known request ID returns the current result of the first call, with `:duplicate t`, and starts nothing. |
 | `:interactive` | Non-nil when a person asks in Emacs. Then Emacs asks that person about stray processes and about the Codex hook trust. A coordinator call gets the status `needs-user`, or the refusal `hooks-not-trusted`, instead. |
 | `:continue` | `t`: after the commit, the target gets the continue prompt. `nil`: it gets nothing more. Without the key, `claude-code-ide-handover-continue` decides, and its value `ask` counts as `always`: this function never asks. |
+| `:batch-next` | The instance IDs that a batch hands over after this one. The document marks them (see "The document"). The registry does not keep it. |
 
 - The handover runs from timers and events. The function returns at once.
 - The control operation `handover` is this function (`claude-code-ide-control-call 'handover ...`).
@@ -60,9 +78,9 @@ A refusal is a result, not a signal: `(:status error :reason REASON :message TEX
 | `invalid-method` | The method is not `fresh` or `fork`. |
 | `no-conversation` | The source has no native ID yet, so it has no conversation to hand over. |
 | `no-registry-entry` | The registry has no entry of the source. |
-| `handover-running` | Another handover holds the worktree of the source. |
+| `handover-running` | Another handover holds the worktree of the source. The result also has `:handover-id`, the ID of that handover. There is no queue: poll `claude-code-ide-handover-status` with that ID, and call again after its end. |
 | `target-unavailable` | Preflight: the `detect` operation of the target provider does not find its CLI. |
-| `other-instance` | Preflight: another live instance runs in the worktree: in this Emacs, or in another Emacs that runs (an open or pending registry entry of that Emacs). A live MCP session of this Emacs without an instance descriptor counts too. An instance or a session in a subfolder counts when the subfolder is no worktree of its own. Give `:force` to go on. |
+| `other-instance` | Preflight, two cases. (1) A live instance of another Emacs that runs is in the worktree (an open or pending registry entry of that Emacs); the message names it and the process ID of its Emacs. Only `:force` goes on, also with `:allow-others`: the stray scan of this Emacs cannot see the process tree of that instance. (2) Another live instance of this Emacs runs in the worktree, or a live MCP session of this Emacs without an instance descriptor. Give `:allow-others` or `:force` to go on. In both cases, an instance or a session in a subfolder counts when the subfolder is no worktree of its own. |
 | `hooks-not-trusted` | Preflight: the target is Codex, and its status hooks are not trusted. Without them, the handover cannot see the delivery. A coordinator call checks only the cached trust; on a cache miss, a check starts in the background, so a later call knows the answer. |
 | `busy` | Subagents or background tasks run. Give `:force` to go on. |
 | `no-earlier-conversation` | `fork`, but the chain has no conversation of the target provider. |
@@ -114,6 +132,7 @@ Emacs saves each stage in the registry entry of the source **before** the step o
   - `:summary-file`: `<worktree>/.handover/<id>-state.md`.
   - `:session-server`: `claude-code-ide-handover-session-server-detection` (default `auto`).
   - `:budget`: `claude-code-ide-handover-budget` (nil: the transcript default, 100000 characters).
+  - `:others`: one line for each other writer in the worktree (`claude-code-ide-handover--writer-lines` on `claude-code-ide-handover--run-writers`): the other instances and MCP sessions of this Emacs, and with `:force` the instances of another Emacs. The source, its session and the target do not count. The list is made when Emacs writes the document, also at a recovery that writes it again. A line of a source in `:batch-next` ends with "; handed over by this batch next". Without other writers, the document has no such part.
 - The Codex provider has no `transcript` operation. So the leg of a Codex source takes its rollout from the registry (the `transcript_path` of its `SessionStart`), else from a search for `rollout-*-<native-id>.jsonl` in `$CODEX_HOME/sessions` (default `~/.codex/sessions`).
 
 ### The delivery
@@ -173,10 +192,16 @@ Emacs saves each stage in the registry entry of the source **before** the step o
 - The stop reports processes that still run in the worktree (`:status strays`).
   - A process in another repository or linked worktree below the worktree does not count. The scan leaves it out (see "Worktrees" below, and "Worktree scan" in docs/process-tree.md). So `end` never signals it.
   - A process that this Emacs runs (`:emacs-process`, for example a language server) does not count.
-  - A process of another live instance of this Emacs (`:instance-id`) does not count. Only a forced handover has such an instance. So `end` never signals its processes.
+  - A process of another live instance of this Emacs (`:instance-id`) does not count, also its detached work (a recorded group or member that left the CLI tree). Only a handover with `:allow-others` or `:force` has such an instance (for example the targets of a batch). So `end` never signals its processes.
   - A process in the CLI tree of another live MCP session of this Emacs (`:session-id`) does not count. A session without an instance descriptor counts as such a session, for example one that an older version of the package started. The sessions of the source and of the target do not count as other sessions. The run keeps the session ID of the source in memory for this, also after the source descriptor ends. A session after its cleanup is no live session, so its processes stay strays.
   - A review process (`claude-code-ide-review-process-ids`) does not count. The stop and the scan also leave it out. Its result goes to the target after the commit.
 - Each stray gets the start time of its process right after the scan (`:start`).
+- **Strays of unknown owner.** When other writers run in the worktree (`claude-code-ide-handover--run-writers`, for example with `:allow-others`), a stray is of the source only when the stop proved it (`:own`: the CLI tree of the source, a recorded member with its start time, or a proven recorded group; see docs/process-tree.md). A command that detached before any record saw it has no proof.
+  - Every other stray is listed with "owner unknown", and the message says how many there are.
+  - `end` signals only the strays of the source. It leaves the others alone. Check them by hand, then choose `wait` or `cancel`.
+  - A later scan cannot prove an owner again, because the records of the source end with the stop. So a stray keeps its `:own` from an earlier result of the same run when its process ID and start time are the same. The registry record keeps `own` too.
+  - **The proof holds the start time of its snapshot.** Each stray of the process file has the `:start` of the snapshot that proved it. When the handover reads the start time later and the process ID runs with another one, another process took that ID: the stray gets the new start time and loses `:own`. A start time that the handover reads later is never paired with a proof.
+  - When no other writer runs in the worktree, every stray is of the source, and `end` signals all of them, as before.
 - A handover with strays, a source that survived SIGKILL (`source-did-not-stop`), a source that may still run (`source-pid-unknown`, `source-still-running`), or a failed scan (`scan-failed`) gets the status `needs-user`.
   - An interactive handover asks at once. It shows the process ID, the command, and the folder of each stray.
   - A coordinator sees `needs-user` in the status, and Emacs shows a message.
@@ -184,7 +209,7 @@ Emacs saves each stage in the registry entry of the source **before** the step o
 
 | Reason | Choices |
 |---|---|
-| `strays`, `source-did-not-stop` | `end`: SIGTERM, then SIGKILL after `claude-code-ide-handover-stray-wait` (10 s), then scan again. `wait`: scan again after that time. `cancel`. |
+| `strays`, `source-did-not-stop` | `end`: SIGTERM, then SIGKILL after `claude-code-ide-handover-stray-wait` (10 s), then scan again. With other writers in the worktree, `end` signals only the strays of the source (see "Strays of unknown owner"). `wait`: scan again after that time. `cancel`. |
 | `source-pid-unknown`, `source-still-running` | `end`: end the source as `claude-code-ide-control-stop` does (the stop of its provider kills its terminal buffer, which ends the CLI), then scan the worktree. The scan waits `claude-code-ide-handover-stray-wait`, but at least the limit of the soft stop of the kept buffers (6 s by default). `wait`: after a refusal of the stop or the scan, try the stop again after `claude-code-ide-handover-stray-wait`. After a refusal in the document step or the target start (for example, in a recovery with a restored source), `wait` runs that step again and checks again; it does not stop the source. `cancel`: the message says whether the source still runs. There is no `go`: the handover never goes on while the source may run. |
 | `scan-failed` | `wait` (scan again), `go` (go on without the check), `cancel`. |
 | `no-delivery` | `wait` (look at the transcript, then wait again for the delivery), `cancel` (stop the target). |
@@ -226,10 +251,100 @@ The scan looks at each process whose working folder is inside the worktree. It f
 
 ## One writer for each worktree
 
-- While a handover is unfinished, Emacs refuses to start another instance in its worktree (`user-error`). Only the start of its own target goes through.
+- While a handover is unfinished, Emacs refuses to start another instance in its worktree. Only the start of its own target goes through.
 - An unfinished handover in the registry, for example of an Emacs that crashed, holds the worktree too, until a recovery or a cancel ends it.
-- The check is an `:around` advice of `claude-code-ide--start-session` (`claude-code-ide-handover--guard-start`).
-- The preflight refuses a handover while other instances or MCP sessions run in the worktree, unless it is forced.
+- The check is an `:around` advice of `claude-code-ide--start-session` (`claude-code-ide-handover--guard-start`). It signals `claude-code-ide-worktree-held`, a child of `user-error`, with the data `(HANDOVER-ID WORKTREE STAGE)`. So an `M-x` start shows a plain error.
+- **Every start through `claude-code-ide-control--start`** (the control operations `launch` and `resume`) gives `(:status error :reason handover-running :instance-id ID :handover-id HANDOVER-ID :message TEXT)`, not `start-failed`. Nothing starts, and nothing waits: a coordinator polls `claude-code-ide-handover-status` with that ID, and launches again after the end.
+- The other instances of the worktree get no prompt from the handover: the hold is only for the source, the inbox moves only from the source to the target, and the continue prompt and the recovery pointer go only to the target. Their own inboxes work as usual during the handover.
+- The preflight refuses a handover while other instances or MCP sessions run in the worktree, unless `:allow-others` (this Emacs only) or `:force` is given.
+- **A handover never adds a writer.** The source ends before the target starts (`claude-code-ide-handover--source-gone-p`): one writer goes, one writer comes. The question about other sessions protects only against a person who does not know that they run; the document tells the target about them.
+
+## Several instances in one worktree
+
+The design and its decisions: [handover-several.md](handover-several.md).
+
+### The batch command
+
+`M-x claude-code-ide-handover-worktree` hands over the live instances of one worktree to one target provider, one after the other.
+
+```elisp
+(claude-code-ide-handover-worktree INSTANCE-IDS TARGET-PROVIDER
+  &optional METHOD CONTEXTS INTERRUPT CONTINUE CONFIRMED)
+```
+
+| Argument | Value |
+|---|---|
+| `INSTANCE-IDS` | The sources, in order. |
+| `TARGET-PROVIDER` | One provider for all. |
+| `METHOD` | `fork` or `fresh`. With `fork`, a source forks when its chain has a conversation of the target provider, else it starts fresh. |
+| `CONTEXTS` | An alist `(INSTANCE-ID . TEXT)`. A source without an entry gets no context. |
+| `INTERRUPT` | Non-nil: interrupt a busy source one time. One policy for all. |
+| `CONTINUE` | `yes`, `no` or nil, as for `claude-code-ide-handover`. |
+| `CONFIRMED` | The IDs of the sessions outside the batch that you confirmed. |
+
+- It returns the result of the first `claude-code-ide-handover-session`.
+- **The questions**, each one time, before the first handover (`claude-code-ide-handover--read-batch-args`):
+  1. The worktree: that of the instance of the current buffer, else one that you choose (one worktree needs no question).
+  2. The checks, before any question: a batch of this Emacs runs there, a handover holds the worktree, or an instance of another Emacs runs there. Each gives a `user-error`.
+  3. The target provider.
+  4. For a Codex target, the hook trust, one time. The handovers then find the cached trust.
+  5. The sources: the live instances of this Emacs in the worktree whose provider is not the target provider (`completing-read-multiple`; empty input selects all). The order is that of `claude-code-ide-instances`.
+  6. The other sessions: the question of `claude-code-ide-handover` for the sessions outside the batch, with the line "The targets of the batch also run here." `C-u` skips it; then the sessions that it would list count as confirmed.
+  7. The method, only when a source can fork.
+  8. "Interrupt a busy session (else wait until it is idle)?", only when a source is busy.
+  9. A context note for each source.
+  10. Continue, last.
+- Every live source must be in the worktree of the first one; else the command refuses before any change.
+- **The handovers** run with `:allow-others` set to the confirmed sessions, the sources and the targets of the batch, with `:interactive nil`, and never with `:force`. A session that starts after the questions refuses the next handover (`other-instance`), and the batch stops with that message. So no question comes later from a timer: a stray or another problem gives `needs-user`, and you answer with `M-x claude-code-ide-handover-resolve`.
+
+### The rules after each handover
+
+| Status and reason | Action |
+|---|---|
+| `committed` | Record the target. Start the next source. |
+| `cancelled` with `busy`, `not-idle` or `recovered-before-stop` (an automatic cancel; the source stays current) | Skip the source, with the reason. Start the next source. |
+| `cancelled` with `user-cancelled` | Stop the batch. |
+| `needs-user` | Wait. One message for each handover: "Handover batch waits at LABEL: REASON; M-x claude-code-ide-handover-resolve". |
+
+- **Before each next source,** the batch stops when its stop flag is set.
+- A refusal with `busy` or `not-running` skips the source (fail safe: it stays current, and the rest goes on). Any other refusal, except `hooks-not-trusted`, stops the batch, with its message (for example `other-instance` names the new session).
+- **The retry at the end.** `hooks-not-trusted` comes when the trust of the Codex status hooks ran out: a trust of the managed hooks holds 60 s, and the trust check is never weakened.
+  - A source with this refusal waits in the retry list. It is not reported as skipped yet.
+  - When no other source is left, the batch tries each source of the retry list one more time, in order. It uses the same answers and the same steps, without a question. By then, the background trust check that a cache miss starts may have an answer.
+  - A second `hooks-not-trusted` skips the source with that reason. No other reason gets a retry.
+  - The stop command and the guards of the stale timers also hold in the retry. A source that waits for the retry when the batch stops is reported as skipped with `hooks-not-trusted`.
+  - The end message marks each source that the retry handed over with "(in the retry)".
+- An error at the start of a source ends the batch with the usual report; the source gets the error text. A handover that started earlier is not touched.
+- A committed or cancelled handover counts only after its final save (the slot `ended`). A notification of `needs-user` only waits.
+- **The messages:** one for each start ("Handover batch in WORKTREE: 2 of 3: LABEL -> TARGET-PROVIDER (ID)"), and one at the end with three lists: handed over (`SOURCE -> TARGET`), skipped (`LABEL (REASON)`), and stopped at, and not started (`LABEL (REASON); LABEL, ...`). When a source is left, it adds "M-x claude-code-ide-handover-worktree hands over the rest."
+
+### One batch for each worktree
+
+- The batches live in memory (`claude-code-ide-handover--batches`, by worktree).
+- A second batch command in the same worktree is refused while the current handover of the batch is unfinished and owned by this Emacs.
+- **A stale batch is dropped** when the command runs again: its current handover is gone, final, or claimed by another Emacs. The drop marks it dead and cancels its pending timer.
+- **`M-x claude-code-ide-handover-worktree-stop`** stops the batch of the worktree of the current buffer (or one that you choose). It starts no new handover. A running handover goes on to its end; `M-x claude-code-ide-handover-cancel` cancels it.
+- **The stop ends the batch at once** when its current handover ended, is gone, or waits for a person (`claude-code-ide-handover--batch-close`). A handover that ended and whose end was saved is recorded first, as the next step would. Else its source is listed as stopped at, with the state of its handover. A handover that waits stays for `M-x claude-code-ide-handover-resolve`. A drop of a stale batch works the same way, and its message names that source.
+
+### The status hook and the timers
+
+- `claude-code-ide-handover--status-functions` is an abnormal hook that gets the run.
+  - `claude-code-ide-handover--finish` runs it one time for each run (the in-memory slot `ended`), after the final save and the release of the inbox hold, and only when the save succeeded. The skip of `claude-code-ide-handover-resolve` for a source without a registry entry ends the run through `--finish` with NO-SAVE.
+  - `claude-code-ide-handover--needs-user` runs it after each save of `needs-user`, and so does a missing registry entry (`registry-entry-missing`).
+  - Each function runs in its own `condition-case`. An error gives a message, changes no run, and does not stop the other functions.
+- The batch function on the hook only schedules `claude-code-ide-handover--batch-step` with no delay, with the batch object and the handover ID. The step acts only while the table still maps the worktree to that batch, the batch is not dead, and its current handover is still that ID. So an old timer never moves or removes a newer batch, and a second call for the same handover does nothing.
+- A final save that fails runs no hook, so the batch waits. The stop command, or the next command in the worktree (a stale batch), ends it.
+
+### Recovery after a crash
+
+The batch lives in memory, so a crash ends it. Do these steps in this order:
+
+1. `M-x claude-code-ide-handover-recover` continues the handover that ran (it also runs by itself when the registry mode turns on).
+2. `M-x claude-code-ide-restore-sessions` starts the other sources again.
+3. `M-x claude-code-ide-handover-worktree` hands over the rest. It offers only the live instances that are not of the target provider.
+
+- A source whose handover was cancelled after its stop is stopped, not live. Start it again with `M-x claude-code-ide-reopen-session` first.
+
 ## The inbox moves to the target
 
 `(claude-code-ide-control-move-inbox FROM TO)` runs at the commit, before the commit is final.
@@ -311,14 +426,14 @@ The handover fields are in schema version 4, in its own file (`claude-code-ide-s
 
 - The MCP tool `request_handover` (instance scope) takes `target_provider`, `method`, and `reason`, all optional.
 - It only saves the request on the instance and returns at once: `{"status": "requested", ...}`.
-- After the next `turn-end` of that instance, Emacs asks you (`y-or-n-p`). A yes starts `claude-code-ide-handover` with the reason as the context. The request is used one time.
+- After the next `turn-end` of that instance, Emacs asks you (`y-or-n-p`). After a yes, the question about other sessions comes too, when they run in the worktree. Two yes answers start `claude-code-ide-handover` with the reason as the context (and `ALLOW-OTHERS` after the second one). The request is used one time.
 - `claude-code-ide-handover-enable-request-tool` (default t) turns the tool off.
 
 ## Coordinator tools
 
 | Tool | Arguments |
 |---|---|
-| `claude-code-ide-control-handover` | `instance_id`, `target_provider`, and optional `method`, `context`, `interrupt`, `force`, `request_id`, `continue` (boolean: the continue prompt after the commit; without it, the user's option, with `ask` as true). It returns at once. |
+| `claude-code-ide-control-handover` | `instance_id`, `target_provider`, and optional `method`, `context`, `interrupt`, `force`, `request_id`, `continue` (boolean: the continue prompt after the commit; without it, the user's option, with `ask` as true), `allow_others` (boolean: go on while other instances of this Emacs run in the worktree; unlike `force`, it does not stop subagents or background tasks). It returns at once. |
 | `claude-code-ide-control-handover-status` | `handover_id` (the handover ID or the request ID). |
 
 - Both have the coordinator scope.

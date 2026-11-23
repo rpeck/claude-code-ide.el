@@ -2238,7 +2238,8 @@ the action."
          id)))))
 
 (declare-function claude-code-ide-handover "claude-code-ide-handover"
-                  (instance-id target-provider &optional method context interrupt force))
+                  (instance-id target-provider &optional method context interrupt force
+                               continue allow-others))
 (declare-function claude-code-ide-handover--read-args "claude-code-ide-handover"
                   (&optional instance-id))
 

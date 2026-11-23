@@ -30,7 +30,7 @@ This document describes the control operations of claude-code-ide.el, the prompt
 | `resume` | `(claude-code-ide-control-resume INSTANCE-ID &key PROMPT DIRECTORY NATIVE-ID PROVIDER)` | The same as `launch`. |
 | `submit-prompt` | `(claude-code-ide-control-submit INSTANCE-ID TEXT &key REQUEST-ID QUEUE GENERATION)` | `(:destination :request-id :result :reason ...)`. |
 | `stop` | `(claude-code-ide-control-stop INSTANCE-ID &key GENERATION)` | `(:status ok :instance-id ID :result stopped)`. |
-| `handover` | `(claude-code-ide-handover-session INSTANCE-ID TARGET-PROVIDER &key METHOD CONTEXT INTERRUPT FORCE REQUEST-ID CONTINUE)` | Defined by `claude-code-ide-handover.el`; see [handover.md](handover.md). It returns at once. CONTINUE t or nil decides whether the target gets the continue prompt after the commit; without it, `claude-code-ide-handover-continue` decides, with `ask` as `always`. |
+| `handover` | `(claude-code-ide-handover-session INSTANCE-ID TARGET-PROVIDER &key METHOD CONTEXT INTERRUPT FORCE ALLOW-OTHERS REQUEST-ID INTERACTIVE CONTINUE BATCH-NEXT)` | Defined by `claude-code-ide-handover.el`; see [handover.md](handover.md). It returns at once. ALLOW-OTHERS t allows the other sessions of this Emacs in the worktree; a list of IDs allows only those. CONTINUE t or nil decides whether the target gets the continue prompt after the commit; without it, `claude-code-ide-handover-continue` decides, with `ask` as `always`. |
 | `track-review` | Phase 3 (`feat/review-tracking`) | Unavailable until that file defines it. |
 
 `claude-code-ide-control-request-status (INSTANCE-ID REQUEST-ID)` gives the current result of a submitted prompt. REQUEST-ID is a string or a number, as for `submit-prompt`.
@@ -70,7 +70,7 @@ This document describes the control operations of claude-code-ide.el, the prompt
 - `:extra-flags` replaces `claude-code-ide-cli-extra-flags` for this start. The MCP tool does not have this argument.
 - The operation makes the instance ID before the start, and the start uses it. So the result always names the instance that started.
 - The result has `:instance-id`, `:provider`, `:generation`, `:display-name`, and `:native-id`.
-- Error reasons: `no-directory`, `unknown-provider`, `start-failed` (with the message of the start).
+- Error reasons: `no-directory`, `unknown-provider`, `handover-running` (a handover holds the worktree; the result has its `:handover-id`: poll `claude-code-ide-handover-status`, and launch again after its end), `start-failed` (with the message of the start).
 
 ### resume
 
@@ -79,7 +79,7 @@ This document describes the control operations of claude-code-ide.el, the prompt
 - Without a registry entry, the caller gives `:directory` and `:native-id`, and optionally `:provider`.
 - `:prompt` is the first message after the resume.
 - With `:native-id` and no registry entry: when another live instance of this Emacs runs that native ID, nothing starts. The reason is `native-id-running`, and `:message` names that instance.
-- Error reasons: `invalid-instance-id`, `already-running`, `archived`, `unknown-instance`, `no-directory`, `unknown-provider`, `native-id-running`, `start-failed`.
+- Error reasons: `invalid-instance-id`, `already-running`, `archived`, `unknown-instance`, `no-directory`, `unknown-provider`, `native-id-running`, `handover-running` (as for `launch`), `start-failed`.
 
 ### stop
 

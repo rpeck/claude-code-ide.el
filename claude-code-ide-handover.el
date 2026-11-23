@@ -61,6 +61,7 @@
 (declare-function claude-code-ide-process--terminal-process "claude-code-ide-process" (instance process))
 (declare-function claude-code-ide-process-live-sessions "claude-code-ide-process" ())
 (declare-function claude-code-ide-process-session-live-p "claude-code-ide-process" (session))
+(declare-function claude-code-ide-process--same-start-p "claude-code-ide-process" (a b))
 (declare-function claude-code-ide-transcript-handover-document "claude-code-ide-transcript" (&rest args))
 (declare-function claude-code-ide-transcript-instance-leg "claude-code-ide-transcript" (instance))
 (declare-function claude-code-ide-transcript-document-id "claude-code-ide-transcript" (text))
@@ -256,11 +257,23 @@ The registry does not keep it: the sessions of an Emacs end with it.")
   (owner-host nil :documentation "Host name of that Emacs, for people.")
   (continuation nil :documentation "What a clean scan does next: `start-target', `resume-target', `cancel', or nil.")
   (ack-deadline nil :documentation "Float time when the wait for acknowledgements ends.")
+  (ended nil :documentation "Non-nil after the status functions got the end of the run.
+The registry does not keep it.")
+  (batch-next nil :documentation "IDs of the sources that the batch of the run hands over next.
+The registry does not keep it: a crash ends the batch.")
   (created-at nil)
   (updated-at nil))
 
 (defvar claude-code-ide-handover--runs (make-hash-table :test 'equal)
   "The handovers of this Emacs, by handover ID.")
+
+(defvar claude-code-ide-handover--status-functions nil
+  "Functions that get a run at its end, and each time it needs a person.
+`claude-code-ide-handover--finish' calls them once for each run, after
+the final save and the release of the inbox hold;
+`claude-code-ide-handover--needs-user' calls them after each save of
+the status `needs-user'.  An error of a function gives a message, and
+the next function runs.")
 
 (defvar claude-code-ide-handover--allowed nil
   "ID of the handover whose own start may run in its worktree.
@@ -299,7 +312,8 @@ while a handover holds the worktree.")
         (cons 'start (plist-get stray :start))
         (cons 'command (plist-get stray :command))
         (cons 'cwd (plist-get stray :cwd))
-        (cons 'reason (claude-code-ide-handover--name (plist-get stray :reason)))))
+        (cons 'reason (claude-code-ide-handover--name (plist-get stray :reason)))
+        (cons 'own (and (plist-get stray :own) t))))
 
 (defun claude-code-ide-handover--stray-from-alist (alist)
   "Return the stray plist of the registry ALIST."
@@ -307,7 +321,8 @@ while a handover holds the worktree.")
         :start (alist-get 'start alist)
         :command (alist-get 'command alist)
         :cwd (alist-get 'cwd alist)
-        :reason (claude-code-ide-handover--symbol (alist-get 'reason alist))))
+        :reason (claude-code-ide-handover--symbol (alist-get 'reason alist))
+        :own (eq (alist-get 'own alist) t)))
 
 (defun claude-code-ide-handover--to-alist (run)
   "Return the registry record of RUN, an alist with JSON keys."
@@ -415,7 +430,8 @@ A retry cannot help, so the run needs a person; nothing is saved."
           (claude-code-ide-handover--run-status run) 'needs-user
           (claude-code-ide-handover--run-reason run) 'registry-entry-missing
           (claude-code-ide-handover--run-message run) text)
-    (message "Handover %s needs you: %s" (claude-code-ide-handover--run-id run) text)))
+    (message "Handover %s needs you: %s" (claude-code-ide-handover--run-id run) text)
+    (claude-code-ide-handover--run-status-functions run)))
 
 (defun claude-code-ide-handover--save (run &optional drop)
   "Save RUN in the registry entry of its source.  Return non-nil when saved.
@@ -508,7 +524,8 @@ document after a crash still has the context."
                            (list :pid (plist-get stray :pid)
                                  :command (plist-get stray :command)
                                  :cwd (plist-get stray :cwd)
-                                 :reason (plist-get stray :reason)))
+                                 :reason (plist-get stray :reason)
+                                 :own (plist-get stray :own)))
                          (claude-code-ide-handover--run-strays run)))
    (when duplicate (list :duplicate t))))
 
@@ -565,12 +582,21 @@ registry (for example of an Emacs that crashed) count."
                 (append (hash-table-values claude-code-ide-handover--runs)
                         (claude-code-ide-handover--registry-runs)))))
 
+(defun claude-code-ide-handover--held-message (run)
+  "Return the text for the working tree that the unfinished RUN holds."
+  (claude-code-ide-control-held-message
+   (claude-code-ide-handover--run-id run)
+   (claude-code-ide-handover--directory-key (or (claude-code-ide-handover--run-worktree run)
+                                                (claude-code-ide-handover--run-directory run)))
+   (claude-code-ide-handover--run-stage run)))
+
 (defun claude-code-ide-handover--guard-start (start &rest args)
   "Refuse a start in a working tree that a handover holds, then call START.
 START is `claude-code-ide--start-session', and ARGS its arguments; the
 third one is the start spec, or nil.  Only the start of the handover's
 own target, in `claude-code-ide-handover--allowed', goes through: one
-writer for each working tree."
+writer for each working tree.  Another start signals
+`claude-code-ide-worktree-held', a `user-error'."
   (let* ((spec (nth 2 args))
          (directory (ignore-errors
                       (if spec
@@ -579,10 +605,10 @@ writer for each working tree."
          (run (and directory (claude-code-ide-handover--holding-run directory))))
     (when (and run (not (equal claude-code-ide-handover--allowed
                                (claude-code-ide-handover--run-id run))))
-      (user-error "Handover %s holds %s (stage %s); no other instance can start there until it ends"
-                  (claude-code-ide-handover--run-id run)
-                  (claude-code-ide-handover--directory-key directory)
-                  (claude-code-ide-handover--run-stage run)))
+      (signal 'claude-code-ide-worktree-held
+              (list (claude-code-ide-handover--run-id run)
+                    (claude-code-ide-handover--directory-key directory)
+                    (claude-code-ide-handover--run-stage run))))
     (apply start args)))
 
 (advice-add 'claude-code-ide--start-session :around #'claude-code-ide-handover--guard-start)
@@ -728,40 +754,45 @@ answer to a question at the end of its turn."
     (and (not (claude-code-ide-provider-unavailable-p detected))
          (plist-get detected :available))))
 
-(defun claude-code-ide-handover--other-instances (instance)
-  "Return the other live instances in the working tree of INSTANCE."
-  (let ((key (claude-code-ide-handover--directory-key
-              (claude-code-ide-known-or-nil (claude-code-ide-instance-project-root instance)))))
-    (cl-remove-if-not
-     (lambda (other)
-       (and (not (eq other instance))
-            (claude-code-ide-instance-live-p other)
-            (equal (claude-code-ide-handover--directory-key
-                    (claude-code-ide-known-or-nil (claude-code-ide-instance-project-root other)))
-                   key)))
-     (claude-code-ide-instances))))
+(defun claude-code-ide-handover--instance-key (instance)
+  "Return the working tree of INSTANCE.
+See `claude-code-ide-handover--directory-key'."
+  (claude-code-ide-handover--directory-key
+   (claude-code-ide-known-or-nil (claude-code-ide-instance-project-root instance))))
 
-(defun claude-code-ide-handover--other-emacs-entries (instance)
+(defun claude-code-ide-handover--own-ids (instance)
+  "Return the instance ID of INSTANCE, and the ID of its MCP session when known."
+  (let ((session (claude-code-ide-instance-session instance)))
+    (delq nil (list (claude-code-ide-instance-id instance)
+                    (and session (claude-code-ide-mcp-session-session-id session))))))
+
+(defun claude-code-ide-handover--other-instances (key exclude)
+  "Return the live instances in the working tree KEY whose IDs are not in EXCLUDE."
+  (cl-remove-if-not
+   (lambda (other)
+     (and (not (member (claude-code-ide-instance-id other) exclude))
+          (claude-code-ide-instance-live-p other)
+          (equal (claude-code-ide-handover--instance-key other) key)))
+   (claude-code-ide-instances)))
+
+(defun claude-code-ide-handover--other-emacs-entries (key exclude)
   "Return the keys of the live registry entries of other Emacs.
-Only the entries in the working tree of INSTANCE count.
-Such an entry is open or pending, and another Emacs that still runs
-owns it (`claude-code-ide-session-registry--other-emacs-p')."
-  (let ((key (claude-code-ide-handover--directory-key
-              (claude-code-ide-known-or-nil (claude-code-ide-instance-project-root instance))))
-        (id (claude-code-ide-instance-id instance)))
-    (delq nil
-          (mapcar
-           (lambda (entry)
-             (let ((entry-key (claude-code-ide-session-registry-entry-key entry)))
-               (and (not (equal entry-key id))
-                    (memq (claude-code-ide-session-registry-entry-state entry) '(open pending))
-                    (equal (claude-code-ide-handover--directory-key
-                            (or (claude-code-ide-session-registry-entry-worktree entry)
-                                (claude-code-ide-session-registry-entry-project-dir entry)))
-                           key)
-                    (claude-code-ide-session-registry--other-emacs-p entry)
-                    entry-key)))
-           (ignore-errors (claude-code-ide-session-registry--entries))))))
+Only the entries in the working tree KEY count, and not those in
+EXCLUDE.  Such an entry is open or pending, and another Emacs that
+still runs owns it (`claude-code-ide-session-registry--other-emacs-p')."
+  (delq nil
+        (mapcar
+         (lambda (entry)
+           (let ((entry-key (claude-code-ide-session-registry-entry-key entry)))
+             (and (not (member entry-key exclude))
+                  (memq (claude-code-ide-session-registry-entry-state entry) '(open pending))
+                  (equal (claude-code-ide-handover--directory-key
+                          (or (claude-code-ide-session-registry-entry-worktree entry)
+                              (claude-code-ide-session-registry-entry-project-dir entry)))
+                         key)
+                  (claude-code-ide-session-registry--other-emacs-p entry)
+                  entry-key)))
+         (ignore-errors (claude-code-ide-session-registry--entries)))))
 
 (defun claude-code-ide-handover--live-sessions ()
   "Return the live MCP sessions of this Emacs, or nil without the process file."
@@ -773,36 +804,79 @@ owns it (`claude-code-ide-session-registry--other-emacs-p')."
   (let ((directory (ignore-errors (claude-code-ide-mcp-session-project-dir session))))
     (and (stringp directory) (file-name-as-directory (expand-file-name directory)))))
 
-(defun claude-code-ide-handover--other-sessions (instance)
-  "Return the IDs of other live MCP sessions in the working tree of INSTANCE.
+(defun claude-code-ide-handover--other-sessions (key exclude)
+  "Return the IDs of the live MCP sessions in the working tree KEY.
+The IDs in EXCLUDE do not count.
 Only a session without a descriptor counts.  Such a session runs in
 this Emacs, for example from an older version of the package.  A
 session with a descriptor counts through its instance
 \(`claude-code-ide-handover--other-instances')."
-  (let ((key (claude-code-ide-handover--directory-key
-              (claude-code-ide-known-or-nil (claude-code-ide-instance-project-root instance))))
-        (own (claude-code-ide-instance-session instance)))
-    (delq nil
-          (mapcar (lambda (session)
-                    (and (not (eq session own))
+  (delq nil
+        (mapcar (lambda (session)
+                  (let ((id (claude-code-ide-mcp-session-session-id session)))
+                    (and (not (member id exclude))
                          (null (claude-code-ide-instance-of-session session))
                          (equal (claude-code-ide-handover--directory-key
                                  (claude-code-ide-handover--session-directory session))
                                 key)
-                         (claude-code-ide-mcp-session-session-id session)))
-                  (claude-code-ide-handover--live-sessions)))))
+                         id)))
+                (claude-code-ide-handover--live-sessions))))
 
-(defun claude-code-ide-handover--other-writers (instance)
-  "Return the IDs of the other live instances in the working tree of INSTANCE.
+(defun claude-code-ide-handover--writers (key exclude)
+  "Return the IDs of the live writers in the working tree KEY, without EXCLUDE.
 They are the instances of this Emacs, its live MCP sessions without a
 descriptor, and the live registry entries of other Emacs.  An instance
 or a session in a subfolder of the tree counts too, as long as the
 subfolder is no working tree of its own."
   (delete-dups
    (append (mapcar #'claude-code-ide-instance-id
-                   (claude-code-ide-handover--other-instances instance))
-           (claude-code-ide-handover--other-sessions instance)
-           (claude-code-ide-handover--other-emacs-entries instance))))
+                   (claude-code-ide-handover--other-instances key exclude))
+           (claude-code-ide-handover--other-sessions key exclude)
+           (claude-code-ide-handover--other-emacs-entries key exclude))))
+
+(defun claude-code-ide-handover--other-writers (instance)
+  "Return the IDs of the other live writers in the working tree of INSTANCE.
+See `claude-code-ide-handover--writers'."
+  (claude-code-ide-handover--writers (claude-code-ide-handover--instance-key instance)
+                                     (claude-code-ide-handover--own-ids instance)))
+
+(defun claude-code-ide-handover--run-writers (run)
+  "Return the IDs of the live writers in the working tree of RUN.
+The source, its MCP session and the target of RUN do not count.  This
+works also after the source descriptor is gone, at the document step."
+  (claude-code-ide-handover--writers
+   (claude-code-ide-handover--run-worktree run)
+   (delq nil (list (claude-code-ide-handover--run-source-id run)
+                   (claude-code-ide-handover--run-source-session-id run)
+                   (claude-code-ide-handover--run-target-id run)))))
+
+(defun claude-code-ide-handover--writer-lines (ids &optional next)
+  "Return a line of text for each writer of IDS, for people and for the target.
+An ID is a live instance of this Emacs (its label and state), a live
+MCP session without a descriptor, or a registry entry of another Emacs
+\(its name, provider, key and the process ID of that Emacs).  The line
+of an ID in NEXT ends with a note that the current batch hands it over
+next."
+  (mapcar
+   (lambda (id)
+     (let ((instance (claude-code-ide-instance-by-id id))
+           (entry nil))
+       (concat
+        (cond
+         ((and instance (claude-code-ide-instance-live-p instance))
+          (format "%s: %s" (claude-code-ide-handover--instance-label instance)
+                  (or (claude-code-ide-control--state-reason (claude-code-ide-control-state-of id))
+                      'unknown)))
+         ((claude-code-ide-mcp--get-session-by-id id)
+          (format "%s: an MCP session without an instance descriptor" id))
+         ((setq entry (claude-code-ide-session-registry-entry-of id))
+          (format "%s (%s, %s): an instance of the Emacs with process %s"
+                  (or (claude-code-ide-session-registry-entry-instance-name entry) id)
+                  (claude-code-ide-session-registry-entry-provider entry) id
+                  (claude-code-ide-session-registry-entry-emacs-pid entry)))
+         (t id))
+        (if (member id next) "; handed over by this batch next" ""))))
+   ids))
 
 (defun claude-code-ide-handover--codex-trusted-p (directory interactive)
   "Return non-nil when the Codex status hooks are trusted for a start in DIRECTORY.
@@ -824,33 +898,50 @@ background, so that a later call knows the answer."
            (claude-code-ide-codex-events--start-trust-check key directory))))
       (eq (claude-code-ide-codex-events--result-status cached) 'trusted)))))
 
-(defun claude-code-ide-handover--preflight (instance target-provider force interactive)
+(defconst claude-code-ide-handover--untrusted-message
+  "The Codex status hooks are not trusted, so the handover could not see the delivery: M-x claude-code-ide-codex-trust-hooks"
+  "The text of a handover to Codex without trusted status hooks.")
+
+(defun claude-code-ide-handover--other-emacs-message (key ids)
+  "Return the text for the instances IDS of another Emacs in the working tree KEY."
+  (format "Instances of another Emacs run in the working tree %s: %s; stop them there first (only :force hands over anyway)"
+          key (string-join (claude-code-ide-handover--writer-lines ids) "; ")))
+
+(defun claude-code-ide-handover--preflight (instance target-provider force allow-others interactive)
   "Return an error result when the handover of INSTANCE cannot start, else nil.
 The checks run before anything of the source changes:
 - the CLI of TARGET-PROVIDER is found (`target-unavailable');
-- no other live instance or MCP session runs in the working tree, in
-  this Emacs or in another Emacs (its registry entry), unless FORCE
-  (`other-instance');
+- no live instance of another Emacs (its registry entry) runs in the
+  working tree, unless FORCE (`other-instance');
+- no other live instance or MCP session of this Emacs runs in the
+  working tree, unless FORCE; ALLOW-OTHERS t allows all of them, and a
+  list of IDs allows only those (`other-instance');
 - a Codex target has trusted status hooks (`hooks-not-trusted'); with
   INTERACTIVE, the user is asked for the trust first."
   (let* ((id (claude-code-ide-instance-id instance))
+         (key (claude-code-ide-handover--instance-key instance))
          (directory (claude-code-ide-known-or-nil (claude-code-ide-instance-project-root instance))))
     (cond
      ((not (claude-code-ide-handover--target-available-p target-provider))
       (claude-code-ide-handover--error
        'target-unavailable (format "The %s CLI is not available" target-provider) id))
-     ((and (not force) (claude-code-ide-handover--other-writers instance))
-      (claude-code-ide-handover--error
-       'other-instance
-       (format "Other instances run in this working tree (%s); give :force to hand over anyway"
-               (string-join (claude-code-ide-handover--other-writers instance) ", "))
-       id))
+     ((when-let* (((not force))
+                  (far (claude-code-ide-handover--other-emacs-entries
+                        key (claude-code-ide-handover--own-ids instance))))
+        (claude-code-ide-handover--error
+         'other-instance (claude-code-ide-handover--other-emacs-message key far) id)))
+     ((when-let* (((not (or force (eq allow-others t))))
+                  (outside (cl-set-difference (claude-code-ide-handover--other-writers instance)
+                                              allow-others :test #'equal)))
+        (claude-code-ide-handover--error
+         'other-instance
+         (format "Other instances run in this working tree: %s; give :allow-others or :force to hand over anyway"
+                 (string-join (claude-code-ide-handover--writer-lines outside) "; "))
+         id)))
      ((and (eq target-provider 'codex)
            (not (claude-code-ide-handover--codex-trusted-p directory interactive)))
       (claude-code-ide-handover--error
-       'hooks-not-trusted
-       "The Codex status hooks are not trusted, so the handover could not see the delivery: M-x claude-code-ide-codex-trust-hooks"
-       id)))))
+       'hooks-not-trusted claude-code-ide-handover--untrusted-message id)))))
 
 (defun claude-code-ide-handover--missing-feature ()
   "Return the name of a function that a handover needs and that is missing."
@@ -861,8 +952,8 @@ The checks run before anything of the source changes:
 
 (cl-defun claude-code-ide-handover-session (instance-id target-provider
                                                         &key (method 'fresh) context interrupt
-                                                        force request-id interactive
-                                                        (continue nil continue-given))
+                                                        force allow-others request-id interactive
+                                                        (continue nil continue-given) batch-next)
   "Hand the work of INSTANCE-ID to a new conversation of TARGET-PROVIDER.
 TARGET-PROVIDER is a provider name, such as `codex'.  The keys:
 
@@ -875,6 +966,11 @@ TARGET-PROVIDER is a provider name, such as `codex'.  The keys:
   it, the handover waits until the source is idle.
 - FORCE: non-nil to go on while subagents or background tasks run,
   and while other instances run in the working tree.
+- ALLOW-OTHERS: t to go on while other instances or MCP sessions of
+  this Emacs run in the working tree; a list of IDs allows only those
+  (the ones that a person confirmed).  Unlike FORCE, it
+  allows nothing more: subagents, background tasks and an instance of
+  another Emacs still refuse the handover.
 - REQUEST-ID: a string that the caller chooses.  A second call with a
   known request ID returns the current result of the first one, with
   :duplicate t, and starts nothing.
@@ -885,8 +981,13 @@ TARGET-PROVIDER is a provider name, such as `codex'.  The keys:
   nil to send nothing.  Without the key, `claude-code-ide-handover-continue'
   decides, and its value `ask' counts as `always': this function never
   asks.  The interactive question is in `claude-code-ide-handover'.
+- BATCH-NEXT: the IDs of the sources that a batch hands over after
+  this one; the document marks them (see
+  `claude-code-ide-handover-worktree').
 
-The handover runs from timers and returns at once.  The result is the
+The handover runs from timers and returns at once.  A working tree
+that another handover holds gives the reason `handover-running', with
+the :handover-id of that handover.  The result is the
 plist of `claude-code-ide-handover-status', or an error result
 \(:status error :reason REASON :message TEXT)."
   (let* ((request-id (cond ((stringp request-id) request-id)
@@ -925,11 +1026,10 @@ plist of `claude-code-ide-handover-status', or an error result
      ((when-let* ((run (claude-code-ide-handover--holding-run
                         (claude-code-ide-known-or-nil
                          (claude-code-ide-instance-project-root instance)))))
-        (claude-code-ide-handover--error
-         'handover-running
-         (format "Handover %s holds this working tree" (claude-code-ide-handover--run-id run))
-         instance-id)))
-     ((claude-code-ide-handover--preflight instance target-provider force interactive))
+        (append (claude-code-ide-handover--error
+                 'handover-running (claude-code-ide-handover--held-message run) instance-id)
+                (list :handover-id (claude-code-ide-handover--run-id run)))))
+     ((claude-code-ide-handover--preflight instance target-provider force allow-others interactive))
      ((and (not force)
            (claude-code-ide-handover--busy-state-p (claude-code-ide-instance-state instance)))
       (claude-code-ide-handover--error
@@ -956,14 +1056,15 @@ plist of `claude-code-ide-handover-status', or an error result
            interactive chain
            (if continue-given
                (and continue t)
-             (not (eq claude-code-ide-handover-continue 'never)))))))))))
+             (not (eq claude-code-ide-handover-continue 'never)))
+           batch-next))))))))
 
 (defun claude-code-ide-handover--begin (instance target-provider method fork-id context
                                                  interrupt force request-id interactive chain
-                                                 continue)
+                                                 continue batch-next)
   "Create and save the run of a handover of INSTANCE, and schedule its first step.
 TARGET-PROVIDER, METHOD, FORK-ID, CONTEXT, INTERRUPT, FORCE,
-REQUEST-ID, INTERACTIVE and CHAIN are as for
+REQUEST-ID, INTERACTIVE, CHAIN and BATCH-NEXT are as for
 `claude-code-ide-handover-session'.  CONTINUE non-nil sends the
 continue prompt at the commit.  Return the result."
   (let* ((session (claude-code-ide-instance-session instance))
@@ -987,6 +1088,7 @@ continue prompt at the commit.  Return the result."
                :source-session-id (and session (claude-code-ide-mcp-session-session-id session))
                :role (claude-code-ide-instance-role instance)
                :chain chain
+               :batch-next batch-next
                :created-at (claude-code-ide-handover--now))))
     (claude-code-ide-handover--write-context run)
     ;; A first save that waits for the lock is dropped: a refused
@@ -1035,17 +1137,38 @@ the step of STAGE runs again a moment later, from
   (setf (claude-code-ide-handover--run-timer run) nil
         (claude-code-ide-handover--run-watch run) nil))
 
-(defun claude-code-ide-handover--finish (run status reason &optional text)
+(defun claude-code-ide-handover--run-status-functions (run)
+  "Call each function of `claude-code-ide-handover--status-functions' with RUN.
+An error of one function gives a message; it changes nothing of RUN,
+and the next function runs."
+  (run-hook-wrapped
+   'claude-code-ide-handover--status-functions
+   (lambda (function)
+     (condition-case err
+         (funcall function run)
+       (error (message "Handover %s: the status function %s failed: %s"
+                       (claude-code-ide-handover--run-id run) function
+                       (error-message-string err))))
+     nil)))
+
+(defun claude-code-ide-handover--finish (run status reason &optional text no-save)
   "End RUN with STATUS, REASON and TEXT, save it, and tell the user.
-The inbox delivery to the source is no longer held."
+The inbox delivery to the source is no longer held.  NO-SAVE non-nil
+ends RUN in this Emacs only, for a source without a registry entry.
+After the save succeeded (or with NO-SAVE), the functions of
+`claude-code-ide-handover--status-functions' get RUN, once for each
+run."
   (claude-code-ide-handover--cancel-timers run)
   (setf (claude-code-ide-handover--run-status run) status
         (claude-code-ide-handover--run-reason run) reason
         (claude-code-ide-handover--run-message run) text)
-  (claude-code-ide-handover--save run)
-  (claude-code-ide-control-release (claude-code-ide-handover--run-source-id run))
-  (message "Handover %s %s%s" (claude-code-ide-handover--run-id run) status
-           (if text (concat ": " text) "")))
+  (let ((saved (or no-save (claude-code-ide-handover--save run))))
+    (claude-code-ide-control-release (claude-code-ide-handover--run-source-id run))
+    (message "Handover %s %s%s" (claude-code-ide-handover--run-id run) status
+             (if text (concat ": " text) ""))
+    (when (and saved (not (claude-code-ide-handover--run-ended run)))
+      (setf (claude-code-ide-handover--run-ended run) t)
+      (claude-code-ide-handover--run-status-functions run))))
 
 (defun claude-code-ide-handover--guarded (run function &rest args)
   "Call FUNCTION with ARGS for RUN, and turn an error into `needs-user'.
@@ -1181,8 +1304,9 @@ goes to the target after the handover, so the stop leaves it alone."
 (defun claude-code-ide-handover--other-live-instance-p (stray run)
   "Return non-nil when STRAY is a process of another live instance.
 The instances of RUN do not count.
-The scan tags such a process with `:instance-id'.  Only a forced
-handover has another live instance in its worktree; the end of a
+The scan tags such a process with `:instance-id', also its detached
+work.  A handover with :allow-others or :force can have another live
+instance in its worktree; the end of a
 stray must never reach it."
   (let ((id (plist-get stray :instance-id)))
     (and (stringp id)
@@ -1233,11 +1357,17 @@ MCP session (see `claude-code-ide-handover--other-session-p')."
                   strays)))
 
 (defun claude-code-ide-handover--with-start (stray)
-  "Return STRAY with :start, the start time of its process now, when it lacks one."
-  (if (plist-get stray :start)
-      stray
-    (append stray (list :start (claude-code-ide-session-registry--process-start-time
-                                (plist-get stray :pid))))))
+  "Return STRAY with :start, the start time of its process.
+A stray of the scan has the start time of the snapshot that proved its
+owner.  When its process ID runs now with another start time, another
+process took it: the stray gets that start time, and no longer :own.
+A stray without a start time gets the one of now, but never with a
+proof of its owner, which holds only for the process of the scan."
+  (let ((now (claude-code-ide-session-registry--process-start-time (plist-get stray :pid)))
+        (start (plist-get stray :start)))
+    (if (and start (or (null now) (claude-code-ide-process--same-start-p start now)))
+        stray
+      (append (list :start now :own nil) stray))))
 
 (defun claude-code-ide-handover--stop (run)
   "End the source of RUN with its process tree, then check the worktree."
@@ -1340,23 +1470,63 @@ needs a person, who can end it, wait, or cancel."
                                                   :key (lambda (s) (plist-get s :pid)))))))
     (claude-code-ide-handover--after-stop run result)))
 
+(defun claude-code-ide-handover--unknown-strays (run strays)
+  "Return the STRAYS of RUN whose owner is unknown; `end' leaves them alone.
+While other writers run in the worktree of RUN, a stray is of the
+source only when the stop proved it (:own: its CLI tree, a recorded
+member with its start time, or a proven recorded group).  Without
+other writers, every stray is of the source."
+  (when (claude-code-ide-handover--run-writers run)
+    (cl-remove-if (lambda (stray) (plist-get stray :own)) strays)))
+
+(defun claude-code-ide-handover--keep-own (stray before)
+  "Return STRAY, marked :own when BEFORE has it as :own with the same start time.
+A scan after the stop cannot prove the owner again, because the records
+of the source end with it; the process ID and its start time keep the
+proof of the stop."
+  (if (and (not (plist-get stray :own))
+           (cl-some (lambda (old)
+                      (and (plist-get old :own)
+                           (eql (plist-get old :pid) (plist-get stray :pid))
+                           (claude-code-ide-process--same-start-p (plist-get old :start)
+                                                                  (plist-get stray :start))))
+                    before))
+      (append stray (list :own t))
+    stray))
+
+(defun claude-code-ide-handover--strays-note (run strays)
+  "Return the note about the STRAYS of RUN whose owner is unknown.
+Without such strays, return the empty text."
+  (if-let* ((unknown (claude-code-ide-handover--unknown-strays run strays)))
+      (format "; %d with owner unknown (other sessions run here): end leaves them alone, check them by hand"
+              (length unknown))
+    ""))
+
 (defun claude-code-ide-handover--after-stop (run result)
   "Go on with RUN after the stop or the scan that gave RESULT.
 Strays, a source that survived, and a failed scan need a person.  Each
 stray gets the start time of its process now, so that a later signal
-reaches only that process."
+reaches only that process, and keeps the proof of its owner (see
+`claude-code-ide-handover--keep-own')."
   (when (eq (claude-code-ide-handover--run-status run) 'running)
-    (let ((strays (mapcar #'claude-code-ide-handover--with-start
-                          (claude-code-ide-handover--relevant-strays (plist-get result :strays) run))))
+    (let* ((before (claude-code-ide-handover--run-strays run))
+           (strays (mapcar (lambda (stray)
+                             (claude-code-ide-handover--keep-own
+                              (claude-code-ide-handover--with-start stray) before))
+                           (claude-code-ide-handover--relevant-strays (plist-get result :strays) run))))
       (pcase (plist-get result :status)
         ((or 'stopped (and 'strays (guard (null strays))))
          (claude-code-ide-handover--after-scan run))
         ('strays
          (claude-code-ide-handover--needs-user
-          run 'strays "Processes still run in the worktree" strays))
+          run 'strays (concat "Processes still run in the worktree"
+                              (claude-code-ide-handover--strays-note run strays))
+          strays))
         ('timeout
          (claude-code-ide-handover--needs-user
-          run 'source-did-not-stop "The source or its processes survived SIGKILL" strays))
+          run 'source-did-not-stop (concat "The source or its processes survived SIGKILL"
+                                           (claude-code-ide-handover--strays-note run strays))
+          strays))
         ((and 'error (guard (string-match-p claude-code-ide-handover--pid-unknown-regexp
                                             (format "%s" (plist-get result :reason)))))
          (claude-code-ide-handover--needs-user
@@ -1393,6 +1563,7 @@ coordinator sees the status `needs-user', and Emacs shows a message."
         (claude-code-ide-handover--run-message run) text
         (claude-code-ide-handover--run-strays run) strays)
   (claude-code-ide-handover--save run)
+  (claude-code-ide-handover--run-status-functions run)
   (if (claude-code-ide-handover--run-interactive run)
       (run-at-time 0 nil #'claude-code-ide-handover--ask run)
     (message "Handover %s needs you: %s.  M-x claude-code-ide-handover-resolve"
@@ -1412,7 +1583,9 @@ would stop the current instance."
   "Return the choices of a person for RUN before the chain of its target is saved."
   (pcase (claude-code-ide-handover--run-reason run)
     ((or 'strays 'source-did-not-stop)
-     '((?e end "end them: SIGTERM, then SIGKILL")
+     `((?e end ,(if (claude-code-ide-handover--unknown-strays run (claude-code-ide-handover--run-strays run))
+                    "end only the strays of the source: SIGTERM, then SIGKILL; those with owner unknown stay, check them by hand"
+                  "end them: SIGTERM, then SIGKILL"))
        (?w wait "wait, then check again")
        (?c cancel "cancel the handover")))
     ((or 'source-pid-unknown 'source-still-running)
@@ -1435,13 +1608,15 @@ would stop the current instance."
      '((?r retry "try the stage again")
        (?c cancel "cancel the handover")))))
 
-(defun claude-code-ide-handover--describe-strays (strays)
-  "Return a text that lists STRAYS: process ID, command and folder."
+(defun claude-code-ide-handover--describe-strays (strays &optional unknown)
+  "Return a text that lists STRAYS: process ID, command and folder.
+A stray in UNKNOWN gets the note \"owner unknown\"."
   (mapconcat (lambda (stray)
-               (format "  %s  %s  (in %s)"
+               (format "  %s  %s  (in %s)%s"
                        (plist-get stray :pid)
                        (or (plist-get stray :command) "?")
-                       (or (plist-get stray :cwd) "?")))
+                       (or (plist-get stray :cwd) "?")
+                       (if (memq stray unknown) "  owner unknown" "")))
              strays "\n"))
 
 (defun claude-code-ide-handover--ask (run)
@@ -1454,7 +1629,8 @@ would stop the current instance."
                             (claude-code-ide-handover--run-id run)
                             (claude-code-ide-handover--run-message run)
                             (if strays
-                                (concat ":\n" (claude-code-ide-handover--describe-strays strays))
+                                (concat ":\n" (claude-code-ide-handover--describe-strays
+                                               strays (claude-code-ide-handover--unknown-strays run strays)))
                               ""))
                     (mapcar (lambda (choice)
                               (list (nth 0 choice) (symbol-name (nth 1 choice)) (nth 2 choice)))
@@ -1583,12 +1759,9 @@ Interactively, choose the handover and the action."
                  (claude-code-ide-control-move-inbox (claude-code-ide-handover--run-source-id run)
                                                      (claude-code-ide-handover--run-target-id run)
                                                      (claude-code-ide-handover--run-id run))
-                 (claude-code-ide-handover--cancel-timers run)
-                 (setf (claude-code-ide-handover--run-status run) 'committed
-                       (claude-code-ide-handover--run-reason run) nil)
-                 (claude-code-ide-control-release (claude-code-ide-handover--run-source-id run))
-                 (message "Handover %s committed in this Emacs; the registry has no entry to save it in"
-                          (claude-code-ide-handover--run-id run)))
+                 (claude-code-ide-handover--finish
+                  run 'committed nil
+                  "in this Emacs only; the registry has no entry of the source to save it in" t))
              (error
               ;; The registry cannot hold the text; keep it in this Emacs
               (setf (claude-code-ide-handover--run-message run)
@@ -1634,7 +1807,9 @@ Interactively, choose the handover and the action."
                  (claude-code-ide-handover--start-watch run)))
            (claude-code-ide-handover--rescan run)))
         ('end
-         (let ((strays (claude-code-ide-handover--run-strays run)))
+         (let* ((all (claude-code-ide-handover--run-strays run))
+                (unknown (claude-code-ide-handover--unknown-strays run all))
+                (strays (cl-remove-if (lambda (stray) (memq stray unknown)) all)))
            (claude-code-ide-handover--end-strays strays 'SIGTERM)
            (claude-code-ide-handover--rescan
             run (lambda (_) (claude-code-ide-handover--end-strays strays 'SIGKILL)))))
@@ -1816,7 +1991,9 @@ nil when WORKTREE is not in Git."
    :handover-id (claude-code-ide-handover--run-id run)
    :target-provider (claude-code-ide-handover--run-target-provider run)
    :summary-file (claude-code-ide-handover--run-summary-file run)
-   :session-server claude-code-ide-handover-session-server-detection))
+   :session-server claude-code-ide-handover-session-server-detection
+   :others (claude-code-ide-handover--writer-lines (claude-code-ide-handover--run-writers run)
+                                                   (claude-code-ide-handover--run-batch-next run))))
 
 (defun claude-code-ide-handover--write-document (run)
   "Write the handover document of RUN with its hash, then start the target."
@@ -2536,10 +2713,70 @@ this Emacs."
                      save (error-message-string err)))))
        (if (memq answer '(?y ?a)) 'yes 'no)))))
 
+(defun claude-code-ide-handover--check-worktree (key)
+  "Signal a `user-error' when no handover can start in the working tree KEY.
+A handover holds KEY, or an instance of another Emacs runs there."
+  (when-let* ((run (claude-code-ide-handover--holding-run key)))
+    (user-error "%s" (claude-code-ide-handover--held-message run)))
+  (when-let* ((far (claude-code-ide-handover--other-emacs-entries key nil)))
+    (user-error "%s" (claude-code-ide-handover--other-emacs-message key far))))
+
+(defun claude-code-ide-handover--confirm-others (instance &optional exclude)
+  "Ask whether to hand over INSTANCE while other sessions run in its working tree.
+They are its other writers (`claude-code-ide-handover--writers').
+Return their IDs, which the person confirmed (nil when there is none),
+or signal `user-error' after n.  EXCLUDE is a list of IDs that the
+question leaves out: the sources of a batch, whose targets also run
+there.  With a prefix argument, the question does not come, and the
+IDs are confirmed."
+  (let* ((key (claude-code-ide-handover--instance-key instance))
+         (ids (claude-code-ide-handover--writers
+               key (append (claude-code-ide-handover--own-ids instance) exclude))))
+    (cond
+     ((or (null ids) current-prefix-arg) ids)
+     ((y-or-n-p
+       (format (concat "%d other %s in the worktree %s:\n%s\n"
+                       "They go on with their work. The handover does not stop them or their processes.\n"
+                       "The target gets this list.\n%sHand over anyway? ")
+               (length ids) (if (cdr ids) "sessions run" "session runs") key
+               (mapconcat (lambda (line) (concat "  " line))
+                          (claude-code-ide-handover--writer-lines ids) "\n")
+               (if exclude "The targets of the batch also run here.\n" "")))
+      ids)
+     (t (user-error "Handover not started")))))
+
+(defun claude-code-ide-handover--read-target (source-provider)
+  "Read the target provider; the default is a provider other than SOURCE-PROVIDER."
+  (let ((default (symbol-name (or (car (remq source-provider (claude-code-ide-provider-names)))
+                                  source-provider))))
+    (intern (completing-read (format "Target provider (default %s): " default)
+                             (mapcar #'symbol-name (claude-code-ide-provider-names))
+                             nil t nil nil default))))
+
+(defun claude-code-ide-handover--instance-fork-id (instance target)
+  "Return the native ID that a handover of INSTANCE to TARGET forks, or nil."
+  (claude-code-ide-handover--fork-id
+   (claude-code-ide-handover--chain-of (claude-code-ide-instance-id instance))
+   (list :provider (claude-code-ide-instance-provider instance)
+         :native-id (claude-code-ide-known-or-nil (claude-code-ide-instance-native-id instance)))
+   target))
+
+(defun claude-code-ide-handover--read-context-note (prompt)
+  "Read a context note for a target with PROMPT; return nil for an empty answer."
+  (let ((text (read-string prompt)))
+    (unless (string-empty-p (string-trim text)) text)))
+
+(defun claude-code-ide-handover--interruptible-p (state)
+  "Return non-nil when a source in STATE is busy, so that an interrupt can help."
+  (and (memq (plist-get state :state) '(working waiting-for-user))
+       (not (claude-code-ide-handover--quiet-state-p state))))
+
 (defun claude-code-ide-handover--read-args (&optional instance-id)
   "Read the arguments of `claude-code-ide-handover'.
 INSTANCE-ID, when given, is the source; else it is the instance of the
-current buffer, or one that you choose."
+current buffer, or one that you choose.  The checks of the working
+tree and the question about other sessions come first; with a prefix
+argument, that question does not come."
   (let* ((instance (or (and instance-id (claude-code-ide-instance-by-id instance-id))
                        (claude-code-ide-handover--current-instance)
                        (let* ((instances (cl-remove-if-not #'claude-code-ide-instance-live-p
@@ -2549,24 +2786,17 @@ current buffer, or one that you choose."
                                                   instances)))
                          (unless candidates (user-error "No instance runs"))
                          (cdr (assoc (completing-read "Hand over: " candidates nil t) candidates)))))
-         (source-provider (claude-code-ide-instance-provider instance))
-         (others (remq source-provider (claude-code-ide-provider-names)))
-         (default (symbol-name (or (car others) source-provider)))
-         (target (intern (completing-read (format "Target provider (default %s): " default)
-                                          (mapcar #'symbol-name (claude-code-ide-provider-names))
-                                          nil t nil nil default)))
-         (fork-id (claude-code-ide-handover--fork-id
-                   (claude-code-ide-handover--chain-of (claude-code-ide-instance-id instance))
-                   (list :provider source-provider
-                         :native-id (claude-code-ide-known-or-nil
-                                     (claude-code-ide-instance-native-id instance)))
-                   target))
-         (method (if fork-id (claude-code-ide-handover--read-method target) 'fresh))
-         (context (let ((text (read-string "Context for the target (empty for none): ")))
-                    (unless (string-empty-p (string-trim text)) text)))
+         (allow-others (progn
+                         (claude-code-ide-handover--check-worktree
+                          (claude-code-ide-handover--instance-key instance))
+                         (claude-code-ide-handover--confirm-others instance)))
+         (target (claude-code-ide-handover--read-target (claude-code-ide-instance-provider instance)))
+         (method (if (claude-code-ide-handover--instance-fork-id instance target)
+                     (claude-code-ide-handover--read-method target)
+                   'fresh))
+         (context (claude-code-ide-handover--read-context-note "Context for the target (empty for none): "))
          (state (claude-code-ide-instance-state instance))
-         (interrupt (and (memq (plist-get state :state) '(working waiting-for-user))
-                         (not (claude-code-ide-handover--quiet-state-p state))
+         (interrupt (and (claude-code-ide-handover--interruptible-p state)
                          (y-or-n-p (format "%s is %s.  Interrupt it (else wait until it is idle)? "
                                            (claude-code-ide-handover--instance-label instance)
                                            (plist-get state :state)))))
@@ -2582,11 +2812,18 @@ current buffer, or one that you choose."
       (user-error "Handover not started"))
     (list (claude-code-ide-instance-id instance) target method context interrupt force
           ;; The last question: whether the target goes on after the commit
-          (claude-code-ide-handover--read-continue))))
+          (claude-code-ide-handover--read-continue)
+          allow-others)))
+
+(defun claude-code-ide-handover--continue-key (continue)
+  "Return the :continue key of a handover for CONTINUE, `yes', `no' or nil."
+  (pcase continue
+    ('yes (list :continue t))
+    ('no (list :continue nil))))
 
 ;;;###autoload
 (defun claude-code-ide-handover (instance-id target-provider &optional method context interrupt force
-                                             continue)
+                                             continue allow-others)
   "Hand the work of INSTANCE-ID to a new conversation of TARGET-PROVIDER.
 METHOD is `fresh' or `fork', CONTEXT optional text for the target,
 INTERRUPT non-nil to interrupt a busy source, and FORCE non-nil to go
@@ -2594,17 +2831,18 @@ on while its subagents or background tasks run, or while its state is
 unknown.  CONTINUE is `yes' or `no': whether the target goes on with
 the task after the commit; nil leaves it to
 `claude-code-ide-handover-continue', where `ask' counts as `always'.
+ALLOW-OTHERS is t or the list of the IDs of the other sessions of this
+Emacs in the working tree that may run during the handover.
 Interactively, the source is the instance of the current buffer, else
 one that you choose, and Emacs asks for the rest, also CONTINUE when
-the option is `ask'.  Emacs asks you about stray processes after the
-stop.  See `claude-code-ide-handover-session'."
+the option is `ask', and whether to go on next to other sessions (a
+prefix argument skips that question).  Emacs asks you about stray
+processes after the stop.  See `claude-code-ide-handover-session'."
   (interactive (claude-code-ide-handover--read-args))
   (let ((result (apply #'claude-code-ide-handover-session
                        instance-id target-provider :method (or method 'fresh) :context context
-                       :interrupt interrupt :force force :interactive t
-                       (pcase continue
-                         ('yes (list :continue t))
-                         ('no (list :continue nil))))))
+                       :interrupt interrupt :force force :allow-others allow-others :interactive t
+                       (claude-code-ide-handover--continue-key continue))))
     (if (eq (plist-get result :status) 'error)
         (user-error "Handover refused: %s%s" (plist-get result :reason)
                     (if (plist-get result :message) (concat ": " (plist-get result :message)) ""))
@@ -2612,10 +2850,403 @@ stop.  See `claude-code-ide-handover-session'."
                instance-id target-provider))
     result))
 
+;;; Handovers of all instances of a working tree
+
+(cl-defstruct (claude-code-ide-handover--batch
+               (:constructor claude-code-ide-handover--batch-create)
+               (:copier nil))
+  "Handovers of the instances of one working tree, one after the other.
+It lives in this Emacs only: a crash ends it."
+  (key nil :documentation "The working tree.")
+  (target-provider nil)
+  (method 'fresh :documentation "`fork' or `fresh'; `fork' only for a source that can fork.")
+  (contexts nil :documentation "Alist of source ID and context text.")
+  (interrupt nil)
+  (continue nil :documentation "`yes', `no' or nil, as for `claude-code-ide-handover'.")
+  (confirmed nil :documentation "IDs of the sessions outside the batch that the person confirmed.")
+  (all nil :documentation "IDs of all sources, in order.")
+  (sources nil :documentation "IDs of the sources that are not started yet, in order.")
+  (labels nil :documentation "Alist of source ID and its label, from the start of the batch.")
+  (current nil :documentation "ID of the current handover, or nil.")
+  (current-source nil :documentation "Source ID of the current handover, or nil.")
+  (done nil :documentation "(SOURCE-ID . TARGET-ID) of each commit, newest first.")
+  (skipped nil :documentation "(SOURCE-ID . REASON) of each skipped source, newest first.")
+  (stopped-at nil :documentation "(SOURCE-ID . REASON) of the source where the batch stopped.")
+  (retry nil :documentation "IDs of the sources refused with `hooks-not-trusted', for one more try.")
+  (retried nil :documentation "IDs of the sources of the retry, once it began.")
+  (stop nil :documentation "Non-nil: start no new handover.")
+  (dead nil :documentation "Non-nil after the batch ended or was dropped.")
+  (told nil :documentation "Non-nil after the wait message of the current handover.")
+  (timer nil :documentation "The pending timer of the next step, or nil.")
+  (result nil :documentation "The result of the first handover."))
+
+;; shortcut: the batches live in memory and a crash ends them (the
+;; current handover recovers), upgrade when a batch must outlive Emacs
+(defvar claude-code-ide-handover--batches (make-hash-table :test 'equal)
+  "The handover batches of this Emacs, by working tree.")
+
+(defun claude-code-ide-handover--batch-label (batch id)
+  "Return the label of the source ID of BATCH."
+  (or (cdr (assoc id (claude-code-ide-handover--batch-labels batch))) id))
+
+(defun claude-code-ide-handover--batch-stale-p (batch)
+  "Return non-nil when BATCH has no unfinished current handover of this Emacs.
+Its current handover is gone, final, or owned by another Emacs, whose
+claim its registry record shows."
+  (let* ((id (claude-code-ide-handover--batch-current batch))
+         (run (claude-code-ide-handover--find id))
+         (record (and run (cl-find id (claude-code-ide-handover--registry-runs)
+                                   :key #'claude-code-ide-handover--run-id :test #'equal))))
+    (not (and run
+              (claude-code-ide-handover--unfinished-p run)
+              (not (eq (and record (claude-code-ide-handover--run-owner record)) 'other))))))
+
+(defun claude-code-ide-handover--batch-drop (batch)
+  "Mark BATCH dead, cancel its pending timer, and take it out of the table.
+It leaves the table only while the table maps its working tree to it,
+so that an old batch never removes a new one."
+  (setf (claude-code-ide-handover--batch-dead batch) t)
+  (when (timerp (claude-code-ide-handover--batch-timer batch))
+    (cancel-timer (claude-code-ide-handover--batch-timer batch)))
+  (setf (claude-code-ide-handover--batch-timer batch) nil)
+  (let ((key (claude-code-ide-handover--batch-key batch)))
+    (when (eq (gethash key claude-code-ide-handover--batches) batch)
+      (remhash key claude-code-ide-handover--batches))))
+
+(defun claude-code-ide-handover--check-no-batch (key)
+  "Signal a `user-error' when a batch of this Emacs runs in the working tree KEY.
+A stale batch (`claude-code-ide-handover--batch-stale-p') is dropped
+first, with a message, through `claude-code-ide-handover--batch-close'."
+  (when-let* ((batch (gethash key claude-code-ide-handover--batches)))
+    (if (claude-code-ide-handover--batch-stale-p batch)
+        (progn
+          (message "Handover batch in %s dropped at %s: its handover %s ended or is gone" key
+                   (claude-code-ide-handover--batch-label
+                    batch (claude-code-ide-handover--batch-current-source batch))
+                   (claude-code-ide-handover--batch-current batch))
+          (claude-code-ide-handover--batch-close batch))
+      (user-error "A handover batch runs in %s; M-x claude-code-ide-handover-worktree-stop stops it"
+                  key))))
+
+(defun claude-code-ide-handover--batch-end (batch)
+  "End BATCH, and tell the user what it handed over, skipped and did not start."
+  (claude-code-ide-handover--batch-drop batch)
+  (let* ((label (lambda (id) (claude-code-ide-handover--batch-label batch id)))
+         (with-reason (lambda (item) (format "%s (%s)" (funcall label (car item)) (cdr item))))
+         (or-none (lambda (items) (if items (string-join items ", ") "none")))
+         ;; A source that waits for the retry when the batch ends was
+         ;; refused with that reason
+         (skipped (append (reverse (claude-code-ide-handover--batch-skipped batch))
+                          (mapcar (lambda (id) (cons id 'hooks-not-trusted))
+                                  (claude-code-ide-handover--batch-retry batch))))
+         (stopped-at (claude-code-ide-handover--batch-stopped-at batch))
+         (rest (claude-code-ide-handover--batch-sources batch)))
+    (message "Handover batch in %s ended.  Handed over: %s.  Skipped: %s.  Stopped at, and not started: %s.%s"
+             (claude-code-ide-handover--batch-key batch)
+             (funcall or-none (mapcar (lambda (done)
+                                        (format "%s -> %s%s" (funcall label (car done)) (cdr done)
+                                                (if (member (car done) (claude-code-ide-handover--batch-retried batch))
+                                                    " (in the retry)"
+                                                  "")))
+                                      (reverse (claude-code-ide-handover--batch-done batch))))
+             (funcall or-none (mapcar with-reason skipped))
+             (if stopped-at
+                 (string-join (cons (funcall with-reason stopped-at)
+                                    (and rest (list (string-join (mapcar label rest) ", "))))
+                              "; ")
+               (funcall or-none (mapcar label rest)))
+             (if (or skipped stopped-at rest)
+                 "  M-x claude-code-ide-handover-worktree hands over the rest."
+               ""))))
+
+(defun claude-code-ide-handover--batch-close (batch)
+  "End BATCH now, without a new start.
+A current handover whose end the status functions got is recorded
+first, through `claude-code-ide-handover--batch-step'.  Else its source
+is where BATCH stopped; an unfinished handover stays for
+`claude-code-ide-handover-resolve'."
+  (setf (claude-code-ide-handover--batch-stop batch) t)
+  (let* ((id (claude-code-ide-handover--batch-current batch))
+         (run (claude-code-ide-handover--find id)))
+    (when (and run (not (claude-code-ide-handover--unfinished-p run)))
+      (claude-code-ide-handover--batch-step batch id))
+    (unless (claude-code-ide-handover--batch-dead batch)
+      (when-let* ((source (claude-code-ide-handover--batch-current-source batch)))
+        (setf (claude-code-ide-handover--batch-stopped-at batch)
+              (cons source (format "handover %s %s" id
+                                   (if run (claude-code-ide-handover--run-status run) "gone")))))
+      (claude-code-ide-handover--batch-end batch))))
+
+(defun claude-code-ide-handover--batch-next (batch)
+  "Start the handover of the next source of BATCH, or end BATCH.
+The handover may go on next to the confirmed sessions, the sources and
+the targets of BATCH; another writer refuses it (`other-instance').  A
+source that the handover refuses with `busy' or `not-running' is
+skipped.  One refused with `hooks-not-trusted' waits for the retry:
+when no other source is left, the batch tries each such source one
+more time, in order, as before (the background trust check may have an
+answer then); a second refusal skips it.  The batch stops at a stop
+request, at another refusal, and at an error of the start."
+  (setf (claude-code-ide-handover--batch-current batch) nil
+        (claude-code-ide-handover--batch-current-source batch) nil)
+  (let ((source (car (claude-code-ide-handover--batch-sources batch))))
+    (cond
+     ((claude-code-ide-handover--batch-stop batch)
+      (claude-code-ide-handover--batch-end batch))
+     ((and (null source) (claude-code-ide-handover--batch-retry batch))
+      (setf (claude-code-ide-handover--batch-retried batch) (claude-code-ide-handover--batch-retry batch)
+            (claude-code-ide-handover--batch-sources batch) (claude-code-ide-handover--batch-retry batch)
+            (claude-code-ide-handover--batch-retry batch) nil)
+      (claude-code-ide-handover--batch-next batch))
+     ((null source)
+      (claude-code-ide-handover--batch-end batch))
+     (t
+      (pop (claude-code-ide-handover--batch-sources batch))
+      (let* ((instance (claude-code-ide-instance-by-id source))
+             (target-provider (claude-code-ide-handover--batch-target-provider batch))
+             (result
+              (condition-case err
+                  (apply #'claude-code-ide-handover-session source target-provider
+                         :method (if (and instance
+                                          (eq (claude-code-ide-handover--batch-method batch) 'fork)
+                                          (claude-code-ide-handover--instance-fork-id
+                                           instance target-provider))
+                                     'fork
+                                   'fresh)
+                         :context (cdr (assoc source (claude-code-ide-handover--batch-contexts batch)))
+                         :interrupt (claude-code-ide-handover--batch-interrupt batch)
+                         :allow-others (append (claude-code-ide-handover--batch-confirmed batch)
+                                               (claude-code-ide-handover--batch-all batch)
+                                               (mapcar #'cdr (claude-code-ide-handover--batch-done batch)))
+                         :interactive nil
+                         :batch-next (claude-code-ide-handover--batch-sources batch)
+                         (claude-code-ide-handover--continue-key
+                          (claude-code-ide-handover--batch-continue batch)))
+                (error (claude-code-ide-handover--error 'error (error-message-string err) source))))
+             (reason (plist-get result :reason)))
+        (unless (claude-code-ide-handover--batch-result batch)
+          (setf (claude-code-ide-handover--batch-result batch) result))
+        (cond
+         ((not (eq (plist-get result :status) 'error))
+          (setf (claude-code-ide-handover--batch-current batch) (plist-get result :handover-id)
+                (claude-code-ide-handover--batch-current-source batch) source
+                (claude-code-ide-handover--batch-told batch) nil)
+          (message "Handover batch in %s: %d of %d: %s -> %s (%s)"
+                   (claude-code-ide-handover--batch-key batch)
+                   (1+ (cl-position source (claude-code-ide-handover--batch-all batch) :test #'equal))
+                   (length (claude-code-ide-handover--batch-all batch))
+                   (claude-code-ide-handover--batch-label batch source) target-provider
+                   (plist-get result :handover-id)))
+         ((and (eq reason 'hooks-not-trusted)
+               (not (claude-code-ide-handover--batch-retried batch)))
+          (setf (claude-code-ide-handover--batch-retry batch)
+                (append (claude-code-ide-handover--batch-retry batch) (list source)))
+          (claude-code-ide-handover--batch-next batch))
+         ;; Fail safe: such a source stays current, and the others do
+         ;; not depend on it
+         ((memq reason '(busy not-running hooks-not-trusted))
+          (push (cons source reason) (claude-code-ide-handover--batch-skipped batch))
+          (claude-code-ide-handover--batch-next batch))
+         (t
+          (setf (claude-code-ide-handover--batch-stopped-at batch)
+                (cons source (if (plist-get result :message)
+                                 (format "%s: %s" reason (plist-get result :message))
+                               reason)))
+          (claude-code-ide-handover--batch-end batch))))))))
+
+(defun claude-code-ide-handover--batch-on-status (run)
+  "Schedule the next step of the batch whose current handover is RUN.
+All work of the batch runs in that timer, outside the stack of the
+handover."
+  (when-let* ((batch (gethash (claude-code-ide-handover--run-worktree run)
+                              claude-code-ide-handover--batches))
+              ((equal (claude-code-ide-handover--batch-current batch)
+                      (claude-code-ide-handover--run-id run))))
+    (setf (claude-code-ide-handover--batch-timer batch)
+          (run-at-time 0 nil #'claude-code-ide-handover--batch-step
+                       batch (claude-code-ide-handover--run-id run)))))
+
+(add-hook 'claude-code-ide-handover--status-functions #'claude-code-ide-handover--batch-on-status)
+
+(defun claude-code-ide-handover--batch-step (batch handover-id)
+  "Go on with BATCH after its handover HANDOVER-ID ended or needs a person.
+Nothing happens unless the table still maps the working tree to BATCH,
+BATCH is not dead, and HANDOVER-ID is still its current handover: an
+old timer never moves a newer batch, and a second call for the same
+handover does nothing.  A committed or cancelled run counts only after
+the status functions got its end (`ended': its final save succeeded);
+a notification of needs-user only waits."
+  (when-let* (((eq (gethash (claude-code-ide-handover--batch-key batch)
+                            claude-code-ide-handover--batches)
+                   batch))
+              ((not (claude-code-ide-handover--batch-dead batch)))
+              ((equal (claude-code-ide-handover--batch-current batch) handover-id))
+              (run (claude-code-ide-handover--find handover-id)))
+    (setf (claude-code-ide-handover--batch-timer batch) nil)
+    (let ((source (claude-code-ide-handover--run-source-id run))
+          (reason (claude-code-ide-handover--run-reason run))
+          (ended (claude-code-ide-handover--run-ended run)))
+      (pcase (claude-code-ide-handover--run-status run)
+        ((and 'committed (guard ended))
+         (push (cons source (claude-code-ide-handover--run-target-id run))
+               (claude-code-ide-handover--batch-done batch))
+         (claude-code-ide-handover--batch-next batch))
+        ;; An automatic cancel before the stop: the source stays current
+        ((and 'cancelled (guard ended) (guard (memq reason '(busy not-idle recovered-before-stop))))
+         (push (cons source reason) (claude-code-ide-handover--batch-skipped batch))
+         (claude-code-ide-handover--batch-next batch))
+        ((and 'cancelled (guard ended))
+         (setf (claude-code-ide-handover--batch-stopped-at batch) (cons source reason))
+         (claude-code-ide-handover--batch-end batch))
+        ('needs-user
+         (unless (claude-code-ide-handover--batch-told batch)
+           (setf (claude-code-ide-handover--batch-told batch) t)
+           (message "Handover batch waits at %s: %s; M-x claude-code-ide-handover-resolve"
+                    (claude-code-ide-handover--batch-label batch source) reason)))))))
+
+(defun claude-code-ide-handover--read-worktree (prompt keys none)
+  "Return the working tree of the instance of the current buffer, if in KEYS.
+Else read one of KEYS with PROMPT; one key needs no question.  Without
+KEYS, signal a `user-error' with the text NONE."
+  (let ((own (when-let* ((instance (claude-code-ide-handover--current-instance)))
+               (claude-code-ide-handover--instance-key instance))))
+    (cond
+     ((member own keys) own)
+     ((null keys) (user-error "%s" none))
+     ((cdr keys) (completing-read prompt keys nil t))
+     (t (car keys)))))
+
+(defun claude-code-ide-handover--read-batch-args ()
+  "Read the arguments of `claude-code-ide-handover-worktree'.
+The checks of the working tree come before any question, and each
+question comes once, before the first handover: the target, the Codex
+hook trust, the sources, the other sessions, the method, the interrupt
+policy, a context note for each source, and continue."
+  (let* ((live (cl-remove-if-not #'claude-code-ide-instance-live-p (claude-code-ide-instances)))
+         (key (claude-code-ide-handover--read-worktree
+               "Hand over the instances of the working tree: "
+               (delete-dups (delq nil (mapcar #'claude-code-ide-handover--instance-key live)))
+               "No instance runs")))
+    (claude-code-ide-handover--check-no-batch key)
+    (claude-code-ide-handover--check-worktree key)
+    (let* ((here (cl-remove-if-not (lambda (instance)
+                                     (equal (claude-code-ide-handover--instance-key instance) key))
+                                   live))
+           (current (car (memq (claude-code-ide-handover--current-instance) here)))
+           (target (claude-code-ide-handover--read-target
+                    (claude-code-ide-instance-provider (or current (car here)))))
+           (candidates (progn
+                         (when (and (eq target 'codex)
+                                    (not (claude-code-ide-handover--codex-trusted-p key t)))
+                           (user-error "%s" claude-code-ide-handover--untrusted-message))
+                         (mapcar (lambda (instance)
+                                   (cons (claude-code-ide-handover--instance-label instance) instance))
+                                 (cl-remove target here :key #'claude-code-ide-instance-provider))))
+           (chosen (if candidates
+                       (completing-read-multiple "Hand over (empty for all): " candidates nil t)
+                     (user-error "No instance in %s runs a provider other than %s" key target)))
+           (sources (if chosen
+                        (cl-remove-if-not (lambda (candidate) (member (car candidate) chosen)) candidates)
+                      candidates))
+           (instances (mapcar #'cdr sources))
+           (ids (mapcar #'claude-code-ide-instance-id instances))
+           (confirmed (claude-code-ide-handover--confirm-others (car instances) ids))
+           (method (if (cl-some (lambda (instance)
+                                  (claude-code-ide-handover--instance-fork-id instance target))
+                                instances)
+                       (claude-code-ide-handover--read-method target)
+                     'fresh))
+           (interrupt (and (cl-some (lambda (instance)
+                                      (claude-code-ide-handover--interruptible-p
+                                       (claude-code-ide-instance-state instance)))
+                                    instances)
+                           (y-or-n-p "Interrupt a busy session (else wait until it is idle)? ")))
+           (contexts (delq nil (mapcar (lambda (source)
+                                         (when-let* ((text (claude-code-ide-handover--read-context-note
+                                                            (format "Context for %s (empty for none): "
+                                                                    (car source)))))
+                                           (cons (claude-code-ide-instance-id (cdr source)) text)))
+                                       sources))))
+      (list ids target method contexts interrupt (claude-code-ide-handover--read-continue) confirmed))))
+
+;;;###autoload
+(defun claude-code-ide-handover-worktree (instance-ids target-provider &optional method contexts
+                                                       interrupt continue confirmed)
+  "Hand over the instances INSTANCE-IDS of one working tree to TARGET-PROVIDER.
+The handovers run one after the other: each starts after the previous
+one ended.  METHOD is `fork' or `fresh'; with `fork', a source forks
+when its chain has a conversation of TARGET-PROVIDER, else it starts
+fresh.  CONTEXTS is an alist of instance ID and context text.
+INTERRUPT non-nil interrupts a busy source one time.  CONTINUE is
+`yes', `no' or nil, as for `claude-code-ide-handover'.  CONFIRMED is
+the list of the IDs of the other sessions in the working tree that
+you confirmed; a session that is not in it, and not of the batch,
+refuses the next handover, and the batch stops.  Every live source
+must be in the working tree of the first one.
+
+After an automatic cancel (`busy', `not-idle'), and a refusal with
+`busy', `not-running' or `hooks-not-trusted', the batch skips that
+source; after a cancel of yours it stops; at `needs-user' it waits
+for `claude-code-ide-handover-resolve'.  The batch never forces a
+handover, and no handover of it asks a question.
+\\[claude-code-ide-handover-worktree-stop] stops it.  Interactively,
+Emacs asks each question once, before the first handover; a prefix
+argument skips the question about other sessions.  Return the result
+of the first handover."
+  (interactive (claude-code-ide-handover--read-batch-args))
+  (let* ((first (claude-code-ide-instance-by-id (car instance-ids)))
+         (key (and first (claude-code-ide-handover--instance-key first))))
+    (unless key (user-error "The instance %s does not run" (car instance-ids)))
+    (when-let* ((outside (cl-remove-if
+                          (lambda (id)
+                            (let ((instance (claude-code-ide-instance-by-id id)))
+                              (or (not (and instance (claude-code-ide-instance-live-p instance)))
+                                  (equal (claude-code-ide-handover--instance-key instance) key))))
+                          instance-ids)))
+      (user-error "The sources %s do not run in the working tree %s" (string-join outside ", ") key))
+    (claude-code-ide-handover--check-no-batch key)
+    (let ((batch (claude-code-ide-handover--batch-create
+                  :key key :target-provider target-provider :method (or method 'fresh)
+                  :contexts contexts :interrupt interrupt :continue continue :confirmed confirmed
+                  :all instance-ids :sources instance-ids
+                  :labels (mapcar (lambda (id)
+                                    (cons id (if-let* ((instance (claude-code-ide-instance-by-id id)))
+                                                 (claude-code-ide-handover--instance-label instance)
+                                               id)))
+                                  instance-ids))))
+      (puthash key batch claude-code-ide-handover--batches)
+      (claude-code-ide-handover--batch-next batch)
+      (claude-code-ide-handover--batch-result batch))))
+
+(defun claude-code-ide-handover-worktree-stop (worktree)
+  "Stop the handover batch in WORKTREE: it starts no new handover.
+The current handover goes on to its end;
+\\[claude-code-ide-handover-cancel] cancels it.  A batch whose current
+handover ended, or waits for a person, ends at once (see
+`claude-code-ide-handover--batch-close'); a handover that waits stays
+for `claude-code-ide-handover-resolve'.  Interactively, WORKTREE is the
+working tree of the current buffer, else one that you choose."
+  (interactive (list (claude-code-ide-handover--read-worktree
+                      "Stop the handover batch in: "
+                      (hash-table-keys claude-code-ide-handover--batches)
+                      "No handover batch runs")))
+  (let ((batch (gethash worktree claude-code-ide-handover--batches)))
+    (unless batch (user-error "No handover batch runs in %s" worktree))
+    (setf (claude-code-ide-handover--batch-stop batch) t)
+    (if (or (claude-code-ide-handover--batch-stale-p batch)
+            (eq (claude-code-ide-handover--run-status
+                 (claude-code-ide-handover--find (claude-code-ide-handover--batch-current batch)))
+                'needs-user))
+        (claude-code-ide-handover--batch-close batch)
+      (message "Handover batch in %s stops after the handover %s; M-x claude-code-ide-handover-cancel cancels it"
+               worktree (claude-code-ide-handover--batch-current batch)))))
+
 ;;; Requests of agents
 
 (defun claude-code-ide-handover--offer-request (instance-id)
-  "Ask the user about the handover request of INSTANCE-ID, after its turn end."
+  "Ask the user about the handover request of INSTANCE-ID, after its turn end.
+After a yes, the question about other sessions in the working tree
+comes too (see `claude-code-ide-handover--confirm-others')."
   (when-let* ((instance (claude-code-ide-instance-by-id instance-id))
               (request (claude-code-ide-instance-property instance :handover-request)))
     (claude-code-ide-instance-set-property instance :handover-request nil)
@@ -2627,7 +3258,8 @@ stop.  See `claude-code-ide-handover-session'."
                                      (format " (%s)" (plist-get request :context))
                                    ""))))
       (claude-code-ide-handover instance-id (plist-get request :target-provider)
-                                (plist-get request :method) (plist-get request :context)))))
+                                (plist-get request :method) (plist-get request :context) nil nil nil
+                                (claude-code-ide-handover--confirm-others instance)))))
 
 (defun claude-code-ide-handover-request (instance-id target-provider &optional method context)
   "Save a handover request of the agent INSTANCE-ID, and return at once.
@@ -2691,10 +3323,12 @@ empty text count as false too."
        (not (member value '("false" "" "no" "0"))) t))
 
 (defun claude-code-ide-handover--mcp-handover (instance-id target-provider &optional method context
-                                                           interrupt force request-id continue)
+                                                           interrupt force request-id continue
+                                                           allow-others)
   "MCP tool: hand INSTANCE-ID over to TARGET-PROVIDER.
-METHOD, CONTEXT, INTERRUPT, FORCE, REQUEST-ID and CONTINUE are the tool
-arguments.  CONTINUE goes to the handover only when the call gives it."
+METHOD, CONTEXT, INTERRUPT, FORCE, REQUEST-ID, CONTINUE and
+ALLOW-OTHERS are the tool arguments.  CONTINUE goes to the handover
+only when the call gives it."
   (claude-code-ide-control-json
    (apply #'claude-code-ide-control-call
           'handover instance-id target-provider
@@ -2702,6 +3336,7 @@ arguments.  CONTINUE goes to the handover only when the call gives it."
           :context (unless (claude-code-ide-control-blank-p context) context)
           :interrupt (claude-code-ide-handover--flag interrupt)
           :force (claude-code-ide-handover--flag force)
+          :allow-others (claude-code-ide-handover--flag allow-others)
           :request-id (unless (claude-code-ide-control-blank-p request-id) request-id)
           (unless (null continue)
             (list :continue (claude-code-ide-handover--flag continue))))))
@@ -2729,7 +3364,9 @@ arguments.  CONTINUE goes to the handover only when the call gives it."
              '(:name "request_id" :type string :optional t
                      :description "ID that makes the request idempotent.")
              '(:name "continue" :type boolean :optional t
-                     :description "After the commit, tell the target to go on with the task of its state summary (true), or let it wait for a prompt (false). Default: the user's option claude-code-ide-handover-continue; its value ask counts as true here.")))
+                     :description "After the commit, tell the target to go on with the task of its state summary (true), or let it wait for a prompt (false). Default: the user's option claude-code-ide-handover-continue; its value ask counts as true here.")
+             '(:name "allow_others" :type boolean :optional t
+                     :description "Hand over while other instances of this Emacs run in the working tree. Unlike force, it does not stop subagents or background tasks.")))
 
 (claude-code-ide-control-define-tool
  :name "claude-code-ide-control-handover-status"
