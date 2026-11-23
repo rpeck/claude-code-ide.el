@@ -30,6 +30,7 @@ This package integrates coding-agent CLIs with Emacs via the Model Context Proto
 - `claude-code-ide-session-registry.el` - Session registry: crash-safe JSON state file (schema version 4, in its own `-v4` file; versions 3, 2 and 1 are read and migrated) of started instances, restore and reopen commands, and the handover chain and stages (`claude-code-ide-session-registry-chain-current`)
 - `claude-code-ide-session-status.el` - Live status of each instance of both providers from CLI hooks (working, waiting, idle), the status buffer, the status snapshot, and the file helpers that both providers share
 - `claude-code-ide-transient.el` - Transient menu interface; the header shows the current provider, and `P` toggles it
+- `claude-code-ide-menu-bar.el` - The Agents and Agent Sessions menus of the menu bar, shown by `claude-code-ide-menu-bar-mode` (on by default). The main file loads it as an optional file.
 - `claude-code-ide-debug.el` - Debug logging utilities
 - `claude-code-ide-reload.el` - `claude-code-ide-reload`: loads the package files again in dependency order in a running Emacs, and turns the package modes that are on off and on again
 
@@ -47,6 +48,7 @@ This package integrates coding-agent CLIs with Emacs via the Model Context Proto
 - `claude-code-ide-transcript-tests.el` - Transcript and handover document tests, with fixtures in `test-fixtures/transcripts/` (made by `make-fixtures.py` there)
 - `claude-code-ide-process-tests.el` - Process tree tests; live tests run with `CLAUDE_CODE_IDE_LIVE_TESTS=1`
 - `claude-code-ide-reload-tests.el` - Reload tests; one test reloads a copy of the package in a new batch Emacs
+- `claude-code-ide-menu-bar-tests.el` - Menu bar tests: the mode and its default, the commands of the Agents menu, and the items of the Agent Sessions menu
 - `claude-code-ide-wiring-tests.el` - Tests of the core wiring: no IDE server without the IDE protocol, provider texts, flags per provider, forks, secrets in the debug log, the CC MCP config file, the process-tree calls, the prepare hook, the provider choice, and the buffers kept after a stop. At load, it points the MCP config folder and the provider file at a temporary folder for the whole run.
 - `claude-code-ide-live-tests.el` - Live tests with the real `claude` and `codex` CLIs: handovers between both providers, recovery after a crash of Emacs, the Codex dialogs in each terminal, and stops without a question. They run only in an own `emacs -Q` daemon with `CLAUDE_CODE_IDE_LIVE_TESTS=1` (docs/live-tests.md); in the batch suite each one skips, and only the unit tests of its helpers run.
 

@@ -180,6 +180,18 @@ After an update of the installed package, =M-x claude-code-ide-reload= loads its
 
 The easiest way to interact with Claude Code IDE is through the transient menu interface, which provides visual access to all available commands. Simply run =M-x claude-code-ide-menu= to open the interactive menu.
 
+*** The menu bar
+
+The package adds two menus to the menu bar:
+
+- *Agents* has the commands: start, continue, resume, hand over, stop, restore, the status buffer, the registry, and the reload.
+- *Agent Sessions* lists the running sessions, with their states as the status buffer shows them (for example =NEEDS ANSWER= or =WAITS FOR YOU=). Select a session to go to its terminal. Without the status file, the items have no state.
+
+=claude-code-ide-menu-bar-mode= shows them, and it is on by default. To turn the menus off:
+
+- In the running Emacs: =M-x claude-code-ide-menu-bar-mode=.
+- For good: =(setq claude-code-ide-menu-bar-mode nil)= before the package loads (for example in the =:init= of your =use-package= form), or set it in =M-x customize-group RET claude-code-ide RET=.
+
 | Command                                 | Description                                       |
 |-----------------------------------------+---------------------------------------------------|
 | =M-x claude-code-ide-menu=                | Open transient menu with all Claude Code commands |

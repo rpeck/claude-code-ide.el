@@ -165,7 +165,7 @@ hooks of the new version."
                 (should (string-match-p "new=cci-test-new" output))
                 (should (string-match-p "kept=\"--cci-test-kept\"" output))
                 (should (string-match-p "hooked=t" output))
-                (should (string-match-p "modes=(claude-code-ide-session-registry-mode)" output))
+                (should (string-match-p "modes=(claude-code-ide-session-registry-mode claude-code-ide-menu-bar-mode)" output))
                 (should (string-match-p "instance=t" output))
                 (should (string-match-p "process=t" output))
                 (should (string-match-p "order=t" output))
