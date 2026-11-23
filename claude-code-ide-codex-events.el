@@ -1309,7 +1309,8 @@ This is a function of `claude-code-ide-session-status-detail-functions'."
 ;;; A plan without Codex
 
 (declare-function claude-code-ide-handover "claude-code-ide-handover"
-                  (instance-id target-provider &optional method context interrupt force))
+                  (instance-id target-provider &optional method context interrupt force
+                               continue allow-others))
 (declare-function claude-code-ide-handover--read-args "claude-code-ide-handover"
                   (&optional instance-id))
 (declare-function claude-code-ide-control-stop "claude-code-ide-control" (instance-id))

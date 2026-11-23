@@ -129,7 +129,7 @@ A leg is a plist, or an instance descriptor that becomes a plist:
 (claude-code-ide-transcript-handover-document
  :source SOURCE :chain CHAIN :context CONTEXT :budget BUDGET
  :handover-id ID :target-provider PROVIDER :summary-file FILE :time TIME
- :session-server SERVER)
+ :session-server SERVER :others LINES)
 ```
 
 - `:source`, `:chain`, `:context`, and `:budget` are the keys of PHASE2-CONTRACTS §6.
@@ -143,6 +143,7 @@ A leg is a plist, or an instance descriptor that becomes a plist:
   - `:summary-file`: the file for the state summary of the target. nil gives `.handover/<ID>-state.md` in the worktree (`claude-code-ide-transcript-summary-file-format`).
   - `:time`: a Lisp time for the header. nil is now.
   - `:session-server`: whether the target has the session server (see "Source sessions"). `t`, nil, or `auto` (the default) to read the configuration of the target provider.
+  - `:others`: a list of strings, one line for each other session in the worktree (see "Other sessions in this worktree" below). nil gives no such part.
 - The result is the text. The caller records its hash, for example with `(secure-hash 'sha256 TEXT)`.
 
 ### Parts, in this order
@@ -150,6 +151,21 @@ A leg is a plist, or an instance descriptor that becomes a plist:
 1. **Header.** The first line is the marker `<!-- claude-code-ide-handover-document id=ID -->`. Then: the handover ID, the source, the target provider, the time, the worktree, the state summary file of the target, and each leg of the chain with its handover ID and document hash.
 2. **Workspace state.** The branch, HEAD, `git status --porcelain`, the diff stat since the start of the source, the untracked files, and `git log --oneline -n 20`.
    - The start of the source is its `:start-commit`. Else it is the commit in the Codex session metadata. Else it is the last commit before the first turn of the source.
+   - **Other sessions in this worktree**, only with `:others` (`claude-code-ide-transcript--render-others`). It comes right after the workspace state:
+
+     ```text
+     ## Other sessions in this worktree
+
+     These sessions ran in this worktree when Emacs wrote this document. They can change files at the same time as you.
+
+     - plan (claude, 5afe576e-...): idle; handed over by this batch next
+     - coder (codex, 01a1eb92-...): working
+
+     The owner of each change in the workspace state above is not known. It can be yours (the earlier conversation), or the work of one of these sessions.
+     Before you write a file that another session can also write, and before you revert or commit a change that you did not make, coordinate with that session or ask the user.
+     ```
+
+     The handover gives one line for each other live instance or MCP session (`claude-code-ide-handover--writer-lines`): the label and the state of an instance of this Emacs, the ID of a session without a descriptor, or the name, provider, key and Emacs process ID of an instance of another Emacs (only with `:force`). The part uses the Git state of the workspace state, and adds no Git call.
 3. **Context from the coordinator**, when CONTEXT is given.
 4. **Source sessions:** how to read the full source sessions, and one entry for each leg (see "Source sessions" below).
 5. **History of the chain:** a short extract.
@@ -218,7 +234,7 @@ Test S7 showed that a document that copies the previous document doubles in size
 
 ### The size budget
 
-- The budget never cuts the header, the workspace state, the coordinator context, the "Source sessions" part, the original task, the "not carried over" list, or the instructions. When these parts are larger than the budget, the document is larger than the budget.
+- The budget never cuts the header, the workspace state, the "Other sessions in this worktree" part, the coordinator context, the "Source sessions" part, the original task, the "not carried over" list, or the instructions. When these parts are larger than the budget, the document is larger than the budget.
 - The rest of the budget goes to the other parts, in this order:
   1. The state summary. It is cut at the end when it does not fit, and its last line is `> [... cut]`. The size counts the `> ` of each quoted line.
   2. The user prompts. They get half of the rest, or more when the latest turns need less. The oldest prompts are left out first.

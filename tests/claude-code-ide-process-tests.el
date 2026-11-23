@@ -1514,6 +1514,94 @@ cleanup, or one whose terminal process ended, gets no tag."
       (kill-buffer done-buffer)
       (delete-directory worktree t))))
 
+;; Item A of docs/handover-several.md: detached work keeps its owner
+(ert-deftest claude-code-ide-test-process-scan-tags-detached-work ()
+  "A recorded process that left the CLI tree keeps the :instance-id of its instance.
+A `nohup ... &' re-parents to PID 1.  Its group, or the process itself
+with its start time, is in the records of the live instance, so the
+scan tags it; an unrecorded process stays untagged."
+  (let ((worktree (make-temp-file "cci-test-wt-" t)))
+    (unwind-protect
+        (claude-code-ide-process-tests--with-table
+            (list (claude-code-ide-process-tests--entry 300 1 300)
+                  ;; Detached: a recorded group, and a recorded member
+                  (claude-code-ide-process-tests--entry 310 1 310)
+                  (claude-code-ide-process-tests--entry 320 1 321)
+                  ;; A recorded PID that runs now with another start time
+                  (claude-code-ide-process-tests--entry 330 1 330 5000.0)
+                  (claude-code-ide-process-tests--entry 340 1 340))
+          (let ((track (claude-code-ide-process--track-create
+                        :instance (claude-code-ide-process-tests--instance)
+                        :pid 300 :start claude-code-ide-process-tests--start)))
+            ;; The live leader of the group has the recorded start time
+            (puthash 310 (list :pgid 310 :leader-start claude-code-ide-process-tests--start)
+                     (claude-code-ide-process--track-groups track))
+            (puthash 320 claude-code-ide-process-tests--start (claude-code-ide-process--track-members track))
+            (puthash 330 claude-code-ide-process-tests--start (claude-code-ide-process--track-members track))
+            (puthash "cci-test-b" track claude-code-ide-process--tracks)
+            (setq claude-code-ide-process-tests--cwds
+                  (mapcar (lambda (pid) (cons pid (file-truename worktree))) '(300 310 320 330 340)))
+            (should (equal (mapcar (lambda (s) (list (plist-get s :pid) (plist-get s :instance-id)))
+                                   (claude-code-ide-process-worktree-strays worktree))
+                           '((300 "cci-test-b") (310 "cci-test-b") (320 "cci-test-b")
+                             (330 nil) (340 nil))))))
+      (delete-directory worktree t))))
+
+(ert-deftest claude-code-ide-test-process-scan-reused-group-untagged ()
+  "A reused group ID gives no owner: the recorded group needs a proof.
+The members of a recorded group of the live instance are gone, and an
+unrelated process took the group ID.  Neither its leader nor a recorded
+member proves the group, so the process is not tagged."
+  (let ((worktree (make-temp-file "cci-test-wt-" t)))
+    (unwind-protect
+        (claude-code-ide-process-tests--with-table
+            (list (claude-code-ide-process-tests--entry 300 1 300)
+                  (claude-code-ide-process-tests--entry 350 1 310 5000.0))
+          (let ((track (claude-code-ide-process--track-create
+                        :instance (claude-code-ide-process-tests--instance)
+                        :pid 300 :start claude-code-ide-process-tests--start)))
+            (puthash 310 (list :pgid 310 :leader-start claude-code-ide-process-tests--start)
+                     (claude-code-ide-process--track-groups track))
+            (puthash 311 claude-code-ide-process-tests--start (claude-code-ide-process--track-members track))
+            (puthash "cci-test-b" track claude-code-ide-process--tracks)
+            (setq claude-code-ide-process-tests--cwds
+                  (mapcar (lambda (pid) (cons pid (file-truename worktree))) '(300 350)))
+            (should (equal (mapcar (lambda (s) (list (plist-get s :pid) (plist-get s :instance-id)))
+                                   (claude-code-ide-process-worktree-strays worktree))
+                           '((300 "cci-test-b") (350 nil))))))
+      (delete-directory worktree t))))
+
+(ert-deftest claude-code-ide-test-process-stop-marks-own-strays ()
+  "The stop marks a stray :own when it is proven to be of the stopped instance.
+A recorded member that left the group of the CLI (setsid) still runs
+in the worktree: it is the instance's own work.  An unrelated process
+there gets no mark."
+  (let ((worktree (make-temp-file "cci-test-wt-" t)))
+    (unwind-protect
+        (claude-code-ide-process-tests--with-table
+            (list (claude-code-ide-process-tests--entry 100 (emacs-pid) 100)
+                  (claude-code-ide-process-tests--entry 120 100 100))
+          (let ((instance (claude-code-ide-process-tests--instance
+                           :worktree worktree :project-root worktree)))
+            (claude-code-ide-process-track instance nil)
+            ;; After the record: 120 leaves the group, and 130 starts
+            (let ((entry (claude-code-ide-process-tests--find 120)))
+              (plist-put entry :pgid 125)
+              (plist-put entry :ppid 1))
+            (push (claude-code-ide-process-tests--entry 130 1 130) claude-code-ide-process-tests--table)
+            (setq claude-code-ide-process-tests--cwds
+                  (list (cons 120 worktree) (cons 130 worktree)))
+            (add-hook 'claude-code-ide-process-tests--reactions
+                      (claude-code-ide-process-tests--cli-exits-on 'SIGHUP))
+            (let ((result (claude-code-ide-process-stop instance)))
+              ;; Each stray has the start time of the snapshot that proved it
+              (should (equal (mapcar (lambda (s) (list (plist-get s :pid) (plist-get s :own)
+                                                       (plist-get s :start)))
+                                     (plist-get result :strays))
+                             (list (list 120 t claude-code-ide-process-tests--start)
+                                   (list 130 nil claude-code-ide-process-tests--start)))))))
+      (delete-directory worktree t))))
+
 (defun claude-code-ide-process-tests--hanging-program ()
   "Return a new script that never ends, as a ps or lsof that hangs."
   (let ((script (make-temp-file "cci-test-hang-" nil ".sh" "#!/bin/sh\nexec /bin/sleep 300\n")))

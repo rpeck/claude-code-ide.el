@@ -100,7 +100,11 @@ Each stray has a `:reason`:
 A stray can also have these keys:
 
 - `:pgid` and `:ppid`.
-- `:instance-id`: it belongs to the tree of another running instance.
+- `:instance-id`: it belongs to the tree of another running instance. It can also have left that tree (a `nohup ... &` re-parents to PID 1). Then it must be proven work of that instance (`claude-code-ide-process--owns-p`):
+  - it is a recorded member with the same start time, or
+  - it is in a recorded group, and that group is proven: its live leader has the recorded start time, or a live member of it is a recorded member with the same start time (`claude-code-ide-process--group-proven-p`, the same proof as the signals of step 4).
+  - A group ID alone proves nothing. An unrelated process can reuse the group ID of a group that ended.
+- `:own`: the stop proved that it is work of the stopped instance: its CLI, a `survivor` of its verified groups, or a `worktree` stray that is proven work of the instance, as above. An `unverified` stray never has it.
 - `:session-id`: it belongs to the CLI tree of a live MCP session of this Emacs (see "Worktree scan").
 - `:emacs-process`: Emacs runs it, for example a shell buffer.
 

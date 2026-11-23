@@ -535,6 +535,32 @@ A missing state summary file is named, and the nested document is not copied."
           (should-not (string-search "### Latest turns" tiny))
           (should-not (string-search "cci-test-reply-" tiny)))))))
 
+(ert-deftest claude-code-ide-test-transcript-document-other-sessions ()
+  "The part about the other sessions comes right after the workspace state.
+The budget never cuts it, and a document without :others has no such part."
+  (claude-code-ide-transcript-tests--with-dir dir
+    (let ((file (expand-file-name "cci-test-long.jsonl" dir)))
+      (claude-code-ide-transcript-tests--long-transcript file 120)
+      (let* ((args (list :source (list :provider 'claude :transcript file :worktree dir)
+                         :handover-id "cci-test-h6" :session-server nil))
+             (lines '("plan (claude, cci-test-1): idle; handed over by this batch next"
+                      "coder (codex, cci-test-2): working")))
+        (dolist (budget '(12000 100))
+          (let* ((doc (apply #'claude-code-ide-transcript-handover-document
+                             :others lines :budget budget args))
+                 (part (string-search "## Other sessions in this worktree" doc))
+                 (workspace (string-search "## Workspace state" doc)))
+            (should part)
+            (should (= part (string-match "^## " doc (1+ workspace))))
+            (dolist (line lines)
+              (should (string-search (concat "\n- " line "\n") doc)))
+            (should (string-search "They can change files at the same time as you." doc))
+            (should (string-search "The owner of each change in the workspace state above is not known."
+                                   doc))
+            (should (string-search "coordinate with that session or ask the user." doc))))
+        (should-not (string-search "## Other sessions"
+                                   (apply #'claude-code-ide-transcript-handover-document args)))))))
+
 (ert-deftest claude-code-ide-test-transcript-fit ()
   "The fit keeps the newest entries and counts the others."
   (should (equal (claude-code-ide-transcript--fit "H" '("aaa" "bbb" "ccc") 100 "(%d out)")

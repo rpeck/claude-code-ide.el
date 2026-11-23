@@ -25,6 +25,7 @@
 (require 'claude-code-ide-mcp-http-server)
 (require 'claude-code-ide-emacs-tools)
 (require 'claude-code-ide-session-registry)
+(require 'claude-code-ide-handover)
 
 ;; The debug macro of compiled files reads these
 (defvar claude-code-ide-debug)
@@ -2100,6 +2101,35 @@ so such a request gets its normal result or error, with id null."
       (should (assq 'id body))
       (should (eq (alist-get 'id body) :null))
       (should (equal (alist-get 'code (alist-get 'error body)) -32601)))))
+
+;;; The handover tool
+
+(ert-deftest claude-code-ide-test-handover-mcp-allow-others ()
+  "The handover tool passes allow_others as :allow-others, and never as :force."
+  (claude-code-ide-mcp-routing-tests--with-state
+    (claude-code-ide-mcp-routing-tests--start "cci-test-inst-a" cci-test-dir)
+    (claude-code-ide-control--make-tool
+     (cl-find "claude-code-ide-control-handover" claude-code-ide-control--extra-tool-specs
+              :key (lambda (spec) (plist-get spec :name)) :test #'equal))
+    (let* ((coordinator (list (cons :X-EMACS-MCP-COORDINATOR
+                                    (claude-code-ide-mcp-server-coordinator-credential))))
+           (calls nil)
+           (call (lambda (&rest more)
+                   (claude-code-ide-mcp-routing-tests--call
+                    "/mcp" "claude-code-ide-control-handover"
+                    (append '((instance_id . "cci-test-inst-a") (target_provider . "codex")) more)
+                    coordinator)
+                   (pop calls))))
+      (cl-letf (((symbol-function 'claude-code-ide-control-call)
+                 (lambda (&rest args) (push args calls) (list :status 'running))))
+        (let ((given (funcall call '(allow_others . t))))
+          (should (eq (plist-get (nthcdr 3 given) :allow-others) t))
+          (should (plist-member (nthcdr 3 given) :force))
+          (should-not (plist-get (nthcdr 3 given) :force)))
+        (should-not (plist-get (nthcdr 3 (funcall call '(allow_others . :json-false))) :allow-others))
+        (should-not (plist-get (nthcdr 3 (funcall call)) :allow-others))))
+    (kill-buffer (claude-code-ide-instance-buffer
+                  (claude-code-ide-instance-by-id "cci-test-inst-a")))))
 
 (provide 'claude-code-ide-mcp-routing-tests)
 ;;; claude-code-ide-mcp-routing-tests.el ends here

@@ -984,7 +984,7 @@ In the status buffer, a session at a quota limit shows =FAILED= with the reason 
    #+end_src
    Without the registry, a handover refuses with =registry-off=.
 2. For a handover to Codex, install the Codex CLI and log in (see [[*Installing the Codex CLI (optional)][Installing the Codex CLI]]). If Emacs does not find the CLI of the target, the handover refuses with =target-unavailable=.
-3. Stop the other instances in the worktree of the source. A handover refuses with =other-instance= while another instance runs in the same worktree.
+3. Other instances can run in the worktree of the source, when they run in this Emacs. Emacs asks you about them (see [[*Start a handover][Start a handover]]). An instance of another Emacs in the same worktree stops the handover with =other-instance=. Stop that instance first.
 
 *** Start a handover
 
@@ -993,15 +993,26 @@ In the status buffer, a session at a quota limit shows =FAILED= with the reason 
    - *Agents > Hand over...* in the menu bar.
    - =H= in the status buffer. It offers the session on the line. On a line without a session, it offers the first session at a quota limit.
 3. Answer the questions. Emacs asks them in this order:
-   1. *Target provider.* The default is the other provider. Press =RET= to accept it.
-   2. *The method.* Emacs asks this only when a fork is possible: the chain has an earlier conversation of the target provider.
+   1. *Other sessions.* Emacs asks this only when other sessions of this Emacs run in the same worktree. The question lists each session with its state:
+      #+begin_example
+      1 other session runs in the worktree /Users/me/src/app/:
+        plan (claude, 5afe576e-...): idle
+      They go on with their work. The handover does not stop them or their processes.
+      The target gets this list.
+      Hand over anyway? (y or n)
+      #+end_example
+      - =y= goes on. The handover document tells the target about these sessions.
+      - =n= stops. Emacs starts nothing.
+      - To skip this question, type =C-u M-x claude-code-ide-handover=.
+   2. *Target provider.* The default is the other provider. Press =RET= to accept it.
+   3. *The method.* Emacs asks this only when a fork is possible: the chain has an earlier conversation of the target provider.
       - =fork= (the default: =RET= or =f=): the target goes on from the last conversation of that provider in the chain, with its full history. It also gets the document.
       - =new= (=n=): a new conversation that knows only the document.
       - Emacs refuses other keys and asks again. =?= shows the choices.
-   3. *Context for the target.* Type an optional note, or press =RET= for none. The note goes into the document as "Context from the coordinator".
-   4. *Interrupt.* Emacs asks this only when the source works, or waits for an approval or a dialog. =y= sends Escape one time. =n= waits until the source is idle.
-   5. *Hand over anyway.* Emacs asks this only when subagents or background tasks run, or when the state of the source is unknown. Type =yes= to go on.
-   6. *"After the handover, should the target go on with the task?"* Emacs asks this while =claude-code-ide-handover-continue= is =ask= (the default).
+   4. *Context for the target.* Type an optional note, or press =RET= for none. The note goes into the document as "Context from the coordinator".
+   5. *Interrupt.* Emacs asks this only when the source works, or waits for an approval or a dialog. =y= sends Escape one time. =n= waits until the source is idle.
+   6. *Hand over anyway.* Emacs asks this only when subagents or background tasks run, or when the state of the source is unknown. Type =yes= to go on.
+   7. *"After the handover, should the target go on with the task?"* Emacs asks this while =claude-code-ide-handover-continue= is =ask= (the default).
       - =y=: yes, this time. =n=: no, this time.
       - =a=: always. =v=: never. Emacs saves these two answers in your custom file.
 4. For a Codex target whose status hooks are not trusted, Emacs asks for the trust. Without the trust, the handover cannot see the delivery.
@@ -1018,7 +1029,28 @@ In the status buffer, a session at a quota limit shows =FAILED= with the reason 
 7. The target reads the document and writes a state summary to =.handover/<id>-state.md=. Then it replies =ready=.
 8. If your answer was yes, the target then gets one more prompt: go on with the task from its state summary.
 
-While a handover runs, Emacs starts no other instance in its worktree. The target has =claude-code-ide-handover-delivery-timeout= (600 s) to get the document. After that time, Emacs asks you to wait again or to cancel.
+While a handover runs, Emacs starts no other instance in its worktree. A launch or a resume there gives =handover-running= with the handover ID. The target has =claude-code-ide-handover-delivery-timeout= (600 s) to get the document. After that time, Emacs asks you to wait again or to cancel.
+
+*** Hand over all instances of a worktree
+
+=M-x claude-code-ide-handover-worktree= hands over the instances of one worktree to one provider, one after the other. Use it, for example, for a plan session and a code session on the same branch.
+
+1. Go to the terminal buffer of one of the instances. Or start from another buffer, and choose the worktree.
+2. Type =M-x claude-code-ide-handover-worktree=.
+3. Answer the questions. Emacs asks each question one time, before the first handover:
+   1. *Target provider.*
+   2. *The sources.* Choose the instances to hand over. Press =RET= with no input to choose all. Emacs offers only the instances whose provider is not the target provider.
+   3. *Other sessions.* Emacs asks this only when sessions that you did not choose run in the worktree. =C-u= skips it.
+   4. *The method*, the *interrupt* question, a *context* note for each source, and *continue*, as for one handover.
+4. Each handover starts after the previous one ends. The echo area shows each start, and a summary at the end.
+
+- An automatic cancel (for example, subagents run in a source) skips that source. The batch goes on with the next source.
+- Your cancel (=M-x claude-code-ide-handover-cancel=) stops the batch.
+- A handover that needs you makes the batch wait. Answer with =M-x claude-code-ide-handover-resolve=.
+- A new session in the worktree stops the batch before the next handover. Run the command again to hand over the rest.
+- For a Codex target, the trust of the status hooks can run out during the batch. Then the batch goes on with the other sources, and tries that source one more time at the end. If the trust is still missing, the batch skips it. Hand it over alone later.
+- =M-x claude-code-ide-handover-worktree-stop= stops the batch. The current handover goes on to its end.
+- After a crash, the current handover recovers. Then run =M-x claude-code-ide-handover-worktree= again for the rest.
 
 *** Stray processes
 

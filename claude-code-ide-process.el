@@ -401,11 +401,13 @@ hold is asked for with `claude-code-ide-process-entry-function'."
 (defun claude-code-ide-process--snapshot (table)
   "Return the snapshot of TABLE, a list of entries."
   (let ((index (make-hash-table))
-        (children (make-hash-table)))
+        (children (make-hash-table))
+        (groups (make-hash-table)))
     (dolist (entry table)
       (puthash (plist-get entry :pid) entry index)
-      (push entry (gethash (plist-get entry :ppid) children)))
-    (list :table table :index index :children children
+      (push entry (gethash (plist-get entry :ppid) children))
+      (push entry (gethash (plist-get entry :pgid) groups)))
+    (list :table table :index index :children children :groups groups
           :protected (claude-code-ide-process--emacs-protected index))))
 
 (defun claude-code-ide-process--entry-of (snapshot pid)
@@ -813,6 +815,35 @@ process ID to its start time."
                (claude-code-ide-process--track-members track)))
     (cons groups members)))
 
+(defun claude-code-ide-process--group-proven-p (pgid leader-start entries members)
+  "Return non-nil when ENTRIES, the live members of the group PGID, prove a record.
+The live leader has the recorded LEADER-START, or a live member is a
+process of MEMBERS (process ID -> start time) with the same start
+time.  A group ID alone proves nothing: an unrelated process can reuse
+it."
+  (cl-some (lambda (e)
+             (let ((pid (plist-get e :pid))
+                   (start (plist-get e :start)))
+               (or (and (eql pid pgid) (numberp leader-start)
+                        (claude-code-ide-process--same-start-p leader-start start))
+                   (claude-code-ide-process--same-start-p (gethash pid members) start))))
+           entries))
+
+(defun claude-code-ide-process--owns-p (track snapshot entry)
+  "Return non-nil when the process ENTRY of SNAPSHOT is proven work of TRACK.
+It is a recorded member of TRACK with the same start time, or it is in
+a recorded group of TRACK that its live members prove
+\(`claude-code-ide-process--group-proven-p')."
+  (let* ((members (claude-code-ide-process--track-members track))
+         (pgid (plist-get entry :pgid))
+         (group (gethash pgid (claude-code-ide-process--track-groups track))))
+    (or (claude-code-ide-process--same-start-p (gethash (plist-get entry :pid) members)
+                                               (plist-get entry :start))
+        (and group
+             (claude-code-ide-process--group-proven-p
+              pgid (plist-get group :leader-start)
+              (gethash pgid (plist-get snapshot :groups)) members)))))
+
 (defun claude-code-ide-process--classify (ledger table protected)
   "Return (VERIFIED . UNVERIFIED) for the recorded groups of LEDGER in TABLE.
 VERIFIED is an alist (PGID . ENTRIES) of the groups that may get a
@@ -837,16 +868,7 @@ them never gets a signal, and protected processes are not listed."
                          (cl-notany (lambda (e) (memq (plist-get e :pid) (car protected)))
                                     entries)
                          (cl-every (lambda (e) (eql (plist-get e :uid) uid)) entries)))
-              (proven
-               (cl-some
-                (lambda (e)
-                  (let ((pid (plist-get e :pid))
-                        (start (plist-get e :start)))
-                    (or (and (eql pid pgid) (numberp leader-start)
-                             (claude-code-ide-process--same-start-p leader-start start))
-                        (claude-code-ide-process--same-start-p
-                         (gethash pid members) start))))
-                entries)))
+              (proven (claude-code-ide-process--group-proven-p pgid leader-start entries members)))
          (if (and safe proven)
              (push (cons pgid entries) verified)
            (setq unverified
@@ -1017,14 +1039,20 @@ this Emacs (`claude-code-ide-process-live-sessions')."
 (defun claude-code-ide-process--instance-trees (snapshot &optional except)
   "Return a hash table from process ID to instance ID, for the live CLIs.
 It holds the tree in SNAPSHOT of each tracked instance whose CLI runs,
-except the instance IDs in EXCEPT."
+except the instance IDs in EXCEPT.  A process that left the tree (a
+`nohup ... &' re-parents to PID 1) counts too, when it is proven work
+of the instance (`claude-code-ide-process--owns-p')."
   (let ((trees (make-hash-table)))
     (maphash (lambda (id track)
                (unless (member id except)
                  (when (claude-code-ide-process--root-alive-p track snapshot)
                    (dolist (entry (claude-code-ide-process--descendants
                                    snapshot (claude-code-ide-process--track-pid track)))
-                     (puthash (plist-get entry :pid) id trees)))))
+                     (puthash (plist-get entry :pid) id trees))
+                   (dolist (entry (plist-get snapshot :table))
+                     (when (and (not (gethash (plist-get entry :pid) trees))
+                                (claude-code-ide-process--owns-p track snapshot entry))
+                       (puthash (plist-get entry :pid) id trees))))))
              claude-code-ide-process--tracks)
     trees))
 
@@ -1059,6 +1087,7 @@ is in another repository or linked worktree below it is left out
                                 :cwd (plist-get item :cwd)
                                 :pgid (plist-get entry :pgid)
                                 :ppid (plist-get entry :ppid)
+                                :start (plist-get entry :start)
                                 :reason 'worktree)
                           (claude-code-ide-process--owner-tags pid trees emacs-pids sessions))
                   strays)))))
@@ -1319,12 +1348,15 @@ full, right before the SIGKILL; only groups that pass get it."
           (claude-code-ide-process--step-finish job))))))
 
 (defun claude-code-ide-process--stray (entry reason)
-  "Return the stray plist of ENTRY with REASON; its folder comes later."
+  "Return the stray plist of ENTRY with REASON; its folder comes later.
+Its :start is the start time of ENTRY, the identity that a proof of its
+owner holds."
   (list :pid (plist-get entry :pid)
         :command (funcall claude-code-ide-process-command-function (plist-get entry :pid))
         :cwd nil
         :pgid (plist-get entry :pgid)
         :ppid (plist-get entry :ppid)
+        :start (plist-get entry :start)
         :reason reason))
 
 (defun claude-code-ide-process--step-finish (job)
@@ -1366,26 +1398,37 @@ SNAPSHOT is a fresh snapshot."
                     (unverified (cl-remove-if-not mine all-unverified))
                     (root-pid (claude-code-ide-process--track-pid track))
                     (scan-failed (and (memq item scanned) (not (listp cwds))))
+                    (own (lambda (stray) (append stray (list :own t))))
                     (strays
                      (append
                       (when root-alive
-                        (list (claude-code-ide-process--stray (list :pid root-pid) 'cli)))
+                        (list (funcall own (claude-code-ide-process--stray
+                                            (or (claude-code-ide-process--entry-of snapshot root-pid)
+                                                (list :pid root-pid))
+                                            'cli))))
                       ;; A root without a start time got no signal; when its
                       ;; PID still runs, nobody knows whether it is the CLI
                       (when-let* (((null (claude-code-ide-process--track-start track)))
                                   (entry (claude-code-ide-process--entry-of snapshot root-pid)))
                         (list (claude-code-ide-process--stray entry 'unverified)))
-                      (mapcar (lambda (e) (claude-code-ide-process--stray e 'survivor))
+                      ;; Survivors are of the verified groups of the instance
+                      (mapcar (lambda (e) (funcall own (claude-code-ide-process--stray e 'survivor)))
                               survivors)
                       (mapcar (lambda (e) (claude-code-ide-process--stray e 'unverified))
                               unverified)
                       (when (and (memq item scanned) (listp cwds))
-                        (claude-code-ide-process--strays-in
-                         (claude-code-ide-process--dirs-of (cdr item))
-                         cwds snapshot trees
-                         (append (claude-code-ide-process--job-exclude job)
-                                 leftover
-                                 (list root-pid)))))))
+                        (mapcar (lambda (stray)
+                                  (if-let* ((entry (claude-code-ide-process--entry-of
+                                                    snapshot (plist-get stray :pid)))
+                                            ((claude-code-ide-process--owns-p track snapshot entry)))
+                                      (funcall own stray)
+                                    stray))
+                                (claude-code-ide-process--strays-in
+                                 (claude-code-ide-process--dirs-of (cdr item))
+                                 cwds snapshot trees
+                                 (append (claude-code-ide-process--job-exclude job)
+                                         leftover
+                                         (list root-pid))))))))
                (cons track
                      (append
                       (list :status (cond ((or root-alive survivors) 'timeout)

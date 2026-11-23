@@ -208,12 +208,28 @@ instance that does not run gives (:status error :reason not-running)."
     (claude-code-ide-control--error 'start-failed instance-id
                                     "The instance did not start")))
 
+(define-error 'claude-code-ide-worktree-held "Working tree held by a handover" 'user-error)
+
+(defun claude-code-ide-control-held-message (handover-id worktree stage)
+  "Return the text for the WORKTREE that the handover HANDOVER-ID holds at STAGE."
+  (format "Handover %s holds the working tree %s (stage %s); no other instance starts there until it ends"
+          handover-id worktree stage))
+
 (defun claude-code-ide-control--start (instance-id thunk)
-  "Call THUNK, which starts INSTANCE-ID, and return the result of the start."
+  "Call THUNK, which starts INSTANCE-ID, and return the result of the start.
+A start in a working tree that a handover holds gives the reason
+`handover-running' with the :handover-id of that handover; the data of
+its `claude-code-ide-worktree-held' error is (HANDOVER-ID WORKTREE
+STAGE)."
   (condition-case err
       (progn
         (funcall thunk)
         (claude-code-ide-control--started instance-id))
+    (claude-code-ide-worktree-held
+     (append (claude-code-ide-control--error
+              'handover-running instance-id
+              (apply #'claude-code-ide-control-held-message (cdr err)))
+             (list :handover-id (nth 1 err))))
     ;; The mailbox mode refuses a start without the MCP tools server
     (claude-code-ide-mailbox-needs-mcp-server
      (claude-code-ide-control--error 'mailbox-needs-mcp-server instance-id
