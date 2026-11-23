@@ -883,14 +883,128 @@ DIRS are folder names with a final slash."
   (let ((name (file-name-as-directory file)))
     (cl-some (lambda (dir) (string-prefix-p dir name)) dirs)))
 
-(defun claude-code-ide-process--owner-tags (pid trees emacs-pids)
+(defun claude-code-ide-process--case-insensitive-p ()
+  "Return non-nil when file names on this system usually ignore case.
+That is the default of macOS and Windows."
+  (memq system-type '(darwin windows-nt cygwin)))
+
+(defun claude-code-ide-process--same-name-p (a b fold)
+  "Return non-nil when the names A and B are equal; FOLD non-nil ignores case."
+  (if fold
+      (eq t (compare-strings a nil nil b nil nil t))
+    (string= a b)))
+
+(defun claude-code-ide-process--own-tree-p (cwd root cache)
+  "Return non-nil when the working tree of the folder CWD is ROOT.
+ROOT is a true folder name with a final slash, and CWD is inside it.
+The working tree of CWD is the nearest folder at or above the true
+name of CWD that has a .git (a folder, or the file of a linked
+worktree or submodule).  When a folder below ROOT has a .git, CWD is
+in another repository, and the result is nil.  ROOT itself needs no
+.git.  A CWD whose true name is not inside ROOT counts as ROOT's own.
+CACHE is a hash table from folder name to result, for one scan."
+  (let* ((fold (claude-code-ide-process--case-insensitive-p))
+         (given (file-name-as-directory cwd))
+         (result (gethash given cache 'unknown))
+         (dir (and (eq result 'unknown) (file-name-as-directory (file-truename cwd))))
+         (visited (list given)))
+    (while (eq result 'unknown)
+      (let ((cached (gethash dir cache 'unknown)))
+        (cond
+         ((not (eq cached 'unknown)) (setq result cached))
+         ((or (not (string-prefix-p root dir fold))
+              (claude-code-ide-process--same-name-p dir root fold))
+          (setq result t))
+         ((file-exists-p (expand-file-name ".git" dir))
+          (push dir visited)
+          (setq result nil))
+         (t
+          (push dir visited)
+          (let ((parent (file-name-directory (directory-file-name dir))))
+            (if (or (null parent) (equal parent dir))
+                (setq result t)
+              (setq dir parent)))))))
+    (dolist (folder visited)
+      (puthash folder result cache))
+    result))
+
+(defun claude-code-ide-process--owner-tags (pid trees emacs-pids &optional sessions)
   "Return the plist part that names the owner of PID.
 TREES maps a process ID to the instance ID whose CLI tree holds it.
-EMACS-PIDS maps a process ID to the name of an Emacs process object."
+EMACS-PIDS maps a process ID to the name of an Emacs process object.
+SESSIONS maps a process ID to the ID of the live MCP session whose CLI
+tree holds it."
   (let ((instance-id (gethash pid trees))
-        (emacs-process (gethash pid emacs-pids)))
+        (emacs-process (gethash pid emacs-pids))
+        (session-id (and sessions (gethash pid sessions))))
     (append (when instance-id (list :instance-id instance-id))
+            (when session-id (list :session-id session-id))
             (when emacs-process (list :emacs-process emacs-process)))))
+
+;;; Sessions of this Emacs
+;;
+;; An MCP session can run without an instance descriptor, for example
+;; a session that an older version of the package started before a
+;; reload.  Its CLI has no records here, so the scan finds its tree
+;; from its terminal process.
+
+(declare-function claude-code-ide-mcp--active-sessions "claude-code-ide-mcp" ())
+(declare-function claude-code-ide-mcp-session-session-id "claude-code-ide-mcp" (session))
+(declare-function claude-code-ide-mcp-session-buffer "claude-code-ide-mcp" (session))
+(declare-function claude-code-ide-mcp-session-cli-pid "claude-code-ide-mcp" (session))
+(declare-function claude-code-ide-mcp-session-cleanup-done "claude-code-ide-mcp" (session))
+
+(defun claude-code-ide-process--session-process (session)
+  "Return the terminal process of SESSION, an MCP session, or nil.
+That is the process of its buffer, else the process that it keeps."
+  (let ((buffer (ignore-errors (claude-code-ide-mcp-session-buffer session))))
+    (or (and (buffer-live-p buffer) (get-buffer-process buffer))
+        (let ((process (ignore-errors (claude-code-ide-mcp-session-process session))))
+          (and (processp process) process)))))
+
+(defun claude-code-ide-process-session-live-p (session)
+  "Return non-nil when SESSION, an MCP session of this Emacs, still runs.
+Its cleanup did not run, and its buffer or its terminal process is
+live.  A session that an older version of the package made, whose
+slots cannot be read, counts as live: the scan must spare it."
+  (condition-case nil
+      (and (not (claude-code-ide-mcp-session-cleanup-done session))
+           (or (buffer-live-p (claude-code-ide-mcp-session-buffer session))
+               (let ((process (claude-code-ide-process--session-process session)))
+                 (and process (process-live-p process)))))
+    (error t)))
+
+(defun claude-code-ide-process-live-sessions ()
+  "Return the live MCP sessions of this Emacs, also those without a descriptor.
+See `claude-code-ide-process-session-live-p'."
+  (when (fboundp 'claude-code-ide-mcp--active-sessions)
+    (cl-remove-if-not #'claude-code-ide-process-session-live-p
+                      (claude-code-ide-mcp--active-sessions))))
+
+(defun claude-code-ide-process--session-root-pids (session)
+  "Return the process IDs of the CLI of SESSION while its terminal runs.
+They are the PID of the terminal process (the ghostel child for a
+ghostel pipe), and the PID that the CLI gave with `ide_connected'.
+Emacs, 0 and 1 never count."
+  (let ((process (claude-code-ide-process--session-process session)))
+    (when (and process (process-live-p process))
+      (cl-remove-if-not
+       (lambda (pid) (and (integerp pid) (> pid 1) (/= pid (emacs-pid))))
+       (delete-dups (list (claude-code-ide-process--process-pid process)
+                          (ignore-errors (claude-code-ide-mcp-session-cli-pid session))))))))
+
+(defun claude-code-ide-process--session-trees (snapshot)
+  "Return a hash table from process ID to session ID, for the live sessions.
+It holds the tree in SNAPSHOT of the CLI of each live MCP session of
+this Emacs (`claude-code-ide-process-live-sessions')."
+  (let ((trees (make-hash-table)))
+    (dolist (session (claude-code-ide-process-live-sessions))
+      (let ((id (ignore-errors (claude-code-ide-mcp-session-session-id session))))
+        (when (stringp id)
+          (dolist (root (claude-code-ide-process--session-root-pids session))
+            (dolist (entry (claude-code-ide-process--descendants snapshot root))
+              (puthash (plist-get entry :pid) id trees))))))
+    trees))
 
 (defun claude-code-ide-process--emacs-pids ()
   "Return a hash table from process ID to name, for the processes of Emacs."
@@ -917,15 +1031,27 @@ except the instance IDs in EXCEPT."
 (defun claude-code-ide-process--strays-in (dirs cwds snapshot trees exclude)
   "Return the stray plists of the processes of CWDS inside DIRS.
 SNAPSHOT gives the group IDs, TREES the owner instances, and EXCLUDE
-the process IDs to leave out.  Emacs itself is always left out."
+the process IDs to leave out.  Emacs itself is always left out.  A
+process in the CLI tree of a live MCP session of this Emacs gets
+:session-id (`claude-code-ide-process--session-trees').
+
+The first of DIRS is the true name of the worktree (see
+`claude-code-ide-process--dirs-of').  A process whose working folder
+is in another repository or linked worktree below it is left out
+\(`claude-code-ide-process--own-tree-p')."
   (let ((emacs-pids (claude-code-ide-process--emacs-pids))
+        (sessions (claude-code-ide-process--session-trees snapshot))
+        (root (car dirs))
+        (trees-of-folders (make-hash-table :test 'equal))
         strays)
     (dolist (item cwds)
       (let ((pid (plist-get item :pid)))
         (when (and (not (eql pid (emacs-pid)))
                    (not (memq pid exclude))
                    (stringp (plist-get item :cwd))
-                   (claude-code-ide-process--in-dir-p (plist-get item :cwd) dirs))
+                   (claude-code-ide-process--in-dir-p (plist-get item :cwd) dirs)
+                   (claude-code-ide-process--own-tree-p
+                    (plist-get item :cwd) root trees-of-folders))
           (let ((entry (claude-code-ide-process--entry-of snapshot pid)))
             (push (append (list :pid pid
                                 :command (or (funcall claude-code-ide-process-command-function pid)
@@ -934,7 +1060,7 @@ the process IDs to leave out.  Emacs itself is always left out."
                                 :pgid (plist-get entry :pgid)
                                 :ppid (plist-get entry :ppid)
                                 :reason 'worktree)
-                          (claude-code-ide-process--owner-tags pid trees emacs-pids))
+                          (claude-code-ide-process--owner-tags pid trees emacs-pids sessions))
                   strays)))))
     (sort strays (lambda (a b) (< (plist-get a :pid) (plist-get b :pid))))))
 
@@ -942,8 +1068,10 @@ the process IDs to leave out.  Emacs itself is always left out."
 (defun claude-code-ide-process-worktree-strays (worktree &optional exclude)
   "Return the processes whose working folder is inside WORKTREE.
 Each one is a plist (:pid :command :cwd :pgid :ppid :reason worktree).
-A process of a running instance has :instance-id too, and a process
-that Emacs runs has :emacs-process.  Emacs itself, and the process IDs
+A process of a running instance has :instance-id too, a process in the
+CLI tree of a live MCP session of this Emacs (also one without a
+descriptor) has :session-id, and a process that Emacs runs has
+:emacs-process.  Emacs itself, and the process IDs
 in EXCLUDE, are left out.  The function only reports; it never ends
 a process.
 

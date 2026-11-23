@@ -1380,6 +1380,140 @@ ps shows the target, and its children, under the CLI's tree."
             (should-error (claude-code-ide-process-worktree-strays worktree))))
       (delete-directory worktree t))))
 
+;;; Processes of other repositories inside the worktree
+
+(defun claude-code-ide-process-tests--folders (root specs)
+  "Make the folders of SPECS below ROOT; return ROOT as a true folder name.
+Each spec is (PATH . KIND): KIND `dir' makes PATH/.git a folder, `file'
+makes PATH/.git a file that names a linked worktree, and nil makes a
+plain folder."
+  (dolist (spec specs)
+    (let ((dir (expand-file-name (car spec) root)))
+      (make-directory dir t)
+      (pcase (cdr spec)
+        ('dir (make-directory (expand-file-name ".git" dir) t))
+        ('file (with-temp-file (expand-file-name ".git" dir)
+                 (insert "gitdir: /nonexistent/cci-test-main/.git/worktrees/x\n"))))))
+  (file-name-as-directory (file-truename root)))
+
+(defun claude-code-ide-process-tests--stray-pids (worktree cwds)
+  "Return the PIDs of the strays of WORKTREE, with CWDS an alist (PID . FOLDER).
+Each FOLDER is relative to the true name of WORKTREE."
+  (let ((true (file-name-as-directory (file-truename worktree))))
+    (claude-code-ide-process-tests--with-table
+        (mapcar (lambda (pair) (claude-code-ide-process-tests--entry (car pair) 1 (car pair)))
+                cwds)
+      (setq claude-code-ide-process-tests--cwds
+            (mapcar (lambda (pair) (cons (car pair) (expand-file-name (cdr pair) true))) cwds))
+      (mapcar (lambda (s) (plist-get s :pid))
+              (claude-code-ide-process-worktree-strays worktree)))))
+
+(ert-deftest claude-code-ide-test-process-scan-leaves-out-other-repositories ()
+  "A process whose own working tree is another repository is no stray.
+Its nearest folder with a .git (a folder, or a file of a linked
+worktree) is below the root.  A process in a plain subfolder, or in the
+root, stays a stray.  A root without a .git counts as its own tree."
+  (let ((root (make-temp-file "cci-test-wt-" t)))
+    (unwind-protect
+        (progn
+          (claude-code-ide-process-tests--folders
+           root '(("." . dir) ("a/b/c/repo/sub") ("a/b/c/repo" . dir)
+                  (".claude/worktrees/x" . file) ("src/deep")))
+          (should (equal (claude-code-ide-process-tests--stray-pids
+                          root '((500 . "a/b/c/repo") (501 . "a/b/c/repo/sub")
+                                 (502 . ".claude/worktrees/x") (503 . "src/deep")
+                                 (504 . "") (505 . "a/b")))
+                         '(503 504 505)))
+          ;; Without its own .git, the root still leaves out the repositories below it
+          (delete-directory (expand-file-name ".git" root) t)
+          (should (equal (claude-code-ide-process-tests--stray-pids
+                          root '((500 . "a/b/c/repo") (502 . ".claude/worktrees/x")
+                                 (503 . "src/deep") (504 . "")))
+                         '(503 504))))
+      (delete-directory root t))))
+
+(ert-deftest claude-code-ide-test-process-scan-root-through-link ()
+  "A root that a link reaches still matches its own processes, and only those."
+  (let* ((root (make-temp-file "cci-test-wt-" t))
+         (link (concat root "-link")))
+    (unwind-protect
+        (progn
+          (claude-code-ide-process-tests--folders
+           root '(("." . dir) ("src") ("vendor/other" . dir)))
+          (make-symbolic-link root link)
+          (should (equal (claude-code-ide-process-tests--stray-pids
+                          link '((600 . "") (601 . "src") (602 . "vendor/other")))
+                         '(600 601))))
+      (ignore-errors (delete-file link))
+      (delete-directory root t))))
+
+(ert-deftest claude-code-ide-test-process-scan-incident-layout ()
+  "An empty .git in a folder of projects: only the plain subfolder has a stray.
+The root holds three repositories whose CLIs run there, and the source
+in a plain subfolder."
+  (let ((root (make-temp-file "cci-test-wt-" t)))
+    (unwind-protect
+        (progn
+          (claude-code-ide-process-tests--folders
+           root '(("." . dir) ("src") ("project-a" . dir) ("project-b" . dir)
+                  ("worktrees/project-c/feat" . file)))
+          (should (equal (claude-code-ide-process-tests--stray-pids
+                          root '((700 . "src") (701 . "project-a") (702 . "project-a")
+                                 (703 . "project-b") (704 . "worktrees/project-c/feat")))
+                         '(700))))
+      (delete-directory root t))))
+
+(defvar claude-code-ide-mcp--sessions)
+
+(ert-deftest claude-code-ide-test-process-scan-tags-session-trees ()
+  "The scan tags the CLI tree of each live MCP session with :session-id.
+A session without an instance descriptor counts too, for example one
+that an older version of the package started.  A session after its
+cleanup, or one whose terminal process ended, gets no tag."
+  (let ((worktree (make-temp-file "cci-test-wt-" t))
+        (buffer (generate-new-buffer " *cci-test-old-session*"))
+        (done-buffer (generate-new-buffer " *cci-test-done-session*"))
+        (pipes nil))
+    (unwind-protect
+        (claude-code-ide-process-tests--with-table
+            (list (claude-code-ide-process-tests--entry 400 1 400)
+                  (claude-code-ide-process-tests--entry 401 400 400)
+                  (claude-code-ide-process-tests--entry 402 401 402)
+                  (claude-code-ide-process-tests--entry 410 1 410)
+                  (claude-code-ide-process-tests--entry 420 1 420))
+          (let ((claude-code-ide-mcp--sessions (make-hash-table :test 'equal))
+                (pipe (make-pipe-process :name "cci-test-old-cli" :buffer buffer :noquery t))
+                (done-pipe (make-pipe-process :name "cci-test-done-cli" :buffer done-buffer
+                                              :noquery t)))
+            (setq pipes (list pipe done-pipe))
+            ;; The ghostel PID of the pipe stands for the CLI
+            (process-put pipe 'ghostel--native-pid 400)
+            (process-put done-pipe 'ghostel--native-pid 410)
+            (puthash "cci-test-old" (make-claude-code-ide-mcp-session
+                                     :session-id "cci-test-old" :buffer buffer :process pipe
+                                     :project-dir worktree)
+                     claude-code-ide-mcp--sessions)
+            (puthash "cci-test-done" (make-claude-code-ide-mcp-session
+                                      :session-id "cci-test-done" :buffer done-buffer
+                                      :process done-pipe :project-dir worktree :cleanup-done t)
+                     claude-code-ide-mcp--sessions)
+            (setq claude-code-ide-process-tests--cwds
+                  (mapcar (lambda (pid) (cons pid (file-truename worktree)))
+                          '(400 401 402 410 420)))
+            (let ((strays (claude-code-ide-process-worktree-strays worktree)))
+              (should (equal (mapcar (lambda (s) (list (plist-get s :pid) (plist-get s :session-id)))
+                                     strays)
+                             '((400 "cci-test-old") (401 "cci-test-old") (402 "cci-test-old")
+                               (410 nil) (420 nil)))))
+            ;; The terminal process ended: no tag
+            (delete-process pipe)
+            (should-not (cl-some (lambda (s) (plist-get s :session-id))
+                                 (claude-code-ide-process-worktree-strays worktree)))))
+      (mapc (lambda (p) (when (process-live-p p) (delete-process p))) pipes)
+      (kill-buffer buffer)
+      (kill-buffer done-buffer)
+      (delete-directory worktree t))))
+
 (defun claude-code-ide-process-tests--hanging-program ()
   "Return a new script that never ends, as a ps or lsof that hangs."
   (let ((script (make-temp-file "cci-test-hang-" nil ".sh" "#!/bin/sh\nexec /bin/sleep 300\n")))

@@ -97,7 +97,12 @@ Each stray has a `:reason`:
 - `unverified`: a process is in a recorded group, but no recorded process proves that it is the same group (see "Safety"). Or the CLI has no known start time and its PID runs. It got no signal.
 - `worktree`: step 5 found it.
 
-A stray can also have `:pgid`, `:ppid`, `:instance-id` (it belongs to the tree of another running instance), and `:emacs-process` (Emacs runs it, for example a shell buffer).
+A stray can also have these keys:
+
+- `:pgid` and `:ppid`.
+- `:instance-id`: it belongs to the tree of another running instance.
+- `:session-id`: it belongs to the CLI tree of a live MCP session of this Emacs (see "Worktree scan").
+- `:emacs-process`: Emacs runs it, for example a shell buffer.
 
 After `stopped` or `strays`, the records of the instance are dropped. After `timeout` or `error`, they stay, so that a later stop can end what is left.
 
@@ -125,7 +130,19 @@ The quit of Emacs uses it with `:budget`, so that N instances wait once and not 
 - Links are resolved, so `/tmp/x` and `/private/tmp/x` match.
 - A folder with the same name prefix (`wt-other` for `wt`) does not match.
 - Emacs itself, and the process IDs in EXCLUDE, are left out.
+- A process in another repository or linked worktree below WORKTREE is left out (`claude-code-ide-process--own-tree-p`):
+  - The scan goes up from the true name of the working folder of the process to the true name of WORKTREE.
+  - When a folder below WORKTREE on that way has a `.git` (a folder or a file), the process belongs to another tree. It is no stray, and the result has nothing that `end` could signal.
+  - WORKTREE itself needs no `.git`. Without one, a subfolder with its own `.git` is left out too.
+  - On macOS and Windows the names are compared without case.
+  - One scan keeps the result of each folder, so many processes in one folder cost one walk.
+  - The step 5 of a stop uses the same check.
 - It only reports. It never ends a process.
+- It tags the CLI tree of each live MCP session of this Emacs with `:session-id`. The step 5 of a stop does this too.
+  - A session without an instance descriptor counts, for example a session that an older version of the package started before a reload. Such a session has no records.
+  - A session is live when its cleanup did not run, and its buffer or its terminal process is live (`claude-code-ide-process-session-live-p`). A session whose slots cannot be read counts as live.
+  - The roots of the tree are the PID of its terminal process (the ghostel child for a ghostel pipe) and the PID that the CLI gave with `ide_connected`. Both count only while the terminal process runs.
+  - The tree holds each root and its descendants in the snapshot, as for the records.
 
 ## Safety
 

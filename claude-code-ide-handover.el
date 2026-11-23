@@ -59,6 +59,8 @@
 (declare-function claude-code-ide-process-stop-later "claude-code-ide-process" (instance &rest args))
 (declare-function claude-code-ide-process-worktree-strays "claude-code-ide-process" (worktree &optional exclude))
 (declare-function claude-code-ide-process--terminal-process "claude-code-ide-process" (instance process))
+(declare-function claude-code-ide-process-live-sessions "claude-code-ide-process" ())
+(declare-function claude-code-ide-process-session-live-p "claude-code-ide-process" (session))
 (declare-function claude-code-ide-transcript-handover-document "claude-code-ide-transcript" (&rest args))
 (declare-function claude-code-ide-transcript-instance-leg "claude-code-ide-transcript" (instance))
 (declare-function claude-code-ide-transcript-document-id "claude-code-ide-transcript" (text))
@@ -236,6 +238,8 @@ Emacs asks you whether to hand over."
   (worktree nil :documentation "Working tree of the source.")
   (directory nil :documentation "Project directory of the source.")
   (instance-name nil :documentation "Instance name of the source.")
+  (source-session-id nil :documentation "ID of the MCP session of the source in this Emacs, or nil.
+The registry does not keep it: the sessions of an Emacs end with it.")
   (role nil :documentation "Role of the source.")
   (source-leg nil :documentation "Leg plist of the source, from the quiescing.")
   (chain nil :documentation "Legs of the chain of the source, oldest first.")
@@ -759,13 +763,45 @@ owns it (`claude-code-ide-session-registry--other-emacs-p')."
                     entry-key)))
            (ignore-errors (claude-code-ide-session-registry--entries))))))
 
+(defun claude-code-ide-handover--live-sessions ()
+  "Return the live MCP sessions of this Emacs, or nil without the process file."
+  (and (fboundp 'claude-code-ide-process-live-sessions)
+       (claude-code-ide-process-live-sessions)))
+
+(defun claude-code-ide-handover--session-directory (session)
+  "Return the project folder of the MCP SESSION as a folder name, or nil."
+  (let ((directory (ignore-errors (claude-code-ide-mcp-session-project-dir session))))
+    (and (stringp directory) (file-name-as-directory (expand-file-name directory)))))
+
+(defun claude-code-ide-handover--other-sessions (instance)
+  "Return the IDs of other live MCP sessions in the working tree of INSTANCE.
+Only a session without a descriptor counts.  Such a session runs in
+this Emacs, for example from an older version of the package.  A
+session with a descriptor counts through its instance
+\(`claude-code-ide-handover--other-instances')."
+  (let ((key (claude-code-ide-handover--directory-key
+              (claude-code-ide-known-or-nil (claude-code-ide-instance-project-root instance))))
+        (own (claude-code-ide-instance-session instance)))
+    (delq nil
+          (mapcar (lambda (session)
+                    (and (not (eq session own))
+                         (null (claude-code-ide-instance-of-session session))
+                         (equal (claude-code-ide-handover--directory-key
+                                 (claude-code-ide-handover--session-directory session))
+                                key)
+                         (claude-code-ide-mcp-session-session-id session)))
+                  (claude-code-ide-handover--live-sessions)))))
+
 (defun claude-code-ide-handover--other-writers (instance)
   "Return the IDs of the other live instances in the working tree of INSTANCE.
-They are the instances of this Emacs, and the live registry entries of
-other Emacs."
+They are the instances of this Emacs, its live MCP sessions without a
+descriptor, and the live registry entries of other Emacs.  An instance
+or a session in a subfolder of the tree counts too, as long as the
+subfolder is no working tree of its own."
   (delete-dups
    (append (mapcar #'claude-code-ide-instance-id
                    (claude-code-ide-handover--other-instances instance))
+           (claude-code-ide-handover--other-sessions instance)
            (claude-code-ide-handover--other-emacs-entries instance))))
 
 (defun claude-code-ide-handover--codex-trusted-p (directory interactive)
@@ -792,13 +828,13 @@ background, so that a later call knows the answer."
   "Return an error result when the handover of INSTANCE cannot start, else nil.
 The checks run before anything of the source changes:
 - the CLI of TARGET-PROVIDER is found (`target-unavailable');
-- no other live instance runs in the working tree, in this Emacs or
-  in another Emacs (its registry entry), unless FORCE
+- no other live instance or MCP session runs in the working tree, in
+  this Emacs or in another Emacs (its registry entry), unless FORCE
   (`other-instance');
 - a Codex target has trusted status hooks (`hooks-not-trusted'); with
   INTERACTIVE, the user is asked for the trust first."
-  (let ((id (claude-code-ide-instance-id instance))
-        (directory (claude-code-ide-known-or-nil (claude-code-ide-instance-project-root instance))))
+  (let* ((id (claude-code-ide-instance-id instance))
+         (directory (claude-code-ide-known-or-nil (claude-code-ide-instance-project-root instance))))
     (cond
      ((not (claude-code-ide-handover--target-available-p target-provider))
       (claude-code-ide-handover--error
@@ -820,6 +856,7 @@ The checks run before anything of the source changes:
   "Return the name of a function that a handover needs and that is missing."
   (cl-find-if-not #'fboundp '(claude-code-ide-process-stop-later
                               claude-code-ide-process-worktree-strays
+                              claude-code-ide-process-live-sessions
                               claude-code-ide-transcript-handover-document)))
 
 (cl-defun claude-code-ide-handover-session (instance-id target-provider
@@ -836,7 +873,8 @@ TARGET-PROVIDER is a provider name, such as `codex'.  The keys:
 - CONTEXT: text of the coordinator for the document, or nil.
 - INTERRUPT: non-nil to interrupt the source when it is busy.  Without
   it, the handover waits until the source is idle.
-- FORCE: non-nil to go on while subagents or background tasks run.
+- FORCE: non-nil to go on while subagents or background tasks run,
+  and while other instances run in the working tree.
 - REQUEST-ID: a string that the caller chooses.  A second call with a
   known request ID returns the current result of the first one, with
   :duplicate t, and starts nothing.
@@ -946,6 +984,7 @@ continue prompt at the commit.  Return the result."
                :worktree (claude-code-ide-handover--directory-key directory)
                :directory directory
                :instance-name (and session (claude-code-ide-mcp-session-instance-name session))
+               :source-session-id (and session (claude-code-ide-mcp-session-session-id session))
                :role (claude-code-ide-instance-role instance)
                :chain chain
                :created-at (claude-code-ide-handover--now))))
@@ -1152,18 +1191,45 @@ stray must never reach it."
          (when-let* ((instance (claude-code-ide-instance-by-id id)))
            (claude-code-ide-instance-live-p instance)))))
 
+(defun claude-code-ide-handover--own-session-p (session run)
+  "Return non-nil when SESSION is the session of the source or target of RUN."
+  (or (equal (claude-code-ide-mcp-session-session-id session)
+             (claude-code-ide-handover--run-source-session-id run))
+      (when-let* ((instance (claude-code-ide-instance-of-session session)))
+        (member (claude-code-ide-instance-id instance)
+                (list (claude-code-ide-handover--run-source-id run)
+                      (claude-code-ide-handover--run-target-id run))))))
+
+(defun claude-code-ide-handover--other-session-p (stray run)
+  "Return non-nil when STRAY is a process of another live MCP session.
+The session runs in this Emacs.  The scan tags a process in the CLI
+tree of a live session with `:session-id', also for a session without
+an instance descriptor (for example one that an older version of the
+package started).  The
+sessions of the source and the target of RUN do not count, and nor
+does a session after its cleanup.  The end of a stray must never
+reach another session."
+  (when-let* ((id (plist-get stray :session-id))
+              ((stringp id))
+              (session (claude-code-ide-mcp--get-session-by-id id))
+              ((fboundp 'claude-code-ide-process-session-live-p))
+              ((claude-code-ide-process-session-live-p session)))
+    (not (claude-code-ide-handover--own-session-p session run))))
+
 (defun claude-code-ide-handover--relevant-strays (strays run)
   "Return the STRAYS that can still write in the worktree of RUN.
 A process that this Emacs runs itself (`:emacs-process', for example a
 language server or a shell buffer) is not a writer of the source.  A
 review process (see `claude-code-ide-handover--review-pids') is left
 alone too, and so is a process of another live instance (see
-`claude-code-ide-handover--other-live-instance-p')."
+`claude-code-ide-handover--other-live-instance-p') or of another live
+MCP session (see `claude-code-ide-handover--other-session-p')."
   (let ((reviews (claude-code-ide-handover--review-pids)))
     (cl-remove-if (lambda (stray)
                     (or (plist-get stray :emacs-process)
                         (memql (plist-get stray :pid) reviews)
-                        (claude-code-ide-handover--other-live-instance-p stray run)))
+                        (claude-code-ide-handover--other-live-instance-p stray run)
+                        (claude-code-ide-handover--other-session-p stray run)))
                   strays)))
 
 (defun claude-code-ide-handover--with-start (stray)
@@ -2421,6 +2487,29 @@ See `claude-code-ide-handover-recover-at-start'."
   (when-let* ((session (ignore-errors (claude-code-ide--buffer-session))))
     (claude-code-ide-instance-of-session session)))
 
+(defun claude-code-ide-handover--read-method (target)
+  "Ask whether the TARGET provider forks its last conversation of the chain.
+Return `fork' or `fresh'.  Emacs asks only when a fork is possible.
+`fork' is the default: RET or f.  n is a new conversation.  Any other
+key is refused, and the question asks again."
+  (let* ((provider (claude-code-ide-get-provider target))
+         (name (or (and provider
+                        (not (string-empty-p (claude-code-ide-provider-display-name provider)))
+                        (claude-code-ide-provider-display-name provider))
+                   (symbol-name target))))
+    (pcase (car (read-multiple-choice
+                 (format (concat "How should %s start?\n"
+                                 "  fork: go on from the last %s conversation of this chain, "
+                                 "with its full history, plus the handover document\n"
+                                 "  new:  a new %s conversation that knows only the handover document\n"
+                                 "Method")
+                         name name name)
+                 `((?f "fork" ,(format "go on from the last %s conversation, with its full history" name))
+                   (?n "new" "a new conversation with only the handover document")
+                   (?\r "fork" "the default: fork"))))
+      (?n 'fresh)
+      (_ 'fork))))
+
 (defun claude-code-ide-handover--read-continue ()
   "Return `yes' or `no': whether the target goes on after the commit.
 See `claude-code-ide-handover-continue'.  With `ask', ask once: y and
@@ -2472,10 +2561,7 @@ current buffer, or one that you choose."
                          :native-id (claude-code-ide-known-or-nil
                                      (claude-code-ide-instance-native-id instance)))
                    target))
-         (method (if fork-id
-                     (intern (completing-read "Method (default fresh): " '("fresh" "fork")
-                                              nil t nil nil "fresh"))
-                   'fresh))
+         (method (if fork-id (claude-code-ide-handover--read-method target) 'fresh))
          (context (let ((text (read-string "Context for the target (empty for none): ")))
                     (unless (string-empty-p (string-trim text)) text)))
          (state (claude-code-ide-instance-state instance))
@@ -2639,7 +2725,7 @@ arguments.  CONTINUE goes to the handover only when the call gives it."
              '(:name "interrupt" :type boolean :optional t
                      :description "Interrupt the source when it is busy. Default: wait until it is idle.")
              '(:name "force" :type boolean :optional t
-                     :description "Hand over while subagents or background tasks run.")
+                     :description "Hand over while subagents or background tasks run, or other instances run in the working tree.")
              '(:name "request_id" :type string :optional t
                      :description "ID that makes the request idempotent.")
              '(:name "continue" :type boolean :optional t
