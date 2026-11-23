@@ -737,7 +737,8 @@ answer to a question at the end of its turn."
      (claude-code-ide-instances))))
 
 (defun claude-code-ide-handover--other-emacs-entries (instance)
-  "Return the keys of the live registry entries of other Emacs in the working tree of INSTANCE.
+  "Return the keys of the live registry entries of other Emacs.
+Only the entries in the working tree of INSTANCE count.
 Such an entry is open or pending, and another Emacs that still runs
 owns it (`claude-code-ide-session-registry--other-emacs-p')."
   (let ((key (claude-code-ide-handover--directory-key
@@ -1138,7 +1139,8 @@ goes to the target after the handover, so the stop leaves it alone."
                       (ignore-errors (funcall 'claude-code-ide-review-process-ids)))))
 
 (defun claude-code-ide-handover--other-live-instance-p (stray run)
-  "Return non-nil when STRAY is a process of another live instance than those of RUN.
+  "Return non-nil when STRAY is a process of another live instance.
+The instances of RUN do not count.
 The scan tags such a process with `:instance-id'.  Only a forced
 handover has another live instance in its worktree; the end of a
 stray must never reach it."
@@ -1962,7 +1964,8 @@ saves again, which does no harm."
     (ignore-errors (float-time (parse-iso8601-time-string time)))))
 
 (defun claude-code-ide-handover--acknowledge-from-transcript (run source)
-  "Mark the sent prompts of SOURCE that the source transcript of RUN holds as delivered.
+  "Mark as delivered the sent prompts of SOURCE that its transcript holds.
+The transcript is the source transcript of RUN.
 The inbox sent such a prompt to SOURCE, and its acknowledgement did not
 come.  When the transcript has a user turn with the same text hash at
 or after the send (within one second), the source got it, and the

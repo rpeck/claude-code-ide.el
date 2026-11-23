@@ -1736,7 +1736,10 @@ stopped, and committed while the source CLI ran on."
 The stop is `claude-code-ide-control-stop'.
 A coordinator stops an instance; nobody is there to answer a question
 such as \"Buffer has a running process; kill it?\".  In a daemon such a
-question blocks Emacs."
+question blocks Emacs.
+The soft stop kills the terminal buffer later, from timers.  So the
+question stubs stay in place until the CLI and the buffer are gone,
+and the check of the questions comes after that."
   (claude-code-ide-live-tests--stop-all)
   (claude-code-ide-live-tests--with-backend backend
     (let* ((dir (claude-code-ide-live-tests--project "projA"))
@@ -1745,7 +1748,8 @@ question blocks Emacs."
                  (when (eq provider 'codex)
                    (claude-code-ide-live-tests--ensure-codex-folder-trust dir))
                  (claude-code-ide-live-tests--launch dir provider nil)))
-           (process (get-buffer-process (claude-code-ide-live-tests--buffer id))))
+           (buffer (claude-code-ide-live-tests--buffer id))
+           (process (get-buffer-process buffer)))
       (claude-code-ide-live-tests--log "%s in %s: the query flag of the terminal process is %S"
                                        provider backend (process-query-on-exit-flag process))
       (accept-process-output nil 3)
@@ -1756,13 +1760,16 @@ question blocks Emacs."
         (let ((result (condition-case err
                           (claude-code-ide-control-stop id)
                         (error (list :status 'signal :error err)))))
-          (claude-code-ide-live-tests--log "%s in %s: stop %S, questions %S" provider backend result questions)
           (unwind-protect
               (progn
-                (should-not questions)
                 (should (eq (plist-get result :status) 'ok))
                 (should (claude-code-ide-live-tests--wait
-                         (lambda () (not (process-live-p process))) 15 "the end of the CLI")))
+                         (lambda () (not (process-live-p process))) 15 "the end of the CLI"))
+                (should (claude-code-ide-live-tests--wait
+                         (lambda () (not (buffer-live-p buffer))) 15 "the end of the terminal buffer"))
+                (claude-code-ide-live-tests--log "%s in %s: stop %S, questions %S"
+                                                 provider backend result questions)
+                (should-not questions))
             (let ((kill-buffer-query-functions nil))
               (when (claude-code-ide-live-tests--running-p id)
                 (claude-code-ide-control-stop id)))))))))

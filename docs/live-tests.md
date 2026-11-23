@@ -133,7 +133,7 @@ emacsclient -s cci-live -e '(claude-code-ide-live-tests-run "handover-chain" "/a
 | `handover-hooks-not-trusted` | A coordinator handover to Codex without trusted hooks gets `hooks-not-trusted`, twice: before and after the real check. |
 | `handover-stray` | A process in the worktree gives `needs-user/strays`; `end` ends it, and the handover commits. `end` ends every stray, so the strays must be exactly the `sleep` of the test. Else the test fails and ends nothing. |
 | `handover-ghostel-sources-end` | In ghostel, CC → Codex and then Codex → CC. Each handover ends the CLI process of its source (by its recorded PID). |
-| `stop-asks-nothing-vterm`, `-eat`, `-ghostel` | `claude-code-ide-control-stop` ends a Codex instance without a question such as "Buffer has a running process; kill it?". |
+| `stop-asks-nothing-vterm`, `-eat`, `-ghostel` | `claude-code-ide-control-stop` ends a Codex instance without a question such as "Buffer has a running process; kill it?". The test waits until the CLI and the terminal buffer are gone, because the soft stop kills the buffer later. |
 | `recovery-1-kill`, `recovery-2-after-kill` | A crash of Emacs between `source-stopped` and `committed`; the next Emacs starts only the target. |
 | `codex-dialogs-vterm`, `-eat`, `-ghostel` | The folder trust, hooks review, and approval dialogs of Codex in each terminal. |
 | `codex-approval-eat-no-window` | The Codex approval dialog in an eat buffer that shows in no window (see [The dialogs](#the-dialogs)). |
