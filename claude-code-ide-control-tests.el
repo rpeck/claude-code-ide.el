@@ -572,12 +572,16 @@ The two instances have the same display name."
       (should (= (length claude-code-ide-tests--control-sent) 1)))))
 
 (ert-deftest claude-code-ide-test-control-guess-and-request-ids ()
-  "A guessed idle state sends and is recorded; number request IDs work."
+  "A guessed idle state sends and is recorded; number request IDs work.
+The stub provider counts as one that types into no terminal, as
+`codex queue'."
   (claude-code-ide-tests--with-control
     (claude-code-ide-tests--control-add "cci-test-a" "proj")
     (setf (alist-get "cci-test-a" claude-code-ide-tests--control-states nil nil #'equal)
           (claude-code-ide-instance-make-state 'idle nil (float-time) t))
-    (let ((result (claude-code-ide-control-submit "cci-test-a" "cci-test-g" :request-id 42)))
+    (let* ((claude-code-ide-control-guess-safe-providers
+            (cons 'cci-test-stub claude-code-ide-control-guess-safe-providers))
+           (result (claude-code-ide-control-submit "cci-test-a" "cci-test-g" :request-id 42)))
       (should (equal (plist-get result :request-id) "42")))
     (should (claude-code-ide-control--record-sent-guess
              (claude-code-ide-control--find-record "cci-test-a" "42")))
@@ -585,6 +589,133 @@ The two instances have the same display name."
                    "42"))
     (should (eq (plist-get (claude-code-ide-control-request-status "cci-test-a" 'bad) :reason)
                 'unknown-request))))
+
+(ert-deftest claude-code-ide-test-control-guessed-idle-typing-provider-queues ()
+  "A provider that types into the terminal gets no prompt on a guessed idle state.
+A guessed idle state can be a dialog that no event reports; typed text
+and Return could answer it."
+  (claude-code-ide-tests--with-control
+    (should (memq 'codex claude-code-ide-control-guess-safe-providers))
+    (should-not (memq 'claude claude-code-ide-control-guess-safe-providers))
+    (claude-code-ide-tests--control-add "cci-test-a" "proj")
+    (setf (alist-get "cci-test-a" claude-code-ide-tests--control-states nil nil #'equal)
+          (claude-code-ide-instance-make-state 'idle nil (float-time) t))
+    (let ((result (claude-code-ide-control-submit "cci-test-a" "cci-test-g" :request-id "g1")))
+      (should (eq (plist-get result :result) 'queued))
+      (should (eq (plist-get result :reason) 'guessed-idle)))
+    (should-not claude-code-ide-tests--control-sent)
+    (should-not (claude-code-ide-control-deliver-pending "cci-test-a"))
+    (should-not claude-code-ide-tests--control-sent)
+    (should (eq (plist-get (claude-code-ide-control-submit "cci-test-a" "cci-test-h"
+                                                           :request-id "g2" :queue nil)
+                           :reason)
+                'guessed-idle))
+    ;; A reported idle state sends
+    (claude-code-ide-tests--control-set-state "cci-test-a" 'idle)
+    (should (equal (claude-code-ide-control-deliver-pending "cci-test-a") "g1"))
+    (should (equal claude-code-ide-tests--control-sent '(("cci-test-a" "cci-test-g"))))))
+
+(ert-deftest claude-code-ide-test-control-failed-queue-sends-again ()
+  "A provider command that fails after the send puts the prompt back in the queue.
+`codex queue' ends after `submit-prompt' returns.  With :outcome
+`failed', Codex did not store the text, so the retry sends it again.
+A `timeout' stays sent: Codex may have stored it."
+  (claude-code-ide-tests--with-control
+    (let ((results nil))
+      (setf (claude-code-ide-provider-submit-prompt (claude-code-ide-get-provider 'cci-test-stub))
+            (lambda (instance text)
+              (push (list (claude-code-ide-instance-id instance) text)
+                    claude-code-ide-tests--control-sent)
+              (car (push (list :status 'queued :thread "cci-test-t" :outcome 'pending
+                               :message-id 'unknown :exit nil)
+                         results))))
+      (let* ((instance (claude-code-ide-tests--control-add "cci-test-a" "proj" 'idle))
+             (finish (lambda (outcome)
+                       (let ((result (car results)))
+                         (plist-put result :outcome outcome)
+                         (plist-put result :exit (and (eq outcome 'failed) 1))
+                         (claude-code-ide--run-session-hook
+                          'claude-code-ide-codex-queue-functions instance result))))
+             (status (lambda () (claude-code-ide-control-request-status "cci-test-a" "q1"))))
+        (claude-code-ide-control-submit "cci-test-a" "cci-test-q" :request-id "q1")
+        (should (eq (plist-get (funcall status) :reason) 'awaiting-acknowledgement))
+        (funcall finish 'failed)
+        (should (eq (plist-get (funcall status) :result) 'queued))
+        (should (eq (plist-get (funcall status) :reason) 'send-failed))
+        (should-not (plist-get (funcall status) :sent-at))
+        ;; The retry sends it again
+        (should (equal (claude-code-ide-control-deliver-pending "cci-test-a") "q1"))
+        (should (= (length claude-code-ide-tests--control-sent) 2))
+        ;; A timeout keeps it sent; the acknowledgement time decides
+        (funcall finish 'timeout)
+        (should (eq (plist-get (funcall status) :reason) 'awaiting-acknowledgement))
+        (should (plist-get (funcall status) :sent-at))
+        ;; A late failure of a command whose record is final changes nothing
+        (claude-code-ide-tests--control-event "cci-test-a" 'prompt-submit '((prompt . "cci-test-q")))
+        (should (eq (plist-get (funcall status) :result) 'delivered))
+        (funcall finish 'failed)
+        (should (eq (plist-get (funcall status) :result) 'delivered))))))
+
+(ert-deftest claude-code-ide-test-control-generation-check ()
+  "Stop and submit with :generation refuse a later launch of the instance ID."
+  (claude-code-ide-tests--with-control
+    (claude-code-ide-tests--control-add "cci-test-a" "proj" 'idle)
+    (claude-code-ide-control-submit "cci-test-a" "cci-test-one" :request-id "k1" :generation 1)
+    (should (equal claude-code-ide-tests--control-sent '(("cci-test-a" "cci-test-one"))))
+    ;; The instance runs again as generation 2
+    (claude-code-ide-instance-unregister "cci-test-a")
+    (claude-code-ide-tests--control-add "cci-test-a" "proj" 'idle)
+    (let ((result (claude-code-ide-control-submit "cci-test-a" "cci-test-two"
+                                                  :request-id "k2" :generation 1)))
+      (should (eq (plist-get result :result) 'rejected))
+      (should (eq (plist-get result :reason) 'generation-changed)))
+    (should (= (length claude-code-ide-tests--control-sent) 1))
+    (should (eq (plist-get (claude-code-ide-control-request-status "cci-test-a" "k2") :reason)
+                'unknown-request))
+    ;; A known request ID is a duplicate, also with an old generation
+    (should (plist-get (claude-code-ide-control-submit "cci-test-a" "cci-test-one"
+                                                       :request-id "k1" :generation 1)
+                       :duplicate))
+    (let ((result (claude-code-ide-control-stop "cci-test-a" :generation 1)))
+      (should (eq (plist-get result :status) 'error))
+      (should (eq (plist-get result :reason) 'generation-changed)))
+    (should-not claude-code-ide-tests--control-stopped)
+    ;; The MCP tools take the generation as a number or a string
+    (should (string-match-p "\"reason\":\"generation-changed\""
+                            (claude-code-ide-control--mcp-submit "cci-test-a" "cci-test-x"
+                                                                 "k3" nil 1)))
+    (should (string-match-p "\"reason\":\"generation-changed\""
+                            (claude-code-ide-control--mcp-stop "cci-test-a" "1")))
+    (should (eq (plist-get (claude-code-ide-control-submit "cci-test-a" "cci-test-two"
+                                                           :request-id "k4" :generation 2)
+                           :result)
+                'queued))
+    (should (eq (plist-get (claude-code-ide-control-stop "cci-test-a" :generation 2) :status) 'ok))
+    (should (equal claude-code-ide-tests--control-stopped '("cci-test-a")))))
+
+(ert-deftest claude-code-ide-test-control-resume-refuses-running-conversation ()
+  "A resume with a native ID that another live instance runs starts nothing."
+  (claude-code-ide-tests--with-control
+    (let ((dir (make-temp-file "cci-test-proj-" t))
+          (started nil))
+      (unwind-protect
+          (progn
+            (setf (claude-code-ide-instance-native-id
+                   (claude-code-ide-tests--control-add "cci-test-a" "proj" 'idle))
+                  "cci-test-native")
+            (cl-letf (((symbol-function 'claude-code-ide--start-session)
+                       (lambda (_c _r spec) (setq started spec))))
+              (let ((result (claude-code-ide-control-resume "cci-test-b" :directory dir
+                                                            :native-id "cci-test-native")))
+                (should (eq (plist-get result :reason) 'native-id-running))
+                (should (equal (plist-get result :instance-id) "cci-test-b"))
+                (should (string-match-p "cci-test-a" (plist-get result :message))))
+              (should-not started)
+              ;; Another conversation starts
+              (claude-code-ide-control-resume "cci-test-b" :directory dir
+                                              :native-id "cci-test-other")
+              (should (equal (claude-code-ide-start-spec-resume-id started) "cci-test-other"))))
+        (delete-directory dir t)))))
 
 (ert-deftest claude-code-ide-test-control-no-submit-is-final ()
   "Queued prompts of a provider without submit-prompt become final."

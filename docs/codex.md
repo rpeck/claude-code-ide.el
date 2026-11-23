@@ -116,7 +116,8 @@ When the list cannot be read, the launch puts no header in a variable:
 
 - The cases: `codex app-server` fails, has an error reply, or does not reply within `claude-code-ide-codex-config-read-timeout`. Also when the flags select a profile (`-p` or `--profile`), because `codex app-server` takes no profile.
 - The header values then go in `mcp_servers.emacs_tools.http_headers`, in the argument list.
-- Emacs shows one warning in each session.
+- The coordinator credential (`X-Emacs-MCP-Coordinator`) never goes in the argument list. A coordinator that launches this way gets no coordinator tools, and the warning says so.
+- Emacs shows a warning at each launch that does this.
 - A launch without headers does not read the config.
 
 ### Approvals
@@ -163,6 +164,7 @@ codex queue --thread=<native-id> --message=<text>
   - `:outcome failed`, with the `:exit` code.
   - `:outcome timeout`, after `claude-code-ide-codex-queue-timeout`. Emacs stops the command.
 - Then `claude-code-ide-codex-queue-functions` run with the instance and the result.
+- The control inbox listens on that hook. After `:outcome failed`, the prompt waits in the inbox again (reason `send-failed`), and the next try sends it. After `timeout`, it waits for its acknowledgement.
 - The result is nil when the command cannot start, or when the instance has no native ID yet. A message in the echo area gives the reason.
 - The acknowledgement of delivery is the `UserPromptSubmit` hook event with the same text.
 

@@ -28,8 +28,8 @@ This document describes the control operations of claude-code-ide.el, the prompt
 | `inspect-instance` | `(claude-code-ide-control-inspect-instance INSTANCE-ID)` | The details of one running instance. |
 | `launch` | `(claude-code-ide-control-launch &key DIRECTORY PROVIDER NAME PROMPT ROLE EXTRA-FLAGS)` | `(:status ok :instance-id ID ...)`. |
 | `resume` | `(claude-code-ide-control-resume INSTANCE-ID &key PROMPT DIRECTORY NATIVE-ID PROVIDER)` | The same as `launch`. |
-| `submit-prompt` | `(claude-code-ide-control-submit INSTANCE-ID TEXT &key REQUEST-ID QUEUE)` | `(:destination :request-id :result :reason ...)`. |
-| `stop` | `(claude-code-ide-control-stop INSTANCE-ID)` | `(:status ok :instance-id ID :result stopped)`. |
+| `submit-prompt` | `(claude-code-ide-control-submit INSTANCE-ID TEXT &key REQUEST-ID QUEUE GENERATION)` | `(:destination :request-id :result :reason ...)`. |
+| `stop` | `(claude-code-ide-control-stop INSTANCE-ID &key GENERATION)` | `(:status ok :instance-id ID :result stopped)`. |
 | `handover` | `(claude-code-ide-handover-session INSTANCE-ID TARGET-PROVIDER &key METHOD CONTEXT INTERRUPT FORCE REQUEST-ID CONTINUE)` | Defined by `claude-code-ide-handover.el`; see [handover.md](handover.md). It returns at once. CONTINUE t or nil decides whether the target gets the continue prompt after the commit; without it, `claude-code-ide-handover-continue` decides, with `ask` as `always`. |
 | `track-review` | Phase 3 (`feat/review-tracking`) | Unavailable until that file defines it. |
 
@@ -78,13 +78,15 @@ This document describes the control operations of claude-code-ide.el, the prompt
 - The session registry gives the directory, the provider, and the native ID. The registry is read only while `claude-code-ide-session-registry-mode` is on.
 - Without a registry entry, the caller gives `:directory` and `:native-id`, and optionally `:provider`.
 - `:prompt` is the first message after the resume.
-- Error reasons: `invalid-instance-id`, `already-running`, `archived`, `unknown-instance`, `no-directory`, `unknown-provider`, `start-failed`.
+- With `:native-id` and no registry entry: when another live instance of this Emacs runs that native ID, nothing starts. The reason is `native-id-running`, and `:message` names that instance.
+- Error reasons: `invalid-instance-id`, `already-running`, `archived`, `unknown-instance`, `no-directory`, `unknown-provider`, `native-id-running`, `start-failed`.
 
 ### stop
 
 - It calls the `stop` operation of the instance's provider.
 - The prompts in the inbox of the instance stay there.
-- Error reasons: `not-running`, `stop-failed`.
+- `:generation` is optional: the launch generation that the caller saw, for example from `list-instances`. When the instance runs another launch now, nothing stops, and the reason is `generation-changed`.
+- Error reasons: `not-running`, `generation-changed`, `stop-failed`.
 - The stop does not wait for the process tree. `feat/process-tree` owns that part.
 
 ## submit-prompt
@@ -95,6 +97,7 @@ This document describes the control operations of claude-code-ide.el, the prompt
 
 - **REQUEST-ID** is a string or a number that the caller chooses. A number becomes its decimal text. nil makes a new UUID. The result gives it.
 - **TEXT** goes out with LF line ends: each CR LF and each lone CR becomes LF before the send.
+- **GENERATION** is optional: the launch generation that the caller saw. When the last launch of the instance has another generation, a new request is `rejected` with the reason `generation-changed`. A known request ID is still a duplicate.
 - **QUEUE** says what happens when the instance cannot take the text now:
 
 | QUEUE | Effect |
@@ -131,14 +134,16 @@ This document describes the control operations of claude-code-ide.el, the prompt
 | `failed/quota-limit`, `failed/exit-code`, `failed/error` | rejected, or queued with QUEUE t | The instance failed. |
 | `stopped` | rejected, or queued with QUEUE t | The instance does not run, and the session registry marks it closed or archived. |
 | `earlier-prompts-pending` | queued or rejected | The instance is idle, but older prompts wait. They go first. |
-| `send-failed` | queued | The provider did not send the prompt. It waits for the next try. |
+| `send-failed` | queued | The provider did not send the prompt. It waits for the next try. A `codex queue` command that ends with `:outcome failed` also puts the prompt back with this reason. A `timeout` does not, because Codex can have the prompt. |
+| `guessed-idle` | queued or rejected | The idle state is a guess (`:guess t`), and the provider types the prompt into the terminal. See "Rules for each state". |
+| `generation-changed` | rejected | GENERATION is not the last launch of the instance. |
 | `no-submit` | rejected | The provider has no `submit-prompt`. Queued prompts of such an instance also become final with this reason. |
 | `held` | queued or rejected | A handover holds the delivery to the instance while it quiesces and stops it (`claude-code-ide-control-hold`). The prompt waits; with QUEUE nil it is rejected. |
 | `handed-over` | rejected, or queued | A handover moved the prompt to its target (`claude-code-ide-control-move-inbox`). The old record is `rejected` with this reason. The target has a `queued` copy with the same request ID and this reason. Follow the chain with `claude-code-ide-session-registry-chain-current`. |
 | `unknown-instance` | rejected | Neither this Emacs nor the registry knows the ID. |
 | `invalid-instance-id`, `empty-text` | rejected | The request is not valid. |
 
-The results `unknown-instance`, `invalid-instance-id`, and `empty-text` make no inbox file.
+The results `unknown-instance`, `invalid-instance-id`, `empty-text`, and `generation-changed` make no inbox file.
 
 ### Rules for each state
 
@@ -161,7 +166,8 @@ The state comes from `claude-code-ide-instance-state`.
   - When the registry marks it `pending`, it is `working` with the reason `starting`.
   - When the registry has it open (as after a crash of Emacs), or this Emacs launched it before, it is `disconnected`.
   - Else it is unknown.
-- **A guessed idle state** (`:guess t`) also sends. The inbox file records it in `sent_guess`.
+- **A guessed idle state** (`:guess t`) sends only when the provider is in `claude-code-ide-control-guess-safe-providers` (default: `codex`). Such a provider never types into the terminal: Codex delivers a `codex queue` text only when the conversation is idle. The inbox file records the guess in `sent_guess`.
+- **Other providers queue on a guessed idle state** (reason `guessed-idle`; with QUEUE nil, reject), because the state can be a dialog that no event reports. Claude Code types the prompt, and its Return can answer that dialog. The prompt goes out when the state is idle and not a guess.
 
 ### Duplicates
 
@@ -257,9 +263,9 @@ Each operation is also an MCP tool with `:scope coordinator`. Only a request wit
 | `claude-code-ide-control-inspect-instance` | `instance_id` |
 | `claude-code-ide-control-launch` | `directory`, `provider`, `name`, `prompt`, `role` (all but `directory` optional) |
 | `claude-code-ide-control-resume` | `instance_id`, `prompt` (optional) |
-| `claude-code-ide-control-submit-prompt` | `instance_id`, `text`, `request_id` (optional), `queue` (optional: `auto`, `always`, or `never`) |
+| `claude-code-ide-control-submit-prompt` | `instance_id`, `text`, `request_id` (optional), `queue` (optional: `auto`, `always`, or `never`), `generation` (optional) |
 | `claude-code-ide-control-request-status` | `instance_id`, `request_id` |
-| `claude-code-ide-control-stop` | `instance_id` |
+| `claude-code-ide-control-stop` | `instance_id`, `generation` (optional) |
 
 - **Results.** Each tool returns the result plist as a JSON object. Keys use `_`, for example `instance_id`. Symbols become strings.
 - **Off without the scope check.** The tools go into `claude-code-ide-mcp-server-tools` only when the MCP server enforces the coordinator scope. The sign of that is the function `claude-code-ide-mcp-request-instance-id`. Without it, any instance could launch, prompt, and stop the others.

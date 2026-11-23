@@ -71,7 +71,6 @@ are bound, and no Codex process runs."
          (claude-code-ide-codex-no-alt-screen t)
          (claude-code-ide-codex-skip-update-check t)
          (claude-code-ide-codex-remove-openai-api-key t)
-         (claude-code-ide-codex--warned-plain-headers nil)
          (claude-code-ide-codex-tests--exclude nil))
      (advice-add 'claude-code-ide-mcp-server-get-config
                  :filter-return #'claude-code-ide-codex-tests--add-header)
@@ -443,7 +442,8 @@ The wait ends after `claude-code-ide-tests--wait-limit' seconds."
                (setup (claude-code-ide-codex--mcp-setup (claude-code-ide-codex-tests--instance))))
           (should (member (format "shell_environment_policy.exclude=[\"%s\"]" variable)
                           (plist-get setup :args))))
-        ;; Not readable: the value goes in http_headers, with one warning
+        ;; Not readable: the value goes in http_headers, with a warning at
+        ;; each launch
         (cl-letf (((symbol-function 'display-warning)
                    (lambda (_type message &rest _) (push message warnings))))
           (let ((claude-code-ide-codex-tests--exclude 'unknown))
@@ -458,8 +458,61 @@ The wait ends after `claude-code-ide-tests--wait-limit' seconds."
                                            (string-match-p "env_http_headers" word)))
                                      (plist-get setup :args)))
                 (should-not (plist-get setup :environment))))))
-        (should (= (length warnings) 1))
+        (should (= (length warnings) 2))
         (should (string-match-p "argument list" (car warnings)))))))
+
+(defconst claude-code-ide-codex-tests--credential "cci-test-coordinator-credential"
+  "Value of the coordinator credential that the stub advice adds.")
+
+(defun claude-code-ide-codex-tests--add-coordinator-header (config)
+  "Add the coordinator credential to the headers of CONFIG."
+  (let* ((server (alist-get 'emacs-tools (alist-get 'mcpServers config)))
+         (headers (append (alist-get 'headers server)
+                          (list (cons 'X-Emacs-MCP-Coordinator
+                                      claude-code-ide-codex-tests--credential))))
+         (new-server (list (cons 'url (alist-get 'url server))
+                           (cons 'headers headers))))
+    (list (cons 'mcpServers (list (cons 'emacs-tools new-server))))))
+
+(ert-deftest claude-code-ide-test-codex-plain-headers-without-coordinator-credential ()
+  "A launch whose header values go in the argument list leaves out the coordinator credential.
+The argument list is visible to all local users in ps.  The launch
+warns each time, and says that the coordinator has no coordinator
+tools.  A readable exclude list keeps the credential in a variable."
+  (let ((claude-code-ide-mcp--sessions (make-hash-table :test 'equal))
+        (warnings nil))
+    (claude-code-ide-codex-tests--with-mcp
+      (advice-add 'claude-code-ide-mcp-server-get-config
+                  :filter-return #'claude-code-ide-codex-tests--add-coordinator-header)
+      (unwind-protect
+          (cl-letf (((symbol-function 'display-warning)
+                     (lambda (_type message &rest _) (push message warnings))))
+            (let ((claude-code-ide-codex-tests--exclude 'unknown))
+              (dotimes (_ 2)
+                (let ((args (plist-get (claude-code-ide-codex--mcp-setup
+                                        (claude-code-ide-codex-tests--instance))
+                                       :args)))
+                  (should (member (format "mcp_servers.emacs_tools.http_headers={\"X-Emacs-MCP-Token\"=\"%s\"}"
+                                          claude-code-ide-codex-tests--token)
+                                  args))
+                  (should-not (cl-some (lambda (word)
+                                         (or (string-match-p claude-code-ide-codex-tests--credential word)
+                                             (string-match-p "Coordinator" word)))
+                                       args)))))
+            (should (= (length warnings) 2))
+            (should (string-match-p "coordinator credential" (car warnings)))
+            ;; Readable: the credential goes in a variable, as every header
+            (setq warnings nil)
+            (let ((setup (claude-code-ide-codex--mcp-setup (claude-code-ide-codex-tests--instance))))
+              (should-not warnings)
+              (should-not (cl-some (lambda (word)
+                                     (string-match-p claude-code-ide-codex-tests--credential word))
+                                   (plist-get setup :args)))
+              (should (member (concat (claude-code-ide-codex--header-variable "X-Emacs-MCP-Coordinator")
+                                      "=" claude-code-ide-codex-tests--credential)
+                              (plist-get setup :environment)))))
+        (advice-remove 'claude-code-ide-mcp-server-get-config
+                       #'claude-code-ide-codex-tests--add-coordinator-header)))))
 
 (ert-deftest claude-code-ide-test-codex-read-exclude ()
   "The exclude list comes from config/read of codex app-server, read only."
