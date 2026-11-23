@@ -801,7 +801,7 @@ handover fields); docs/session-schema.md describes the files."
   (let ((source (with-temp-buffer
                   (insert-file-contents (locate-library "claude-code-ide.el" t))
                   (buffer-string))))
-    (dolist (feature '("codex" "control" "transcript" "handover" "review"))
+    (dolist (feature '("codex" "control" "transcript" "handover" "review" "mailbox"))
       (should (string-match-p
                (regexp-quote (format "(claude-code-ide--require-optional 'claude-code-ide-%s)" feature))
                source))))

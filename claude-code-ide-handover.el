@@ -745,7 +745,7 @@ answer to a question at the end of its turn."
   "Return the keys of the live registry entries of other Emacs.
 Only the entries in the working tree of INSTANCE count.
 Such an entry is open or pending, and another Emacs that still runs
-owns it (`claude-code-ide-session-registry--other-emacs-p')."
+owns it (`claude-code-ide-session-registry-other-emacs-p')."
   (let ((key (claude-code-ide-handover--directory-key
               (claude-code-ide-known-or-nil (claude-code-ide-instance-project-root instance))))
         (id (claude-code-ide-instance-id instance)))
@@ -759,7 +759,7 @@ owns it (`claude-code-ide-session-registry--other-emacs-p')."
                             (or (claude-code-ide-session-registry-entry-worktree entry)
                                 (claude-code-ide-session-registry-entry-project-dir entry)))
                            key)
-                    (claude-code-ide-session-registry--other-emacs-p entry)
+                    (claude-code-ide-session-registry-other-emacs-p entry)
                     entry-key)))
            (ignore-errors (claude-code-ide-session-registry--entries))))))
 

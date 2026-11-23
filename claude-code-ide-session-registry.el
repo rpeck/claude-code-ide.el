@@ -1400,6 +1400,19 @@ a review result goes to the current owner after a handover."
                  (setq entry next))))
       (claude-code-ide-session-registry-entry-key entry))))
 
+(defun claude-code-ide-session-registry-chain-ids (instance-id)
+  "Return the instance IDs of the chain of INSTANCE-ID, oldest first.
+They are the legs of the entry of the current instance of the chain
+\(`claude-code-ide-session-registry-chain-current'): the target of a
+handover saves all earlier legs and its own.  The first ID is the root
+of the chain, which no handover changes.  An instance without a chain
+gives the list of its own ID."
+  (let* ((current (or (claude-code-ide-session-registry-chain-current instance-id) instance-id))
+         (entry (claude-code-ide-session-registry-entry-of current)))
+    (or (delq nil (mapcar (lambda (leg) (plist-get leg :instance-id))
+                          (and entry (claude-code-ide-session-registry-entry-legs entry))))
+        (list instance-id))))
+
 ;;; Flags
 
 (defun claude-code-ide-session-registry--parse-flags (flags)
@@ -1839,7 +1852,7 @@ and they stay `open', which is what a restore looks for."
   (member (claude-code-ide-session-registry-entry-key entry)
           (claude-code-ide-session-registry--live-keys)))
 
-(defun claude-code-ide-session-registry--other-emacs-p (entry &optional cache)
+(defun claude-code-ide-session-registry-other-emacs-p (entry &optional cache)
   "Return non-nil when another live Emacs on this host owns ENTRY.
 The process ID and the start time of that Emacs identify it.  An entry
 without the start time (an older file) needs a process with that ID
@@ -1976,7 +1989,7 @@ CACHE is as for `claude-code-ide-session-registry--process-attributes'."
       (when (and (equal (claude-code-ide-session-registry-entry-closed-by entry) "emacs-exit")
                  (claude-code-ide-session-registry--this-host-p entry host-id)
                  (not (eql (claude-code-ide-session-registry-entry-emacs-pid entry) (emacs-pid)))
-                 (not (claude-code-ide-session-registry--other-emacs-p entry cache))
+                 (not (claude-code-ide-session-registry-other-emacs-p entry cache))
                  (string< (or latest "")
                           (or (claude-code-ide-session-registry-entry-closed-at entry) "")))
         (setq latest (claude-code-ide-session-registry-entry-closed-at entry)
@@ -2096,7 +2109,7 @@ computes one."
                                 claude-code-ide-session-registry-restore-attempts)))
                   (claude-code-ide-session-registry--this-host-p
                    entry (claude-code-ide-session-registry--restore-context-host-id context))
-                  (not (claude-code-ide-session-registry--other-emacs-p entry cache)))
+                  (not (claude-code-ide-session-registry-other-emacs-p entry cache)))
              (member (claude-code-ide-session-registry-entry-key entry)
                      (claude-code-ide-session-registry--restore-context-exit-keys context)))
          (not (member (claude-code-ide-session-registry-entry-key entry)

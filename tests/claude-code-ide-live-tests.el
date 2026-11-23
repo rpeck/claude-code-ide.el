@@ -36,6 +36,7 @@
 (require 'claude-code-ide-handover)
 (require 'claude-code-ide-mcp-server)
 (require 'claude-code-ide-emacs-tools)
+(require 'claude-code-ide-mailbox)
 
 (defvar claude-code-ide-mcp-allowed-tools)
 (defvar claude-code-ide-enable-mcp-server)
@@ -1791,6 +1792,54 @@ and the check of the questions comes after that."
   :tags '(:live)
   (claude-code-ide-live-tests--live
     (claude-code-ide-live-tests--stop-asks-nothing 'vterm 'codex)))
+
+;;; The mailbox
+
+(ert-deftest claude-code-ide-live-test-mailbox-multi-line-claude ()
+  "A message of three lines reaches a real Claude Code instance as one prompt.
+A Claude Code sender calls `claude-code-ide-send-message' (as its MCP
+request does, with its instance bound).  The receiver has one
+UserPromptSubmit event after the send, its prompt is the whole frame,
+and the request becomes delivered.  The mode is on before both launch,
+so both approve the tools."
+  :tags '(:live)
+  (claude-code-ide-live-tests--live
+    (let ((frames nil)
+          (was claude-code-ide-mailbox-mode))
+      (claude-code-ide-mailbox-mode 1)
+      (advice-add 'claude-code-ide-mailbox--frame :filter-return
+                  (lambda (frame) (push frame frames) frame)
+                  '((name . cci-live-mailbox)))
+      (unwind-protect
+          (let* ((dir (claude-code-ide-live-tests--claude-project "projA"))
+                 (sender (claude-code-ide-live-tests--launch dir 'claude nil))
+                 (receiver (claude-code-ide-live-tests--launch
+                            dir 'claude "cci-test-mailbox: reply with the word ready, and nothing else.")))
+            ;; After its first turn, the receiver is idle, and not by a guess
+            (should (claude-code-ide-live-tests--wait-turn receiver 0 claude-code-ide-live-tests--turn-limit))
+            (let* ((start (float-time))
+                   (result (claude-code-ide-control-json-decode
+                            (let ((claude-code-ide-mcp-server--current-instance-id sender))
+                              (claude-code-ide-mailbox--send
+                               receiver "cci-test three lines"
+                               "cci-test line one\ncci-test line two\ncci-test line three"))))
+                   (request (alist-get 'request_id result)))
+              (claude-code-ide-live-tests--log "mailbox send: %S" result)
+              (should (equal (alist-get 'result result) "queued"))
+              (should (= (length frames) 1))
+              ;; The prompt of the event equals the frame
+              (let ((delivered (claude-code-ide-live-tests--wait-delivered
+                                receiver request (car frames) start)))
+                (claude-code-ide-live-tests--wait-turn receiver delivered
+                                                       claude-code-ide-live-tests--turn-limit)
+                (should (= (cl-count-if (lambda (entry)
+                                          (and (> (car entry) start)
+                                               (equal (plist-get (cdr entry) :instance-id) receiver)
+                                               (eq (plist-get (cdr entry) :event) 'prompt-submit)))
+                                        claude-code-ide-live-tests--events)
+                           1)))))
+        (advice-remove 'claude-code-ide-mailbox--frame 'cci-live-mailbox)
+        (unless was (claude-code-ide-mailbox-mode -1))))))
 
 ;;; Unit tests of the helpers
 ;;

@@ -2455,6 +2455,34 @@ words."
                      '("--verbose;" "echo" "cci-test-injected" "$(echo" "cci-test-sub)"
                        "--model" "opus"))))))
 
+(ert-deftest claude-code-ide-test-session-registry-chain-ids ()
+  "The IDs of a chain, oldest first, from each instance of it.
+An instance without a chain gives its own ID."
+  (claude-code-ide-tests--with-registry
+    (let ((legs '(((instance_id . "cci-test-l1")) ((instance_id . "cci-test-l2"))
+                  ((instance_id . "cci-test-l3"))))
+          (committed (lambda (id target)
+                       `((id . ,id) (status . "committed") (stage . "committed")
+                         (target_instance_id . ,target)))))
+      (claude-code-ide-session-registry--submit
+       "test"
+       (lambda (entries)
+         (append entries
+                 (list (claude-code-ide-tests--registry-entry
+                        "cci-test-l1" :handover (funcall committed "h1" "cci-test-l2"))
+                       (claude-code-ide-tests--registry-entry
+                        "cci-test-l2" :chain (butlast legs)
+                        :handover (funcall committed "h2" "cci-test-l3"))
+                       (claude-code-ide-tests--registry-entry "cci-test-l3" :chain legs)
+                       (claude-code-ide-tests--registry-entry "cci-test-alone")))))
+      (dolist (id '("cci-test-l1" "cci-test-l2" "cci-test-l3"))
+        (should (equal (claude-code-ide-session-registry-chain-ids id)
+                       '("cci-test-l1" "cci-test-l2" "cci-test-l3"))))
+      (should (equal (claude-code-ide-session-registry-chain-ids "cci-test-alone")
+                     '("cci-test-alone")))
+      (should (equal (claude-code-ide-session-registry-chain-ids "cci-test-unknown")
+                     '("cci-test-unknown"))))))
+
 (provide 'claude-code-ide-session-registry-tests)
 
 ;; Local Variables:

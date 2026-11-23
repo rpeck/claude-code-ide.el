@@ -252,6 +252,16 @@ Returns the tool specification for convenience."
       ;; Return the spec for convenience
       spec)))
 
+(defun claude-code-ide-mcp-server-remove-tools (names)
+  "Remove the tools whose names are in NAMES from the MCP tools.
+The tools are `claude-code-ide-mcp-server-tools'.  A tool of the old
+format (FUNCTION . PLIST) stays."
+  (setq claude-code-ide-mcp-server-tools
+        (cl-remove-if (lambda (tool)
+                        (and (consp tool) (keywordp (car tool))
+                             (member (plist-get tool :name) names)))
+                      claude-code-ide-mcp-server-tools)))
+
 (defun claude-code-ide-mcp-server-tool-scope (tool-spec)
   "Return the scope of TOOL-SPEC: `instance' or `coordinator'.
 TOOL-SPEC is a normalized tool specification."
