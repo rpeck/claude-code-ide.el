@@ -860,7 +860,9 @@ the CLI."
             (should-not (buffer-live-p (plist-get started :buffer)))))))))
 
 (ert-deftest claude-code-ide-test-wiring-quit-stops-all-first ()
-  "At Emacs quit, one stop of all CLIs with the quit budget comes before any cleanup."
+  "At Emacs quit, one stop of all CLIs with the quit budget comes before any cleanup.
+The cleanup of each session then runs no second stop: that stop would
+wait without the budget for a CLI that still runs."
   (claude-code-ide-wiring-tests--with-clean
     (let ((calls nil)
           (claude-code-ide-process-quit-timeout 1.5))
@@ -880,8 +882,10 @@ the CLI."
             (should (= 2 (length (nth 1 (car order)))))
             (should (equal (nth 2 (car order))
                            '(:budget 1.5 :timeout 1 :kill-wait 0.25 :scan nil)))
-            ;; Then each cleanup
-            (should (= 2 (cl-count 'stop (mapcar #'car (cdr order)))))))))
+            ;; Then each cleanup, without a second stop
+            (should-not (cdr order))
+            (should-not (claude-code-ide-instance-of-session a))
+            (should-not (claude-code-ide-instance-of-session b))))))
     (should (memq #'claude-code-ide--cleanup-all-sessions kill-emacs-hook))))
 
 (defun claude-code-ide-wiring-tests--ghostel-like ()
